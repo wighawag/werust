@@ -6,6 +6,8 @@ blockedBy: [renderer-seam-trait-and-webview-backend-navigate]
 covers: [1, 2]
 ---
 
+> **FORWARD-POINTER (planted by drive-tasks after `renderer-seam-trait-and-webview-backend-navigate` landed).** On the WebKitGTK backend the seam's input-forwarding methods (`send_pointer` / `send_key` / `send_scroll`, and to a degree `set_focus`) are DELIBERATE NO-OPS: the live view is a real embedded GTK widget, so the OS/GTK routes scroll/click/focus/keyboard input to it NATIVELY. For the webview backend, "input reaches the page" (acceptance criterion) is satisfied simply by embedding the live `ViewHandle` widget and giving it focus — you do NOT need to (and should not try to) drive interactivity by calling `send_*`; those calls will do nothing on this backend and that is correct. The `send_*` seam methods exist for a FUTURE native renderer that has no OS-level input routing and must be fed synthetic events. So: wire the URL bar + back/forward/reload/stop + lifecycle-driven chrome through the seam, embed the live widget for interaction, and test input-forwarding at the SEAM boundary (that the shell calls the seam / that the widget is embedded and focusable) rather than asserting the webview's `send_*` no-ops move anything. Don't "fix" the no-ops.
+
 ## What to build
 
 Build the browser product shell around the `Renderer` seam: a window with a URL

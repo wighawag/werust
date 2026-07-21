@@ -1,0 +1,43 @@
+# CONTEXT — werust domain language
+
+The domain glossary for `werust`. Agents and skills use THIS vocabulary when naming modules, tests, and discussing the system. Architectural rationale lives in `docs/adr/` (decisions); product framing lives in `work/specs/`; the native-renderer conformance ladder lives in `docs/conformance-tiers.md`.
+
+## What werust is
+
+**werust** is a from-scratch, general-purpose web browser in **Rust** — the single-language successor to the Zig project **wezig**, carrying forward all of wezig's language-independent learning but implemented in Rust for one-language uniformity (one language, one toolchain, one mental model for a solo + LLM-driven codebase).
+
+It is built for a **"post-trusted-server" web**: the origin is NOT trusted by default; it prefers **verifiable / content-addressed** content (native `ipfs://` resolution) over server-authoritative content, protects **privacy**, and is **local-first**. It MUST render the normal server web with **full compatibility** (a hard requirement). On top of that, decentralised-web capabilities are **first-class, not extensions**: a native Ethereum EIP-1193 provider and native IPFS content resolution — a *consequence* of the trust stance, not the reason to exist (the thesis ADR, `docs/adr/0001`).
+
+It ships **usable from day one** on a system-webview backend (WebKitGTK first) while a from-scratch **native Rust renderer** grows in parallel behind a hot-swappable `Renderer` seam (the "webview now, native later" hedge). The native renderer is **assembled from the mature pure-Rust stack** (html5ever, stylo, taffy, parley/cosmic-text, vello+wgpu) rather than binding C for renderer internals — this is the whole reason Rust is being trialled.
+
+werust runs as a **reversible experiment**: does standing on the pure-Rust renderer stack give a simpler/faster path to conformance-tier **T1** than wezig's Zig arm? **wezig stays the live control group.** If Rust drowns in DOM object-graph friction, that is a valid finding.
+
+## Core domain terms
+
+- **wezig** — the sibling Zig browser project; werust's **control group** in a reversible language experiment. Both arms aim at the SAME conformance ladder so results are comparable.
+- **thesis (trust model)** — the origin is not trusted by default; prefer verifiable/content-addressed over server-authoritative; privacy-protecting; local-first. Recorded in `docs/adr/0001-general-browser-for-a-post-trusted-server-web.md` (ported from wezig ADR-0011). The decentralised web is a *consequence/expression*, not the purpose.
+- **T0–T3 conformance ladder** — the native renderer's tiered capability target (`docs/conformance-tiers.md`, ported from wezig ADR-0012). T0 fixed subset → T1 real static docs → T2 full static layout → T3 interactive sites. Each rung is DRIVEN by a page checklist and MEASURED by a WPT-subset bar; each rung carries BOTH a normal server-served page AND a content-addressed (`ipfs://`) page — a tier is not "reached" until both land.
+- **`Renderer` seam** — the wide, hot-swappable rendering backend interface: navigate/reload/stop, live interactive view, input/scroll/focus forwarding, load-lifecycle events, a script-message bridge (to inject the EIP-1193 provider), and request-interception / custom-scheme hook (for `ipfs://`). A backend qualifies ONLY if it satisfies the **trust hooks** (provider injection + `ipfs://` scheme), not just rendering.
+- **webview-now / native-later** — ship usability on a system webview (WebKitGTK first) while the native Rust renderer matures behind the `Renderer` seam; the hedge that avoids the "no product for years" trap.
+- **`ScriptEngine` seam** — the JS runtime interface. BIND a mature engine first (SpiderMonkey leant); a pure-Rust engine is an aspirational later swap-in. Do NOT write a JS engine first.
+- **`Fetcher` seam** — the networking interface. BIND a vetted HTTP+TLS stack (rustls or bound libcurl) — NEVER write TLS — plus a hash-verified content-addressed fetch path.
+- **content-addressed / `ipfs://`** — content fetched and verified by hash (CID) rather than trusted because a server served it; the earliest place the thesis lands. A first-class scheme, not a novelty.
+- **EIP-1193 provider** — the native Ethereum RPC provider injected into pages via the `Renderer` seam's script-message bridge; a first-class capability.
+- **Page-GPU** — page rendering on wgpu (WebGPU); WebGL via the ANGLE-style GLES-to-native route, not a hand-written GL stack.
+- **pure-Rust renderer stack** — html5ever (parse), stylo (cascade), taffy (flex/grid layout), parley/cosmic-text/swash (text shaping), vello + wgpu (paint). Standing on this stack to reach T1 is the project's first real experiment vs the Zig arm.
+- **work/ contract** — the on-disk system this repo uses, defined by the reference docs in **`work/protocol/`** (copied here by `setup`): `WORK-CONTRACT.md` (the contract), `CLAIM-PROTOCOL.md`, `REVIEW-PROTOCOL.md`, `SURFACE-PROTOCOL.md`, `TASKING-PROTOCOL.md`, `task-template.md`, `spec-template.md`, `ADR-FORMAT.md`. Three REGIME umbrellas — `notes/` (capture buckets), `tasks/` (the build board), `specs/` (the spec lifecycle) — plus top-level `questions/` and `protocol/`. One markdown file per item, status = the folder it lives in (never a field). Capture buckets: `notes/ideas/` (proposed), `notes/observations/` (spotted, unverified, append-only), `notes/findings/` (verified external/domain ground truth, each with a `source:`). ADRs (`docs/adr/`, format in `work/protocol/ADR-FORMAT.md`) record what WE decided and why.
+- **promptGuidance** — the per-repo NUDGE namespace in `dorfl.json` whose members (currently just `testFirst`) strengthen the wording in the worker's in-band prompt. NOT a gate: the `verify` step is still the only acceptance bar. This repo sets `testFirst: true`.
+
+## Conventions
+
+Standing per-change rules agents must follow in this repo.
+
+- **Test-first (a NUDGE, not a gate).** Autonomous builds default to writing the failing test BEFORE the production code (`promptGuidance.testFirst: true` in `dorfl.json`). The `verify` gate still decides pass/fail either way.
+- **Conventional commits (load-bearing for releases).** Every change commits a conventional-commit subject (`feat:` / `fix:` / `docs:` / `chore:` / `test:` / …). Releases generate their changelog FROM this git history — there are **no per-change changeset files to maintain** (this mirrors wezig). Keep subjects clean and correctly typed.
+- **Releases via GoReleaser (Rust builder) — a deliberately Zig-less build path (`docs/adr/0002`).** werust mirrors wezig's release approach, swapping GoReleaser's `builder: zig` for its native **`builder: rust`** (GoReleaser v2.5+, via cargo-zigbuild): a `.goreleaser.yaml` runs `cargo build` and cross-compiles per target; a tag push (`v*`) cuts the GitHub Release with binaries + checksums + the conventional-commit changelog, plus the **mobile artifacts (Android APK, iOS simulator `.app`)** built by hand-written jobs alongside it — **parity with wezig, mobile included, is the bar.** The build-toolchain choice is itself part of the experiment (Rust-only, no Zig in the toolchain vs wezig's `zig build`). Set this up when the first shippable binary exists; port the desktop + mobile artifact shape from wezig's `release.yml`. Rationale + the rejected `dist` alternative: `docs/adr/0002-release-via-goreleaser-rust-builder-a-zig-less-build-path.md`.
+- **Reproducible dorfl (pinned).** This repo PINS the dorfl version via `dorflCmd` in `dorfl.json` (`npx dorfl@0.8.1`), so bare `dorfl` self-forwards to a fixed version instead of floating with whatever is globally installed. To bump: change the version in `dorflCmd` -> `dorfl sync` -> re-run `install-ci` only if templates changed. See `docs/dorfl-cmd/README.md`.
+
+## Skills this repo uses
+
+- Required: `setup` (onboarding/migration), `to-spec`, `to-task`.
+- Recommended: `review`, `grill-me`.

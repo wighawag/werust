@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/werust",
     "crates/renderer",
+    "crates/webview-renderer",
     "crates/native-renderer",
     "crates/fetcher",
     "crates/script-engine",

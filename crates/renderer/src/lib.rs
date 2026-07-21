@@ -184,7 +184,8 @@ pub type ScriptMessageHandler = Box<dyn FnMut(ScriptMessage) + Send>;
 
 /// A callback invoked to resolve an intercepted [`SchemeRequest`] for a custom
 /// scheme, returning the body to hand back to the engine.
-pub type SchemeHandler = Box<dyn FnMut(SchemeRequest) -> Result<SchemeResponse, RendererError> + Send>;
+pub type SchemeHandler =
+    Box<dyn FnMut(SchemeRequest) -> Result<SchemeResponse, RendererError> + Send>;
 
 /// The wide, hot-swappable rendering-backend interface.
 ///
@@ -213,7 +214,13 @@ pub trait Renderer {
     fn load_state(&self) -> LoadState;
 
     /// The URL of the current (committed or in-flight) load, if any.
-    fn current_url(&self) -> Option<&str>;
+    ///
+    /// Returned by value, not borrowed: a real event-driven backend (the
+    /// WebKitGTK webview) keeps its load state behind interior mutability so its
+    /// load-lifecycle signals can update it, and cannot lend a borrow out from
+    /// there. Owning the returned `String` keeps the seam implementable by such
+    /// backends (see the `webview-renderer` crate).
+    fn current_url(&self) -> Option<String>;
 
     /// Pull the next pending [`LoadEvent`], or `None` if the queue is empty.
     ///
@@ -308,8 +315,8 @@ mod tests {
             self.state
         }
 
-        fn current_url(&self) -> Option<&str> {
-            self.url.as_deref()
+        fn current_url(&self) -> Option<String> {
+            self.url.clone()
         }
 
         fn poll_event(&mut self) -> Option<LoadEvent> {
@@ -343,7 +350,8 @@ mod tests {
         fn drive_to_finished(&mut self) {
             let url = self.url.clone().expect("a load in flight");
             self.state = LoadState::Committed;
-            self.events.push_back(LoadEvent::Committed { url: url.clone() });
+            self.events
+                .push_back(LoadEvent::Committed { url: url.clone() });
             self.state = LoadState::Finished;
             self.events.push_back(LoadEvent::Finished { url });
         }
@@ -358,7 +366,7 @@ mod tests {
         r.navigate("https://example.com/").expect("valid https url");
         assert_eq!(r.load_state(), LoadState::Started);
         assert!(r.load_state().is_loading());
-        assert_eq!(r.current_url(), Some("https://example.com/"));
+        assert_eq!(r.current_url().as_deref(), Some("https://example.com/"));
 
         // The Started transition emits a matching lifecycle event.
         assert_eq!(

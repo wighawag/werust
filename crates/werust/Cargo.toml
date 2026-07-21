@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 renderer = { path = "../renderer" }
+webview-renderer = { path = "../webview-renderer" }
 native-renderer = { path = "../native-renderer" }
 fetcher = { path = "../fetcher" }
 script-engine = { path = "../script-engine" }
+gtk4 = { version = "=0.10.0", features = ["v4_18"] }

@@ -8,9 +8,10 @@
 //!
 //! # What it renders, and how a load gets its bytes
 //!
-//! It renders the fixed v0 subset (`docs/conformance-tiers.md` T0) through the
-//! [`render_with`](crate::pipeline::render_with) pipeline. At T0 there is no
-//! networking yet (the server-web `http(s)://` fetch is the `Fetcher` seam's job,
+//! It parses REAL documents (`docs/conformance-tiers.md` T1) with html5ever behind
+//! the [`Parser`](crate::parser::Parser) seam and renders them through the
+//! [`render_with`](crate::pipeline::render_with) pipeline. Still no networking yet
+//! (the server-web `http(s)://` fetch is the `Fetcher` seam's job,
 //! and `ipfs://` resolution is the content-addressed seam's — separate tasks), so
 //! this backend navigates only self-contained document sources it does not need a
 //! network for:
@@ -45,9 +46,8 @@ use renderer::{
     ScriptMessageHandler, ScrollDelta, TrustHooks, ViewHandle,
 };
 
+use crate::html5ever_parser::Html5everParser;
 use crate::pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};
-use crate::tokenizer::SubsetTokenizer;
-use crate::tree::AllowlistTreeBuilder;
 
 /// A [`Renderer`] backed by the in-process T0 native render pipeline.
 ///
@@ -59,8 +59,7 @@ use crate::tree::AllowlistTreeBuilder;
 /// for inspection and for the software surface a windowing layer would blit.
 #[derive(Default)]
 pub struct NativeRenderer {
-    tokenizer: SubsetTokenizer,
-    tree_builder: AllowlistTreeBuilder,
+    parser: Html5everParser,
     viewport_width: f32,
     state: LoadState,
     url: Option<String>,
@@ -89,18 +88,14 @@ impl NativeRenderer {
 
     /// Render a document `source` directly, bypassing URL handling.
     ///
-    /// This is the seam-free entry point: it runs the full T0 pipeline
-    /// (tokenize → allowlist tree → cascade → flow → software text) on `source`
-    /// and returns the [`RenderOutput`]. The backend also stores it as the
+    /// This is the seam-free entry point: it runs the full pipeline
+    /// (parse → cascade → flow → software text) on `source` — parsed by
+    /// html5ever behind the [`Parser`](crate::parser::Parser) seam — and returns
+    /// the [`RenderOutput`]. The backend also stores it as the
     /// [`last_render`](NativeRenderer::last_render); `navigate` is a thin wrapper
     /// that decodes a `data:` URL and calls this.
     pub fn render_source(&mut self, source: &str) -> &RenderOutput {
-        let output = render_with(
-            &self.tokenizer,
-            &self.tree_builder,
-            source,
-            self.viewport_width,
-        );
+        let output = render_with(&self.parser, source, self.viewport_width);
         self.last_render.insert(output)
     }
 

@@ -1,25 +1,25 @@
 //! The T0 render pipeline: source HTML → painted [`Surface`], end to end.
 //!
-//! This ties the four T0 stages into the one call the backend makes per load
-//! (`docs/conformance-tiers.md` T0): tokenize → allowlist tree → cascade (small
-//! property set) → block/inline flow → software text. Each stage sits behind its
-//! own seam ([`Tokenizer`], [`TreeBuilder`]) or module (cascade, layout, paint),
-//! so this function is just the wiring; swapping the T0 front-end for T1's
-//! html5ever means swapping the [`Tokenizer`]/[`TreeBuilder`] passed in, not
-//! rewriting the pipeline.
+//! This ties the render stages into the one call the backend makes per load
+//! (`docs/conformance-tiers.md`): parse → cascade (small property set) →
+//! block/inline flow → software text. The front-end sits behind the
+//! [`Parser`] seam and the rest behind modules (cascade, layout, paint), so this
+//! function is just the wiring; swapping the T0 subset front-end for T1's
+//! html5ever means passing a different [`Parser`], not rewriting the pipeline.
 //!
-//! Author CSS is a wrinkle worth noting: the allowlist tree builder DROPS
-//! `<style>` (it is not on the v0 element allowlist), so the stylesheet cannot be
-//! recovered from the tree. The pipeline therefore extracts author CSS straight
-//! from the token stream (the text inside `<style>…</style>`) before tree building,
-//! and feeds it to the cascade. This keeps `<style>` out of the rendered box tree
-//! (it must not paint) while still honouring the author rules it carried.
+//! Author CSS travels WITH the parse: a [`Parser`] returns the
+//! [`ParsedDocument`]'s `author_css` (the concatenated text of the document's
+//! `<style>` elements) alongside the [`Dom`], so the pipeline feeds it to the
+//! cascade without caring HOW it was recovered (the T0 parser reads it from the
+//! token stream because the allowlist builder drops `<style>`; the T1 parser walks
+//! the tree html5ever keeps it in). `<style>` never paints either way: the UA
+//! sheet sets `head { display: none }` and `<style>` lives under `<head>`.
 
 use crate::css::Stylesheet;
 use crate::layout::{layout, LayoutResult};
 use crate::paint::{paint, Surface};
-use crate::tokenizer::{Token, Tokenizer};
-use crate::tree::{Dom, TreeBuilder};
+use crate::parser::Parser;
+use crate::tree::Dom;
 
 /// The default T0 viewport width in px, used when a caller does not specify one.
 pub const DEFAULT_VIEWPORT_WIDTH: f32 = 800.0;
@@ -40,65 +40,40 @@ pub struct RenderOutput {
     pub surface: Surface,
 }
 
-/// Render `source` HTML into a [`RenderOutput`] using the given T0 front-end.
+/// Render `source` HTML into a [`RenderOutput`] using the given front-end.
 ///
-/// `tokenizer` + `tree_builder` are the `Tokenizer | TreeBuilder` seam pair; at T0
-/// they are the naive subset pair, at T1 they become html5ever. `viewport_width`
-/// is the content width block boxes fill and inline content wraps within.
+/// `parser` is the [`Parser`] seam: at T0 the naive subset parser, at T1
+/// html5ever. `viewport_width` is the content width block boxes fill and inline
+/// content wraps within.
 #[must_use]
-pub fn render_with(
-    tokenizer: &dyn Tokenizer,
-    tree_builder: &dyn TreeBuilder,
-    source: &str,
-    viewport_width: f32,
-) -> RenderOutput {
-    let tokens = tokenizer.tokenize(source);
-    let css = extract_author_css(&tokens);
-    let sheet = Stylesheet::parse(&css);
-    let dom = tree_builder.build(&tokens);
-    let layout = layout(&dom, &sheet, viewport_width);
+pub fn render_with(parser: &dyn Parser, source: &str, viewport_width: f32) -> RenderOutput {
+    let parsed = parser.parse(source);
+    let sheet = Stylesheet::parse(&parsed.author_css);
+    let layout = layout(&parsed.dom, &sheet, viewport_width);
     let surface = paint(&layout);
     RenderOutput {
-        dom,
+        dom: parsed.dom,
         layout,
         surface,
     }
-}
-
-/// Extract the concatenated author CSS from the token stream.
-///
-/// Walks the flat tokens and gathers the text between each `<style>` start tag and
-/// its matching `</style>` end tag. `<style>` is not on the element allowlist, so
-/// this is the only place its contents are read; the tree builder drops the tag
-/// itself so it never paints.
-fn extract_author_css(tokens: &[Token]) -> String {
-    let mut css = String::new();
-    let mut in_style = false;
-    for token in tokens {
-        match token {
-            Token::StartTag { name, .. } if name == "style" => in_style = true,
-            Token::EndTag { name } if name == "style" => in_style = false,
-            Token::Text(text) if in_style => css.push_str(text),
-            _ => {}
-        }
-    }
-    css
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::css::Color;
+    use crate::html5ever_parser::Html5everParser;
+    use crate::parser::SubsetParser;
     use crate::tokenizer::SubsetTokenizer;
     use crate::tree::AllowlistTreeBuilder;
 
     fn render(html: &str) -> RenderOutput {
-        render_with(
-            &SubsetTokenizer::new(),
-            &AllowlistTreeBuilder::new(),
-            html,
-            DEFAULT_VIEWPORT_WIDTH,
-        )
+        let parser = SubsetParser::new(SubsetTokenizer::new(), AllowlistTreeBuilder::new());
+        render_with(&parser, html, DEFAULT_VIEWPORT_WIDTH)
+    }
+
+    fn render_t1(html: &str) -> RenderOutput {
+        render_with(&Html5everParser::new(), html, DEFAULT_VIEWPORT_WIDTH)
     }
 
     #[test]
@@ -139,6 +114,68 @@ mod tests {
         let out = render("<html><head>metadata</head><body><p>body</p></body></html>");
         assert!(out.surface.transcript().contains("body"));
         assert!(!out.surface.transcript().contains("metadata"));
+    }
+
+    #[test]
+    fn same_pipeline_renders_via_the_t1_parser_swap() {
+        // The whole point of the seam: swapping the T0 subset parser for html5ever
+        // is the ONLY change; cascade/layout/paint are untouched and still paint
+        // the styled content. Same source, different `Parser`, real render.
+        let out =
+            render_t1("<html><body><h1>Hello</h1><p>world <strong>bold</strong></p></body></html>");
+        let transcript = out.surface.transcript();
+        assert!(
+            transcript.contains("Hello[b]"),
+            "heading bold: {transcript}"
+        );
+        assert!(transcript.contains("world"));
+        assert!(transcript.contains("bold[b]"), "strong bold: {transcript}");
+        assert!(!out.layout.runs.is_empty());
+        assert!(out.surface.height > 0);
+    }
+
+    #[test]
+    fn t1_parser_renders_a_real_document_off_the_v0_subset() {
+        // A real document using semantic elements the T0 allowlist would DROP
+        // (`<article>`, `<header>`, `<h2>` inside them), an author `<style>` block
+        // html5ever keeps in the tree, and named entities beyond the T0 set. It
+        // parses and paints via the native path end to end.
+        let out = render_t1(
+            "<!doctype html><html><head><title>Doc</title>\
+             <style>.lead{color:#008000}</style></head><body>\
+             <article><header><h1>Real &amp; Static</h1></header>\
+             <p class=\"lead\">An <em>article</em> with <strong>real</strong> markup &copy; 2026.</p>\
+             <ul><li>alpha</li><li>beta</li></ul></article></body></html>",
+        );
+        let transcript = out.surface.transcript();
+        // Title lives in <head> (display:none) and must not paint.
+        assert!(
+            !transcript.contains("Doc"),
+            "head title not painted: {transcript}"
+        );
+        // The <h1> is bold (UA sheet) and the `&amp;` entity is decoded to `&`
+        // (layout emits one run per word, so `Real`/`&`/`Static` are separate).
+        assert!(transcript.contains("Real[b]"), "h1 bold: {transcript}");
+        assert!(
+            transcript.contains("&[b]"),
+            "decoded entity in h1: {transcript}"
+        );
+        assert!(transcript.contains("Static[b]"), "h1 bold: {transcript}");
+        assert!(transcript.contains("article[i]"), "em italic: {transcript}");
+        assert!(transcript.contains("real[b]"), "strong bold: {transcript}");
+        assert!(
+            transcript.contains('\u{00a9}'),
+            "&copy; decoded: {transcript}"
+        );
+        assert!(transcript.contains("alpha") && transcript.contains("beta"));
+        // The author `.lead` rule (kept via the html5ever tree) coloured the para.
+        let lead = out
+            .layout
+            .runs
+            .iter()
+            .find(|r| r.text.contains("An"))
+            .expect("the lead paragraph run");
+        assert_eq!(lead.style.color, Color { r: 0, g: 128, b: 0 });
     }
 
     fn contains_tag(dom: &Dom, tag: &str) -> bool {

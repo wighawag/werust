@@ -22,10 +22,12 @@
 //!
 //! A load runs one pass:
 //!
-//! 1. **Tokenize** — [`SubsetTokenizer`] over the [`Tokenizer`] seam turns source
-//!    into a flat [`Token`](tokenizer::Token) stream.
-//! 2. **Tree** — [`AllowlistTreeBuilder`] over the [`TreeBuilder`] seam builds an
-//!    allowlist [`Dom`](tree::Dom), dropping anything off the v0 element allowlist.
+//! 1. **Parse** — a [`Parser`](parser::Parser) turns source HTML into a
+//!    [`ParsedDocument`](parser::ParsedDocument): the render [`Dom`](tree::Dom)
+//!    plus the document's author CSS. At T0 this is the [`SubsetParser`] (the
+//!    naive [`SubsetTokenizer`] + [`AllowlistTreeBuilder`], dropping anything off
+//!    the v0 allowlist); at T1 it is [`Html5everParser`], a real WHATWG parser
+//!    that keeps every element.
 //! 3. **Cascade** — [`css::cascade`] resolves each element's
 //!    [`ComputedStyle`](css::ComputedStyle) over the small T0 property set
 //!    (UA sheet + author `<style>` rules by specificity/order + inline `style`).
@@ -34,9 +36,12 @@
 //! 5. **Paint** — [`paint::paint`] rasterizes the runs into an in-memory software
 //!    [`Surface`](paint::Surface) (the software-text stage).
 //!
-//! The [`Tokenizer`] and [`TreeBuilder`] together are the swap seam T1 grows by:
-//! everything downstream consumes the [`Dom`](tree::Dom), so replacing the T0
-//! front-end does not touch cascade/layout/paint.
+//! The [`Parser`](parser::Parser) seam (the whole HTML front-end — the
+//! `Tokenizer | TreeBuilder` seam of the conformance ladder) is the swap point T1
+//! grows by: everything downstream consumes the [`Dom`](tree::Dom), so replacing
+//! the T0 subset front-end with html5ever does not touch cascade/layout/paint.
+//! The T0 [`Tokenizer`] and [`TreeBuilder`] traits stay the subset
+//! implementation, composed behind [`SubsetParser`].
 //!
 //! # Backend + trust hooks
 //!
@@ -50,13 +55,17 @@
 
 pub mod backend;
 pub mod css;
+pub mod html5ever_parser;
 pub mod layout;
 pub mod paint;
+pub mod parser;
 pub mod pipeline;
 pub mod tokenizer;
 pub mod tree;
 
 pub use backend::NativeRenderer;
+pub use html5ever_parser::Html5everParser;
+pub use parser::{ParsedDocument, Parser, SubsetParser};
 pub use pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};
 pub use tokenizer::{SubsetTokenizer, Token, Tokenizer};
 pub use tree::{AllowlistTreeBuilder, Dom, Element, Node, TreeBuilder};

@@ -6,3 +6,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# The vetted HTTP+TLS stack the `Fetcher` seam binds. `ureq` is a small,
+# synchronous HTTP client whose TLS is rustls (a vetted, memory-safe
+# implementation) — TLS is NEVER hand-written here. Default features pull
+# `rustls` + `rustls-webpki-roots`, i.e. a working, safe default trust store;
+# the durable trust-store / pinning POLICY is deferred (see the module docs and
+# `docs/spikes/fetcher-seam-bound-http-tls-stack/`).
+ureq = "=3.3.0"

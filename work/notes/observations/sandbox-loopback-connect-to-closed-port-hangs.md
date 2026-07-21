@@ -1,0 +1,3 @@
+# Sandbox loopback connect to a closed port hangs ~134s (no RST)
+
+2026-07-21 — Noticed while writing `fetcher` seam tests (task `fetcher-seam-bound-http-tls-stack`). In this build sandbox a `TcpStream::connect` to a *closed* `127.0.0.1:<port>` does not receive an immediate connection-refused; it hangs on SYN retransmission for ~134s before erroring. Any networking test that expects a fast "connection refused" from a dead loopback port will stall the suite. Worked around in the fetcher tests by not relying on connect-to-dead-port (see `docs/spikes/fetcher-seam-bound-http-tls-stack/README.md`). Out of scope for this task; captured for the next person writing loopback network tests.

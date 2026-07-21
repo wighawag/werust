@@ -17,6 +17,33 @@
 
 use crate::tree::Element;
 
+/// The fixed T0 CSS property allowlist (`docs/conformance-tiers.md` T0).
+///
+/// These are the ONLY property names the T0 cascade honours; every other property
+/// in a declaration block is silently ignored (see [`parse_declaration`]). It is
+/// the CSS-side companion to the element-side [`ELEMENT_ALLOWLIST`](crate::tree::ELEMENT_ALLOWLIST):
+/// together they are the single machine-readable source of truth for "what the v0
+/// subset supports", which the committed-fixture drift guard checks fixtures
+/// against so a golden fixture can never quietly drift outside the documented
+/// subset. `text-decoration-line` is the longhand the cascade also accepts for the
+/// `text-decoration` shorthand.
+pub const SUPPORTED_PROPERTIES: &[&str] = &[
+    "display",
+    "color",
+    "font-weight",
+    "font-style",
+    "text-decoration",
+    "text-decoration-line",
+    "margin-bottom",
+];
+
+/// Whether `name` is on the T0 CSS property allowlist (case-insensitively).
+#[must_use]
+pub fn is_supported_property(name: &str) -> bool {
+    let name = name.trim().to_ascii_lowercase();
+    SUPPORTED_PROPERTIES.contains(&name.as_str())
+}
+
 /// An sRGB colour, 8 bits per channel, opaque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Color {
@@ -225,6 +252,37 @@ impl Stylesheet {
         }
         Stylesheet { rules }
     }
+}
+
+/// Whether `text` is a selector the T0 subset supports: a single type, `.class`,
+/// `#id`, or the universal `*` (no combinators, no pseudo-classes).
+///
+/// This is the selector-side companion to [`SUPPORTED_PROPERTIES`] and
+/// [`is_supported_property`]: the committed-fixture drift guard uses it to reject a
+/// fixture whose `<style>` block uses a selector outside the documented T0 set,
+/// keeping the golden fixtures within the subset.
+///
+/// It does its OWN single-token validation rather than trusting [`parse_selector`]:
+/// the cascade's parser is deliberately lenient (its `.class` / `#id` branches
+/// accept any non-empty remainder, so a malformed `.a > .b` parses as a class that
+/// simply never matches), which is fine for the cascade but too loose for a drift
+/// guard whose whole job is to REJECT such selectors. A supported selector is `*`,
+/// or a single identifier optionally prefixed by `.` or `#` (identifier chars:
+/// ASCII alphanumeric, `-`, `_`).
+#[must_use]
+pub fn is_supported_selector(text: &str) -> bool {
+    let text = text.trim();
+    if text == "*" {
+        return true;
+    }
+    let ident = text
+        .strip_prefix('.')
+        .or_else(|| text.strip_prefix('#'))
+        .unwrap_or(text);
+    !ident.is_empty()
+        && ident
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Parse a single restricted selector.
@@ -492,6 +550,50 @@ mod tests {
             &sheet,
         );
         assert_eq!(style.display, Display::None);
+    }
+
+    #[test]
+    fn supported_property_allowlist_matches_the_cascade() {
+        // Every property the allowlist advertises is actually honoured by the
+        // cascade parser, and a property off the allowlist is not — so the
+        // machine-readable allowlist the drift guard trusts cannot silently
+        // diverge from what `parse_declaration` really supports.
+        assert!(is_supported_property("color"));
+        assert!(is_supported_property("MARGIN-BOTTOM"));
+        assert!(!is_supported_property("padding"));
+        assert!(!is_supported_property("width"));
+        for prop in SUPPORTED_PROPERTIES {
+            let value = match *prop {
+                "display" => "block",
+                "color" => "#000000",
+                "font-weight" => "bold",
+                "font-style" => "italic",
+                "text-decoration" | "text-decoration-line" => "underline",
+                "margin-bottom" => "1px",
+                other => panic!("untested allowlisted property {other}"),
+            };
+            assert!(
+                parse_declaration(prop, value).is_some(),
+                "allowlisted property {prop} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_selector_accepts_the_t0_set_and_rejects_the_rest() {
+        // The drift guard's selector check: a single type/.class/#id/* is
+        // supported; combinators, pseudo-classes, and multi-token selectors are
+        // not — including a malformed `.class` the lenient cascade parser would
+        // otherwise wave through.
+        assert!(is_supported_selector("p"));
+        assert!(is_supported_selector(".lead"));
+        assert!(is_supported_selector("#main"));
+        assert!(is_supported_selector("*"));
+        assert!(!is_supported_selector("div p"));
+        assert!(!is_supported_selector("a:hover"));
+        assert!(!is_supported_selector(".a > .b"));
+        assert!(!is_supported_selector("ul > li"));
+        assert!(!is_supported_selector(""));
     }
 
     #[test]

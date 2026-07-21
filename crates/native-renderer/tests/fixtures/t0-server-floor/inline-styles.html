@@ -1,0 +1,16 @@
+<html>
+<head>
+<style>
+#title { color: #800000 }
+.hidden { display: none }
+.red { color: red }
+</style>
+</head>
+<body>
+<h1 id="title">Cascade Order</h1>
+<p>Author rules, then <span style="color:#0000ff">inline style wins</span> over them.</p>
+<p class="red">This paragraph is red by class, <span style="color:green">green by inline style</span>.</p>
+<p class="hidden">This paragraph is display:none and must not paint.</p>
+<p>A forced break here:<br>and the text continues on a new line.</p>
+</body>
+</html>

@@ -230,6 +230,234 @@ impl Fetcher for HttpFetcher {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The hash-verified content-addressed fetch path (the `ipfs://` fetch half).
+// ---------------------------------------------------------------------------
+//
+// This is the technical CORE of the thesis (`CONTEXT.md`, `docs/adr/0001`):
+// content fetched by a content identifier (CID) is trusted because it VERIFIES
+// against the hash the CID names, NOT because some origin served it. The origin
+// (a gateway, a peer, a local store) is untrusted; verification moves to the
+// hash. A mismatch is a HARD failure, never a silent pass.
+//
+// # Where the bytes come from is a seam ([`ContentSource`])
+//
+// This path splits cleanly in two: *getting* candidate bytes for a CID (from an
+// IPFS gateway over the HTTP [`Fetcher`], a local blockstore, a peer, or (in
+// tests) a temp-dir store) and *verifying* those bytes hash to the CID. Only
+// the verification is this task's technical core, and it must be identical
+// wherever the bytes came from. So the origin is abstracted behind the
+// [`ContentSource`] trait and [`VerifyingContentFetcher`] layers verification on
+// top of ANY source. The concrete gateway/network source is the consuming
+// task's job (`ipfs-scheme-resolution-through-renderer-seam`); this seam owns
+// the verify.
+//
+// # CID scope: any codec, sha2-256 multihash (the IPFS default)
+//
+// A CID names its content by a self-describing multihash. This path parses the
+// full CID (via the vetted `cid`/`multihash` crates, since CID parsing is byte
+// layout, not a cryptographic primitive) and RE-COMPUTES the digest over the
+// fetched bytes with the hash function the multihash names, then compares. It
+// supports the `sha2-256` multihash (multihash code `0x12`), the dominant IPFS
+// default, for ANY CID version/codec whose block bytes are addressed directly
+// (raw / the leaf block). A CID naming a different, not-yet-supported hash
+// function is rejected as [`VerifyError::UnsupportedHash`]: an explicit refusal,
+// NEVER a silent pass (rejecting-when-unsure is the whole trust stance). DAG/UnixFS
+// traversal (a CID whose block is an IPLD node linking child blocks rather than
+// the content itself) is out of scope here and belongs to the render/resolution
+// tasks; this seam verifies the block bytes it is handed against the CID.
+
+use cid::Cid;
+use sha2::{Digest, Sha256};
+
+/// The multihash code for `sha2-256` (the IPFS default content hash).
+///
+/// A CID whose multihash uses this code is verified by re-hashing the fetched
+/// bytes with SHA-256 and comparing against the digest the CID carries. Any
+/// other code is refused as [`VerifyError::UnsupportedHash`] rather than trusted.
+const MULTIHASH_SHA2_256: u64 = 0x12;
+
+/// Where candidate bytes for a CID come from, before verification.
+///
+/// The content-addressed path is deliberately split: a `ContentSource` PRODUCES
+/// bytes for a CID (an IPFS gateway over the HTTP [`Fetcher`], a local
+/// blockstore, a peer, or, in tests, a temp-dir store), and
+/// [`VerifyingContentFetcher`] VERIFIES them against the CID's hash. A source is
+/// UNTRUSTED: whatever it returns is verified before it is ever handed back, so
+/// a hostile or buggy source cannot cause unverified bytes to be returned as if
+/// valid. Implementations surface a miss / transport failure as a
+/// [`FetchError`]; the verification (and its hard-failure on mismatch) is not
+/// their concern.
+pub trait ContentSource {
+    /// Produce the candidate bytes a source has for `cid`.
+    ///
+    /// The returned bytes are NOT yet trusted: the caller verifies them against
+    /// the CID. A source that does not have the content, or fails to retrieve
+    /// it, returns a [`FetchError`] (e.g. [`FetchError::Transport`]).
+    fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError>;
+}
+
+/// A failure of the hash-verified content-addressed fetch path.
+///
+/// Kept distinct from [`FetchError`] because the failure modes are different:
+/// the CID itself can be malformed ([`InvalidCid`](VerifyError::InvalidCid)),
+/// name a hash function this path does not yet implement
+/// ([`UnsupportedHash`](VerifyError::UnsupportedHash)), the source can fail to
+/// produce bytes ([`Source`](VerifyError::Source)), or, the load-bearing one,
+/// the produced bytes can FAIL to hash to the CID
+/// ([`HashMismatch`](VerifyError::HashMismatch)). The mismatch is the whole
+/// point: it means the content did not match its hash, so it is rejected, never
+/// returned as if valid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyError {
+    /// The CID string could not be parsed as a content identifier.
+    InvalidCid(String),
+    /// The CID names a multihash function this path does not verify (only
+    /// `sha2-256` is supported today). Refused rather than trusted: an
+    /// unverifiable CID must not silently pass.
+    UnsupportedHash {
+        /// The multihash code the CID carried.
+        code: u64,
+    },
+    /// The [`ContentSource`] failed to produce bytes for the CID.
+    Source(FetchError),
+    /// The produced bytes did NOT hash to the CID's digest: the content is
+    /// tampered/incorrect and is rejected. This is the loud failure the whole
+    /// path exists to guarantee.
+    HashMismatch {
+        /// The CID the caller asked for (its canonical string form).
+        cid: String,
+    },
+}
+
+impl fmt::Display for VerifyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VerifyError::InvalidCid(c) => write!(f, "invalid content identifier: {c}"),
+            VerifyError::UnsupportedHash { code } => {
+                write!(
+                    f,
+                    "unsupported content hash function (multihash code {code:#x})"
+                )
+            }
+            VerifyError::Source(e) => write!(f, "content source error: {e}"),
+            VerifyError::HashMismatch { cid } => {
+                write!(f, "content hash mismatch: bytes do not match cid {cid}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for VerifyError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            VerifyError::Source(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// The content-addressed half of the [`Fetcher`] seam: fetch by CID, return the
+/// bytes ONLY after they verify against the CID's hash.
+///
+/// The rest of werust obtains content-addressed bytes ONLY through this trait,
+/// so the verify can never be skipped by a caller: there is no way to get the
+/// bytes without going through the hash check. The `ipfs://` scheme wiring
+/// (`ipfs-scheme-resolution-through-renderer-seam`) resolves a CID through this
+/// path and renders the verified bytes.
+pub trait ContentAddressedFetcher {
+    /// Fetch the content named by `cid` and return its bytes only after they
+    /// verify against the CID's hash.
+    ///
+    /// `cid` is a content identifier string (e.g. the `<cid>` in
+    /// `ipfs://<cid>/…`). The bytes are obtained from the underlying source and
+    /// their hash recomputed and compared to the digest the CID carries: on a
+    /// match the bytes are returned; on a mismatch the result is
+    /// [`VerifyError::HashMismatch`] and NOTHING is returned. A malformed CID is
+    /// [`VerifyError::InvalidCid`]; a CID naming an unsupported hash is
+    /// [`VerifyError::UnsupportedHash`]; a source failure is
+    /// [`VerifyError::Source`]. Verification NEVER trusts the origin: it trusts
+    /// the hash.
+    fn fetch_verified(&self, cid: &str) -> Result<Vec<u8>, VerifyError>;
+}
+
+/// A [`ContentAddressedFetcher`] that layers hash verification over any
+/// [`ContentSource`].
+///
+/// Construct with [`VerifyingContentFetcher::new`], handing it the source the
+/// bytes come from (a temp-dir store in tests; an IPFS gateway over the HTTP
+/// [`Fetcher`] in production, the consuming task's job). Every
+/// [`fetch_verified`](ContentAddressedFetcher::fetch_verified) call parses the
+/// CID, asks the source for bytes, and verifies them BEFORE returning: the
+/// source is never trusted.
+pub struct VerifyingContentFetcher<S: ContentSource> {
+    source: S,
+}
+
+impl<S: ContentSource> VerifyingContentFetcher<S> {
+    /// Wrap a [`ContentSource`] with hash verification.
+    pub fn new(source: S) -> Self {
+        Self { source }
+    }
+
+    /// The wrapped source (untrusted; every fetch through this fetcher verifies
+    /// what it produces).
+    pub fn source(&self) -> &S {
+        &self.source
+    }
+}
+
+/// Verify that `bytes` hash to the digest `cid` names, returning the exact
+/// [`VerifyError`] on any failure.
+///
+/// This is the technical core in one place: recompute the digest with the hash
+/// function the CID's multihash names, then compare it constant-length against
+/// the digest the CID carries. An unsupported hash function is refused, never
+/// assumed to match.
+fn verify_bytes_against_cid(cid: &Cid, bytes: &[u8]) -> Result<(), VerifyError> {
+    let mh = cid.hash();
+    match mh.code() {
+        MULTIHASH_SHA2_256 => {
+            let computed = Sha256::digest(bytes);
+            if computed.as_slice() == mh.digest() {
+                Ok(())
+            } else {
+                Err(VerifyError::HashMismatch {
+                    cid: cid.to_string(),
+                })
+            }
+        }
+        code => Err(VerifyError::UnsupportedHash { code }),
+    }
+}
+
+impl<S: ContentSource> ContentAddressedFetcher for VerifyingContentFetcher<S> {
+    fn fetch_verified(&self, cid: &str) -> Result<Vec<u8>, VerifyError> {
+        let parsed = Cid::try_from(cid).map_err(|_| VerifyError::InvalidCid(cid.to_string()))?;
+        let bytes = self.source.get(&parsed).map_err(VerifyError::Source)?;
+        verify_bytes_against_cid(&parsed, &bytes)?;
+        Ok(bytes)
+    }
+}
+
+/// Compute the canonical CIDv1 (raw codec, `sha2-256` multihash) that addresses
+/// `bytes`, as its base32 string.
+///
+/// This is the inverse of the verify: it names content by its hash. It is how a
+/// content store (or a test) derives the CID a blob should be stored under, so
+/// the round-trip "store bytes under their CID, fetch that CID, get the bytes
+/// back verified" holds. Returns [`VerifyError::InvalidCid`] only if the derived
+/// multihash could not be assembled (not expected for `sha2-256`).
+pub fn cid_v1_raw_sha256(bytes: &[u8]) -> Result<String, VerifyError> {
+    use cid::multihash::Multihash;
+    /// The `raw` IPLD multicodec code (block bytes ARE the content).
+    const RAW_CODEC: u64 = 0x55;
+    let digest = Sha256::digest(bytes);
+    let mh = Multihash::<64>::wrap(MULTIHASH_SHA2_256, digest.as_slice())
+        .map_err(|e| VerifyError::InvalidCid(e.to_string()))?;
+    Ok(Cid::new_v1(RAW_CODEC, mh).to_string())
+}
+
 /// Returns the seam's crate name. A trivial anchor kept for callers that probe
 /// the workspace; the real surface is the [`Fetcher`] trait.
 #[must_use]
@@ -446,5 +674,170 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
+    }
+
+    // -----------------------------------------------------------------------
+    // The hash-verified content-addressed fetch path.
+    // -----------------------------------------------------------------------
+
+    /// A throwaway content store backed by a TEMP DIRECTORY, isolated from the
+    /// live network and from every other test.
+    ///
+    /// It plays the role of an untrusted origin (a gateway / blockstore / peer):
+    /// it just hands back whatever bytes it holds for a CID's canonical string.
+    /// The verify happens ABOVE it in [`VerifyingContentFetcher`], so this store
+    /// can be pointed at either honest content (stored under its real CID) or
+    /// TAMPERED content (bytes that do not match the CID) to exercise both the
+    /// matching and mismatching cases. The temp dir is removed on [`Drop`].
+    struct TempDirContentStore {
+        dir: tempfile::TempDir,
+    }
+
+    impl TempDirContentStore {
+        fn new() -> Self {
+            Self {
+                dir: tempfile::tempdir().expect("create isolated temp content store"),
+            }
+        }
+
+        /// Store honest content: derive its real CID, save the bytes under it,
+        /// and return that CID. Fetching this CID must verify and return the
+        /// bytes.
+        fn put(&self, bytes: &[u8]) -> String {
+            let cid = cid_v1_raw_sha256(bytes).expect("derive cid for content");
+            std::fs::write(self.dir.path().join(&cid), bytes).expect("write content blob");
+            cid
+        }
+
+        /// Store TAMPERED content under a CID: the file saved for `cid` holds
+        /// `tampered`, which does NOT hash to `cid`. Fetching this CID must fail
+        /// loudly with a hash mismatch, never return the bytes.
+        fn put_tampered_under(&self, cid: &str, tampered: &[u8]) {
+            std::fs::write(self.dir.path().join(cid), tampered).expect("write tampered blob");
+        }
+    }
+
+    impl ContentSource for TempDirContentStore {
+        fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
+            let path = self.dir.path().join(cid.to_string());
+            std::fs::read(&path)
+                .map_err(|e| FetchError::Transport(format!("content store miss: {e}")))
+        }
+    }
+
+    #[test]
+    fn fetches_and_returns_content_that_verifies_against_its_cid() {
+        // The matching case: content stored under its real CID fetches back,
+        // verified, byte-for-byte. This drives ONLY through the seam trait: a
+        // caller holds `dyn ContentAddressedFetcher`, never the store.
+        let store = TempDirContentStore::new();
+        let content = b"<html><body>verifiable, content-addressed</body></html>";
+        let cid = store.put(content);
+
+        let fetcher: &dyn ContentAddressedFetcher = &VerifyingContentFetcher::new(store);
+        let got = fetcher
+            .fetch_verified(&cid)
+            .expect("content that matches its cid is returned");
+
+        assert_eq!(got, content);
+    }
+
+    #[test]
+    fn a_hash_mismatch_fails_loudly_and_never_returns_the_bytes() {
+        // The mismatching case, the whole point of the path. The store is asked
+        // for a real CID but has been made to hold TAMPERED bytes under it. The
+        // fetch MUST reject: a HashMismatch, never `Ok`, never the tampered
+        // bytes returned as if valid (we don't trust the origin, we verify the
+        // content).
+        let store = TempDirContentStore::new();
+        let honest = b"the content this cid actually names";
+        let cid = cid_v1_raw_sha256(honest).expect("derive cid");
+        store.put_tampered_under(&cid, b"tampered bytes that do not match the cid");
+
+        let fetcher = VerifyingContentFetcher::new(store);
+        let result = fetcher.fetch_verified(&cid);
+
+        assert_eq!(
+            result,
+            Err(VerifyError::HashMismatch { cid: cid.clone() }),
+            "tampered content must be rejected as a loud mismatch, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_cid_is_rejected_before_touching_the_source() {
+        // A CID that does not parse is refused up front as InvalidCid: the
+        // source is never consulted (an unparseable identifier cannot name
+        // anything to verify against).
+        let store = TempDirContentStore::new();
+        let fetcher = VerifyingContentFetcher::new(store);
+
+        let err = fetcher
+            .fetch_verified("not-a-valid-cid")
+            .expect_err("a malformed cid is rejected");
+        assert_eq!(err, VerifyError::InvalidCid("not-a-valid-cid".to_string()));
+    }
+
+    #[test]
+    fn a_source_miss_surfaces_as_a_source_error_not_a_silent_empty_pass() {
+        // A well-formed CID the store does not hold must surface as a Source
+        // error, NOT as an empty success, and NOT verified against nothing.
+        let store = TempDirContentStore::new();
+        // A real CID (derived, not stored) so parsing succeeds but the get misses.
+        let cid = cid_v1_raw_sha256(b"never stored").expect("derive cid");
+        let fetcher = VerifyingContentFetcher::new(store);
+
+        let err = fetcher
+            .fetch_verified(&cid)
+            .expect_err("a missing blob must fail, not silently pass");
+        assert!(
+            matches!(err, VerifyError::Source(FetchError::Transport(_))),
+            "expected a surfaced source error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_cid_naming_an_unsupported_hash_is_refused_not_trusted() {
+        // A CID whose multihash is NOT sha2-256 cannot be verified by this path
+        // yet. It must be REFUSED (UnsupportedHash), never assumed to match:
+        // rejecting-when-unsure is the trust stance. Here we hand-build a CIDv1
+        // with an identity multihash (code 0x00) over some bytes and store those
+        // same bytes; even though the bytes "match" the identity digest, the
+        // path refuses because it does not implement that hash function.
+        use cid::multihash::Multihash;
+        const IDENTITY_CODE: u64 = 0x00;
+        const RAW_CODEC: u64 = 0x55;
+        let bytes = b"content behind an unsupported hash";
+        let mh = Multihash::<64>::wrap(IDENTITY_CODE, bytes).expect("identity multihash");
+        let cid = Cid::new_v1(RAW_CODEC, mh).to_string();
+
+        let store = TempDirContentStore::new();
+        std::fs::write(store.dir.path().join(&cid), bytes).expect("store the blob");
+        let fetcher = VerifyingContentFetcher::new(store);
+
+        let err = fetcher
+            .fetch_verified(&cid)
+            .expect_err("an unsupported hash function must be refused");
+        assert_eq!(
+            err,
+            VerifyError::UnsupportedHash {
+                code: IDENTITY_CODE
+            }
+        );
+    }
+
+    #[test]
+    fn derived_cid_round_trips_through_verification() {
+        // The CID derivation used to store content is the exact inverse of the
+        // verify: content stored under its derived CID verifies against that
+        // same CID. Guards the store/verify pair from drifting apart.
+        let bytes = b"round-trip me";
+        let cid = cid_v1_raw_sha256(bytes).expect("derive cid");
+        let parsed = Cid::try_from(cid.as_str()).expect("derived cid parses");
+        assert!(verify_bytes_against_cid(&parsed, bytes).is_ok());
+        assert_eq!(
+            verify_bytes_against_cid(&parsed, b"different bytes"),
+            Err(VerifyError::HashMismatch { cid })
+        );
     }
 }

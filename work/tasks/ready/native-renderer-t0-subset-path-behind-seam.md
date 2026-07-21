@@ -6,6 +6,8 @@ blockedBy: [renderer-seam-trait-and-webview-backend-navigate]
 covers: [10]
 ---
 
+> **FORWARD-POINTER (planted by drive-tasks after `renderer-seam-trust-hook-qualification-gate` landed).** The seam now enforces trust-hook qualification via `Renderer::trust_hooks()` + the `qualify()` gate: a backend qualifies ONLY if it declares BOTH trust hooks (EIP-1193 provider injection AND `ipfs://` custom-scheme resolution). IMPORTANT: `trust_hooks()` DEFAULTS to `TrustHooks::all()` (fail-OPEN) — so if you leave it defaulted, this T0 backend will silently "qualify" even though a fixed-subset renderer does NOT actually wire provider-injection or ipfs resolution. Declare `trust_hooks()` HONESTLY for this backend: only claim a hook it genuinely satisfies. If the T0 subset path cannot yet satisfy the trust hooks (likely — it renders an allowlist subset, it is not yet a full browser backend with a live provider / scheme resolver), have it declare only the hooks it truly wires (possibly `TrustHooks::none()`), and let `qualify()` legitimately report it as not-yet-qualifying. Do NOT fail-open-declare `all()` to make the gate pass; that would defeat the thesis the gate encodes. (Criterion 3 already requires this backend to be "subject to the trust-hook qualification gate" — this note pins HOW: honest declaration, not a rubber-stamp.)
+
 ## What to build
 
 Build a T0 native render path as a SECOND `Renderer` backend (beside the webview):

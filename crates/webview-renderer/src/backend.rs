@@ -143,6 +143,30 @@ impl Renderer for WebViewRenderer {
         self.life.borrow_mut().stop();
     }
 
+    fn go_back(&mut self) {
+        // WebKitGTK owns the session (back/forward) list; a back navigation
+        // restarts the load, and the webview's `load-changed` signals feed the
+        // shared `LoadLifecycle` exactly as a fresh `navigate` does. Guarded by
+        // `can_go_back` so a stray call at the start of history is a no-op.
+        if self.view.can_go_back() {
+            self.view.go_back();
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if self.view.can_go_forward() {
+            self.view.go_forward();
+        }
+    }
+
+    fn can_go_back(&self) -> bool {
+        self.view.can_go_back()
+    }
+
+    fn can_go_forward(&self) -> bool {
+        self.view.can_go_forward()
+    }
+
     fn load_state(&self) -> LoadState {
         self.life.borrow().state()
     }

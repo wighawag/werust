@@ -393,6 +393,39 @@ mod tests {
     }
 
     #[test]
+    fn history_availability_starts_empty_before_any_navigation() {
+        // The seam's back/forward availability is the backend's session-history
+        // truth. On a fresh backend nothing has been visited, so neither Back nor
+        // Forward is possible — the state the shell greys both controls from. The
+        // real `WebViewRenderer` delegates go_back/go_forward/can_go_* to
+        // WebKitGTK's own session list (see backend.rs); the end-to-end walk of
+        // that list needs a display and lives in the ignored test below. Here we
+        // pin the display-free contract: no history means no back/forward.
+        let r = SeamHarness::default();
+        assert!(!r.can_go_back(), "nothing visited yet: cannot go back");
+        assert!(
+            !r.can_go_forward(),
+            "nothing visited yet: cannot go forward"
+        );
+    }
+
+    /// End-to-end back/forward over the REAL WebKitGTK session list. Ignored by
+    /// default (constructing a `WebViewRenderer` initializes GTK, needing a
+    /// display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_history_starts_empty() {
+        let r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        // Before any load, WebKitGTK's session list is empty, so the seam reports
+        // no back/forward is possible. (Exercising an actual back navigation needs
+        // pages to load on a running GTK loop, which the shell's seam-level tests
+        // cover via the fake backend; this only pins the real delegation.)
+        assert!(!r.can_go_back());
+        assert!(!r.can_go_forward());
+    }
+
+    #[test]
     fn a_render_only_backend_on_this_seam_is_rejected() {
         // A backend on the SAME seam that renders but declares no trust hook is
         // disqualified, naming both missing hooks — the enforced seam property

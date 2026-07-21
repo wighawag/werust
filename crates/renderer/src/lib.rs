@@ -384,6 +384,46 @@ pub trait Renderer {
     /// Stop the in-flight load, if any, returning the view to a settled state.
     fn stop(&mut self);
 
+    /// Navigate one step back in the session history, if possible.
+    ///
+    /// The session history is the backend's, not the browser's: a real webview
+    /// keeps the back/forward list itself (as does a future native backend that
+    /// owns navigation), so the shell drives history THROUGH the seam rather than
+    /// tracking a URL stack of its own. A back navigation restarts the load
+    /// lifecycle (a fresh [`LoadEvent::Started`]) exactly like [`navigate`]. When
+    /// [`can_go_back`](Renderer::can_go_back) is `false` this is a no-op.
+    ///
+    /// The provided default is a no-op, for the fixed-subset backends that have no
+    /// session history yet; a backend with real history (the webview) overrides
+    /// it. [`navigate`]: Renderer::navigate
+    fn go_back(&mut self) {}
+
+    /// Navigate one step forward in the session history, if possible.
+    ///
+    /// The mirror of [`go_back`](Renderer::go_back): forward is only available
+    /// after a back navigation left a forward entry. Restarts the load lifecycle
+    /// like [`navigate`](Renderer::navigate); a no-op when
+    /// [`can_go_forward`](Renderer::can_go_forward) is `false`. Defaults to a
+    /// no-op for backends without session history.
+    fn go_forward(&mut self) {}
+
+    /// Whether a back navigation is currently possible.
+    ///
+    /// This is the checkable half of the back control: the shell greys out its
+    /// Back button when this is `false`. Defaults to `false` for backends without
+    /// session history.
+    fn can_go_back(&self) -> bool {
+        false
+    }
+
+    /// Whether a forward navigation is currently possible.
+    ///
+    /// The checkable half of the forward control (see
+    /// [`can_go_back`](Renderer::can_go_back)). Defaults to `false`.
+    fn can_go_forward(&self) -> bool {
+        false
+    }
+
     /// The current load-lifecycle state.
     fn load_state(&self) -> LoadState;
 
@@ -613,6 +653,24 @@ mod tests {
         assert!(r.load_state().is_loading());
         r.stop();
         assert_eq!(r.load_state(), LoadState::Idle);
+    }
+
+    #[test]
+    fn history_navigation_defaults_to_a_no_history_backend() {
+        // The session-history methods are part of the seam so the shell can drive
+        // back/forward THROUGH it, but they carry a no-op default so a backend
+        // without session history (a fixed-subset native path) is not forced to
+        // fake one: it simply reports no back/forward is possible, and the
+        // go_back/go_forward calls do nothing.
+        let mut r = FakeBackend::default();
+        r.navigate("https://example.com/").unwrap();
+        assert!(!r.can_go_back(), "a no-history backend can never go back");
+        assert!(!r.can_go_forward());
+        // Driving history on such a backend is a harmless no-op: it does not move
+        // the lifecycle off the current load.
+        r.go_back();
+        r.go_forward();
+        assert_eq!(r.current_url().as_deref(), Some("https://example.com/"));
     }
 
     #[test]

@@ -1,0 +1,16 @@
+[package]
+name = "werust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "werust"
+path = "src/main.rs"
+
+[dependencies]
+renderer = { path = "../renderer" }
+native-renderer = { path = "../native-renderer" }
+fetcher = { path = "../fetcher" }
+script-engine = { path = "../script-engine" }

@@ -48,3 +48,7 @@ trivial passing test so `cargo test` is meaningful.
 >
 > Done = a clean checkout builds, the gate is green, CI runs it, and the workspace
 > is shaped so the seam crates have obvious homes.
+
+## Requeue 2026-07-21
+
+Gate previously failed exit 127: cargo not found because dorfl's non-interactive gate shell didn't have ~/.cargo/bin on PATH. This is now fixed at the environment level (BASH_ENV=~/.cargo/env exported for the re-run) — the toolchain (cargo 1.97.1, rustfmt, clippy) is present. Your committed workspace code is likely fine; the gate just couldn't run. No code change should be needed beyond making cargo fmt/clippy/build/test pass.

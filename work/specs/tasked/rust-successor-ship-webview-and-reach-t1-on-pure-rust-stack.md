@@ -190,47 +190,11 @@ throughout.
   or are name-independent (the code slug `werust` is used throughout so a later
   rename never churns cross-references).
 
-## Implementation Decisions
-
-> Trimmed at tasking-time: this detail moves into the tasks and, where durable,
-> into an ADR.
-
-- **The `Renderer` seam is the load-bearing abstraction** and encodes the thesis:
-  a backend qualifies only if it satisfies provider-injection + `ipfs://`-scheme,
-  not just rendering. Webview (WebKitGTK) is the first backend; the native Rust
-  renderer is the second, grown behind the same seam.
-- **Bind, don't build, the dangerous engines.** `ScriptEngine` binds SpiderMonkey
-  (a pure-Rust engine is an aspirational later swap-in). `Fetcher` binds a vetted
-  HTTP+TLS stack (rustls or bound libcurl) — TLS is NEVER hand-written. Page-GPU
-  is wgpu; WebGL is the ANGLE-style GLES-to-native route.
-- **The native renderer is ASSEMBLED from the pure-Rust stack** (html5ever,
-  stylo, taffy, parley/cosmic-text/swash, vello+wgpu). Reaching T1 by standing on
-  this stack is the project's first real experiment vs the Zig arm. (WHICH final
-  architecture — own engine vs Servo vs Blitz/Stylo assembly — is the follow-on
-  exploration spec's decision, not this one's.)
-- **The conformance ladder is pinned** in `docs/conformance-tiers.md`: the page
-  checklist DRIVES each tier; the WPT-subset bar MEASURES/guards it. A tier is
-  reached only when BOTH the server-web floor AND the content-addressed floor
-  render correctly.
-- **Code slug `werust` is name-independent** — the user-facing product name is
-  deliberately undecided (deferred), so the work/ identity never churns on a
-  rename.
-
-## Testing Decisions
-
-> Also trimmed at tasking-time (moves into tasks' acceptance criteria / an ADR).
-
-- **Golden-image fixtures** are the T0 regression guard (no WPT at T0 — a fixed
-  private subset has no meaningful public pass-rate). **WPT subsets** are the
-  objective regression meter from T1 up (thresholds per `docs/conformance-tiers.md`).
-- **Every tier tests BOTH a server page AND a content-addressed (`ipfs://`)
-  page** — the content-addressed floor is a first-class test requirement, not an
-  afterthought.
-- **Test at the seams** (`Renderer`, `ScriptEngine`, `Fetcher`) — the highest,
-  most stable surface. Trust hooks (provider injection, `ipfs://` scheme,
-  hash-verified fetch) are tested as behaviour through the seam.
-- **The comparative meter vs wezig** uses the SHARED conformance ladder so the two
-  arms aim at the same bar and results are comparable.
+> Tasked — the Implementation/Testing detail that seeded tasking has moved into
+> the `work/tasks/` tasks (what to build) and the durable rationale into ADRs
+> (`docs/adr/0001` thesis, `docs/adr/0002` release; the pinned ladder in
+> `docs/conformance-tiers.md`). This spec has settled to its durable framing
+> below. Current truth: `docs/adr/` + code; remaining work: `work/tasks/`.
 
 ## Out of Scope
 

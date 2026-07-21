@@ -1,0 +1,47 @@
+---
+title: Release via GoReleaser Rust builder — desktop binaries + mobile artifacts
+slug: release-goreleaser-rust-desktop-and-mobile-artifacts
+spec: rust-successor-ship-webview-and-reach-t1-on-pure-rust-stack
+blockedBy: [mobile-android-shell-and-static-lib, mobile-ios-shell-and-static-lib]
+covers: [19]
+---
+
+## What to build
+
+Wire the release pipeline via GoReleaser's native Rust builder (`builder: rust`,
+cargo-zigbuild) — a deliberately Zig-less build path (`docs/adr/0002`). A tag push
+(`v*`) cuts one GitHub Release carrying the desktop Linux binaries (amd64, arm64) +
+checksums + a conventional-commit changelog, PLUS the mobile artifacts (the Android
+debug APK and the iOS Simulator `.app` zip) built by hand-written jobs alongside it.
+Port the desktop + mobile artifact shape from wezig's `release.yml`, swapping the
+Zig builder/steps for the Rust equivalents. Include the `workflow_dispatch` dry-run
+(snapshot, publishes nothing) that wezig's release workflow has.
+
+## Acceptance criteria
+
+- [ ] `.goreleaser.yaml` uses `builder: rust` and produces desktop Linux binaries (amd64, arm64) + checksums on a tag.
+- [ ] The changelog is generated from conventional-commit git history (no per-change changeset files).
+- [ ] The release workflow also builds + attaches the Android debug APK and the iOS Simulator `.app` zip (from the real mobile app modules), gated after the desktop build.
+- [ ] A `workflow_dispatch` dry-run builds everything via snapshot + uploads workflow artifacts WITHOUT publishing a release.
+- [ ] The same `verify` gate runs before a tag build so a tag can't ship a red tree.
+
+## Blocked by
+
+- Blocked by `mobile-android-shell-and-static-lib` and `mobile-ios-shell-and-static-lib`.
+
+## Prompt
+
+> Goal: release parity with wezig — GoReleaser Rust builder for desktop + the mobile
+> artifacts, mobile included (see `docs/adr/0002`, `CONTEXT.md`). This proves the
+> deliberately Zig-less build path end-to-end.
+>
+> Port wezig's `release.yml` + `.goreleaser.yaml` shape, swapping `builder: zig` →
+> `builder: rust` (cargo-zigbuild) and the Zig-lib cross-compile steps in the mobile
+> jobs for the Rust static-lib cross-compiles from `mobile-android-shell-and-static-lib`
+> / `mobile-ios-shell-and-static-lib`. Keep the tag path (real release) + the
+> `workflow_dispatch` dry-run (snapshot, workflow artifacts only) that wezig has. The
+> changelog comes from conventional commits.
+>
+> Done = a version tag cuts a GitHub Release with desktop binaries + checksums +
+> changelog + the Android APK + iOS Simulator `.app`, and a dispatch dry-run validates
+> all artifacts without publishing.

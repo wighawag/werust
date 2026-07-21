@@ -179,6 +179,180 @@ impl fmt::Display for RendererError {
 
 impl std::error::Error for RendererError {}
 
+/// One of the two **trust hooks** a backend must be able to satisfy to qualify.
+///
+/// These are the concrete seam capabilities that carry the thesis (`docs/adr/0001`,
+/// `CONTEXT.md`): a backend that renders beautifully but cannot expose EITHER of
+/// these is not a real backend for werust. They are checked as a pass/fail
+/// qualifying set (see [`TrustHooks`] and [`qualify`]), not graded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrustHook {
+    /// EIP-1193 provider injection over the script-message bridge
+    /// ([`register_script_message_handler`](Renderer::register_script_message_handler)
+    /// with [`inject_script`](Renderer::inject_script)) — task
+    /// `eip1193-provider-injection-via-script-bridge`.
+    ProviderInjection,
+    /// `ipfs://` custom-scheme / request-interception resolution
+    /// ([`register_scheme_handler`](Renderer::register_scheme_handler)) — task
+    /// `ipfs-scheme-resolution-through-renderer-seam`.
+    IpfsScheme,
+}
+
+impl TrustHook {
+    /// Every trust hook a qualifying backend must satisfy, in a stable order.
+    ///
+    /// This is the single source of truth for "which hooks qualify a backend":
+    /// [`TrustHooks::all`], [`TrustHooks::is_qualifying`], and [`qualify`] are all
+    /// defined against it, so adding a future trust hook here tightens the gate
+    /// everywhere at once.
+    pub const ALL: [TrustHook; 2] = [TrustHook::ProviderInjection, TrustHook::IpfsScheme];
+}
+
+impl fmt::Display for TrustHook {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TrustHook::ProviderInjection => write!(f, "EIP-1193 provider injection"),
+            TrustHook::IpfsScheme => write!(f, "ipfs:// custom-scheme resolution"),
+        }
+    }
+}
+
+/// The set of [`TrustHook`]s a backend DECLARES it can satisfy.
+///
+/// This is the checkable capability a backend reports through
+/// [`Renderer::trust_hooks`]; the [`qualify`] gate accepts a backend ONLY when
+/// this set covers every [`TrustHook`]. It is a value (not a comment), so "a
+/// backend qualifies only if it satisfies the trust hooks" is an enforced,
+/// testable property rather than documentation — the same gate qualifies the
+/// webview now and the native renderer later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TrustHooks {
+    provider_injection: bool,
+    ipfs_scheme: bool,
+}
+
+impl TrustHooks {
+    /// A backend that declares BOTH trust hooks — the qualifying set.
+    #[must_use]
+    pub const fn all() -> Self {
+        TrustHooks {
+            provider_injection: true,
+            ipfs_scheme: true,
+        }
+    }
+
+    /// A backend that declares NO trust hook — a render-only backend.
+    #[must_use]
+    pub const fn none() -> Self {
+        TrustHooks {
+            provider_injection: false,
+            ipfs_scheme: false,
+        }
+    }
+
+    /// The set declaring exactly the one given [`TrustHook`].
+    #[must_use]
+    pub const fn with(hook: TrustHook) -> Self {
+        let mut set = TrustHooks::none();
+        set = set.and(hook);
+        set
+    }
+
+    /// The same set, additionally declaring `hook`.
+    #[must_use]
+    pub const fn and(mut self, hook: TrustHook) -> Self {
+        match hook {
+            TrustHook::ProviderInjection => self.provider_injection = true,
+            TrustHook::IpfsScheme => self.ipfs_scheme = true,
+        }
+        self
+    }
+
+    /// Whether this set declares `hook`.
+    #[must_use]
+    pub const fn contains(&self, hook: TrustHook) -> bool {
+        match hook {
+            TrustHook::ProviderInjection => self.provider_injection,
+            TrustHook::IpfsScheme => self.ipfs_scheme,
+        }
+    }
+
+    /// Whether this set covers EVERY trust hook — i.e. the backend qualifies.
+    #[must_use]
+    pub fn is_qualifying(&self) -> bool {
+        TrustHook::ALL.iter().all(|h| self.contains(*h))
+    }
+
+    /// The trust hooks NOT declared, in [`TrustHook::ALL`] order (empty iff the
+    /// set qualifies).
+    #[must_use]
+    pub fn missing(&self) -> Vec<TrustHook> {
+        TrustHook::ALL
+            .into_iter()
+            .filter(|h| !self.contains(*h))
+            .collect()
+    }
+}
+
+/// A backend that declares every trust hook by default.
+///
+/// The DEFAULT is qualifying: a backend that implements the hook methods is
+/// presumed to satisfy them unless it overrides [`Renderer::trust_hooks`] to say
+/// otherwise. The gate's job is to reject a backend that HONESTLY reports it
+/// cannot — the render-only case — not to catch a backend lying about a hook it
+/// stubbed. (Wiring real behaviour onto the hooks, and asserting that behaviour,
+/// is the sibling provider/ipfs tasks' job.)
+impl Default for TrustHooks {
+    fn default() -> Self {
+        TrustHooks::all()
+    }
+}
+
+/// The reason a backend failed the trust-hook [`qualify`] gate.
+///
+/// Carries the exact [`TrustHook`]s the backend did not declare, so the caller
+/// (the seam's own conformance test now; the native-renderer benchmark harness
+/// later) can report precisely why a render-only backend was rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Disqualified {
+    /// The trust hooks the backend did not declare, in [`TrustHook::ALL`] order.
+    pub missing: Vec<TrustHook>,
+}
+
+impl fmt::Display for Disqualified {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "backend does not satisfy the trust hooks:")?;
+        for (i, hook) in self.missing.iter().enumerate() {
+            let sep = if i == 0 { " " } else { ", " };
+            write!(f, "{sep}{hook}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for Disqualified {}
+
+/// The trust-hook qualification GATE: accept a backend ONLY if it satisfies both
+/// trust hooks.
+///
+/// This is the enforced form of the seam's qualifying rule (`CONTEXT.md`,
+/// `docs/adr/0001`): a backend qualifies as *real* for werust only if it can
+/// satisfy the trust hooks, not merely if it renders well. A qualifying backend
+/// returns `Ok(())`; a render-only backend is rejected with a [`Disqualified`]
+/// naming exactly the hooks it does not declare. The webview backend passes this
+/// gate today; the native renderer will be held to the SAME gate later, and the
+/// benchmark harness reuses it as its pass/fail trust-hook check.
+pub fn qualify(backend: &dyn Renderer) -> Result<(), Disqualified> {
+    let declared = backend.trust_hooks();
+    if declared.is_qualifying() {
+        Ok(())
+    } else {
+        Err(Disqualified {
+            missing: declared.missing(),
+        })
+    }
+}
+
 /// A callback invoked with a [`ScriptMessage`] posted by an injected page script.
 pub type ScriptMessageHandler = Box<dyn FnMut(ScriptMessage) + Send>;
 
@@ -265,6 +439,25 @@ pub trait Renderer {
     /// surface: a backend that cannot intercept a custom scheme is not a real
     /// backend for werust.
     fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler);
+
+    /// Which [`TrustHook`]s this backend can actually satisfy.
+    ///
+    /// This is the CHECKABLE half of the qualifying rule. The hook methods above
+    /// are structural (every `Renderer` impl has them, and a render-only backend
+    /// can stub them), so structural presence alone does not prove a backend can
+    /// satisfy the trust hooks. A backend reports its real capability here, and
+    /// the [`qualify`] gate accepts it ONLY if this set covers both hooks — making
+    /// "a backend qualifies only if it satisfies the trust hooks" an enforced seam
+    /// property, not a comment.
+    ///
+    /// The provided default declares BOTH hooks: a backend that wires the hook
+    /// methods to real behaviour (the webview, wired by the sibling provider/ipfs
+    /// tasks) qualifies without extra ceremony. A backend that renders but cannot
+    /// satisfy a hook OVERRIDES this to drop it, and is then rejected by
+    /// [`qualify`].
+    fn trust_hooks(&self) -> TrustHooks {
+        TrustHooks::all()
+    }
 }
 
 #[cfg(test)]
@@ -284,6 +477,9 @@ mod tests {
         scheme_handlers: Vec<String>,
         script_handlers: Vec<String>,
         injected: Vec<String>,
+        // Which trust hooks this backend declares it can satisfy. Defaults to all
+        // (it exposes both hooks); tests override it to model partial capability.
+        declares_hooks: TrustHooks,
     }
 
     impl Renderer for FakeBackend {
@@ -342,6 +538,10 @@ mod tests {
 
         fn register_scheme_handler(&mut self, scheme: &str, _handler: SchemeHandler) {
             self.scheme_handlers.push(scheme.to_string());
+        }
+
+        fn trust_hooks(&self) -> TrustHooks {
+            self.declares_hooks
         }
     }
 
@@ -436,5 +636,113 @@ mod tests {
         assert_eq!(r.script_handlers, ["werustProvider"]);
         assert_eq!(r.injected, ["globalThis.ethereum = {};"]);
         assert_eq!(r.scheme_handlers, ["ipfs"]);
+    }
+
+    /// A backend that renders but declares NO trust-hook capability: it stubs the
+    /// hook methods (they compile, as any `Renderer` impl must) yet reports it
+    /// cannot actually satisfy either trust hook. This is the "renders well but
+    /// cannot satisfy the thesis" case the qualification gate must reject.
+    #[derive(Default)]
+    struct RenderOnlyBackend {
+        state: LoadState,
+        url: Option<String>,
+    }
+
+    impl Renderer for RenderOnlyBackend {
+        fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
+            self.url = Some(url.to_string());
+            self.state = LoadState::Started;
+            Ok(())
+        }
+        fn reload(&mut self) -> Result<(), RendererError> {
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.state = LoadState::Idle;
+        }
+        fn load_state(&self) -> LoadState {
+            self.state
+        }
+        fn current_url(&self) -> Option<String> {
+            self.url.clone()
+        }
+        fn poll_event(&mut self) -> Option<LoadEvent> {
+            None
+        }
+        fn view_handle(&self) -> ViewHandle {
+            ViewHandle(std::ptr::null_mut())
+        }
+        fn send_pointer(&mut self, _event: PointerEvent) {}
+        fn send_key(&mut self, _event: KeyEvent) {}
+        fn send_scroll(&mut self, _delta: ScrollDelta) {}
+        fn set_focus(&mut self, _focused: bool) {}
+        fn register_script_message_handler(&mut self, _name: &str, _handler: ScriptMessageHandler) {
+        }
+        fn inject_script(&mut self, _script: &str) {}
+        fn register_scheme_handler(&mut self, _scheme: &str, _handler: SchemeHandler) {}
+
+        // The whole point: this backend renders, but cannot satisfy the trust
+        // hooks, so it declares NO trust-hook capability.
+        fn trust_hooks(&self) -> TrustHooks {
+            TrustHooks::none()
+        }
+    }
+
+    #[test]
+    fn qualification_gate_accepts_a_backend_that_declares_both_trust_hooks() {
+        // A backend that declares both trust hooks (provider injection + ipfs://
+        // scheme) QUALIFIES: it is a real backend for werust, not just a renderer.
+        let backend = FakeBackend::default();
+        assert_eq!(
+            backend.trust_hooks(),
+            TrustHooks::all(),
+            "a qualifying backend declares both trust hooks"
+        );
+        qualify(&backend).expect("a backend declaring both trust hooks qualifies");
+    }
+
+    #[test]
+    fn qualification_gate_rejects_a_render_only_backend() {
+        // A backend that renders but declares neither trust hook is DISQUALIFIED,
+        // naming BOTH missing hooks — the enforced seam property.
+        let backend = RenderOnlyBackend::default();
+        let err = qualify(&backend).expect_err("a render-only backend is rejected");
+        assert_eq!(
+            err.missing,
+            vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme],
+            "both trust hooks are reported missing"
+        );
+    }
+
+    #[test]
+    fn qualification_gate_rejects_a_backend_missing_only_one_hook() {
+        // Satisfying ONE trust hook is not enough: a backend must satisfy BOTH to
+        // qualify. Missing exactly the ipfs:// scheme is still a disqualification
+        // that names precisely the missing hook.
+        let backend = FakeBackend {
+            declares_hooks: TrustHooks::with(TrustHook::ProviderInjection),
+            ..FakeBackend::default()
+        };
+        let err = qualify(&backend).expect_err("one hook is not enough to qualify");
+        assert_eq!(err.missing, vec![TrustHook::IpfsScheme]);
+    }
+
+    #[test]
+    fn trust_hooks_capability_set_reports_membership() {
+        // The capability set is a checkable value: contains/all/none behave as a
+        // set of the two trust hooks.
+        let both = TrustHooks::all();
+        assert!(both.contains(TrustHook::ProviderInjection));
+        assert!(both.contains(TrustHook::IpfsScheme));
+        assert!(both.is_qualifying());
+
+        let none = TrustHooks::none();
+        assert!(!none.contains(TrustHook::ProviderInjection));
+        assert!(!none.is_qualifying());
+
+        let one = TrustHooks::with(TrustHook::ProviderInjection);
+        assert!(one.contains(TrustHook::ProviderInjection));
+        assert!(!one.contains(TrustHook::IpfsScheme));
+        assert!(!one.is_qualifying());
     }
 }

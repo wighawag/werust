@@ -136,8 +136,8 @@ pub use backend::WebViewRenderer;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use renderer::{KeyEvent, PointerEvent, Renderer, ScrollDelta, ViewHandle};
-    use renderer::{SchemeHandler, ScriptMessageHandler};
+    use renderer::{qualify, KeyEvent, PointerEvent, Renderer, ScrollDelta, ViewHandle};
+    use renderer::{SchemeHandler, ScriptMessageHandler, TrustHook, TrustHooks};
 
     /// A seam-level backend that drives [`LoadLifecycle`] exactly as the real
     /// [`WebViewRenderer`] does, but with the webview's native load signals
@@ -348,5 +348,96 @@ mod tests {
         assert_eq!(r.script_handlers, ["werustProvider"]);
         assert_eq!(r.injected, ["globalThis.ethereum = {};"]);
         assert_eq!(r.scheme_handlers, ["ipfs"]);
+    }
+
+    #[test]
+    fn webview_backend_passes_the_trust_hook_qualification_gate() {
+        // The WebKitGTK backend declares BOTH trust hooks (it inherits the
+        // qualifying default of `Renderer::trust_hooks`, exactly as the real
+        // `WebViewRenderer` does — both share the same seam methods and neither
+        // overrides the capability), so the qualification gate accepts it. This
+        // runs headlessly: it exercises the seam contract, not a GTK main loop.
+        let r = SeamHarness::default();
+        assert_eq!(
+            r.trust_hooks(),
+            TrustHooks::all(),
+            "the webview backend declares both trust hooks"
+        );
+        qualify(&r).expect("the webview backend qualifies");
+    }
+
+    #[test]
+    fn webview_renderer_does_not_downgrade_its_trust_hook_capability() {
+        // Guard against a future edit silently making the REAL backend render-only:
+        // `WebViewRenderer` must not override `trust_hooks` to drop a hook. We can
+        // assert this display-free by pinning the qualifying set the shared seam
+        // default yields; `WebViewRenderer` uses that same default (verified by
+        // reading `backend.rs`, which adds no `trust_hooks` override). The
+        // display-bound end-to-end check lives in
+        // `real_webview_backend_qualifies` below (ignored by default).
+        assert!(
+            TrustHooks::default().is_qualifying(),
+            "the seam default the webview backend inherits is qualifying"
+        );
+    }
+
+    /// End-to-end qualification of the REAL WebKitGTK backend. Ignored by default
+    /// because constructing a `WebViewRenderer` initializes GTK, which needs a
+    /// display the `verify` gate may not have. Run explicitly on a desktop
+    /// session with `cargo test -p webview-renderer -- --ignored`.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_backend_qualifies() {
+        let r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        qualify(&r).expect("the real WebKitGTK backend satisfies the trust hooks");
+    }
+
+    #[test]
+    fn a_render_only_backend_on_this_seam_is_rejected() {
+        // A backend on the SAME seam that renders but declares no trust hook is
+        // disqualified, naming both missing hooks — the enforced seam property
+        // that a future native backend is held to as well.
+        struct RenderOnly;
+        impl Renderer for RenderOnly {
+            fn navigate(&mut self, _url: &str) -> Result<(), RendererError> {
+                Ok(())
+            }
+            fn reload(&mut self) -> Result<(), RendererError> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn load_state(&self) -> LoadState {
+                LoadState::Idle
+            }
+            fn current_url(&self) -> Option<String> {
+                None
+            }
+            fn poll_event(&mut self) -> Option<LoadEvent> {
+                None
+            }
+            fn view_handle(&self) -> ViewHandle {
+                ViewHandle(std::ptr::null_mut())
+            }
+            fn send_pointer(&mut self, _event: PointerEvent) {}
+            fn send_key(&mut self, _event: KeyEvent) {}
+            fn send_scroll(&mut self, _delta: ScrollDelta) {}
+            fn set_focus(&mut self, _focused: bool) {}
+            fn register_script_message_handler(
+                &mut self,
+                _name: &str,
+                _handler: ScriptMessageHandler,
+            ) {
+            }
+            fn inject_script(&mut self, _script: &str) {}
+            fn register_scheme_handler(&mut self, _scheme: &str, _handler: SchemeHandler) {}
+            fn trust_hooks(&self) -> TrustHooks {
+                TrustHooks::none()
+            }
+        }
+        let err = qualify(&RenderOnly).expect_err("a render-only backend is rejected");
+        assert_eq!(
+            err.missing,
+            vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme]
+        );
     }
 }

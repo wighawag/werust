@@ -6,6 +6,8 @@ blockedBy: [browser-shell-url-bar-and-live-interactive-view, fetcher-hash-verifi
 covers: [6]
 ---
 
+> **FORWARD-POINTER (planted by drive-tasks after `fetcher-hash-verified-content-addressed-path` landed).** The verified fetch path landed with a deliberate two-layer split in the `fetcher` crate: an UNTRUSTED `ContentSource` trait (raw candidate bytes for a CID, e.g. from a gateway) plus a `VerifyingContentFetcher` that layers hash-verification over any source and exposes `fetch_verified(cid) -> Result<Vec<u8>, VerifyError>`. CRITICAL: route your production `ipfs://` gateway source THROUGH `fetch_verified` (wrap it in `VerifyingContentFetcher`) — do NOT call the raw `ContentSource` directly, or you bypass verification and silently defeat the thesis (a mismatch must fail the load, never render). A `VerifyError::HashMismatch` from `fetch_verified` MUST map to a failed load (do not render the bytes). SCOPE the fixture accordingly: verification currently supports the `sha2-256` multihash (code 0x12) for a CID that addresses RAW / single-leaf-block bytes; DAG-PB / UnixFS multi-block traversal is OUT OF SCOPE in the fetcher (a multi-block CID is not yet resolvable), so PIN a single-block sha2-256 raw CID as your test fixture (you can produce one with the fetcher's `cid_v1_raw_sha256(bytes)` helper). An unsupported-hash or multi-block CID is refused by the fetcher, not trusted — surface that as a failed load too.
+
 ## What to build
 
 Wire `ipfs://` URLs end-to-end: the `Renderer` seam's custom-scheme /

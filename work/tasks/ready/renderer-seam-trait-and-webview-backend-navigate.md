@@ -42,3 +42,7 @@ system webview behind the seam.
 >
 > Done = on Linux, werust opens a URL through the `Renderer` trait and shows the
 > page via the WebKitGTK backend, with the seam surface fully declared.
+
+## Requeue 2026-07-21
+
+Interrupted by host OOM mid-build (WebKitGTK/webkit6 native compile is memory-heavy). WIP is safe on this branch: the Renderer trait surface is largely drafted in crates/renderer/src/lib.rs (+421 lines) — navigate/reload/stop, live view, input/scroll/focus forwarding, load-lifecycle events, script-message bridge, request-interception/custom-scheme hook. STILL TODO: the WebKitGTK (webkit6 / GTK4 — the host has webkitgtk-6.0 + gtk4) backend crate that implements the trait far enough to navigate to an https:// URL and show the page, ensure nothing leaks past the seam, and seam-level tests. Continue from the branch tip; do not restart. NOTE for whoever resumes: this build is RAM-hungry — consider a machine with more memory or limiting cargo codegen parallelism (e.g. CARGO_BUILD_JOBS=1 / a lower -j).

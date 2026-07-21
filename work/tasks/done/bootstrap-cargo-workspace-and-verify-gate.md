@@ -3,7 +3,6 @@ title: Bootstrap the Cargo workspace and make the verify gate green
 slug: bootstrap-cargo-workspace-and-verify-gate
 blockedBy: []
 covers: []
-needsAnswers: true
 ---
 
 ## What to build

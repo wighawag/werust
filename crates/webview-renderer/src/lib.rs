@@ -257,6 +257,46 @@ mod tests {
     use renderer::{qualify, KeyEvent, PointerEvent, Renderer, ScrollDelta, ViewHandle};
     use renderer::{SchemeHandler, ScriptMessageHandler, TrustHook, TrustHooks, TrustPosture};
 
+    /// A pinned, in-memory [`ContentRetriever`](fetcher::ContentRetriever) double
+    /// (an untrusted-origin stand-in), off the live network, that verifies a
+    /// single raw/leaf block against its CID. It holds bytes for a CID and
+    /// RE-VERIFIES them against that CID before returning, so it can be pointed
+    /// at honest content (stored under its real CID) or TAMPERED content to
+    /// exercise the resolve-verified and mismatch-fails-the-load cases. The full
+    /// multi-block CAR/DAG verify is covered in the `fetcher::retriever` tests;
+    /// the seam wiring here pins a single raw block.
+    #[derive(Default)]
+    struct PinnedRawRetriever {
+        blobs: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    impl PinnedRawRetriever {
+        fn insert(&mut self, cid: &str, bytes: &[u8]) {
+            self.blobs.insert(cid.to_string(), bytes.to_vec());
+        }
+    }
+
+    impl fetcher::ContentRetriever for PinnedRawRetriever {
+        fn retrieve(
+            &self,
+            cid: &str,
+            _path: &str,
+        ) -> Result<fetcher::RetrievedContent, fetcher::RetrieveError> {
+            let bytes = self.blobs.get(cid).cloned().ok_or_else(|| {
+                fetcher::RetrieveError::MissingBlock {
+                    cid: cid.to_string(),
+                }
+            })?;
+            let expected = fetcher::cid_v1_raw_sha256(&bytes).expect("derive cid for held bytes");
+            if expected != cid {
+                return Err(fetcher::RetrieveError::BlockHashMismatch {
+                    cid: cid.to_string(),
+                });
+            }
+            Ok(fetcher::RetrievedContent { bytes, codec: 0x55 })
+        }
+    }
+
     /// A seam-level backend that drives [`LoadLifecycle`] exactly as the real
     /// [`WebViewRenderer`] does, but with the webview's native load signals
     /// simulated by [`drive_to_finished`](SeamHarness::drive_to_finished) instead
@@ -598,36 +638,21 @@ mod tests {
         // hook, resolved by the hash-verified Fetcher path, and its VERIFIED bytes
         // handed back as the response the backend would render — at parity with a
         // served page (text/html). Pinned fixture CID, no live network, no GTK loop.
-        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use fetcher::cid_v1_raw_sha256;
         use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
-
-        // A pinned in-memory source (an untrusted origin stand-in), off the network.
-        #[derive(Default)]
-        struct PinnedSource {
-            blobs: std::collections::HashMap<String, Vec<u8>>,
-        }
-        impl ContentSource for PinnedSource {
-            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
-                self.blobs
-                    .get(&cid.to_string())
-                    .cloned()
-                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
-            }
-        }
 
         let page = b"<!doctype html><title>ipfs</title><h1>verifiable page</h1>";
         let cid = cid_v1_raw_sha256(page).expect("derive pinned fixture cid");
-        let mut source = PinnedSource::default();
-        source.blobs.insert(cid.clone(), page.to_vec());
-        let fetcher = VerifyingContentFetcher::new(source);
+        let mut retriever = PinnedRawRetriever::default();
+        retriever.insert(&cid, page);
 
         // Wire the ipfs scheme handler onto the seam EXACTLY as install_ipfs does:
         // route each intercepted request through resolve_ipfs_request against the
-        // verifying fetcher.
+        // verifying retriever.
         let mut r = SeamHarness::default();
         r.register_scheme_handler(
             IPFS_SCHEME,
-            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
+            Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
         );
         assert_eq!(r.scheme_handlers, ["ipfs"]);
 
@@ -646,35 +671,19 @@ mod tests {
         // a real CID, so the intercepted `ipfs://<cid>` request must FAIL (an Err
         // the backend surfaces via `request.finish_error`, a failed load) and must
         // NEVER return the tampered bytes to render. Verification gates the load.
-        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use fetcher::cid_v1_raw_sha256;
         use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
-
-        #[derive(Default)]
-        struct PinnedSource {
-            blobs: std::collections::HashMap<String, Vec<u8>>,
-        }
-        impl ContentSource for PinnedSource {
-            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
-                self.blobs
-                    .get(&cid.to_string())
-                    .cloned()
-                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
-            }
-        }
 
         let honest = b"the page this cid actually names";
         let cid = cid_v1_raw_sha256(honest).expect("derive pinned fixture cid");
-        let mut source = PinnedSource::default();
-        source.blobs.insert(
-            cid.clone(),
-            b"tampered bytes that do not match the cid".to_vec(),
-        );
-        let fetcher = VerifyingContentFetcher::new(source);
+        let mut retriever = PinnedRawRetriever::default();
+        // Hold TAMPERED bytes under the real CID: the retrieve will fail to verify.
+        retriever.insert(&cid, b"tampered bytes that do not match the cid");
 
         let mut r = SeamHarness::default();
         r.register_scheme_handler(
             IPFS_SCHEME,
-            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
+            Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
         );
 
         let result = r.deliver_scheme_request(IPFS_SCHEME, &format!("ipfs://{cid}/index.html"));
@@ -694,27 +703,13 @@ mod tests {
         // `ipfs://`. This wires the posture-marking onto the lifecycle EXACTLY as
         // `WebViewRenderer::install_ipfs` does (the scheme handler marks the shared
         // lifecycle verified on a successful resolution), without a GTK loop.
-        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use fetcher::cid_v1_raw_sha256;
         use werust_core::ipfs::resolve_ipfs_request;
-
-        #[derive(Default)]
-        struct PinnedSource {
-            blobs: std::collections::HashMap<String, Vec<u8>>,
-        }
-        impl ContentSource for PinnedSource {
-            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
-                self.blobs
-                    .get(&cid.to_string())
-                    .cloned()
-                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
-            }
-        }
 
         let page = b"<!doctype html><title>ipfs</title><h1>verified</h1>";
         let cid = cid_v1_raw_sha256(page).expect("derive pinned fixture cid");
-        let mut source = PinnedSource::default();
-        source.blobs.insert(cid.clone(), page.to_vec());
-        let fetcher = VerifyingContentFetcher::new(source);
+        let mut retriever = PinnedRawRetriever::default();
+        retriever.insert(&cid, page);
 
         // The shared lifecycle the scheme handler marks, mirroring `install_ipfs`.
         let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
@@ -724,7 +719,7 @@ mod tests {
         // `Send`-bounded `SchemeHandler`) because this stands in for the webview's
         // own GTK-thread scheme registration.
         let ipfs_handler = move |request: renderer::SchemeRequest| {
-            let response = resolve_ipfs_request(&fetcher, &request)?;
+            let response = resolve_ipfs_request(&retriever, &request)?;
             life_for_handler.borrow_mut().mark_content_verified();
             Ok::<_, RendererError>(response)
         };
@@ -768,35 +763,19 @@ mod tests {
         // FAILS the load on a hash mismatch, it never marks the lifecycle, so the
         // posture stays untrusted — a page whose URL looks content-addressed but
         // did not actually verify is NEVER reported content-verified.
-        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use fetcher::cid_v1_raw_sha256;
         use werust_core::ipfs::resolve_ipfs_request;
-
-        #[derive(Default)]
-        struct PinnedSource {
-            blobs: std::collections::HashMap<String, Vec<u8>>,
-        }
-        impl ContentSource for PinnedSource {
-            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
-                self.blobs
-                    .get(&cid.to_string())
-                    .cloned()
-                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
-            }
-        }
 
         let honest = b"the page this cid actually names";
         let cid = cid_v1_raw_sha256(honest).expect("derive pinned fixture cid");
-        let mut source = PinnedSource::default();
-        // Store TAMPERED bytes under the real CID: the fetch will fail to verify.
-        source
-            .blobs
-            .insert(cid.clone(), b"tampered bytes that do not match".to_vec());
-        let fetcher = VerifyingContentFetcher::new(source);
+        let mut retriever = PinnedRawRetriever::default();
+        // Hold TAMPERED bytes under the real CID: the retrieve will fail to verify.
+        retriever.insert(&cid, b"tampered bytes that do not match");
 
         let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
         let life_for_handler = life.clone();
         let ipfs_handler = move |request: renderer::SchemeRequest| {
-            let response = resolve_ipfs_request(&fetcher, &request)?;
+            let response = resolve_ipfs_request(&retriever, &request)?;
             life_for_handler.borrow_mut().mark_content_verified();
             Ok::<_, RendererError>(response)
         };

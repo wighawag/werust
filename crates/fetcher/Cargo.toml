@@ -8,6 +8,23 @@ repository.workspace = true
 [dependencies]
 cid = "0.11.3"
 sha2 = "0.10"
+# The vetted CAR + dag-pb/UnixFS decode stack the trustless-gateway CAR backend
+# binds so it never hand-rolls CAR block layout, dag-pb decode, or crypto
+# (`docs/adr/0001`, `docs/adr/0004`). All three sit on the SAME `ipld-core` /
+# `cid 0.11` lineage this crate already verifies against, so a CID that enters
+# the CAR reader is the same `cid::Cid` type the verify boundary uses (no
+# second CID lineage at the trust edge). `rs-car-sync` is the SYNCHRONOUS CAR
+# reader (the task's named `rs-car`/`rs-car-ipfs` are async-only and their
+# UnixFS decode is `pub(crate)`, which cannot serve this crate's sync `Fetcher`
+# seam (see `docs/adr/0004`); `ipld-dagpb` decodes the dag-pb node shell;
+# `quick-protobuf` decodes the inner UnixFS `Data` message (a bound protobuf
+# decode, not hand-rolled).
+rs-car-sync = "0.5.1"
+ipld-dagpb = "0.2.2"
+quick-protobuf = "0.8"
+# `ipld-dagpb::PbNode::from_bytes` takes a `bytes::Bytes`; the CAR backend wraps
+# each verified block in one to decode it. Same `bytes 1` `ipld-dagpb` binds.
+bytes = "1"
 # The vetted HTTP+TLS stack the `Fetcher` seam binds. `ureq` is a small,
 # synchronous HTTP client whose TLS is rustls (a vetted, memory-safe
 # implementation) — TLS is NEVER hand-written here. Default features pull
@@ -18,3 +35,10 @@ ureq = "=3.3.0"
 
 [dev-dependencies]
 tempfile = "3"
+# Test-only: synthesize CAR fixtures (dag-cbor CAR header + unsigned-varint
+# block framing) so the CAR backend's tests build a real multi-block DAG
+# offline, with NO live network. Same lineage as the runtime CAR deps.
+serde = { version = "1", features = ["derive"] }
+serde_ipld_dagcbor = "0.6"
+unsigned-varint = "0.8"
+ipld-core = "0.4"

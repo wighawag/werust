@@ -194,30 +194,33 @@ impl WebViewRenderer {
     /// unverified bytes.
     ///
     /// It registers the `ipfs` scheme handler and routes each intercepted request
-    /// through the pure [`resolve_ipfs_request`] resolver, backed by a production
-    /// [`GatewayContentSource`] (an IPFS gateway over the bound HTTP
-    /// [`HttpFetcher`](fetcher::HttpFetcher)) wrapped in a
-    /// [`VerifyingContentFetcher`](fetcher::VerifyingContentFetcher) so the origin
-    /// is never trusted, only the hash. The gateway source is UNTRUSTED; the
-    /// verify above it is what makes the load safe. The pure resolution
-    /// (scheme -> verified-fetch -> render, and its mismatch-fails-the-load
-    /// guarantee) is exercised headlessly against a pinned fixture CID by the
+    /// through the pure [`resolve_ipfs_request`] resolver, backed by the default
+    /// [`TrustlessGatewayCarRetriever`](fetcher::TrustlessGatewayCarRetriever)
+    /// (fetch the DAG blocks as a CAR from a trustless gateway over the bound
+    /// HTTP [`HttpFetcher`](fetcher::HttpFetcher), verify EACH block against its
+    /// own CID, and reassemble/traverse the UnixFS DAG client-side). The gateway
+    /// is UNTRUSTED; the per-block verify above it is what makes the load safe,
+    /// so a real multi-block directory site renders legitimately content-verified.
+    /// The pure resolution (scheme -> verified-retrieve -> render, and its
+    /// tamper/incomplete/budget-fails-the-load guarantees) is exercised headlessly
+    /// against real CAR fixtures by the `fetcher::retriever` and
     /// `werust_core::ipfs` tests.
     ///
     /// [`resolve_ipfs_request`]: werust_core::ipfs::resolve_ipfs_request
-    /// [`GatewayContentSource`]: werust_core::ipfs::GatewayContentSource
     pub fn install_ipfs(&mut self) {
-        use fetcher::{HttpFetcher, VerifyingContentFetcher};
-        use werust_core::ipfs::{resolve_ipfs_request, GatewayContentSource, IPFS_SCHEME};
+        use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
+        use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
 
-        // The production content-addressed fetcher: candidate bytes from an IPFS
-        // gateway over the bound HTTP+TLS stack, hash-verified against the CID
-        // before they are ever handed back. Owned by the scheme handler closure.
-        let fetcher = VerifyingContentFetcher::new(GatewayContentSource::new(HttpFetcher::new()));
+        // The production content retriever: the DAG blocks fetched as a CAR from
+        // a trustless gateway over the bound HTTP+TLS stack, each block verified
+        // against its own CID and the UnixFS DAG reassembled/traversed locally
+        // before any byte is handed back. Owned by the scheme handler closure.
+        let retriever = TrustlessGatewayCarRetriever::new(HttpFetcher::new());
         // Share the load lifecycle into the scheme handler so a SUCCESSFUL verified
         // resolution can mark the current load content-verified — this is what
-        // drives the chrome's trust indicator from the ACTUAL load path (the bytes
-        // came back through `fetch_verified`), not from the `ipfs://` URL string.
+        // drives the chrome's trust indicator from the ACTUAL load path (every
+        // block came back verified through the retriever), not from the `ipfs://`
+        // URL string.
         // A hash mismatch fails the load (the resolver returns an error) and never
         // reaches the mark, so a page that merely looks content-addressed but did
         // not verify is never reported verified (task
@@ -238,7 +241,7 @@ impl WebViewRenderer {
         let life = self.life.clone();
         context.register_uri_scheme(IPFS_SCHEME, move |request| {
             let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
-            match resolve_ipfs_request(&fetcher, &renderer::SchemeRequest { uri }) {
+            match resolve_ipfs_request(&retriever, &renderer::SchemeRequest { uri }) {
                 Ok(response) => {
                     // The bytes verified against their CID: mark the current load
                     // content-verified so the chrome's trust indicator reflects the

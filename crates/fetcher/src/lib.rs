@@ -44,6 +44,16 @@ use std::time::Duration;
 
 use ureq::ResponseExt;
 
+/// The multi-block content-retrieval seam ([`ContentRetriever`]) and its default
+/// trustless-gateway CAR backend live in a sibling module; the key types are
+/// re-exported below so callers use `fetcher::ContentRetriever` alongside
+/// `fetcher::ContentAddressedFetcher`.
+pub mod retriever;
+pub use retriever::{
+    ContentRetriever, RetrievalBudget, RetrieveError, RetrievedContent,
+    TrustlessGatewayCarRetriever, DEFAULT_TRUSTLESS_GATEWAY,
+};
+
 /// The connect timeout the default fetcher applies.
 ///
 /// A safe default so a fetch to an unreachable or silently-dropping host fails

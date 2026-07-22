@@ -11,14 +11,15 @@
 //!
 //! It reuses, rather than reinvents, the two seams the blocking tasks landed:
 //!
-//! * the **hash-verified content-addressed `Fetcher` path**: a pinned fixture CID
-//!   is derived from the fragment bytes ([`fetcher::cid_v1_raw_sha256`]), the bytes
-//!   are stored under it in an isolated in-memory source, and they are resolved
-//!   through [`werust_core::ipfs::resolve_ipfs_request`] over a
-//!   [`VerifyingContentFetcher`](fetcher::VerifyingContentFetcher), which returns
-//!   bytes ONLY after they hash to the CID (task
-//!   `ipfs-scheme-resolution-through-renderer-seam` +
-//!   `fetcher-hash-verified-content-addressed-path`);
+//! * the **verifiable content-retrieval seam**: a pinned fixture CID is derived
+//!   from the fragment bytes ([`fetcher::cid_v1_raw_sha256`], a raw/leaf CID), and
+//!   the bytes are resolved through [`werust_core::ipfs::resolve_ipfs_request`]
+//!   over a [`ContentRetriever`](fetcher::ContentRetriever), which returns bytes
+//!   ONLY after each block hashes to its CID (task
+//!   `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend`). The full
+//!   multi-block CAR/DAG verify mechanics are covered in the `fetcher::retriever`
+//!   tests; this floor pins a single raw block so the render-parity assertion is
+//!   the only variable;
 //! * the **native T0 render path**: the resolved, verified bytes are rendered by
 //!   the SAME [`NativeRenderer`] backend, driven THROUGH the [`Renderer`] seam at
 //!   the SAME pinned viewport, that the server floor uses.
@@ -35,10 +36,13 @@
 
 use std::path::{Path, PathBuf};
 
-use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+use fetcher::{cid_v1_raw_sha256, ContentRetriever, RetrieveError, RetrievedContent};
 use native_renderer::{NativeRenderer, RenderOutput};
 use renderer::{LoadState, Renderer, SchemeRequest};
 use werust_core::ipfs::resolve_ipfs_request;
+
+/// The `raw` IPLD multicodec code (a leaf block's bytes ARE the content).
+const RAW_CODEC: u64 = 0x55;
 
 /// The viewport width the goldens are pinned at, in px. Identical to the server
 /// floor's ([`t0_server_floor_goldens::FIXTURE_VIEWPORT_WIDTH`]) so the transcript
@@ -70,23 +74,24 @@ fn golden_path(name: &str) -> PathBuf {
     fixtures_dir().join(format!("{name}.golden.txt"))
 }
 
-/// A pinned, in-memory content source, isolated from the live network.
+/// A pinned, in-memory [`ContentRetriever`], isolated from the live network,
+/// that verifies a single raw/leaf block against its CID.
 ///
-/// It plays the role of the untrusted origin (an IPFS gateway / blockstore /
-/// peer): it hands back whatever bytes it holds for a CID's canonical string. The
-/// verify happens ABOVE it in [`VerifyingContentFetcher`], so it can be pointed at
-/// honest content (stored under its real CID) or TAMPERED content (bytes that do
-/// not match the CID) to exercise both the render-verified and
-/// mismatch-fails-the-load cases, with NO network access. Mirrors the pinned
-/// source the `werust_core::ipfs` and `fetcher` seam tests use.
+/// It plays the untrusted-origin role: it holds bytes for a CID and RE-VERIFIES
+/// them against that CID before returning, so it can be pointed at honest
+/// content (stored under its real CID) or TAMPERED content (bytes that do not
+/// match the CID) to exercise both the render-verified and
+/// mismatch-fails-the-load cases, with NO network access. The full multi-block
+/// CAR/DAG verify is covered in the `fetcher::retriever` tests; this floor
+/// pins a single raw block.
 #[derive(Default)]
-struct PinnedContentSource {
+struct PinnedRawRetriever {
     blobs: std::collections::HashMap<String, Vec<u8>>,
 }
 
-impl PinnedContentSource {
-    /// Store honest content under its real (derived) CID and return that CID:
-    /// fetching this CID must verify and return these exact bytes.
+impl PinnedRawRetriever {
+    /// Store honest content under its real (derived) raw CID and return that CID:
+    /// retrieving this CID must verify and return these exact bytes.
     fn put(&mut self, bytes: &[u8]) -> String {
         let cid = cid_v1_raw_sha256(bytes).expect("derive pinned fixture cid");
         self.blobs.insert(cid.clone(), bytes.to_vec());
@@ -94,18 +99,33 @@ impl PinnedContentSource {
     }
 
     /// Store TAMPERED bytes under `cid`: the bytes do NOT hash to `cid`, so a
-    /// fetch of `cid` must fail the load with a hash mismatch, never render.
+    /// retrieve of `cid` must fail the load with a hash mismatch, never render.
     fn put_tampered_under(&mut self, cid: &str, tampered: &[u8]) {
         self.blobs.insert(cid.to_string(), tampered.to_vec());
     }
 }
 
-impl ContentSource for PinnedContentSource {
-    fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
-        self.blobs
-            .get(&cid.to_string())
+impl ContentRetriever for PinnedRawRetriever {
+    fn retrieve(&self, cid: &str, _path: &str) -> Result<RetrievedContent, RetrieveError> {
+        let bytes = self
+            .blobs
+            .get(cid)
             .cloned()
-            .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
+            .ok_or_else(|| RetrieveError::MissingBlock {
+                cid: cid.to_string(),
+            })?;
+        // Re-verify against the CID: a raw block's bytes ARE the content, so a
+        // mismatch is a hard tamper failure that is never returned.
+        let expected = cid_v1_raw_sha256(&bytes).expect("derive cid for held bytes");
+        if expected != cid {
+            return Err(RetrieveError::BlockHashMismatch {
+                cid: cid.to_string(),
+            });
+        }
+        Ok(RetrievedContent {
+            bytes,
+            codec: RAW_CODEC,
+        })
     }
 }
 
@@ -155,15 +175,12 @@ fn data_url(html: &str) -> String {
 /// returning the VERIFIED bytes (as UTF-8), or panicking if the load would fail.
 ///
 /// This drives the exact seam the `ipfs://` scheme handler drives in production:
-/// [`resolve_ipfs_request`] over a [`VerifyingContentFetcher`], which returns
-/// bytes ONLY after they hash to the CID. So the fragment is provably
+/// [`resolve_ipfs_request`] over a [`ContentRetriever`], which returns bytes
+/// ONLY after each block hashes to its CID. So the fragment is provably
 /// hash-verified on the way in before it is ever rendered.
-fn resolve_verified_html(
-    fetcher: &VerifyingContentFetcher<PinnedContentSource>,
-    cid: &str,
-) -> String {
+fn resolve_verified_html(retriever: &PinnedRawRetriever, cid: &str) -> String {
     let response = resolve_ipfs_request(
-        fetcher,
+        retriever,
         &SchemeRequest {
             uri: format!("ipfs://{cid}/index.html"),
         },
@@ -187,12 +204,11 @@ fn content_addressed_fragment_renders_at_parity_with_the_server_floor_golden() {
         let fragment = read_fixture_html(name);
 
         // Pin the fragment under its real CID and resolve it through the
-        // hash-verified content-addressed path (the bytes come back ONLY after
-        // they verify against the CID).
-        let mut source = PinnedContentSource::default();
-        let cid = source.put(fragment.as_bytes());
-        let fetcher = VerifyingContentFetcher::new(source);
-        let verified = resolve_verified_html(&fetcher, &cid);
+        // verifiable content-retrieval seam (the bytes come back ONLY after they
+        // verify against the CID).
+        let mut retriever = PinnedRawRetriever::default();
+        let cid = retriever.put(fragment.as_bytes());
+        let verified = resolve_verified_html(&retriever, &cid);
 
         // The verified bytes are byte-for-byte the authored fragment: nothing was
         // altered on the content-addressed way in.
@@ -232,13 +248,12 @@ fn a_hash_mismatch_fails_the_content_addressed_load_and_never_renders() {
     let fragment = read_fixture_html("article");
     let honest_cid = cid_v1_raw_sha256(fragment.as_bytes()).expect("derive fixture cid");
 
-    let mut source = PinnedContentSource::default();
-    // The source (an untrusted origin) holds bytes that do NOT match the CID.
-    source.put_tampered_under(&honest_cid, b"<h1>tampered</h1> not the pinned fragment");
-    let fetcher = VerifyingContentFetcher::new(source);
+    let mut retriever = PinnedRawRetriever::default();
+    // The origin holds bytes that do NOT match the CID.
+    retriever.put_tampered_under(&honest_cid, b"<h1>tampered</h1> not the pinned fragment");
 
     let result = resolve_ipfs_request(
-        &fetcher,
+        &retriever,
         &SchemeRequest {
             uri: format!("ipfs://{honest_cid}/index.html"),
         },
@@ -268,29 +283,18 @@ fn the_pinned_cid_is_derived_from_the_fragment_and_verifies_deterministically() 
         "the pinned CID is deterministic for the fragment"
     );
 
-    let mut source = PinnedContentSource::default();
-    let stored_cid = source.put(fragment.as_bytes());
+    let mut retriever = PinnedRawRetriever::default();
+    let stored_cid = retriever.put(fragment.as_bytes());
     assert_eq!(stored_cid, cid_a, "content is stored under its derived CID");
 
-    let fetcher = VerifyingContentFetcher::new(source);
-    let verified = resolve_verified_html(&fetcher, &stored_cid);
+    let verified = resolve_verified_html(&retriever, &stored_cid);
     assert_eq!(
         verified, fragment,
         "the pinned CID resolves to exactly the fragment bytes, off the network"
     );
 
-    // Sanity: the source holds the fragment under its derived CID, and a CID
-    // naming DIFFERENT bytes is a different identifier (so it could never verify
-    // against this fragment).
-    let parsed = Cid::try_from(stored_cid.as_str()).expect("the derived CID parses");
-    assert_eq!(
-        fetcher
-            .source()
-            .get(&parsed)
-            .expect("the source holds the fragment"),
-        fragment.as_bytes(),
-        "the source holds the fragment under its CID"
-    );
+    // Sanity: a CID naming DIFFERENT bytes is a different identifier (so it could
+    // never verify against this fragment).
     let other_cid = cid_v1_raw_sha256(b"different bytes").expect("derive other cid");
     assert_ne!(other_cid, stored_cid);
 }

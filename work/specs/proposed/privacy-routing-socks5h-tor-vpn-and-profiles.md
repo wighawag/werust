@@ -139,8 +139,11 @@ connection. Better a failed load than a silent deanonymisation.
 ## Out of Scope (for this spec)
 
 - Full Tor-Browser-grade FINGERPRINTING resistance (letterboxing, exhaustive UA/JS surface
-  normalisation) \u2014 werust promises NO NETWORK LEAK here, not unlinkability; fingerprinting is
-  a separate future spec so we never over-claim.
+  normalisation) \u2014 werust promises NO NETWORK LEAK here, not unlinkability. Fingerprinting is
+  the separate, sequenced-after spec `fingerprinting-resistance-tor-browser-grade` (kept in
+  view per the human's request). THIS spec must still be built fingerprinting-AWARE (uniform
+  headers, single bundled font, per-profile isolation) so that follow-on needs no rework; the
+  unlinkability guarantee is that spec's, not this one's.
 - The per-protocol backends themselves (their specs) \u2014 this governs how they are ROUTED, not
   what they are.
 - System-level VPN setup (that is the OS's job) \u2014 werust ensures it does not leak AROUND a

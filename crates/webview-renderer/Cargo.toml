@@ -9,5 +9,8 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 werust-core = { path = "../werust-core" }
 fetcher = { path = "../fetcher" }
-gtk4 = { version = "=0.10.0", features = ["v4_18"] }
-webkit6 = { version = "=0.5.0", features = ["v2_50", "gtk_v4_18"] }
+gtk4 = { version = "=0.10.0", features = ["v4_14"] }
+# NOTE: webkit6 0.5.0's only gtk-feature-forward is `gtk_v4_18` (= gtk4/v4_18); it has
+# no `gtk_v4_14`. Enabling `gtk_v4_18` would force gtk4 >= 4.18, which Ubuntu 24.04 CI
+# (GTK 4.14) cannot meet. We omit it so gtk4 stays at the `v4_14` pin below.
+webkit6 = { version = "=0.5.0", features = ["v2_50"] }

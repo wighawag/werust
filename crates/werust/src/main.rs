@@ -117,6 +117,13 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // `eip1193-provider-injection-via-script-bridge`).
     let mut backend = WebViewRenderer::new()?;
     backend.install_provider();
+    // Wire the second trust hook: native `ipfs://` resolution through the seam's
+    // custom-scheme hook, backed by the hash-verified content-addressed fetch
+    // path. An `ipfs://<cid>/…` URL then loads and renders a VERIFIED
+    // content-addressed page at parity with a served page; a hash mismatch fails
+    // the load rather than rendering unverified bytes (task
+    // `ipfs-scheme-resolution-through-renderer-seam`).
+    backend.install_ipfs();
     let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
 
     // Embed the live, interactive view. The seam hands the shell an opaque

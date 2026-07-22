@@ -181,6 +181,44 @@ impl WebViewRenderer {
         // Make the provider detectable from document start.
         self.inject_script(&provider_shim());
     }
+
+    /// Wire native `ipfs://` resolution into this webview, over the seam's
+    /// custom-scheme / request-interception hook.
+    ///
+    /// This wires werust's SECOND trust hook (`CONTEXT.md`, `docs/adr/0001`): an
+    /// `ipfs://<cid>/…` URL typed in the URL bar is intercepted at the seam, its
+    /// CID resolved through the hash-verified content-addressed
+    /// [`Fetcher`](fetcher::Fetcher) path, and the VERIFIED bytes rendered on the
+    /// webview — at parity with a served page. Verification GATES the load: a hash
+    /// mismatch (or any other verify failure) fails the load rather than rendering
+    /// unverified bytes.
+    ///
+    /// It registers the `ipfs` scheme handler and routes each intercepted request
+    /// through the pure [`resolve_ipfs_request`] resolver, backed by a production
+    /// [`GatewayContentSource`] (an IPFS gateway over the bound HTTP
+    /// [`HttpFetcher`](fetcher::HttpFetcher)) wrapped in a
+    /// [`VerifyingContentFetcher`](fetcher::VerifyingContentFetcher) so the origin
+    /// is never trusted, only the hash. The gateway source is UNTRUSTED; the
+    /// verify above it is what makes the load safe. The pure resolution
+    /// (scheme -> verified-fetch -> render, and its mismatch-fails-the-load
+    /// guarantee) is exercised headlessly against a pinned fixture CID by the
+    /// `werust_core::ipfs` tests.
+    ///
+    /// [`resolve_ipfs_request`]: werust_core::ipfs::resolve_ipfs_request
+    /// [`GatewayContentSource`]: werust_core::ipfs::GatewayContentSource
+    pub fn install_ipfs(&mut self) {
+        use fetcher::{HttpFetcher, VerifyingContentFetcher};
+        use werust_core::ipfs::{resolve_ipfs_request, GatewayContentSource, IPFS_SCHEME};
+
+        // The production content-addressed fetcher: candidate bytes from an IPFS
+        // gateway over the bound HTTP+TLS stack, hash-verified against the CID
+        // before they are ever handed back. Owned by the scheme handler closure.
+        let fetcher = VerifyingContentFetcher::new(GatewayContentSource::new(HttpFetcher::new()));
+        self.register_scheme_handler(
+            IPFS_SCHEME,
+            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
+        );
+    }
 }
 
 impl Renderer for WebViewRenderer {

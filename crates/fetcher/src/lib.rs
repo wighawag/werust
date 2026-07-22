@@ -267,8 +267,14 @@ impl Fetcher for HttpFetcher {
 // the content itself) is out of scope here and belongs to the render/resolution
 // tasks; this seam verifies the block bytes it is handed against the CID.
 
-use cid::Cid;
 use sha2::{Digest, Sha256};
+
+// The `ContentSource` trait's `get` takes a `&Cid`, so an out-of-crate
+// implementor (e.g. the `ipfs://` scheme resolver's content source) needs the
+// type. Re-export it from the seam rather than making callers depend on the
+// `cid` crate directly and risk a version skew with the one this seam verifies
+// against.
+pub use cid::Cid;
 
 /// The multihash code for `sha2-256` (the IPFS default content hash).
 ///

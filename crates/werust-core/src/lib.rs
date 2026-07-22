@@ -24,6 +24,7 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError};
 
+pub mod ipfs;
 pub mod provider;
 
 /// The chrome state the shell reflects: everything the window must draw ABOUT the

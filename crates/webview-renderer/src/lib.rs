@@ -153,6 +153,10 @@ mod tests {
         /// The registered script-message handlers, so the harness can deliver a
         /// page-posted message to the same handler a real backend would.
         message_handlers: std::collections::HashMap<String, ScriptMessageHandler>,
+        /// The registered custom-scheme handlers, so the harness can hand an
+        /// intercepted request to the same handler a real backend would (the
+        /// stand-in for WebKitGTK's `register_uri_scheme` callback).
+        scheme_request_handlers: std::collections::HashMap<String, SchemeHandler>,
         /// JS the seam pushed back into the page via `evaluate_javascript` — the
         /// browser -> page response half of the bridge, recorded so the round-trip
         /// can be asserted headlessly.
@@ -213,12 +217,31 @@ mod tests {
             self.evaluated.borrow_mut().push(script.to_string());
         }
 
-        fn register_scheme_handler(&mut self, scheme: &str, _handler: SchemeHandler) {
+        fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler) {
             self.scheme_handlers.push(scheme.to_string());
+            self.scheme_request_handlers
+                .insert(scheme.to_string(), handler);
         }
     }
 
     impl SeamHarness {
+        /// Hand an intercepted `<scheme>://…` [`SchemeRequest`] to the handler
+        /// registered under `scheme`, returning its answer exactly as WebKitGTK's
+        /// `register_uri_scheme` callback would drive it on the GTK loop.
+        fn deliver_scheme_request(
+            &mut self,
+            scheme: &str,
+            uri: &str,
+        ) -> Result<renderer::SchemeResponse, RendererError> {
+            let handler = self
+                .scheme_request_handlers
+                .get_mut(scheme)
+                .expect("a handler is registered for this scheme");
+            handler(renderer::SchemeRequest {
+                uri: uri.to_string(),
+            })
+        }
+
         /// Deliver a page-posted [`ScriptMessage`] to the handler registered under
         /// its `handler` name, exactly as WebKitGTK's
         /// `script-message-received` signal would on the GTK loop.
@@ -441,6 +464,101 @@ mod tests {
     }
 
     #[test]
+    fn ipfs_scheme_resolves_verified_content_through_the_seam_hook() {
+        // Acceptance (scheme -> verified-fetch -> render at the seam, headless): an
+        // intercepted `ipfs://<cid>...` request is routed through the SAME resolver
+        // the real `WebViewRenderer::install_ipfs` wires onto the custom-scheme
+        // hook, resolved by the hash-verified Fetcher path, and its VERIFIED bytes
+        // handed back as the response the backend would render — at parity with a
+        // served page (text/html). Pinned fixture CID, no live network, no GTK loop.
+        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+
+        // A pinned in-memory source (an untrusted origin stand-in), off the network.
+        #[derive(Default)]
+        struct PinnedSource {
+            blobs: std::collections::HashMap<String, Vec<u8>>,
+        }
+        impl ContentSource for PinnedSource {
+            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
+                self.blobs
+                    .get(&cid.to_string())
+                    .cloned()
+                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
+            }
+        }
+
+        let page = b"<!doctype html><title>ipfs</title><h1>verifiable page</h1>";
+        let cid = cid_v1_raw_sha256(page).expect("derive pinned fixture cid");
+        let mut source = PinnedSource::default();
+        source.blobs.insert(cid.clone(), page.to_vec());
+        let fetcher = VerifyingContentFetcher::new(source);
+
+        // Wire the ipfs scheme handler onto the seam EXACTLY as install_ipfs does:
+        // route each intercepted request through resolve_ipfs_request against the
+        // verifying fetcher.
+        let mut r = SeamHarness::default();
+        r.register_scheme_handler(
+            IPFS_SCHEME,
+            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
+        );
+        assert_eq!(r.scheme_handlers, ["ipfs"]);
+
+        // An intercepted `ipfs://<cid>/index.html` resolves to the VERIFIED bytes,
+        // rendered as an html document (served-page parity).
+        let response = r
+            .deliver_scheme_request(IPFS_SCHEME, &format!("ipfs://{cid}/index.html"))
+            .expect("verified content resolves through the scheme hook");
+        assert_eq!(response.body, page);
+        assert_eq!(response.mime_type, "text/html");
+    }
+
+    #[test]
+    fn ipfs_scheme_hash_mismatch_fails_the_load_and_never_renders() {
+        // The load-bearing gate at the seam: the source holds TAMPERED bytes under
+        // a real CID, so the intercepted `ipfs://<cid>` request must FAIL (an Err
+        // the backend surfaces via `request.finish_error`, a failed load) and must
+        // NEVER return the tampered bytes to render. Verification gates the load.
+        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+
+        #[derive(Default)]
+        struct PinnedSource {
+            blobs: std::collections::HashMap<String, Vec<u8>>,
+        }
+        impl ContentSource for PinnedSource {
+            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
+                self.blobs
+                    .get(&cid.to_string())
+                    .cloned()
+                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
+            }
+        }
+
+        let honest = b"the page this cid actually names";
+        let cid = cid_v1_raw_sha256(honest).expect("derive pinned fixture cid");
+        let mut source = PinnedSource::default();
+        source.blobs.insert(
+            cid.clone(),
+            b"tampered bytes that do not match the cid".to_vec(),
+        );
+        let fetcher = VerifyingContentFetcher::new(source);
+
+        let mut r = SeamHarness::default();
+        r.register_scheme_handler(
+            IPFS_SCHEME,
+            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
+        );
+
+        let result = r.deliver_scheme_request(IPFS_SCHEME, &format!("ipfs://{cid}/index.html"));
+        let err = result.expect_err("a hash mismatch must fail the load, not render");
+        assert!(
+            matches!(&err, RendererError::Backend(msg) if msg.contains("mismatch")),
+            "the mismatch fails the load with a verify reason, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn evaluate_javascript_pushes_into_the_page_over_the_seam() {
         // The browser -> page response half of the bridge is a first-class seam
         // method: a backend can push JS into the live page. Asserted headlessly on
@@ -509,6 +627,23 @@ mod tests {
     fn real_webview_installs_the_eip1193_provider() {
         let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
         r.install_provider();
+    }
+
+    /// End-to-end install of native `ipfs://` resolution on the REAL WebKitGTK
+    /// backend. Ignored by default (constructing a `WebViewRenderer` initializes
+    /// GTK, which needs a display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. The full
+    /// scheme -> verified-fetch -> render path (and its mismatch-fails-the-load
+    /// guarantee) is pinned display-free by the headless
+    /// `ipfs_scheme_resolves_verified_content_through_the_seam_hook` and
+    /// `ipfs_scheme_hash_mismatch_fails_the_load_and_never_renders` above; here we
+    /// only pin that installing the scheme hook on the real backend wires the
+    /// custom scheme without panicking.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_installs_the_ipfs_scheme() {
+        let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        r.install_ipfs();
     }
 
     #[test]

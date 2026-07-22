@@ -1,0 +1,89 @@
+# GoReleaser config for werust — the deliberately Zig-less release path.
+#
+# This is the port of wezig's `.goreleaser.yaml`, swapping GoReleaser's
+# `builder: zig` for its native `builder: rust` (GoReleaser v2.5+, which
+# cross-compiles via cargo-zigbuild). A tag push (`v*`) cuts one GitHub Release
+# carrying the desktop Linux binaries (amd64, arm64) + checksums + a
+# conventional-commit changelog; the mobile artifacts (Android APK, iOS Simulator
+# `.app` zip) are attached by the hand-written jobs in
+# `.github/workflows/release.yml` alongside this (parity with wezig, mobile
+# included — `docs/adr/0002`, CONTEXT.md Conventions).
+#
+# The release workflow ALSO runs this in `--snapshot` mode on a
+# `workflow_dispatch` dry-run, which builds every artifact but publishes nothing.
+version: 2
+
+# GoReleaser's Rust builder cross-compiles with cargo-zigbuild and needs the Rust
+# targets installed. The desktop binary links system WebKitGTK, so install the
+# GTK/WebKit dev libraries too. Runs on the Linux desktop leg only.
+before:
+  hooks:
+    - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+    - cargo install --locked cargo-zigbuild
+
+builds:
+  - id: werust-desktop
+    # The Zig-less build path: GoReleaser's native Rust builder (cargo-zigbuild).
+    builder: rust
+    binary: werust
+    # `cargo build` the desktop binary crate for each desktop Linux target.
+    tool: cargo
+    command: zigbuild
+    # Desktop Linux amd64 + arm64 (the wezig-parity desktop floor). Rust target
+    # triples, as the Rust builder expects.
+    targets:
+      - x86_64-unknown-linux-gnu
+      - aarch64-unknown-linux-gnu
+
+# One archive per desktop target so the Release carries downloadable tarballs.
+archives:
+  - id: werust-desktop
+    formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+
+# Checksums for every artifact (criterion 1: "+ checksums on a tag").
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+# The changelog is generated FROM conventional-commit git history — there are NO
+# per-change changeset files (CONTEXT.md Conventions; the load-bearing
+# conventional-commit rule). Grouped by conventional-commit type.
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^chore:"
+      - "^ci:"
+      - "^test:"
+      - "^docs:"
+      - "Merge "
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+# On a `workflow_dispatch` snapshot dry-run this whole `release` section is
+# skipped (GoReleaser `--snapshot` never touches the forge); on a tag it
+# publishes the GitHub Release.
+release:
+  github:
+    owner: wighawag
+    name: werust
+  # The mobile jobs (android-apk, ios-simulator-app) attach their artifacts to
+  # THIS release afterwards via `gh release upload <tag>`, so don't mark it a
+  # draft that they cannot upload into, and don't auto-finalize before they run.
+  draft: false
+  prerelease: auto
+
+# A snapshot build (the dispatch dry-run) needs a deterministic version name
+# since there is no tag.
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"

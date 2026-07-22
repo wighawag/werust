@@ -9,3 +9,10 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 fetcher = { path = "../fetcher" }
 serde_json = "1"
+
+[dev-dependencies]
+# Parses the release-plumbing config files (`.goreleaser.yaml` +
+# `.github/workflows/release.yml`) for the shape test in
+# `tests/release_plumbing_shape.rs`. Dev-only: it never enters the shipped
+# binary, only `cargo test` (the verify gate).
+serde_yaml = "0.9"

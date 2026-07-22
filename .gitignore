@@ -1,5 +1,10 @@
 /target
 
+# GoReleaser build output (`.goreleaser.yaml` / release.yml): the desktop
+# binaries, archives, and checksums are produced under dist/ in CI (and by a
+# local `goreleaser release --snapshot`); never committed.
+/dist
+
 # Android app module (crates/werust-android) build scratch + local config.
 # The Gradle wrapper (gradlew, gradle/wrapper/*) IS tracked; only build output
 # and machine-local config are ignored.

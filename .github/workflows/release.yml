@@ -1,0 +1,235 @@
+name: release
+
+# The release pipeline — parity with wezig's `release.yml`, mobile included, on
+# the deliberately Zig-less build path (GoReleaser `builder: rust`; ADR-0002,
+# CONTEXT.md Conventions). Two paths:
+#
+#   * TAG PUSH (`v*`)      — a REAL release: GoReleaser publishes a GitHub Release
+#                            with the desktop Linux binaries (amd64, arm64) +
+#                            checksums + a conventional-commit changelog, then the
+#                            Android APK + iOS Simulator `.app` zip are attached to
+#                            it with `gh release upload`.
+#   * workflow_dispatch    — a DRY RUN: GoReleaser runs `--snapshot` (publishes
+#                            NOTHING) and every leg uploads workflow artifacts via
+#                            actions/upload-artifact instead of attaching to a
+#                            Release, so all artifacts are validated end-to-end
+#                            without cutting a release.
+#
+# Three build jobs mirror wezig's shape, gated by `verify` (the pure-Rust gate)
+# so a tag can never ship a red tree:
+#   verify -> goreleaser (Linux desktop)  ->  android-apk (Linux, SDK+NDK)
+#                                         ->  ios-simulator-app (macos-14)
+# The mobile legs `needs: goreleaser` so, on a tag, the Release already exists to
+# upload into.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # The SAME verify gate as dorfl.json / verify.yml runs first: a tag build is
+  # gated on a green tree (criterion 5).
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup component add rustfmt clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # The verify gate — identical to dorfl.json's `verify`.
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy
+      - name: cargo build
+        run: cargo build
+      - name: cargo test
+        run: cargo test
+
+  # The desktop leg: GoReleaser's Rust builder cuts the Linux binaries +
+  # checksums + changelog. On a tag it PUBLISHES the Release; on a dispatch
+  # dry-run it runs `--snapshot` (publishes nothing) and uploads the built dist
+  # as a workflow artifact.
+  goreleaser:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # GoReleaser reads the full git history to build the conventional-commit
+          # changelog; a shallow checkout would truncate it.
+          fetch-depth: 0
+
+      - name: Install the desktop build toolchain (WebKitGTK + cross targets)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-4-dev
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+
+      - name: Set up Zig (for cargo-zigbuild cross-compiles)
+        uses: mlugg/setup-zig@v1
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-release-cargo-
+
+      # TAG PATH: publish the real GitHub Release with binaries + checksums +
+      # changelog. `github.ref` is `refs/tags/v...` on a tag push.
+      - name: GoReleaser (tag — real release)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # DRY-RUN PATH: snapshot build, publishes nothing.
+      - name: GoReleaser (workflow_dispatch — snapshot dry-run, publishes nothing)
+        if: github.event_name == 'workflow_dispatch'
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean --snapshot --skip=publish
+
+      # On the dry-run, surface every desktop artifact as a workflow artifact so
+      # the dispatch validates the desktop build without publishing.
+      - name: Upload desktop artifacts (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: werust-desktop-dist
+          path: dist/*
+
+  # The Android leg: build the debug APK from the REAL app module (its Gradle
+  # step cross-compiles the shared werust-core into libwerust_mobile.so per ABI),
+  # run the acceptance ABI check, then attach the APK to the Release (tag) or
+  # upload it as a workflow artifact (dry-run). Reuses the exact contract the
+  # mobile-android task landed (task DECISIONS.md; forward-pointer on this task).
+  android-apk:
+    needs: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up the Android SDK + NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install the Android Rust targets
+        run: rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-android-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-android-cargo-
+
+      - name: Build the debug APK (cross-compiles the Rust core per ABI)
+        working-directory: crates/werust-android
+        run: ./gradlew :app:assembleDebug
+
+      - name: BUILD-leg check — the APK carries the Rust core for both ABIs
+        # This is where criterion 4's ABI assertion actually EXECUTES (it is
+        # deliberately NOT in the pure-Rust verify gate, which lacks the SDK/NDK).
+        run: docs/spikes/mobile-android-shell-and-static-lib/check-apk-abis.sh crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
+
+      # TAG PATH: attach the APK to the Release cut by the goreleaser job.
+      - name: Attach the APK to the Release (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" crates/werust-android/app/build/outputs/apk/debug/app-debug.apk --clobber
+
+      # DRY-RUN PATH: upload the APK as a workflow artifact, publish nothing.
+      - name: Upload the APK (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: werust-android-apk
+          path: crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
+
+  # The iOS leg: build the Simulator `.app` on a macOS runner (Xcode/Simulator
+  # are macOS-only), run the acceptance bundle check, zip the `.app`, then attach
+  # it to the Release (tag) or upload it as a workflow artifact (dry-run). Reuses
+  # the mobile-ios task's BUILD_ONLY packaging path + check-app-bundle.sh.
+  ios-simulator-app:
+    needs: goreleaser
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show Xcode + iOS runtimes
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Install the iOS Simulator Rust target
+        run: rustup target add aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-cargo-
+
+      - name: Build the Simulator .app (BUILD_ONLY — no simulator boot)
+        run: BUILD_ONLY=1 crates/werust-ios/build-and-run.sh
+
+      - name: BUILD-leg check — the .app is a real bundle carrying the Rust core
+        run: docs/spikes/mobile-ios-shell-and-static-lib/check-app-bundle.sh crates/werust-ios/build/WerustShell.app
+
+      - name: Zip the Simulator .app
+        run: |
+          cd crates/werust-ios/build
+          zip -r -y WerustShell-Simulator.app.zip WerustShell.app
+
+      # TAG PATH: attach the zipped `.app` to the Release.
+      - name: Attach the Simulator .app zip to the Release (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${GITHUB_REF_NAME}" crates/werust-ios/build/WerustShell-Simulator.app.zip --clobber
+
+      # DRY-RUN PATH: upload the zipped `.app` as a workflow artifact, publish
+      # nothing.
+      - name: Upload the Simulator .app zip (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: werust-ios-simulator-app
+          path: crates/werust-ios/build/WerustShell-Simulator.app.zip

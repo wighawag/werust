@@ -1,8 +1,8 @@
 ---
 title: "werust: Tor-Browser-grade fingerprinting resistance (unlinkability, not just no-leak)"
 slug: fingerprinting-resistance-tor-browser-grade
-status: proposed
 needsAnswers: true
+taskedAfter: [privacy-routing-socks5h-tor-vpn-and-profiles]
 ---
 
 > PROPOSED spec \u2014 records intent, kept IN VIEW per the human's request but sequenced AFTER

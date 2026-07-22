@@ -1,8 +1,8 @@
 ---
 title: "werust: gated protocol subsystems \u2014 consent + lazy activation for heavyweight backends"
 slug: gated-protocol-subsystems-consent-and-lazy-activation
-status: proposed
 needsAnswers: true
+taskedAfter: []
 ---
 
 > PROPOSED spec \u2014 records intent for human review before tasking. A CROSS-CUTTING model

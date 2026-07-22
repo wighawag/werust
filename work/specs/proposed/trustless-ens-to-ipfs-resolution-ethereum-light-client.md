@@ -1,8 +1,8 @@
 ---
 title: "werust: trustless ENS name -> IPFS resolution via an embedded Ethereum light client"
 slug: trustless-ens-to-ipfs-resolution-ethereum-light-client
-status: proposed
 needsAnswers: true
+taskedAfter: []
 ---
 
 > PROPOSED spec — records intent for human review before tasking. It reuses the seams

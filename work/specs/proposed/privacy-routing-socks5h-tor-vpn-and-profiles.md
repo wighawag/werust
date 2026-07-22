@@ -1,8 +1,8 @@
 ---
 title: "werust: privacy routing (SOCKS5h / Tor / VPN, embedded Tor option) + browser profiles, leak-proof by construction"
 slug: privacy-routing-socks5h-tor-vpn-and-profiles
-status: proposed
 needsAnswers: true
+taskedAfter: [gated-protocol-subsystems-consent-and-lazy-activation]
 ---
 
 > PROPOSED spec \u2014 records intent for human review before tasking. Privacy/anonymity is a

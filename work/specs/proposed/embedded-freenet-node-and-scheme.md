@@ -1,8 +1,8 @@
 ---
 title: "werust: embedded Freenet node + a first-class Freenet scheme"
 slug: embedded-freenet-node-and-scheme
-status: proposed
 needsAnswers: true
+taskedAfter: [gated-protocol-subsystems-consent-and-lazy-activation]
 ---
 
 > PROPOSED spec \u2014 records intent for human review before tasking. SEPARATE from the ENS/IPFS

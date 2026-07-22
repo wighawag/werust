@@ -61,16 +61,37 @@ BACKEND behind it. Two backends, delivered in phases:
   for mobile). `eth_call` results are verified against a chain head the client validated.
   This is what makes `ronan.eth` genuinely trustless.
 
-### New seam 2 — ENS resolution logic (`ens://` scheme + name->CID)
+### New seam 2 — ENS resolution logic (bare `name.eth` front door -> contenthash-typed scheme)
 
-- A new `ens://` scheme (register it on the `Renderer` seam's custom-scheme hook, exactly
-  like `ipfs://`), OR treat a bare `name.eth` in the URL bar as `ens://name.eth`.
-- `namehash` (ENSIP-1 normalization + hashing), the registry->resolver->`contenthash(node)`
-  call sequence (ENSIP-7 / EIP-1577), and CCIP-Read (EIP-3668) awareness (see open Q).
-- Decode the returned contenthash (a multicodec-prefixed multihash: `ipfs-ns` /
-  `ipns-ns` / `swarm-ns`) into an `ipfs://<cid>` URL, then hand that to the EXISTING
-  ipfs verified render path. A name with no/invalid contenthash FAILS the load (never
-  renders something unverified).
+**URL-scheme model (decided after surveying Brave / Opera / MetaMask / eth.limo — see the
+resolved question below).** The user-facing contract is a BARE ENS NAME, not an `ens://`
+scheme:
+
+- **Front door: a bare `ronan.eth` typed in the URL bar.** No scheme required (the natural
+  UX, and what Brave/Opera do). werust recognises a `.eth` (and future ENS TLDs) input and
+  resolves it as ENS.
+- **Dispatch by the contenthash's OWN type, not a fixed scheme.** ENS `contenthash`
+  (ENSIP-7/EIP-1577) is a multicodec-prefixed value: `ipfs-ns` -> immutable CID,
+  `ipns-ns` -> mutable IPNS name, `swarm-ns`/others. werust reads the multicodec prefix and
+  dispatches to the RIGHT path: `ipfs://<cid>` (existing verified path) or `ipns://<name>`
+  (needs IPNS resolution -> a CID -> the existing verified path). Getting THIS wrong
+  (defaulting to `ipfs://` when the name is actually `ipns://`) is the exact bug real
+  browsers ship; werust must key off the contenthash type.
+- **The address bar KEEPS `ronan.eth`.** The ENS name is the identity the user cares about;
+  do NOT rewrite the bar to the underlying `ipfs://<cid>` (the top complaint about existing
+  browsers is losing the name). Internally the load is the resolved CID; the displayed URL
+  is the name.
+- **NO `https://ronan.eth` rewrite, NO trusted gateway.** Rewriting to `https://` (the
+  eth.limo / `ronan.eth.limo` model) reintroduces a trusted HTTPS gateway and false
+  TLS-trust semantics — the exact trusted-server model this project rejects.
+- **`namehash`** (ENSIP-1 normalization + hashing), the registry->resolver->
+  `contenthash(node)` call sequence (ENSIP-7/EIP-1577), and CCIP-Read (EIP-3668) awareness
+  (see open Q).
+- A name with no/invalid contenthash, or one whose resolution fails verification, FAILS the
+  load (never renders something unverified/guessed).
+- **`ens://ronan.eth` is a secondary, explicit disambiguator ONLY** (e.g. to force ENS
+  resolution of an ambiguous input) — NOT the primary contract and NOT required. No other
+  browser uses `ens://`; the bare name is the convention.
 
 ### Trust indicator integration
 
@@ -112,7 +133,29 @@ name-verification the light client did not prove.
 - Non-Ethereum name systems (Unstoppable, Handshake) — future.
 - L2/other-chain ENS beyond CCIP-Read awareness in Phase 3.
 
-## OPEN QUESTIONS (must be answered before tasking — needsAnswers: true)
+## DECISIONS CONFIRMED BY THE HUMAN (2026-07-22)
+
+The human accepted the recommended defaults, so these are settled for tasking:
+- **Q1 endgame + phasing:** trustless Helios light-client backend is the target; the
+  trusted `RpcProvider` is an EARLY skeleton behind the SAME seam, not the permanent answer.
+- **Q2 checkpoint:** ship a recent weak-subjectivity checkpoint in-build + allow user
+  override + strict-checkpoint-age WARNING; NOT the community fallback as the default root.
+- **Q3 execution RPC:** user-configurable with a sensible default, clearly labelled
+  untrusted (Helios verifies it); must support `eth_getProof`.
+- **Q4 Helios dependency:** embed Helios (Rust-native, mobile/WASM-proven); do NOT hand-roll
+  a sync-committee verifier.
+- **Q5 CCIP-Read:** Phase 3.
+- **Q6 scheme:** RESOLVED above — bare `ronan.eth` front door, contenthash-typed dispatch,
+  keep the name in the bar, no `https://`/gateway, `ens://` secondary only.
+- **Q7 async bridge:** a dedicated tokio runtime bridged async->sync at the
+  `EthereumProvider` seam.
+
+Remaining genuinely-open items for a human touch before/within tasking: Q2's exact
+checkpoint-refresh mechanics, Q6's `.eth`-input strictness sub-question, and Q8 (IPNS
+scope). Phase 1 can be tasked now on the confirmed decisions; Q8 defaults to `ipfs-ns`-only
+for Phase 1.
+
+## OPEN QUESTIONS (context + the still-open sub-items)
 
 1. **Trust-level endgame + phasing.** Confirm the target is the TRUSTLESS Helios
    light-client backend (recommended), with the trusted-`RpcProvider` as an EARLY skeleton
@@ -133,9 +176,23 @@ name-verification the light client did not prove.
    (OffchainLookup). Phase 1/2 can handle onchain contenthash only; is CCIP-Read a Phase-3
    must, or required earlier? (A CCIP-Read fetch is itself an untrusted gateway call whose
    response is signature-verified — fits the thesis, but is extra work.)
-6. **`ens://` scheme vs bare `name.eth`.** Should a bare `ronan.eth` in the URL bar auto-
-   resolve as ENS, or only an explicit `ens://ronan.eth`? (Bare-name is nicer UX but risks
-   colliding with real DNS `.eth`-like inputs / typos.)
+6. **RESOLVED — URL scheme.** A bare `ronan.eth` is the front door (matches Brave/Opera and
+   user expectation); the underlying scheme is chosen by the contenthash's OWN multicodec
+   type (`ipfs://` vs `ipns://` vs …); the address bar keeps `ronan.eth`; NO `https://`
+   rewrite / trusted gateway; `ens://` is only a secondary explicit disambiguator. (Decided
+   from a survey of Brave, Opera, MetaMask, eth.limo: nobody uses `ens://`; `https://`
+   rewrite is the trusted-gateway anti-pattern this project rejects.) The one open sub-
+   question: how strict is `.eth`-input detection to avoid mis-firing on typos / real inputs
+   that merely LOOK like a name (e.g. require a trailing `/` or an explicit resolve action
+   vs. auto-resolving any `*.eth`).
+8. **NEW — IPNS (mutable contenthash) resolution.** Because dispatch is by contenthash type,
+   a name pointing at `ipns-ns` (very common — e.g. sites that update without re-paying gas)
+   needs IPNS -> CID resolution, which the current fetcher does NOT do (it fetches immutable
+   CIDs only). IPNS resolution is itself a trust question (an IPNS record is signed by its
+   key; resolving it via a gateway is a trust hop unless the signature is verified). Scope:
+   is `ipfs-ns`-only acceptable for Phase 1/2 (fail an `ipns-ns` name with a clear "mutable
+   names not yet supported"), with verified IPNS resolution as Phase 3? (Recommended:
+   yes — immutable `ipfs-ns` first; IPNS is its own verified-resolution sub-project.)
 7. **Async vs the current sync fetch path.** The ipfs/fetcher path is synchronous (`ureq`).
    Helios is async (tokio). How does the light-client read integrate with the sync render
    path — a dedicated runtime/thread bridging async->sync at the seam? (An architecture

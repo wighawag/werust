@@ -24,6 +24,7 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
+pub mod contenthash;
 pub mod ethereum;
 pub mod ipfs;
 pub mod provider;

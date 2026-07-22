@@ -40,6 +40,34 @@ This is the whole design tension; get it right or werust accretes a framework it
 Litmus test for every proposed piece: "does this add API SURFACE the dev programs against, or
 does it just REUSE an existing werust mechanism to package their app?" Only the latter passes.
 
+## Second principle: build the COMPONENTS so the recipe stays simple
+
+"Recipe, not framework" does NOT mean "leave the complexity in the recipe." The opposite: the
+recipe is simple BECAUSE the werust components are BUILT to be embeddable. Design-for-
+embedding is a requirement ON THE COMPONENTS, not documentation bolted on afterward. Concretely:
+
+- The desktop shell must expose a clean "run as an embedded app pointed at THESE bundled
+  assets, chrome off" entry — not force the dev to fork `main.rs`. If wrapping an app needs a
+  hand-edit of a shell internal, that is a COMPONENT bug: fix the component to take the
+  manifest, so the recipe is just "provide a manifest + assets."
+- The mobile scaffolds must be parameterisable by the manifest (app id/name/icon/entry), not
+  hand-edited per app.
+- The custom-scheme asset serving must be a reusable, drop-in mechanism.
+
+The test: adding a feature that makes the RECIPE shorter/simpler by pushing the work into a
+well-shaped COMPONENT is GOOD and in scope; adding developer-facing API surface is NOT. Keep
+the dev's steps minimal by making the substrate do the work, cleanly.
+
+## Scope: MINIMAL — a static page embedded in an app, like Tauri's core
+
+This is deliberately the SMALL version: serve a self-contained STATIC web app (HTML/CSS/JS
+assets) embedded in the native app and render it in the shell window — that is it, the Tauri
+"webview shows your bundled frontend" core. It ships NONE of werust's browser machinery: NO
+ipfs/ENS/Freenet subsystems, NO decentralised schemes, NO trust indicator, NO privacy
+routing, NO arbitrary-URL browsing. An embedded-app build is a PLAIN static-page app; the
+decentralised/browser features are compiled OUT (or simply never wired) for this mode. If a
+dev ever wants those, that is a different, later conversation — not this recipe.
+
 ## What werust ALREADY has to reuse (this is why it is a recipe, not a build-out)
 
 - **Desktop shell** (`crates/werust`): a GTK window + the WebKitGTK `Renderer` backend + the
@@ -70,8 +98,18 @@ app + serve it, NOT a green-field framework.
    (an app, not a browser), while the same `werust-core` + webview backend drive it.
 4. **Reuse the build/packaging paths.** The Android/iOS scaffolds + GoReleaser leg,
    parameterised by the manifest, produce the dev's desktop binary + APK + iOS `.app`.
-5. **Documented as a RECIPE.** The primary deliverable is DOCS (a `docs/` how-to +
-   `docs/spikes` proof) + the thin manifest support + whatever minimal shell parameterisation
+5. **A scaffold CLI that emits a project and SYNCS to latest.** The dev's entry point is a
+   scaffolding CLI (e.g. `werust-app new <name>` / `create-werust-app`) that GENERATES a thin
+   project wiring their static assets + manifest to the reusable werust shell + build scaffolds
+   (like `create-tauri-app`, but it emits a project that REUSES werust components — it is NOT a
+   runtime API). Crucially it also SYNCS: a `werust-app update`/`sync` verb pulls the LATEST
+   werust shell/build-scaffold version into an existing project (bump the pinned werust
+   version; refresh the regenerable scaffold files) so a dev is never stranded on an old
+   werust. This is what keeps the recipe simple over TIME: the scaffold is generated +
+   updatable, not copy-pasted once and left to rot. Scaffolding + version-sync ONLY — no
+   runtime API the app codes against (that would be a framework).
+6. **Documented as a RECIPE.** Alongside the CLI, DOCS (a `docs/` how-to + a `docs/spikes`
+   proof) + the thin manifest support + whatever minimal shell/scaffold parameterisation
    the reuse needs \u2014 not a new crate the dev depends on as a framework.
 
 ## User Stories
@@ -87,31 +125,38 @@ app + serve it, NOT a green-field framework.
    permissions/plugin config \u2014 and get native artifacts.
 5. As the werust maintainer, adding this does NOT saddle werust with a framework API surface
    (IPC/plugins/permissions) to maintain; it reuses existing mechanisms.
+6. As a developer, I scaffold my app project with a CLI (`werust-app new` /
+   `create-werust-app`), and later run its `update`/`sync` verb to pull the latest werust
+   shell/build version into my project, so I stay current without re-scaffolding by hand.
+7. As a developer, my embedded app is a PLAIN static-page app: no ipfs/ENS/Freenet, no browser
+   chrome, no arbitrary browsing — just my bundled frontend in a native window, like Tauri.
 
 ## Relationship to the other specs
 
 - Reuses the `Renderer` custom-scheme hook (same one `ipfs://` uses) to serve bundled assets.
 - The subsystem/privacy/ENS/Freenet specs are BROWSER features; an embedded app is a
-  different product mode. An embedded-app build likely SHIPS WITHOUT the browser chrome and
-  MAY ship without the decentralised subsystems (a plain-app build), OR a dev could opt into
-  them \u2014 an open question about how much of the browser an embedded app inherits.
+  different, MINIMAL product mode that ships WITHOUT them: no browser chrome, no decentralised
+  subsystems, no arbitrary browsing (DECIDED — minimal static-page embed, per the human). They
+  are compiled out / never wired for an embedded-app build \u2014 an open question about how much of the browser an embedded app inherits.
 - The `werust-core` extraction + mobile scaffolds (done for the browser's own mobile apps)
   are the exact substrate this reuses \u2014 a nice payoff of that earlier architecture.
 
 ## Phased delivery (proposed, for review)
 
 - **Phase 0 \u2014 spike + recipe proof:** manually wrap ONE sample web app as a werust desktop
-  app (point the shell at bundled assets via the custom scheme, hide the chrome), documenting
-  every step. Output: a findings/recipe doc + the minimal shell parameterisation it needed.
-  Proves "recipe, not framework" is sufficient.
+  app (bundled assets via the custom scheme, chrome off). The OUTPUT is not just docs — it is
+  the COMPONENT changes that make it clean: a shell entry taking "embedded-app mode + these
+  assets + no chrome" WITHOUT forking `main.rs`. Proves the recipe stays simple BECAUSE the
+  substrate does the work.
 - **Phase 1 \u2014 desktop recipe:** the thin manifest (name/id/icon/entry/window) + custom-scheme
-  bundled-asset serving + chrome-off app mode + a documented desktop build. A dev can ship a
-  desktop app from their web app.
+  bundled-asset serving + chrome-off app mode + the `werust-app new` CLI that emits a desktop
+  project reusing the shell. A dev scaffolds + ships a desktop app from their static web app.
 - **Phase 2 \u2014 mobile recipe:** parameterise the Android/iOS scaffolds by the manifest so the
-  same web app produces an APK + iOS `.app`; documented.
-- **Phase 3 \u2014 polish:** icon/splash/window ergonomics, a `create`-style helper ONLY IF it
-  stays a scaffolding convenience (not a framework runtime), release-pipeline parameterisation
-  per app.
+  same static app produces an APK + iOS `.app` (via the same CLI).
+- **Phase 3 \u2014 the SYNC verb + polish:** `werust-app update`/`sync` pulls the latest werust
+  shell/build version into an existing project (version bump + regenerable-scaffold refresh);
+  icon/splash/window ergonomics; per-app release-pipeline parameterisation. Scaffolding + sync
+  only, never a runtime API.
 
 ## Out of Scope (for this spec)
 
@@ -124,29 +169,27 @@ app + serve it, NOT a green-field framework.
 - The browser identity itself (arbitrary-URL browsing, decentralised subsystems) \u2014 an embedded
   app is a different mode reusing the same substrate.
 
+## DECISIONS CONFIRMED BY THE HUMAN (2026-07-22)
+
+- **Recipe made simple by embeddable COMPONENTS** (design-for-embedding is a requirement on
+  the shell/scaffolds, not docs bolted on).
+- **A scaffold CLI (`werust-app new` / `create-werust-app`) that SYNCS to latest** (an
+  `update`/`sync` verb): scaffolding + version-sync only, no runtime API.
+- **MINIMAL scope: a static page embedded in an app, like Tauri's core.** NO ipfs/ENS/Freenet,
+  no browser chrome, no arbitrary browsing; the browser/decentralised features are compiled
+  out / never wired for an embedded-app build.
+- **No JS<->native bridge**: the recipe wraps a self-contained static web app; deep native
+  integration is out of scope (the framework line).
+
 ## OPEN QUESTIONS (needsAnswers: true)
 
-1. **Recipe vs. thin-crate boundary.** Where exactly is the line? Purely docs + a manifest the
-   existing shell reads, or a small `werust-app` helper crate/CLI that does the packaging? The
-   moment it grows an API the dev programs AGAINST, it has become a framework \u2014 how do we keep
-   it a recipe while still being usable? (Recommend: docs + manifest + a thin scaffolding CLI
-   that emits a project reusing the existing crates, with NO runtime API surface.)
-2. **Asset serving mode.** Bundled-static-via-custom-scheme (offline, no port \u2014 recommended
-   default) vs. point-at-URL vs. both? How are assets bundled into the desktop binary / APK /
-   `.app`?
-3. **How much browser does an embedded app inherit?** Chrome hidden by default (it is an app)
-   \u2014 confirm. Do the decentralised subsystems (ipfs/ENS/Freenet) ship in an embedded-app build
-   at all, or is that a plain-app build with them compiled out? (Likely: off by default,
-   opt-in.)
-4. **Manifest scope.** Exactly which fields (name/id/icon/entry/window/platforms) \u2014 and hold
-   the line that it is PACKAGING metadata, never a permissions/plugin config.
-5. **No-native-bridge stance.** Confirm the recipe deliberately does NOT provide a JS<->native
-   bridge (that is the framework line). A dev needing native code is out of scope \u2014 acceptable?
-6. **Maintenance model.** Is this maintained as first-class (a supported way to build apps on
-   werust) or as an example/recipe that may lag? (Affects how much shell parameterisation is
-   worth building vs. documenting.)
-7. **Mobile signing/store.** Recipe covers unsigned/dev artifacts (as the browser's own mobile
-   build does); production signing/store submission is the dev's job \u2014 confirm.
+1. **Scaffold-CLI sync MECHANISM.** How does `update`/`sync` work: a pinned werust version in the scaffolded project that the verb bumps + re-emits the regenerable scaffold files (overwriting scaffold-owned files, leaving the dev's assets/manifest untouched)? How is "scaffold-owned vs dev-owned" delineated so a sync never clobbers the dev's code? (The crux of keeping the recipe simple over time; get the regeneration boundary right.)
+2. **Recipe boundary (residual).** Decided: docs + manifest + a thin scaffolding/sync CLI reusing the existing crates, NO runtime API. Residual: does the emitted project VENDOR the scaffold files or DEPEND on a published werust template/crate version?
+3. **Asset serving mode.** Bundled-static-via-custom-scheme (offline, no port; recommended default) vs. point-at-URL vs. both? How are the static assets bundled into the desktop binary / APK / `.app`?
+4. **Compiling the browser features OUT (decided WHETHER, open HOW).** Chrome-off + no ipfs/ENS/Freenet is DECIDED; the open question is the MECHANISM: Cargo features on `werust-core`/the shell, or a separate thin app-shell binary linking only the minimal render+window path, so a static-embed build carries none of that code.
+5. **Manifest scope.** Exactly which fields (name/id/icon/entry/window/platforms), holding the line that it is PACKAGING metadata, never a permissions/plugin config.
+6. **Maintenance model.** First-class (a supported way to build apps on werust) or an example/recipe that may lag? (The design-for-embedding principle already pushes toward first-class.)
+7. **Mobile signing/store.** Recipe covers unsigned/dev artifacts (as the browser's own mobile build does); production signing/store submission is the dev's job; confirm.
 
 ## Why this fits werust
 

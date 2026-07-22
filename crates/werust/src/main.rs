@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation, Widget,
+    gdk, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
+    Orientation, Widget,
 };
 
 use webview_renderer::WebViewRenderer;
@@ -68,6 +69,10 @@ struct Chrome {
     reload: Button,
     stop: Button,
     status: Label,
+    /// The trust indicator: shows whether the current page was content-verified
+    /// (hash-checked on the content-addressed path) or served by an unverified
+    /// origin (`docs/adr/0001`: the trust posture is a product surface).
+    trust: Label,
 }
 
 impl Chrome {
@@ -88,6 +93,19 @@ impl Chrome {
         self.stop.set_sensitive(state.is_loading());
         self.reload.set_sensitive(!state.is_loading());
         self.status.set_text(&status_line(state));
+        // The trust indicator: a distinct, legible label for content-verified vs
+        // served-by-an-unverified-origin, plus a CSS class so the two states are
+        // visually distinct (a verified badge vs an unverified one).
+        self.trust.set_text(trust_indicator(state));
+        self.trust
+            .set_tooltip_text(Some(trust_indicator_detail(state)));
+        if state.is_content_verified() {
+            self.trust.remove_css_class("trust-unverified");
+            self.trust.add_css_class("trust-verified");
+        } else {
+            self.trust.remove_css_class("trust-verified");
+            self.trust.add_css_class("trust-unverified");
+        }
     }
 }
 
@@ -100,6 +118,53 @@ fn status_line(state: &ChromeState) -> String {
         "loading…".to_string()
     } else {
         "idle".to_string()
+    }
+}
+
+/// The short label the chrome's trust indicator shows: a distinct, legible badge
+/// for a content-verified load vs a served-by-an-unverified-origin load
+/// (`docs/adr/0001`: the trust posture is a product surface, not a silent
+/// internal). A pure function of [`ChromeState`] so it is trivially correct and
+/// testable without a display; the label text carries a shield vs a plain-globe
+/// glyph so the two states read at a glance even before colour.
+fn trust_indicator(state: &ChromeState) -> &'static str {
+    if state.is_content_verified() {
+        "✓ verified"
+    } else {
+        "⚠ unverified origin"
+    }
+}
+
+/// The longer explanation shown as the trust indicator's tooltip, so the badge is
+/// self-explaining on hover. Pure, for the same reason as [`trust_indicator`].
+fn trust_indicator_detail(state: &ChromeState) -> &'static str {
+    if state.is_content_verified() {
+        "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
+    } else {
+        "This page was served by an origin werust does not trust by default; its content was not hash-verified."
+    }
+}
+
+/// The stylesheet that makes the two trust-indicator states visually distinct: a
+/// green content-verified badge vs an amber unverified-origin one. Kept as one
+/// constant next to the classes the chrome toggles (`trust-verified` /
+/// `trust-unverified`).
+const TRUST_INDICATOR_CSS: &str = "\
+.trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
+.trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }";
+
+/// Load the trust-indicator stylesheet onto the default display, so the
+/// `trust-verified` / `trust-unverified` classes the chrome toggles render as
+/// two visually distinct badges. A no-op if there is no display.
+fn install_trust_indicator_css() {
+    let provider = CssProvider::new();
+    provider.load_from_string(TRUST_INDICATOR_CSS);
+    if let Some(display) = gdk::Display::default() {
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
     }
 }
 
@@ -126,6 +191,11 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     backend.install_ipfs();
     let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
 
+    // Make the two trust-indicator states VISUALLY DISTINCT: a green verified
+    // badge vs an amber unverified-origin one. Loaded once for the display so the
+    // `trust-verified` / `trust-unverified` classes the chrome toggles are styled.
+    install_trust_indicator_css();
+
     // Embed the live, interactive view. The seam hands the shell an opaque
     // pointer to the backend's native view; the shell reconstructs it as a plain
     // GtkWidget to pack into its window without knowing it is a WebKitGTK view.
@@ -148,6 +218,10 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         .placeholder_text("Enter a URL and press Enter")
         .build();
     let status = Label::new(Some("idle"));
+    // The trust indicator sits in the toolbar, next to the URL bar, so the trust
+    // posture of the current page is always visible in the chrome.
+    let trust = Label::new(Some(trust_indicator(&ChromeState::default())));
+    trust.add_css_class("trust-unverified");
 
     let toolbar = GtkBox::new(Orientation::Horizontal, 4);
     toolbar.append(&back);
@@ -155,6 +229,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     toolbar.append(&reload);
     toolbar.append(&stop);
     toolbar.append(&url_entry);
+    toolbar.append(&trust);
 
     let chrome = Rc::new(Chrome {
         url_entry: url_entry.clone(),
@@ -163,6 +238,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         reload: reload.clone(),
         stop: stop.clone(),
         status: status.clone(),
+        trust: trust.clone(),
     });
 
     let root = GtkBox::new(Orientation::Vertical, 0);
@@ -252,8 +328,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 
 #[cfg(test)]
 mod tests {
-    use super::{banner, status_line, DEFAULT_URL};
-    use renderer::LoadState;
+    use super::{banner, status_line, trust_indicator, trust_indicator_detail, DEFAULT_URL};
+    use renderer::{LoadState, TrustPosture};
     use werust_core::ChromeState;
 
     #[test]
@@ -285,5 +361,40 @@ mod tests {
             ..ChromeState::default()
         };
         assert_eq!(status_line(&failed), "failed: name not resolved");
+    }
+
+    #[test]
+    fn trust_indicator_distinguishes_verified_from_unverified_and_is_a_pure_fn_of_posture() {
+        // Acceptance: the chrome's trust indicator shows a clear, distinct state
+        // for a content-verified load vs an unverified served-origin load, and it
+        // is driven by the posture the seam reports (the actual load path), not by
+        // any URL string. The two labels are visibly different and legible.
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+
+        assert_eq!(trust_indicator(&served), "⚠ unverified origin");
+        assert_eq!(trust_indicator(&verified), "✓ verified");
+        assert_ne!(
+            trust_indicator(&served),
+            trust_indicator(&verified),
+            "the two trust states are visually distinct"
+        );
+
+        // The detail/tooltip likewise distinguishes the two and names the reason.
+        assert!(trust_indicator_detail(&verified).contains("content-verified"));
+        assert!(trust_indicator_detail(&served).contains("not"));
+
+        // The default (nothing loaded yet) is the untrusted posture: werust does
+        // not claim verification it has not proven.
+        assert_eq!(
+            trust_indicator(&ChromeState::default()),
+            "⚠ unverified origin"
+        );
     }
 }

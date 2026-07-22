@@ -214,10 +214,54 @@ impl WebViewRenderer {
         // gateway over the bound HTTP+TLS stack, hash-verified against the CID
         // before they are ever handed back. Owned by the scheme handler closure.
         let fetcher = VerifyingContentFetcher::new(GatewayContentSource::new(HttpFetcher::new()));
-        self.register_scheme_handler(
-            IPFS_SCHEME,
-            Box::new(move |request| resolve_ipfs_request(&fetcher, &request)),
-        );
+        // Share the load lifecycle into the scheme handler so a SUCCESSFUL verified
+        // resolution can mark the current load content-verified — this is what
+        // drives the chrome's trust indicator from the ACTUAL load path (the bytes
+        // came back through `fetch_verified`), not from the `ipfs://` URL string.
+        // A hash mismatch fails the load (the resolver returns an error) and never
+        // reaches the mark, so a page that merely looks content-addressed but did
+        // not verify is never reported verified (task
+        // `trust-indicator-verified-vs-served`).
+        //
+        // This registers the scheme DIRECTLY on the web context rather than
+        // through the seam's `register_scheme_handler`, for the same reason
+        // `install_provider` pushes its response directly: the seam's
+        // `SchemeHandler` is `Send` (so a generic backend can move it across
+        // threads), but the lifecycle is an `Rc<RefCell<_>>` shared with the
+        // webview's single-GTK-thread load signals and is NOT `Send`. The webview
+        // runs this handler only on its own GTK loop, so capturing the `Rc`-shared
+        // lifecycle here is sound — exactly the non-`Send` wiring the provider path
+        // does for its live-page response push.
+        let Some(context) = self.view.web_context() else {
+            return;
+        };
+        let life = self.life.clone();
+        context.register_uri_scheme(IPFS_SCHEME, move |request| {
+            let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+            match resolve_ipfs_request(&fetcher, &renderer::SchemeRequest { uri }) {
+                Ok(response) => {
+                    // The bytes verified against their CID: mark the current load
+                    // content-verified so the chrome's trust indicator reflects the
+                    // real (hash-verified) load path.
+                    life.borrow_mut().mark_content_verified();
+                    let bytes = glib::Bytes::from(&response.body);
+                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+                    request.finish(
+                        &stream,
+                        response.body.len() as i64,
+                        Some(&response.mime_type),
+                    );
+                }
+                Err(e) => {
+                    // Verification failed (a hash mismatch, an unverifiable CID, a
+                    // source error): fail the load WITHOUT marking it verified, so
+                    // unverified bytes never render AND the posture stays untrusted.
+                    let mut error =
+                        glib::Error::new(gtk4::gio::IOErrorEnum::Failed, &e.to_string());
+                    request.finish_error(&mut error);
+                }
+            }
+        });
     }
 }
 
@@ -271,6 +315,15 @@ impl Renderer for WebViewRenderer {
 
     fn load_state(&self) -> LoadState {
         self.life.borrow().state()
+    }
+
+    fn trust_posture(&self) -> renderer::TrustPosture {
+        // Read the shared lifecycle's posture: `ContentVerified` iff the current
+        // page's bytes came back through the hash-verified `ipfs://` path (marked
+        // by the scheme handler `install_ipfs` wires), else the served-origin
+        // posture. Interior-mutable because the load signals and the scheme
+        // handler mutate it on the GTK loop.
+        self.life.borrow().posture()
     }
 
     fn current_url(&self) -> Option<String> {

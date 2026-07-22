@@ -24,7 +24,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 
-use renderer::{LoadEvent, LoadState, RendererError};
+use renderer::{LoadEvent, LoadState, RendererError, TrustPosture};
 
 /// Validate a URL for [`Renderer::navigate`], rejecting unusable ones.
 ///
@@ -55,17 +55,57 @@ pub struct LoadLifecycle {
     state: LoadState,
     url: Option<String>,
     events: VecDeque<LoadEvent>,
+    /// The [`TrustPosture`] of the CURRENT load. It reflects the ACTUAL load
+    /// path, not the URL: every fresh [`begin`](LoadLifecycle::begin) resets it
+    /// to [`TrustPosture::UnverifiedOrigin`] (a load is untrusted until proven
+    /// verified), and it is upgraded to [`TrustPosture::ContentVerified`] ONLY by
+    /// [`mark_content_verified`](LoadLifecycle::mark_content_verified) — which the
+    /// `ipfs://` scheme handler calls when it has actually served the main
+    /// resource through the hash-verified content-addressed fetch path. A plain
+    /// served load never calls it, so it stays untrusted.
+    posture: TrustPosture,
 }
 
 impl LoadLifecycle {
     /// Start a load of `url`: move to [`LoadState::Started`] and emit
     /// [`LoadEvent::Started`].
+    ///
+    /// A fresh load starts UNVERIFIED: the trust posture resets to
+    /// [`TrustPosture::UnverifiedOrigin`], and is only upgraded to
+    /// [`TrustPosture::ContentVerified`] if this load's main resource is actually
+    /// served through the hash-verified content-addressed path (via
+    /// [`mark_content_verified`](LoadLifecycle::mark_content_verified)). So the
+    /// posture always tracks the ACTUAL load path of the CURRENT page, never a
+    /// stale value from a previous verified load.
     pub fn begin(&mut self, url: &str) {
         self.url = Some(url.to_string());
         self.state = LoadState::Started;
+        self.posture = TrustPosture::UnverifiedOrigin;
         self.events.push_back(LoadEvent::Started {
             url: url.to_string(),
         });
+    }
+
+    /// Mark the CURRENT load as content-verified: its main resource was served
+    /// through the hash-verified content-addressed fetch path.
+    ///
+    /// The `ipfs://` scheme handler calls this the moment it has resolved the
+    /// current page's bytes through
+    /// [`fetch_verified`](fetcher::ContentAddressedFetcher::fetch_verified) — i.e.
+    /// once the bytes are proven to hash to their CID. This is what makes the
+    /// trust indicator track the REAL load path rather than the URL string: only
+    /// bytes that actually verified flip the posture. A hash mismatch fails the
+    /// load (the handler returns an error and never calls this), so a page that
+    /// merely LOOKS content-addressed is never reported verified.
+    pub fn mark_content_verified(&mut self) {
+        self.posture = TrustPosture::ContentVerified;
+    }
+
+    /// The [`TrustPosture`] of the current load (content-verified vs served by an
+    /// unverified origin).
+    #[must_use]
+    pub fn posture(&self) -> TrustPosture {
+        self.posture
     }
 
     /// Record that the load committed on `url` (the effective URL after any
@@ -137,7 +177,7 @@ pub use backend::WebViewRenderer;
 mod tests {
     use super::*;
     use renderer::{qualify, KeyEvent, PointerEvent, Renderer, ScrollDelta, ViewHandle};
-    use renderer::{SchemeHandler, ScriptMessageHandler, TrustHook, TrustHooks};
+    use renderer::{SchemeHandler, ScriptMessageHandler, TrustHook, TrustHooks, TrustPosture};
 
     /// A seam-level backend that drives [`LoadLifecycle`] exactly as the real
     /// [`WebViewRenderer`] does, but with the webview's native load signals
@@ -555,6 +595,134 @@ mod tests {
         assert!(
             matches!(&err, RendererError::Backend(msg) if msg.contains("mismatch")),
             "the mismatch fails the load with a verify reason, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn trust_posture_tracks_the_actual_load_path_not_the_url() {
+        // Acceptance (the indicator is driven by the REAL load path, headless): a
+        // plain served load reports the untrusted posture, and a load served
+        // through the hash-verified `ipfs://` path reports content-verified — but
+        // ONLY because the bytes actually verified, not because the URL is
+        // `ipfs://`. This wires the posture-marking onto the lifecycle EXACTLY as
+        // `WebViewRenderer::install_ipfs` does (the scheme handler marks the shared
+        // lifecycle verified on a successful resolution), without a GTK loop.
+        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use werust_core::ipfs::resolve_ipfs_request;
+
+        #[derive(Default)]
+        struct PinnedSource {
+            blobs: std::collections::HashMap<String, Vec<u8>>,
+        }
+        impl ContentSource for PinnedSource {
+            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
+                self.blobs
+                    .get(&cid.to_string())
+                    .cloned()
+                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
+            }
+        }
+
+        let page = b"<!doctype html><title>ipfs</title><h1>verified</h1>";
+        let cid = cid_v1_raw_sha256(page).expect("derive pinned fixture cid");
+        let mut source = PinnedSource::default();
+        source.blobs.insert(cid.clone(), page.to_vec());
+        let fetcher = VerifyingContentFetcher::new(source);
+
+        // The shared lifecycle the scheme handler marks, mirroring `install_ipfs`.
+        let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
+        let life_for_handler = life.clone();
+        // Mirror `install_ipfs`: on a verified resolution the handler marks the
+        // shared lifecycle content-verified. A plain closure (not the seam's
+        // `Send`-bounded `SchemeHandler`) because this stands in for the webview's
+        // own GTK-thread scheme registration.
+        let ipfs_handler = move |request: renderer::SchemeRequest| {
+            let response = resolve_ipfs_request(&fetcher, &request)?;
+            life_for_handler.borrow_mut().mark_content_verified();
+            Ok::<_, RendererError>(response)
+        };
+
+        // A plain served load: begin, no scheme handler ever runs. The posture is
+        // the untrusted origin — the default, driven by the load path.
+        life.borrow_mut().begin("https://example.com/");
+        life.borrow_mut().commit("https://example.com/");
+        life.borrow_mut().finish("https://example.com/");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "a plain served load is not content-verified"
+        );
+
+        // A content-addressed load: begin resets the posture to untrusted, THEN the
+        // ipfs scheme handler serves the main resource and (only) on a verified
+        // success marks it content-verified.
+        let uri = format!("ipfs://{cid}/index.html");
+        life.borrow_mut().begin(&uri);
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "begin resets the posture: a load is untrusted until proven verified"
+        );
+        let response = ipfs_handler(renderer::SchemeRequest { uri: uri.clone() })
+            .expect("verified content resolves");
+        assert_eq!(response.body, page);
+        life.borrow_mut().commit(&uri);
+        life.borrow_mut().finish(&uri);
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::ContentVerified,
+            "the verified content path flips the posture to content-verified"
+        );
+    }
+
+    #[test]
+    fn a_hash_mismatch_load_is_never_reported_content_verified() {
+        // The load-bearing guard for the indicator: when the `ipfs://` handler
+        // FAILS the load on a hash mismatch, it never marks the lifecycle, so the
+        // posture stays untrusted — a page whose URL looks content-addressed but
+        // did not actually verify is NEVER reported content-verified.
+        use fetcher::{cid_v1_raw_sha256, Cid, ContentSource, FetchError, VerifyingContentFetcher};
+        use werust_core::ipfs::resolve_ipfs_request;
+
+        #[derive(Default)]
+        struct PinnedSource {
+            blobs: std::collections::HashMap<String, Vec<u8>>,
+        }
+        impl ContentSource for PinnedSource {
+            fn get(&self, cid: &Cid) -> Result<Vec<u8>, FetchError> {
+                self.blobs
+                    .get(&cid.to_string())
+                    .cloned()
+                    .ok_or_else(|| FetchError::Transport("pinned source miss".into()))
+            }
+        }
+
+        let honest = b"the page this cid actually names";
+        let cid = cid_v1_raw_sha256(honest).expect("derive pinned fixture cid");
+        let mut source = PinnedSource::default();
+        // Store TAMPERED bytes under the real CID: the fetch will fail to verify.
+        source
+            .blobs
+            .insert(cid.clone(), b"tampered bytes that do not match".to_vec());
+        let fetcher = VerifyingContentFetcher::new(source);
+
+        let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
+        let life_for_handler = life.clone();
+        let ipfs_handler = move |request: renderer::SchemeRequest| {
+            let response = resolve_ipfs_request(&fetcher, &request)?;
+            life_for_handler.borrow_mut().mark_content_verified();
+            Ok::<_, RendererError>(response)
+        };
+
+        let uri = format!("ipfs://{cid}/index.html");
+        life.borrow_mut().begin(&uri);
+        let err = ipfs_handler(renderer::SchemeRequest { uri }).expect_err("a mismatch fails");
+        assert!(matches!(err, RendererError::Backend(_)));
+        // The load failed, so the posture was NEVER upgraded: not content-verified.
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "an unverified (mismatched) load is never reported content-verified"
         );
     }
 

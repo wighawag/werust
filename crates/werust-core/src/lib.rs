@@ -22,7 +22,7 @@
 //! forward-pointer in the task), so this module wires navigation + chrome and
 //! leaves raw input to the embedded widget.
 
-use renderer::{LoadEvent, LoadState, Renderer, RendererError};
+use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
 pub mod ipfs;
 pub mod provider;
@@ -50,6 +50,13 @@ pub struct ChromeState {
     /// A human-readable failure surfaced to the user when the last load failed,
     /// cleared when a new load starts. `None` when nothing has failed.
     pub last_error: Option<String>,
+    /// The [`TrustPosture`] of the current page, driving the chrome's trust
+    /// indicator: content-verified vs served by an unverified origin
+    /// (`docs/adr/0001`: the trust posture is a product surface). Read straight
+    /// from the seam's [`Renderer::trust_posture`], so it tracks the ACTUAL load
+    /// path (a page whose bytes came back through the hash-verified
+    /// content-addressed path), not the URL string.
+    pub trust_posture: TrustPosture,
 }
 
 impl ChromeState {
@@ -58,6 +65,14 @@ impl ChromeState {
     #[must_use]
     pub fn is_loading(&self) -> bool {
         self.load_state.is_loading()
+    }
+
+    /// Whether the current page was content-verified (its bytes hash-checked on
+    /// the content-addressed path), as opposed to merely served by an unverified
+    /// origin. The window paints its trust indicator from this.
+    #[must_use]
+    pub fn is_content_verified(&self) -> bool {
+        self.trust_posture.is_content_verified()
     }
 }
 
@@ -202,6 +217,12 @@ impl BrowserShell {
         self.chrome.load_state = self.renderer.load_state();
         self.chrome.can_go_back = self.renderer.can_go_back();
         self.chrome.can_go_forward = self.renderer.can_go_forward();
+        // The trust posture is the backend's truth about the current load path
+        // (content-verified vs served), pulled fresh like the load state so the
+        // indicator tracks the page actually shown — including after a scheme
+        // handler verifies the bytes mid-load, which flips the posture without a
+        // queued LoadEvent.
+        self.chrome.trust_posture = self.renderer.trust_posture();
         if let Some(url) = self.renderer.current_url() {
             self.chrome.url_text = url;
         }
@@ -240,6 +261,11 @@ mod tests {
         pointer_calls: u32,
         key_calls: u32,
         scroll_calls: u32,
+        /// The trust posture of the current load, mirroring the real backend's
+        /// shared `LoadLifecycle`: reset to the untrusted origin on every fresh
+        /// navigation and flipped to content-verified only when the simulated
+        /// verified content-addressed path served this load's bytes.
+        posture: TrustPosture,
     }
 
     impl BackendInner {
@@ -300,12 +326,26 @@ mod tests {
         fn focus_calls(&self) -> Vec<bool> {
             self.inner.borrow().focus_calls.clone()
         }
+
+        /// Simulate the `ipfs://` scheme handler serving the current load's main
+        /// resource through the hash-verified content-addressed path: it marks the
+        /// current load content-verified exactly as the real backend does when
+        /// `resolve_ipfs_request` returns verified bytes. Only a load that actually
+        /// went through this path flips the posture — a plain served load never
+        /// calls it.
+        fn serve_via_verified_content_path(&self) {
+            self.inner.borrow_mut().posture = TrustPosture::ContentVerified;
+        }
     }
 
     impl Renderer for FakeBackend {
         fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
-            if !(url.starts_with("https://") || url.starts_with("http://")) {
-                return Err(RendererError::InvalidUrl(url.to_string()));
+            // Accept any `scheme://rest` URL (the day-one http(s) path plus the
+            // ipfs:// trust-hook scheme), mirroring the real backend's
+            // `validate_url`; a scheme-less string is still rejected.
+            match url.split_once("://") {
+                Some((scheme, rest)) if !scheme.is_empty() && !rest.is_empty() => {}
+                _ => return Err(RendererError::InvalidUrl(url.to_string())),
             }
             let mut b = self.inner.borrow_mut();
             // A fresh navigation from mid-history drops the forward entries.
@@ -314,6 +354,11 @@ mod tests {
             b.history.push(url.to_string());
             b.cursor = Some(b.history.len() - 1);
             b.state = LoadState::Started;
+            // A fresh load starts UNVERIFIED and is only marked verified if this
+            // load's bytes actually go through the verified content path — exactly
+            // the real `LoadLifecycle::begin` reset that keeps the posture tracking
+            // the CURRENT page's load path, never a stale value.
+            b.posture = TrustPosture::UnverifiedOrigin;
             b.events.push_back(LoadEvent::Started {
                 url: url.to_string(),
             });
@@ -327,6 +372,7 @@ mod tests {
                 .ok_or_else(|| RendererError::Backend("nothing to reload".into()))?
                 .clone();
             b.state = LoadState::Started;
+            b.posture = TrustPosture::UnverifiedOrigin;
             b.events.push_back(LoadEvent::Started { url });
             Ok(())
         }
@@ -345,6 +391,7 @@ mod tests {
                     b.cursor = Some(c - 1);
                     let url = b.history[c - 1].clone();
                     b.state = LoadState::Started;
+                    b.posture = TrustPosture::UnverifiedOrigin;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -357,6 +404,7 @@ mod tests {
                     b.cursor = Some(c + 1);
                     let url = b.history[c + 1].clone();
                     b.state = LoadState::Started;
+                    b.posture = TrustPosture::UnverifiedOrigin;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -373,6 +421,10 @@ mod tests {
 
         fn load_state(&self) -> LoadState {
             self.inner.borrow().state
+        }
+
+        fn trust_posture(&self) -> TrustPosture {
+            self.inner.borrow().posture
         }
 
         fn current_url(&self) -> Option<String> {
@@ -546,6 +598,87 @@ mod tests {
         // A new navigation clears the surfaced failure.
         shell.navigate("https://example.com/").unwrap();
         assert_eq!(shell.chrome().last_error, None);
+    }
+
+    #[test]
+    fn the_chrome_shows_the_unverified_posture_for_a_plain_served_load() {
+        // Acceptance: an ordinary served-origin load surfaces the UNVERIFIED trust
+        // posture in the chrome. It is read straight from the seam (the actual
+        // load path), and a plain load never went through the verified
+        // content-addressed path, so it is content-verified == false.
+        let (mut shell, handle) = shell_with_backend();
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "nothing loaded yet: the untrusted default"
+        );
+
+        shell
+            .navigate("https://example.com/")
+            .expect("valid https url");
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "a plain served page is not content-verified"
+        );
+        assert!(!shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn the_chrome_shows_the_content_verified_posture_when_served_via_the_verified_path() {
+        // Acceptance: a page whose bytes came back through the hash-verified
+        // content-addressed path surfaces the CONTENT-VERIFIED posture in the
+        // chrome — and it tracks the ACTUAL load path, not the URL: the posture
+        // only flips after the verified content path serves this load's main
+        // resource (mirroring the real `ipfs://` scheme handler marking the
+        // lifecycle on a verified resolution).
+        let (mut shell, handle) = shell_with_backend();
+        shell
+            .navigate("ipfs://bafyfixturecid/index.html")
+            .expect("an ipfs url is navigable through the seam");
+        // Before the verified content path serves the bytes, the load is untrusted
+        // — the URL looking like `ipfs://` is NOT enough to claim verified.
+        shell.pump();
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "an ipfs:// URL is not content-verified until its bytes actually verify"
+        );
+
+        // The scheme handler resolves the main resource through the hash-verified
+        // path and marks the load verified; then the load settles.
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::ContentVerified,
+            "the verified content path surfaces the content-verified posture"
+        );
+        assert!(shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn the_verified_posture_does_not_leak_into_a_later_served_load() {
+        // The indicator must track the CURRENT page: after a content-verified load,
+        // navigating to a plain served origin resets the chrome to the untrusted
+        // posture (a fresh navigation begins unverified until proven otherwise).
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("ipfs://bafyfixturecid/").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert!(shell.chrome().is_content_verified());
+
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "the verified posture does not leak onto a later plain served load"
+        );
+        assert!(!shell.chrome().is_content_verified());
     }
 
     #[test]

@@ -53,6 +53,52 @@ impl LoadState {
     }
 }
 
+/// The **trust posture** of the current load: was the page CONTENT-VERIFIED
+/// (fetched and hash-checked on the content-addressed path) or merely SERVED by
+/// an origin werust does not trust by default?
+///
+/// This is a first-class seam fact, not a chrome cosmetic: `docs/adr/0001` fixes
+/// that "the trust posture is itself a product surface" and calls out exactly
+/// this indicator ("this was content-verified" vs "this was served by an
+/// unverified origin") as something the chrome MUST expose rather than keep as a
+/// silent internal. A backend reports it through
+/// [`Renderer::trust_posture`](Renderer::trust_posture); the shell folds it into
+/// its chrome and the window paints the indicator from it.
+///
+/// Crucially it reflects the **actual load path**, not the URL string: a load is
+/// [`ContentVerified`](TrustPosture::ContentVerified) only when its bytes came
+/// back through the hash-verified content-addressed fetch path (the `ipfs://`
+/// custom-scheme hook resolving through
+/// [`fetch_verified`](fetcher::ContentAddressedFetcher::fetch_verified)), so a
+/// page whose URL merely LOOKS content-addressed but was not actually verified is
+/// never reported as verified. Anything served straight to the engine (the
+/// ordinary `http(s)://` path) is [`UnverifiedOrigin`](TrustPosture::UnverifiedOrigin).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrustPosture {
+    /// The page was served by an origin that is not trusted by default: the
+    /// ordinary server-web load path, where verification did NOT move to a hash.
+    /// This is the DEFAULT posture — werust does not trust the origin unless the
+    /// bytes were actually content-verified, so anything not proven verified is
+    /// reported here.
+    #[default]
+    UnverifiedOrigin,
+    /// The page was content-verified: its bytes were fetched on the
+    /// content-addressed path and hash-checked against their content identifier
+    /// before rendering (the `ipfs://` trust hook resolving through the verified
+    /// `Fetcher` path). Verification moved to the hash, so the origin need not be
+    /// trusted.
+    ContentVerified,
+}
+
+impl TrustPosture {
+    /// Whether the current page was content-verified (its bytes hash-checked on
+    /// the content-addressed path), as opposed to merely served.
+    #[must_use]
+    pub fn is_content_verified(self) -> bool {
+        matches!(self, TrustPosture::ContentVerified)
+    }
+}
+
 /// A load-lifecycle event emitted by a backend as a load progresses.
 ///
 /// Backends push these as the underlying engine reports progress; the browser
@@ -515,6 +561,28 @@ pub trait Renderer {
     fn trust_hooks(&self) -> TrustHooks {
         TrustHooks::all()
     }
+
+    /// The [`TrustPosture`] of the CURRENT load: content-verified vs served by an
+    /// unverified origin.
+    ///
+    /// This is the checkable seam fact behind the chrome's trust indicator
+    /// (`docs/adr/0001`: the trust posture is a product surface, not a silent
+    /// internal). The shell reads it into its chrome exactly as it reads
+    /// [`load_state`](Renderer::load_state), and the window paints the indicator
+    /// from it. It MUST reflect the ACTUAL load path — a backend reports
+    /// [`TrustPosture::ContentVerified`] only when the current page's bytes came
+    /// back through the hash-verified content-addressed path, NOT because the URL
+    /// happened to start with `ipfs://`.
+    ///
+    /// The provided default is [`TrustPosture::UnverifiedOrigin`]: a backend that
+    /// has no verified content-addressed path (a plain renderer, a fixed-subset
+    /// native path) serves ordinary origins, so it reports the untrusted posture
+    /// unless it overrides this to track real verification. werust does not trust
+    /// the origin unless the bytes were proven verified, so "not proven verified"
+    /// defaults to unverified.
+    fn trust_posture(&self) -> TrustPosture {
+        TrustPosture::UnverifiedOrigin
+    }
 }
 
 #[cfg(test)]
@@ -537,6 +605,9 @@ mod tests {
         // Which trust hooks this backend declares it can satisfy. Defaults to all
         // (it exposes both hooks); tests override it to model partial capability.
         declares_hooks: TrustHooks,
+        // The trust posture of the current load. Defaults to the untrusted origin;
+        // tests set it to model a content-verified load path.
+        posture: TrustPosture,
     }
 
     impl Renderer for FakeBackend {
@@ -599,6 +670,10 @@ mod tests {
 
         fn trust_hooks(&self) -> TrustHooks {
             self.declares_hooks
+        }
+
+        fn trust_posture(&self) -> TrustPosture {
+            self.posture
         }
     }
 
@@ -819,5 +894,71 @@ mod tests {
         assert!(one.contains(TrustHook::ProviderInjection));
         assert!(!one.contains(TrustHook::IpfsScheme));
         assert!(!one.is_qualifying());
+    }
+
+    #[test]
+    fn trust_posture_defaults_to_the_unverified_origin() {
+        // A backend with no verified content-addressed path serves ordinary
+        // origins, so the seam default posture is the untrusted one: werust does
+        // not trust the origin unless the bytes were proven content-verified.
+        assert_eq!(TrustPosture::default(), TrustPosture::UnverifiedOrigin);
+        assert!(!TrustPosture::default().is_content_verified());
+        // The seam's provided `trust_posture` default is the untrusted posture,
+        // so a backend that does not track verification is never mislabelled as
+        // verified.
+        struct BareBackend;
+        impl Renderer for BareBackend {
+            fn navigate(&mut self, _url: &str) -> Result<(), RendererError> {
+                Ok(())
+            }
+            fn reload(&mut self) -> Result<(), RendererError> {
+                Ok(())
+            }
+            fn stop(&mut self) {}
+            fn load_state(&self) -> LoadState {
+                LoadState::Idle
+            }
+            fn current_url(&self) -> Option<String> {
+                None
+            }
+            fn poll_event(&mut self) -> Option<LoadEvent> {
+                None
+            }
+            fn view_handle(&self) -> ViewHandle {
+                ViewHandle(std::ptr::null_mut())
+            }
+            fn send_pointer(&mut self, _event: PointerEvent) {}
+            fn send_key(&mut self, _event: KeyEvent) {}
+            fn send_scroll(&mut self, _delta: ScrollDelta) {}
+            fn set_focus(&mut self, _focused: bool) {}
+            fn register_script_message_handler(
+                &mut self,
+                _name: &str,
+                _handler: ScriptMessageHandler,
+            ) {
+            }
+            fn inject_script(&mut self, _script: &str) {}
+            fn register_scheme_handler(&mut self, _scheme: &str, _handler: SchemeHandler) {}
+        }
+        assert_eq!(BareBackend.trust_posture(), TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn a_backend_reports_the_content_verified_posture_through_the_seam() {
+        // The seam carries the trust posture as a first-class fact: a backend that
+        // served the current page through its verified content-addressed path
+        // reports `ContentVerified`, which the shell reads into its chrome exactly
+        // as it reads `load_state`.
+        let verified = FakeBackend {
+            posture: TrustPosture::ContentVerified,
+            ..FakeBackend::default()
+        };
+        assert_eq!(verified.trust_posture(), TrustPosture::ContentVerified);
+        assert!(verified.trust_posture().is_content_verified());
+
+        // A plain served load reports the untrusted origin posture.
+        let served = FakeBackend::default();
+        assert_eq!(served.trust_posture(), TrustPosture::UnverifiedOrigin);
+        assert!(!served.trust_posture().is_content_verified());
     }
 }

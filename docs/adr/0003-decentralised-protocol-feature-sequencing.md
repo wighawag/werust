@@ -10,7 +10,7 @@ The decisions:
 
 3. **Fingerprinting resistance is sequenced after no-leak routing** (`taskedAfter: [privacy-routing-...]`). They are independent concerns — no-leak = where bytes go; fingerprinting = what the page can observe — and shipping no-leak first is right, but the no-leak work must be built fingerprinting-AWARE (uniform headers, the single bundled font, per-profile isolation) so the follow-on needs no rework. werust promises NO NETWORK LEAK before it promises UNLINKABILITY, and must never imply the latter before it ships.
 
-4. **The trustless-ENS Phase 1 (trusted-RPC skeleton) has no prerequisite** (`taskedAfter: []`): it delivers the `ronan.eth` win self-contained (the RPC skeleton is a cheap, always-on provider), before the framework or the light client exist. Its Phase 2 (Helios) then depends on the framework.
+4. **The trustless-ENS Phase 1 (trusted-RPC skeleton) has no prerequisite** (`taskedAfter: []`): it delivers the `ronan.eth` win self-contained (the RPC skeleton is a cheap, always-on provider), before the framework or the light client exist. It is its own spec `ens-to-ipfs-resolution-phase1-rpc-skeleton` (fully answered, taskable now); its Phase 2-3 follow-on `trustless-ens-to-ipfs-phase2-3-helios-and-hardening` (Helios + IPNS + CCIP-Read) is `taskedAfter` it and stays `needsAnswers` (checkpoint/bootstrap decisions).
 
 Consequences:
 - Sequencing lives in each spec's `taskedAfter` frontmatter (resolved against `work/specs/tasked/` residence, per the `work/` contract), NOT in a separate roadmap file. The mutable "what to task next" priority is a human choice at tasking time from the ready pool, deliberately not a tracked artifact.

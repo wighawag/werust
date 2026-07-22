@@ -1,3 +1,5 @@
 # Flaky loopback test: ethereum end-to-end eth_call
 
 2026-07-22 — While running `cargo test -p werust-core` during the `ensip7-contenthash-decoder-typed-graceful-errors` task, `ethereum::tests::end_to_end_eth_call_over_the_bound_transport_off_the_network` (in `crates/werust-core/src/ethereum.rs`) failed intermittently (roughly 1 run in ~6), passing on every re-run. It is a `127.0.0.1:0` loopback HTTP fixture test; the flake looks like a timing/accept race in the throwaway `LocalRpcServer`, not a logic bug, and is unrelated to this task's pure decoder. Left untouched per scope.
+
+2026-07-22 (ens-namehash-registry-resolver-contenthash-resolution) — the same class of one-off flake was observed once for `ens::tests::resolution_end_to_end_over_the_bound_rpc_transport_off_the_network` (in `crates/werust-core/src/ens.rs`), which reuses the same `127.0.0.1:0` loopback fixture pattern (`SequencedRpcServer`). It passed on every re-run (10+ full `cargo test` sweeps green afterward). Same timing/accept race in the throwaway loopback server, not a logic bug. Left untouched per scope; a shared, race-hardened loopback test harness would fix the whole family in one place.

@@ -9,6 +9,18 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 fetcher = { path = "../fetcher" }
 serde_json = "1"
+# keccak256 for the ENS `namehash` (ENSIP-1) and the function selectors ENS
+# resolution ABI-encodes. `sha3::Keccak256` is the LEGACY Keccak variant
+# Ethereum uses (NOT NIST SHA3-256), from the same vetted RustCrypto family as
+# `fetcher`'s `sha2`/`digest` (`digest 0.10`) — a BOUND primitive, never a
+# hand-rolled hash (`CONTEXT.md` / `docs/adr/0001`: bind vetted crypto).
+sha3 = "0.10"
+# ENSIP-1/ENSIP-15 name normalization for `namehash`. A Rust port of adraffy's
+# reference ENS normalizer, returning a `Result` so an unnormalizable name is a
+# distinct fail-closed error rather than a silently-mangled label — bound, not
+# hand-rolled Unicode normalization. See the `ens` module's normalization
+# decision in `docs/spikes/ens-namehash-registry-resolver-contenthash-resolution/`.
+ens-normalize = "0.1.1"
 # The bound HTTP+TLS stack the `RpcProvider` backend's own minimal synchronous
 # JSON-RPC POST transport binds (the `ethereum` module's `UreqRpcTransport`).
 # A JSON-RPC `eth_call` is a POST with a JSON body, which the GET-only `Fetcher`

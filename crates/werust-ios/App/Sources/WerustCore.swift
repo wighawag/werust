@@ -55,6 +55,54 @@ final class WerustCore {
         return String(cString: c)
     }
 
+    /// Resolve an intercepted `ipfs://<cid>[/path]` request through the SHARED
+    /// `werust-core` resolve path (the same hash-verified path desktop uses), for
+    /// the `WKURLSchemeHandler`.
+    ///
+    /// A `WKWebView` loads `ipfs://` only via a registered `WKURLSchemeHandler`,
+    /// so the shell's handler calls this and answers the `WKURLSchemeTask` from
+    /// the result: verified bytes + MIME type on success, a fail-closed
+    /// `.failure(reason)` (a hash mismatch / unverifiable CID / source error,
+    /// never rendered) on failure, or `nil` if the URL is not an intercepted
+    /// scheme. The native resolution handle is queried and freed here.
+    func resolveIpfs(_ uri: String) -> Resolution? {
+        guard let res = uri.withCString({ werust_ios_resolve_ipfs(handle, $0) }) else {
+            return nil
+        }
+        defer { werust_ios_resolution_free(res) }
+        if werust_ios_resolution_is_ok(res) {
+            let mime = werust_ios_resolution_mime(res).map { c -> String in
+                defer { werust_ios_string_free(c) }
+                return String(cString: c)
+            } ?? ""
+            let ptr = werust_ios_resolution_body(res)
+            let len = werust_ios_resolution_body_len(res)
+            let body: Data
+            if let ptr = ptr, len > 0 {
+                body = Data(bytes: ptr, count: len)
+            } else {
+                body = Data()
+            }
+            return .success(mimeType: mime, body: body)
+        } else {
+            let reason = werust_ios_resolution_error(res).map { c -> String in
+                defer { werust_ios_string_free(c) }
+                return String(cString: c)
+            } ?? "ipfs resolution failed"
+            return .failure(reason: reason)
+        }
+    }
+
+    /// The outcome of resolving an intercepted `ipfs://` request through the core:
+    /// verified bytes + MIME type, or a fail-closed reason. Mirrors the Rust
+    /// `SchemeResolution`; the `WKURLSchemeHandler` turns `.success` into a
+    /// `URLResponse` + data on the task and `.failure` into `didFailWithError`,
+    /// so the desktop fail-closed posture holds on iOS.
+    enum Resolution {
+        case success(mimeType: String, body: Data)
+        case failure(reason: String)
+    }
+
     /// Report the platform `WKWebView`'s commit signal into the core.
     func onPageCommitted(_ url: String) {
         url.withCString { werust_ios_on_page_committed(handle, $0) }

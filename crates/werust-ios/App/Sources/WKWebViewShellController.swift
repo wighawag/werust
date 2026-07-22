@@ -91,7 +91,21 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         toolbar.distribution = .fill
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
-        webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())
+        // Register the native `ipfs` custom-scheme handler on the configuration
+        // BEFORE the WKWebView is created (WKWebView refuses a scheme handler set
+        // after init). This is the iOS realisation of the mobile `ipfs://`
+        // interception: a `WKURLSchemeHandler` for `ipfs` routes each intercepted
+        // request through the SHARED werust-core resolve path (the same
+        // hash-verified path desktop uses via WebKitGTK `install_ipfs`), so an
+        // ENS-resolved `ipfs://<cid>` site renders instead of failing. The `.eth`
+        // name stays in the bar (the core's chrome truth); no https/gateway URL is
+        // shown. INTERCEPTION MECHANISM (iOS): the NATIVE custom scheme via
+        // WKURLSchemeHandler (main-frame-capable since iOS 11). See the recorded
+        // decision at
+        // work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md.
+        let configuration = WKWebViewConfiguration()
+        configuration.setURLSchemeHandler(IpfsSchemeHandler(core: core), forURLScheme: "ipfs")
+        webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
 
@@ -198,4 +212,50 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
     /// The URL the app opens on launch, so it shows a browsing surface.
     private static let startURL = "https://example.com/"
+}
+
+/// The `WKURLSchemeHandler` for `ipfs://`: the iOS edge that intercepts an
+/// `ipfs://<cid>[/path]` request the `WKWebView` cannot load itself and answers
+/// it from the SHARED `werust-core` resolve path (the same hash-verified path
+/// desktop uses). A verified resolution is served as a `URLResponse` + data on
+/// the task; a fail-closed resolution error fails the task with a legible reason
+/// (never rendering unverified bytes), matching the desktop trust posture where a
+/// hash mismatch fails the load.
+final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
+    private let core: WerustCore
+
+    init(core: WerustCore) {
+        self.core = core
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        guard let url = urlSchemeTask.request.url else {
+            urlSchemeTask.didFailWithError(
+                NSError(domain: "werust.ipfs", code: -1, userInfo: nil))
+            return
+        }
+        switch core.resolveIpfs(url.absoluteString) {
+        case .some(.success(let mimeType, let body)):
+            let response = URLResponse(
+                url: url, mimeType: mimeType,
+                expectedContentLength: body.count, textEncodingName: "utf-8")
+            urlSchemeTask.didReceive(response)
+            urlSchemeTask.didReceive(body)
+            urlSchemeTask.didFinish()
+        case .some(.failure(let reason)):
+            // Fail closed: never render unverified bytes; surface the honest reason.
+            urlSchemeTask.didFailWithError(
+                NSError(
+                    domain: "werust.ipfs", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: reason]))
+        case nil:
+            // Not an intercepted scheme (should not happen for the ipfs handler).
+            urlSchemeTask.didFailWithError(
+                NSError(domain: "werust.ipfs", code: -2, userInfo: nil))
+        }
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
+        // The core resolution is synchronous; nothing to cancel.
+    }
 }

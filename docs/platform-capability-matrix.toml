@@ -72,11 +72,15 @@ android = { state = "implemented" }
 name = "ipfs-render"
 description = "Intercept `ipfs://<cid>` and render hash-verified content through the shared core resolve path."
 # Desktop intercepts via WebKitGTK `install_ipfs` (register_uri_scheme). Both
-# mobile backends' `register_scheme_handler` is an empty `{}` no-op today — the
-# gap this whole guard was built to stop hiding. Tracked, not hidden.
+# mobile backends now intercept too (task
+# mobile-ipfs-scheme-interception-ios-and-android): `register_scheme_handler` is
+# REAL (the mobile `CoreSession`'s `install_ipfs` registers the `ipfs` handler
+# routing through the SAME `werust_core::ipfs::resolve_ipfs_request` path), and
+# the OS edge dispatches it — Android via `WebViewClient.shouldInterceptRequest`,
+# iOS via a `WKURLSchemeHandler` for `ipfs`. The former silent no-op is gone.
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
-android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
 
 [[capability]]
 name = "eip1193-provider"

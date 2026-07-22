@@ -41,6 +41,34 @@ class WerustCore : AutoCloseable {
      */
     fun takePendingLoad(): String? = nativeTakePendingLoad(handle).ifEmpty { null }
 
+    /**
+     * Resolve an intercepted `ipfs://<cid>[/path]` request through the SHARED
+     * `werust-core` resolve path (the same hash-verified path desktop uses), for
+     * the [android.webkit.WebViewClient.shouldInterceptRequest] hook.
+     *
+     * The platform `WebView` cannot load an `ipfs://` URL itself
+     * (`net::ERR_UNKNOWN_URL_SCHEME`), so the `BrowserActivity`'s `WebViewClient`
+     * intercepts the request and calls this. Returns the verified bytes + MIME
+     * type on success, a fail-closed [Resolution.Error] with a legible reason
+     * (a hash mismatch / unverifiable CID / source error, never rendered) on
+     * failure, or `null` if the URL is not an intercepted scheme (let the
+     * `WebView` handle it normally). The native resolution handle is queried and
+     * freed here so no native memory leaks across the JNI boundary.
+     */
+    fun resolveIpfs(uri: String): Resolution? {
+        val res = nativeResolveIpfs(handle, uri)
+        if (res == 0L) return null
+        try {
+            return if (nativeResolutionIsOk(res)) {
+                Resolution.Ok(nativeResolutionMime(res), nativeResolutionBody(res))
+            } else {
+                Resolution.Error(nativeResolutionError(res))
+            }
+        } finally {
+            nativeResolutionFree(res)
+        }
+    }
+
     /** Report the platform `WebView`'s commit signal into the core. */
     fun onPageCommitted(url: String) = nativeOnPageCommitted(handle, url)
 
@@ -58,6 +86,18 @@ class WerustCore : AutoCloseable {
             nativeFree(handle)
             handle = 0L
         }
+    }
+
+    /**
+     * The outcome of resolving an intercepted `ipfs://` request through the core:
+     * verified bytes + MIME type, or a fail-closed reason. Mirrors the Rust
+     * `SchemeResolution`; the `WebViewClient` turns [Resolution.Ok] into a
+     * `WebResourceResponse` and [Resolution.Error] into a failed load, so the
+     * desktop fail-closed posture holds on Android.
+     */
+    sealed class Resolution {
+        data class Ok(val mimeType: String, val body: ByteArray) : Resolution()
+        data class Error(val reason: String) : Resolution()
     }
 
     /**
@@ -102,6 +142,12 @@ class WerustCore : AutoCloseable {
     private external fun nativeReload(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
     private external fun nativeTakePendingLoad(handle: Long): String
+    private external fun nativeResolveIpfs(handle: Long, uri: String): Long
+    private external fun nativeResolutionIsOk(resolution: Long): Boolean
+    private external fun nativeResolutionMime(resolution: Long): String
+    private external fun nativeResolutionBody(resolution: Long): ByteArray
+    private external fun nativeResolutionError(resolution: Long): String
+    private external fun nativeResolutionFree(resolution: Long)
     private external fun nativeOnPageCommitted(handle: Long, url: String)
     private external fun nativeOnPageFinished(handle: Long, url: String)
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)

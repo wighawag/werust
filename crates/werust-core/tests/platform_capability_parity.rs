@@ -35,10 +35,11 @@
 //!    linked task, or when a cell is missing
 //!    (`an_untracked_stub_fails_the_guard`, `a_missing_cell_fails_the_guard`,
 //!    `a_stub_pointing_at_a_nonexistent_task_fails_the_guard`).
-//! 3. The matrix is SEEDED with current reality incl. the known mobile `ipfs://`
-//!    gap, tracked (not hidden)
+//! 3. The matrix is SEEDED with current reality; the once-known mobile `ipfs://`
+//!    gap is now CLOSED (implemented on every platform), and the remaining gaps
+//!    are tracked (not hidden)
 //!    (`the_real_matrix_passes_because_gaps_are_tracked`,
-//!    `the_known_mobile_ipfs_gap_is_recorded_as_a_tracked_stub`).
+//!    `the_mobile_ipfs_gap_is_now_implemented_on_every_platform`).
 //! 4. The no-op-seam rule: an unmarked silent no-op reds the gate; the current
 //!    mobile no-ops are marked+linked
 //!    (`no_op_seam_methods_on_mobile_are_represented_as_tracked_stubs`).
@@ -330,11 +331,16 @@ fn the_real_matrix_passes_because_gaps_are_tracked() {
 }
 
 #[test]
-fn the_known_mobile_ipfs_gap_is_recorded_as_a_tracked_stub() {
-    // Criterion 3 (the motivating gap): `ipfs://` render is desktop-implemented,
-    // iOS/Android-stubbed, linked to the real follow-on task. This pins the seed
-    // so a future edit that "resolves" the row by hiding it (deleting it, or
-    // flipping mobile to implemented while the no-op remains) breaks this test.
+fn the_mobile_ipfs_gap_is_now_implemented_on_every_platform() {
+    // Criterion 3 (the motivating gap, now CLOSED): `ipfs://` render is
+    // implemented on ALL three contexts. Desktop intercepts via WebKitGTK
+    // `install_ipfs`; both mobile edges now intercept too (task
+    // `mobile-ipfs-scheme-interception-ios-and-android`) — the mobile
+    // `register_scheme_handler` no-op is gone (it now stores + dispatches the
+    // handler through the SAME core resolve path), and the OS edge drives it
+    // (Android `shouldInterceptRequest`, iOS `WKURLSchemeHandler`). This pins the
+    // resolution so a regression that re-stubs a mobile edge (or drops the row)
+    // breaks this test.
     let matrix = load_real_matrix();
     let ipfs = matrix
         .capabilities
@@ -348,24 +354,12 @@ fn the_known_mobile_ipfs_gap_is_recorded_as_a_tracked_stub() {
             .and_then(|(_, c)| c.clone())
             .unwrap_or_else(|| panic!("ipfs-render must have a `{platform}` cell"))
     };
-    assert_eq!(
-        cell("desktop"),
-        CellState::Implemented,
-        "`ipfs://` render is implemented on desktop (WebKitGTK install_ipfs)"
-    );
-    for mobile in ["ios", "android"] {
+    for platform in ["desktop", "ios", "android"] {
         assert_eq!(
-            cell(mobile),
-            CellState::Stubbed {
-                task: "mobile-ipfs-scheme-interception-ios-and-android".to_string(),
-            },
-            "`ipfs://` render must be a TRACKED stub on {mobile} (linked to the mobile \
-             interception task), so the known gap is recorded not hidden"
-        );
-        // And the linked task must really exist in the work board.
-        assert!(
-            real_task_exists("mobile-ipfs-scheme-interception-ios-and-android"),
-            "the linked follow-on task must exist in work/tasks/{{backlog,ready,done}}/"
+            cell(platform),
+            CellState::Implemented,
+            "`ipfs://` render must be implemented on {platform} (desktop via install_ipfs, \
+             mobile via the real register_scheme_handler + OS-edge interception)"
         );
     }
 }
@@ -373,16 +367,17 @@ fn the_known_mobile_ipfs_gap_is_recorded_as_a_tracked_stub() {
 #[test]
 fn no_op_seam_methods_on_mobile_are_represented_as_tracked_stubs() {
     // Criterion 4 (the no-silent-no-op-seam rule, expressed through the matrix):
-    // the seam methods that are empty `{}` no-ops on the mobile backends today
-    // (`register_scheme_handler` -> ipfs-render; `register_script_message_handler`
-    // + `inject_script` -> eip1193-provider; the default `trust_posture` ->
-    // trust-indicator) MUST each show up as a marked + task-linked `stubbed`
-    // cell on mobile, never as a silent `implemented`. If any is flipped to
-    // `implemented` while the backend still no-ops it, or dropped, this reds.
+    // the seam methods that are STILL empty `{}` no-ops on the mobile backends
+    // (`register_script_message_handler` + `inject_script` -> eip1193-provider;
+    // the default `trust_posture` -> trust-indicator) MUST each show up as a
+    // marked + task-linked `stubbed` cell on mobile, never as a silent
+    // `implemented`. If any is flipped to `implemented` while the backend still
+    // no-ops it, or dropped, this reds. (`register_scheme_handler` -> ipfs-render
+    // is NO LONGER a no-op — it is implemented on mobile now, asserted by
+    // `the_mobile_ipfs_gap_is_now_implemented_on_every_platform` — so it is not in
+    // this list anymore.)
     let matrix = load_real_matrix();
     for (capability, platform) in [
-        ("ipfs-render", "ios"),
-        ("ipfs-render", "android"),
         ("eip1193-provider", "ios"),
         ("eip1193-provider", "android"),
         ("trust-indicator", "ios"),

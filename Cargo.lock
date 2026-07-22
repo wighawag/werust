@@ -2160,6 +2160,7 @@ dependencies = [
 name = "werust-android-core"
 version = "0.0.0"
 dependencies = [
+ "fetcher",
  "jni",
  "renderer",
  "werust-core",
@@ -2183,6 +2184,7 @@ dependencies = [
 name = "werust-ios-core"
 version = "0.0.0"
 dependencies = [
+ "fetcher",
  "renderer",
  "werust-core",
 ]

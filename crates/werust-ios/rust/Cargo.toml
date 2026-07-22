@@ -21,3 +21,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 renderer = { path = "../../renderer" }
 werust-core = { path = "../../werust-core" }
+# The verifiable content-retrieval seam + its default trustless-gateway CAR
+# backend, so the iOS edge resolves `ipfs://` through the SAME hash-verified path
+# desktop does (`install_ipfs`), not a forked mobile resolver.
+fetcher = { path = "../../fetcher" }

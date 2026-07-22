@@ -19,6 +19,10 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 renderer = { path = "../../renderer" }
 werust-core = { path = "../../werust-core" }
+# The verifiable content-retrieval seam + its default trustless-gateway CAR
+# backend, so the Android edge resolves `ipfs://` through the SAME hash-verified
+# path desktop does (`install_ipfs`), not a forked mobile resolver.
+fetcher = { path = "../../fetcher" }
 
 # The JNI bridge is only compiled for the Android target (the host verify gate
 # tests the JVM-free logic; it never links against the JVM). Keeping `jni`

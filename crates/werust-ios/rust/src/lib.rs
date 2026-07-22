@@ -43,7 +43,22 @@ mod ffi_json;
 
 pub use backend::{IosBackend, IosHandle};
 
+use renderer::Renderer;
 use werust_core::{BrowserShell, ChromeState};
+
+/// The wire form of a resolved `ipfs://` request handed back to the Swift edge:
+/// the MIME type and the verified bytes, or the fail-closed reason.
+///
+/// The Swift `WKURLSchemeHandler` turns an [`Ok`] into a `URLResponse` + data on
+/// the `WKURLSchemeTask` and a [`Err`] into `didFailWithError`, so the
+/// fail-closed posture desktop has (a hash mismatch fails the load, never
+/// renders) holds on iOS too.
+pub enum SchemeResolution {
+    /// A verified resolution: the MIME type and the verified body bytes.
+    Ok { mime_type: String, body: Vec<u8> },
+    /// A fail-closed resolution failure carrying its legible reason.
+    Err { reason: String },
+}
 
 /// A single browsing session for one iOS `UIViewController`: a
 /// [`BrowserShell`](werust_core::BrowserShell) over an [`IosBackend`], plus the
@@ -67,11 +82,21 @@ impl Default for CoreSession {
 }
 
 impl CoreSession {
-    /// Build a fresh session over an [`IosBackend`].
+    /// Build a fresh session over an [`IosBackend`], with the native `ipfs://`
+    /// scheme handler installed.
     #[must_use]
     pub fn new() -> Self {
-        let backend = IosBackend::new();
+        let mut backend = IosBackend::new();
         let handle = backend.handle();
+        // Wire the SECOND trust hook exactly as the desktop backend's
+        // `install_ipfs` does, BEFORE handing the backend to the shell: register
+        // the `ipfs` scheme handler routing each intercepted request through the
+        // SAME `werust_core::ipfs::resolve_ipfs_request` path desktop uses, over
+        // the default trustless-gateway CAR retriever (per-block hash-verified).
+        // A `WKWebView` loads `ipfs://` only via a registered `WKURLSchemeHandler`,
+        // so Swift's handler drives the intercepted request through
+        // [`resolve_ipfs`](CoreSession::resolve_ipfs) into this handler.
+        install_ipfs(&mut backend);
         Self {
             shell: BrowserShell::new(Box::new(backend)),
             backend: handle,
@@ -112,6 +137,27 @@ impl CoreSession {
         self.backend.take_pending_load()
     }
 
+    /// Resolve an intercepted `ipfs://<cid>[/path]` request through the SHARED
+    /// core resolve path, for Swift's `WKURLSchemeHandler`.
+    ///
+    /// A `WKWebView` will only load `ipfs://` if a `WKURLSchemeHandler` is
+    /// registered, so Swift's handler calls this: it routes `uri` through the
+    /// `ipfs` scheme handler installed at [`new`](CoreSession::new) (the SAME
+    /// `resolve_ipfs_request` + trustless-gateway CAR path desktop uses), and
+    /// returns the verified bytes + MIME type, or the fail-closed reason. Returns
+    /// `None` if `uri` is not a registered scheme.
+    pub fn resolve_ipfs(&self, uri: &str) -> Option<SchemeResolution> {
+        self.backend.resolve_scheme(uri).map(|result| match result {
+            Ok(response) => SchemeResolution::Ok {
+                mime_type: response.mime_type,
+                body: response.body,
+            },
+            Err(e) => SchemeResolution::Err {
+                reason: e.to_string(),
+            },
+        })
+    }
+
     /// Report the platform `WKWebView`'s commit signal into the core, then fold
     /// the resulting lifecycle events into the chrome.
     pub fn on_page_committed(&mut self, url: &str) {
@@ -145,6 +191,35 @@ impl CoreSession {
     pub fn chrome_json(&self) -> String {
         ffi_json::chrome_to_json(self.shell.chrome())
     }
+}
+
+/// Install the native `ipfs://` scheme handler on `backend`, the twin of the
+/// desktop backend's `install_ipfs`.
+///
+/// It registers the `ipfs` scheme through the seam's
+/// [`register_scheme_handler`](Renderer::register_scheme_handler) and routes each
+/// intercepted request through the pure
+/// [`resolve_ipfs_request`](werust_core::ipfs::resolve_ipfs_request) resolver,
+/// backed by the default
+/// [`TrustlessGatewayCarRetriever`](fetcher::TrustlessGatewayCarRetriever) (fetch
+/// the DAG blocks as a CAR from a trustless gateway over the bound HTTP fetcher,
+/// verify EACH block against its own CID, reassemble/traverse the UnixFS DAG
+/// client-side). The gateway is UNTRUSTED; the per-block verify is what makes the
+/// load safe, so a hash mismatch fails the load rather than rendering unverified
+/// bytes. This is the SAME core path desktop uses — mobile does not fork it.
+///
+/// Unlike desktop, the mobile backend does not own a native webview, so the
+/// handler is dispatched by the OS edge (Swift's `WKURLSchemeHandler`) via
+/// [`CoreSession::resolve_ipfs`], not by a webview signal.
+fn install_ipfs(backend: &mut IosBackend) {
+    use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
+    use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+
+    let retriever = TrustlessGatewayCarRetriever::new(HttpFetcher::new());
+    backend.register_scheme_handler(
+        IPFS_SCHEME,
+        Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -303,6 +378,118 @@ mod ffi {
         match session_mut(session).and_then(|s| s.take_pending_load()) {
             Some(url) => into_c_string(url),
             None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Resolve an intercepted `ipfs://` request through the shared core path.
+    ///
+    /// Returns an opaque handle to a boxed [`SchemeResolution`](super::SchemeResolution)
+    /// Swift queries via `werust_ios_resolution_is_ok` / `_mime` / `_body` +
+    /// `_body_len` / `_error`, then frees with `werust_ios_resolution_free`. A
+    /// NULL return means the URI was not an intercepted scheme (Swift lets the
+    /// `WKWebView` handle it normally). Bytes stay out of the JSON chrome wire
+    /// form and cross as a `const uint8_t *` + length via `_body` / `_body_len`.
+    ///
+    /// # Safety
+    /// `session` is a live handle; `uri` is a valid NUL-terminated C string.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolve_ipfs(
+        session: *mut CoreSession,
+        uri: *const c_char,
+    ) -> *mut super::SchemeResolution {
+        let uri = read(uri);
+        match session_mut(session).and_then(|s| s.resolve_ipfs(&uri)) {
+            Some(resolution) => Box::into_raw(Box::new(resolution)),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Whether the resolution succeeded (a verified load) vs a fail-closed error.
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_is_ok(
+        resolution: *const super::SchemeResolution,
+    ) -> bool {
+        matches!(
+            resolution.as_ref(),
+            Some(super::SchemeResolution::Ok { .. })
+        )
+    }
+
+    /// The MIME type of a successful resolution as a heap C string (empty on an
+    /// error result / null handle). Free with `werust_ios_string_free`.
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_mime(
+        resolution: *const super::SchemeResolution,
+    ) -> *mut c_char {
+        let mime = match resolution.as_ref() {
+            Some(super::SchemeResolution::Ok { mime_type, .. }) => mime_type.clone(),
+            _ => String::new(),
+        };
+        into_c_string(mime)
+    }
+
+    /// A pointer to the verified body bytes of a successful resolution (null / 0
+    /// length on an error result). The bytes are owned by the resolution handle
+    /// and valid until `werust_ios_resolution_free`; Swift copies them into `Data`
+    /// before freeing. Pair with `werust_ios_resolution_body_len`.
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_body(
+        resolution: *const super::SchemeResolution,
+    ) -> *const u8 {
+        match resolution.as_ref() {
+            Some(super::SchemeResolution::Ok { body, .. }) => body.as_ptr(),
+            _ => std::ptr::null(),
+        }
+    }
+
+    /// The length in bytes of the verified body (0 on an error result).
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_body_len(
+        resolution: *const super::SchemeResolution,
+    ) -> usize {
+        match resolution.as_ref() {
+            Some(super::SchemeResolution::Ok { body, .. }) => body.len(),
+            _ => 0,
+        }
+    }
+
+    /// The fail-closed reason of an error resolution as a heap C string (empty on
+    /// success / null handle). Free with `werust_ios_string_free`.
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_error(
+        resolution: *const super::SchemeResolution,
+    ) -> *mut c_char {
+        let reason = match resolution.as_ref() {
+            Some(super::SchemeResolution::Err { reason }) => reason.clone(),
+            _ => String::new(),
+        };
+        into_c_string(reason)
+    }
+
+    /// Free a resolution handle from `werust_ios_resolve_ipfs`.
+    ///
+    /// # Safety
+    /// `resolution` must be a handle from `werust_ios_resolve_ipfs`, freed at most
+    /// once. A null pointer is ignored.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_free(resolution: *mut super::SchemeResolution) {
+        if !resolution.is_null() {
+            drop(Box::from_raw(resolution));
         }
     }
 
@@ -479,6 +666,40 @@ mod tests {
     }
 
     #[test]
+    fn ipfs_scheme_reaches_the_shared_core_resolve_path() {
+        // The motivating gap: an `ipfs://` URL the WKWebView cannot load without a
+        // WKURLSchemeHandler is intercepted by the Swift edge and routed through
+        // the SAME core resolve path desktop uses. Here we prove the scheme is
+        // intercepted (not `None`) and reaches the core, which fails CLOSED on a
+        // malformed CID BEFORE any network fetch (network-isolated):
+        // `Cid::try_from` rejects it, so a fail-closed reason is surfaced and
+        // nothing unverified is rendered — desktop-parity trust posture.
+        let s = CoreSession::new();
+        let resolution = s
+            .resolve_ipfs("ipfs://not-a-valid-cid/index.html")
+            .expect("the ipfs scheme is intercepted and routed to the core");
+        match resolution {
+            SchemeResolution::Err { reason } => {
+                assert!(
+                    reason.contains("ipfs://"),
+                    "the fail-closed reason names the ipfs load failure: {reason}"
+                );
+            }
+            SchemeResolution::Ok { .. } => {
+                panic!("a malformed CID must fail closed, never render bytes")
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_ipfs_url_is_not_intercepted() {
+        // A plain `https://` URL is NOT a registered scheme, so the edge lets the
+        // WKWebView load it normally (no interception).
+        let s = CoreSession::new();
+        assert!(s.resolve_ipfs("https://example.com/").is_none());
+    }
+
+    #[test]
     fn chrome_json_carries_every_field_the_swift_edge_paints() {
         // The JSON is the wire form Swift reads across the C-ABI; it must carry the
         // URL bar text, nav-control enablement, load state, and any failure so the
@@ -543,6 +764,59 @@ mod tests {
             assert!(werust_ios_chrome_json(std::ptr::null_mut()).is_null());
             werust_ios_session_free(std::ptr::null_mut());
             werust_ios_string_free(std::ptr::null_mut());
+        }
+    }
+
+    /// Drive the `ipfs://` resolution across the raw C-ABI exports exactly as the
+    /// Swift `WKURLSchemeHandler` does: intercept the scheme, read the
+    /// fail-closed result (a malformed CID fails BEFORE any network fetch, so this
+    /// is network-isolated), and free the resolution + strings. Also proves a
+    /// non-`ipfs` URL is not intercepted (NULL handle) and null handles are
+    /// tolerated.
+    #[test]
+    fn the_c_abi_resolves_ipfs_through_the_core_and_frees_its_handle() {
+        use super::ffi::*;
+        use std::ffi::{CStr, CString};
+
+        unsafe {
+            let s = werust_ios_session_new();
+
+            // A non-ipfs URL is not an intercepted scheme: NULL handle.
+            let https = CString::new("https://example.com/").unwrap();
+            assert!(werust_ios_resolve_ipfs(s, https.as_ptr()).is_null());
+
+            // An `ipfs://` URL IS intercepted and routed to the shared core path;
+            // a malformed CID fails closed with a legible reason, no bytes.
+            let ipfs = CString::new("ipfs://not-a-valid-cid/index.html").unwrap();
+            let res = werust_ios_resolve_ipfs(s, ipfs.as_ptr());
+            assert!(!res.is_null(), "the ipfs scheme is intercepted");
+            assert!(
+                !werust_ios_resolution_is_ok(res),
+                "malformed CID fails closed"
+            );
+            assert_eq!(
+                werust_ios_resolution_body_len(res),
+                0,
+                "no bytes on failure"
+            );
+
+            let reason_ptr = werust_ios_resolution_error(res);
+            assert!(!reason_ptr.is_null());
+            let reason = CStr::from_ptr(reason_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(reason_ptr);
+            assert!(
+                reason.contains("ipfs://"),
+                "legible fail-closed reason: {reason}"
+            );
+
+            werust_ios_resolution_free(res);
+            werust_ios_session_free(s);
+
+            // Null handles are tolerated.
+            assert!(werust_ios_resolve_ipfs(std::ptr::null_mut(), ipfs.as_ptr()).is_null());
+            assert!(!werust_ios_resolution_is_ok(std::ptr::null()));
+            assert_eq!(werust_ios_resolution_body_len(std::ptr::null()), 0);
+            werust_ios_resolution_free(std::ptr::null_mut());
         }
     }
 }

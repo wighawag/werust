@@ -24,6 +24,8 @@
 #define WERUST_MOBILE_H
 
 #include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -31,6 +33,12 @@ extern "C" {
 
 /* Opaque browsing session (a Rust `CoreSession`). Threaded through every call. */
 typedef struct WerustCoreSession WerustCoreSession;
+
+/* Opaque resolved `ipfs://` request (a Rust `SchemeResolution`): the verified
+ * bytes + MIME type, or a fail-closed reason. Produced by
+ * werust_ios_resolve_ipfs; queried via the _resolution_* accessors; freed with
+ * werust_ios_resolution_free. */
+typedef struct WerustSchemeResolution WerustSchemeResolution;
 
 /* Create a fresh browsing session; free with werust_ios_session_free. */
 WerustCoreSession *werust_ios_session_new(void);
@@ -55,6 +63,39 @@ void werust_ios_stop(WerustCoreSession *session);
  * C string (free with werust_ios_string_free), or NULL if nothing is pending.
  * Swift drains this after driving the core and calls WKWebView.load with it. */
 char *werust_ios_take_pending_load(WerustCoreSession *session);
+
+/* Resolve an intercepted `ipfs://<cid>[/path]` request through the SHARED core
+ * resolve path (the same hash-verified path desktop uses). The WKWebView loads
+ * `ipfs://` only via a WKURLSchemeHandler, so Swift's handler calls this with
+ * the intercepted URL and answers the WKURLSchemeTask from the result. Returns
+ * an opaque resolution handle (query via the accessors below, free with
+ * werust_ios_resolution_free), or NULL if the URL is not an intercepted scheme
+ * (Swift then lets the WKWebView handle it normally). */
+WerustSchemeResolution *werust_ios_resolve_ipfs(WerustCoreSession *session,
+                                                const char *uri);
+
+/* True iff the resolution is a verified success (bytes to render); false is a
+ * fail-closed error (a hash mismatch / unverifiable CID / source error) whose
+ * reason is werust_ios_resolution_error — fail the WKURLSchemeTask, never render. */
+bool werust_ios_resolution_is_ok(const WerustSchemeResolution *resolution);
+
+/* The MIME type of a successful resolution, as a heap C string (empty on an
+ * error result). Free with werust_ios_string_free. */
+char *werust_ios_resolution_mime(const WerustSchemeResolution *resolution);
+
+/* The verified body bytes of a successful resolution (NULL / 0 length on an
+ * error result). The bytes are owned by the resolution and valid until
+ * werust_ios_resolution_free; copy them into Data before freeing. Pair with
+ * werust_ios_resolution_body_len. */
+const uint8_t *werust_ios_resolution_body(const WerustSchemeResolution *resolution);
+size_t werust_ios_resolution_body_len(const WerustSchemeResolution *resolution);
+
+/* The fail-closed reason of an error resolution, as a heap C string (empty on
+ * success). Free with werust_ios_string_free. */
+char *werust_ios_resolution_error(const WerustSchemeResolution *resolution);
+
+/* Free a resolution handle from werust_ios_resolve_ipfs (NULL tolerated). */
+void werust_ios_resolution_free(WerustSchemeResolution *resolution);
 
 /* Report the WKWebView's real load-lifecycle signals back into the core (from the
  * WKNavigationDelegate). `url` / `reason` are borrowed C strings. */

@@ -11,8 +11,10 @@ import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import java.io.ByteArrayInputStream
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
@@ -162,6 +164,64 @@ class BrowserActivity : Activity() {
      * into the Rust core, then repaints the chrome from the core.
      */
     private inner class CoreWebViewClient : WebViewClient() {
+        /**
+         * Intercept `ipfs://` requests the platform `WebView` cannot load itself
+         * (`net::ERR_UNKNOWN_URL_SCHEME`) and answer them from the SHARED
+         * `werust-core` resolve path (the same hash-verified path desktop uses via
+         * WebKitGTK `install_ipfs`). This is the Android realisation of the mobile
+         * `ipfs://` interception: the request is routed through
+         * [WerustCore.resolveIpfs] into the core, and the verified bytes are
+         * served as a `WebResourceResponse` so an ENS-resolved `ipfs://<cid>` site
+         * renders instead of failing. A fail-closed resolution error is answered
+         * with an HTTP error status (no bytes), matching the desktop posture where
+         * a hash mismatch fails the load rather than rendering unverified bytes.
+         *
+         * The `.eth` name the user typed stays in the address bar (the core's
+         * chrome truth); the `ipfs://<cid>` scheme is served here transparently
+         * with no `https://`/gateway URL shown to the user. A non-`ipfs://`
+         * request returns `null` so the `WebView` handles it normally.
+         *
+         * INTERCEPTION MECHANISM (Android): the NATIVE custom scheme via
+         * `shouldInterceptRequest`. See the recorded decision at
+         * work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md
+         * for the internal-`https://appassets` fallback if a device build shows a
+         * top-level `ipfs://` navigation does not reach this hook.
+         */
+        override fun shouldInterceptRequest(
+            view: WebView,
+            request: WebResourceRequest,
+        ): WebResourceResponse? {
+            val url = request.url.toString()
+            return when (val resolution = core.resolveIpfs(url)) {
+                null -> null // not an intercepted scheme: let the WebView handle it
+                is WerustCore.Resolution.Ok ->
+                    WebResourceResponse(
+                        resolution.mimeType,
+                        "utf-8",
+                        ByteArrayInputStream(resolution.body),
+                    )
+                is WerustCore.Resolution.Error ->
+                    // Fail closed: an HTTP error status with no body, so unverified
+                    // bytes never render and the failure is honest. The reason is
+                    // carried in the reason phrase; the `WebView` surfaces the
+                    // failed load via `onReceivedHttpError` on the UI thread (this
+                    // hook runs off the UI thread, so it must not mutate the core).
+                    WebResourceResponse(
+                        "text/plain",
+                        "utf-8",
+                        502,
+                        // The HTTP reason phrase must be a single line: collapse any
+                        // newlines so a multi-line reason cannot throw.
+                        resolution.reason
+                            .replace('\n', ' ')
+                            .replace('\r', ' ')
+                            .ifBlank { "ipfs resolution failed" },
+                        emptyMap<String, String>(),
+                        ByteArrayInputStream(ByteArray(0)),
+                    )
+            }
+        }
+
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             core.onPageCommitted(url)
             refreshChrome()

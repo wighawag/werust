@@ -40,7 +40,23 @@ mod ffi_json;
 
 pub use backend::{AndroidBackend, AndroidHandle};
 
+use renderer::Renderer;
 use werust_core::{BrowserShell, ChromeState};
+
+/// The wire form of a resolved `ipfs://` request handed back to the Kotlin edge:
+/// the MIME type and the verified bytes, or the fail-closed reason.
+///
+/// The Kotlin `shouldInterceptRequest` turns an [`Ok`] into a
+/// `WebResourceResponse` (bytes + MIME) and a [`Err`] into a failed load
+/// (`WebResourceResponse` with an error status / null stream), so the fail-closed
+/// posture desktop has (a hash mismatch fails the load, never renders) holds on
+/// Android too.
+pub enum SchemeResolution {
+    /// A verified resolution: the MIME type and the verified body bytes.
+    Ok { mime_type: String, body: Vec<u8> },
+    /// A fail-closed resolution failure carrying its legible reason.
+    Err { reason: String },
+}
 
 /// A single browsing session for one Android `Activity`: a
 /// [`BrowserShell`](werust_core::BrowserShell) over an [`AndroidBackend`], plus the
@@ -64,11 +80,21 @@ impl Default for CoreSession {
 }
 
 impl CoreSession {
-    /// Build a fresh session over an [`AndroidBackend`].
+    /// Build a fresh session over an [`AndroidBackend`], with the native `ipfs://`
+    /// scheme handler installed.
     #[must_use]
     pub fn new() -> Self {
-        let backend = AndroidBackend::new();
+        let mut backend = AndroidBackend::new();
         let handle = backend.handle();
+        // Wire the SECOND trust hook exactly as the desktop backend's
+        // `install_ipfs` does, BEFORE handing the backend to the shell: register
+        // the `ipfs` scheme handler routing each intercepted request through the
+        // SAME `werust_core::ipfs::resolve_ipfs_request` path desktop uses, over
+        // the default trustless-gateway CAR retriever (per-block hash-verified).
+        // The platform `WebView` cannot load `ipfs://` itself, so Kotlin's
+        // `shouldInterceptRequest` drives the intercepted request through
+        // [`resolve_ipfs`](CoreSession::resolve_ipfs) into this handler.
+        install_ipfs(&mut backend);
         Self {
             shell: BrowserShell::new(Box::new(backend)),
             backend: handle,
@@ -109,6 +135,28 @@ impl CoreSession {
         self.backend.take_pending_load()
     }
 
+    /// Resolve an intercepted `ipfs://<cid>[/path]` request through the SHARED
+    /// core resolve path, for Kotlin's `WebViewClient.shouldInterceptRequest`.
+    ///
+    /// The platform `WebView` dies on an `ipfs://` URL with
+    /// `net::ERR_UNKNOWN_URL_SCHEME`, so Kotlin intercepts the request and calls
+    /// this: it routes `uri` through the `ipfs` scheme handler installed at
+    /// [`new`](CoreSession::new) (the SAME `resolve_ipfs_request` +
+    /// trustless-gateway CAR path desktop uses), and returns the verified bytes +
+    /// MIME type, or the fail-closed reason. Returns `None` if `uri` is not a
+    /// registered scheme (Kotlin then lets the `WebView` handle it normally).
+    pub fn resolve_ipfs(&self, uri: &str) -> Option<SchemeResolution> {
+        self.backend.resolve_scheme(uri).map(|result| match result {
+            Ok(response) => SchemeResolution::Ok {
+                mime_type: response.mime_type,
+                body: response.body,
+            },
+            Err(e) => SchemeResolution::Err {
+                reason: e.to_string(),
+            },
+        })
+    }
+
     /// Report the platform `WebView`'s commit signal into the core, then fold the
     /// resulting lifecycle events into the chrome.
     pub fn on_page_committed(&mut self, url: &str) {
@@ -141,6 +189,35 @@ impl CoreSession {
     pub fn chrome_json(&self) -> String {
         ffi_json::chrome_to_json(self.shell.chrome())
     }
+}
+
+/// Install the native `ipfs://` scheme handler on `backend`, the twin of the
+/// desktop backend's `install_ipfs`.
+///
+/// It registers the `ipfs` scheme through the seam's
+/// [`register_scheme_handler`](Renderer::register_scheme_handler) and routes each
+/// intercepted request through the pure
+/// [`resolve_ipfs_request`](werust_core::ipfs::resolve_ipfs_request) resolver,
+/// backed by the default
+/// [`TrustlessGatewayCarRetriever`](fetcher::TrustlessGatewayCarRetriever) (fetch
+/// the DAG blocks as a CAR from a trustless gateway over the bound HTTP fetcher,
+/// verify EACH block against its own CID, reassemble/traverse the UnixFS DAG
+/// client-side). The gateway is UNTRUSTED; the per-block verify is what makes the
+/// load safe, so a hash mismatch fails the load rather than rendering unverified
+/// bytes. This is the SAME core path desktop uses — mobile does not fork it.
+///
+/// Unlike desktop, the mobile backend does not own a native webview, so the
+/// handler is dispatched by the OS edge (Kotlin `shouldInterceptRequest`) via
+/// [`CoreSession::resolve_ipfs`], not by a webview signal.
+fn install_ipfs(backend: &mut AndroidBackend) {
+    use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
+    use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+
+    let retriever = TrustlessGatewayCarRetriever::new(HttpFetcher::new());
+    backend.register_scheme_handler(
+        IPFS_SCHEME,
+        Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -262,6 +339,113 @@ mod jni_exports {
         env.new_string(s)
             .map(|js| js.into_raw())
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Resolve an intercepted `ipfs://` request through the shared core path.
+    ///
+    /// Returns an opaque handle to a boxed [`SchemeResolution`] Kotlin queries via
+    /// `nativeResolutionIsOk` / `nativeResolutionMime` / `nativeResolutionBody` /
+    /// `nativeResolutionError` and then frees with `nativeResolutionFree`. A `0`
+    /// return means the URI was not an intercepted scheme (Kotlin lets the
+    /// `WebView` handle it normally). Bytes cross the boundary as a `jbyteArray`
+    /// via `nativeResolutionBody`, kept out of the JSON chrome wire form.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolveIpfs(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        uri: JString,
+    ) -> jlong {
+        let uri = read(&mut env, &uri);
+        match unsafe { session(handle) }.resolve_ipfs(&uri) {
+            Some(resolution) => Box::into_raw(Box::new(resolution)) as jlong,
+            None => 0,
+        }
+    }
+
+    /// Reconstruct a `&SchemeResolution` from the opaque handle Kotlin threads back.
+    ///
+    /// # Safety
+    /// `handle` must be a non-zero pointer from `nativeResolveIpfs` not yet freed.
+    unsafe fn resolution<'a>(handle: jlong) -> &'a super::SchemeResolution {
+        &*(handle as *const super::SchemeResolution)
+    }
+
+    /// Whether the resolution succeeded (a verified load) vs a fail-closed error.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionIsOk(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jboolean {
+        match unsafe { resolution(handle) } {
+            super::SchemeResolution::Ok { .. } => JNI_TRUE,
+            super::SchemeResolution::Err { .. } => JNI_FALSE,
+        }
+    }
+
+    /// The MIME type of a successful resolution (empty string on an error result).
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionMime(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let mime = match unsafe { resolution(handle) } {
+            super::SchemeResolution::Ok { mime_type, .. } => mime_type.as_str(),
+            super::SchemeResolution::Err { .. } => "",
+        };
+        env.new_string(mime)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The verified body bytes of a successful resolution (empty array on error).
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionBody(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jni::sys::jbyteArray {
+        let empty = Vec::new();
+        let body: &[u8] = match unsafe { resolution(handle) } {
+            super::SchemeResolution::Ok { body, .. } => body,
+            super::SchemeResolution::Err { .. } => &empty,
+        };
+        env.byte_array_from_slice(body)
+            .map(|a| a.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The fail-closed reason of an error resolution (empty string on success).
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionError(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let reason = match unsafe { resolution(handle) } {
+            super::SchemeResolution::Ok { .. } => "",
+            super::SchemeResolution::Err { reason } => reason.as_str(),
+        };
+        env.new_string(reason)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Free a resolution handle from `nativeResolveIpfs`.
+    ///
+    /// # Safety
+    /// `handle` must be a non-zero pointer from `nativeResolveIpfs`, freed once.
+    #[no_mangle]
+    pub unsafe extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionFree(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) {
+        if handle != 0 {
+            drop(Box::from_raw(handle as *mut super::SchemeResolution));
+        }
     }
 
     #[no_mangle]
@@ -419,6 +603,40 @@ mod tests {
         // A new navigation clears the surfaced failure.
         assert!(s.navigate("https://example.com/"));
         assert_eq!(s.chrome().last_error, None);
+    }
+
+    #[test]
+    fn ipfs_scheme_reaches_the_shared_core_resolve_path() {
+        // The motivating gap: an `ipfs://` URL the platform WebView cannot load
+        // (ERR_UNKNOWN_URL_SCHEME) is intercepted by the Kotlin edge and routed
+        // through the SAME core resolve path desktop uses. Here we prove the
+        // scheme is intercepted (not `None`) and reaches the core, which fails
+        // CLOSED on a malformed CID BEFORE any network fetch (network-isolated):
+        // `Cid::try_from` rejects it, so a fail-closed reason is surfaced and
+        // nothing unverified is rendered — desktop-parity trust posture.
+        let s = CoreSession::new();
+        let resolution = s
+            .resolve_ipfs("ipfs://not-a-valid-cid/index.html")
+            .expect("the ipfs scheme is intercepted and routed to the core");
+        match resolution {
+            SchemeResolution::Err { reason } => {
+                assert!(
+                    reason.contains("ipfs://"),
+                    "the fail-closed reason names the ipfs load failure: {reason}"
+                );
+            }
+            SchemeResolution::Ok { .. } => {
+                panic!("a malformed CID must fail closed, never render bytes")
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_ipfs_url_is_not_intercepted() {
+        // A plain `https://` URL is NOT a registered scheme, so the edge lets the
+        // platform WebView load it normally (no interception).
+        let s = CoreSession::new();
+        assert!(s.resolve_ipfs("https://example.com/").is_none());
     }
 
     #[test]

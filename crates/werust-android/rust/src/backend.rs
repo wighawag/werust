@@ -32,12 +32,12 @@
 //! Rust, behind the seam.
 
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use renderer::{
     KeyEvent, LoadEvent, LoadState, PointerEvent, Renderer, RendererError, SchemeHandler,
-    ScriptMessageHandler, ScrollDelta, ViewHandle,
+    SchemeRequest, SchemeResponse, ScriptMessageHandler, ScrollDelta, ViewHandle,
 };
 
 /// Validate a URL for [`Renderer::navigate`], rejecting unusable ones.
@@ -56,7 +56,7 @@ fn validate_url(url: &str) -> Result<(), RendererError> {
 /// The mutable innards shared between the [`AndroidBackend`] (owned by the core's
 /// shell as a `dyn Renderer`) and the [`AndroidHandle`] (kept by the session for
 /// the platform-`WebView` protocol the cross-backend seam does not carry).
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct Inner {
     /// The back/forward list; `cursor` indexes the current entry.
     history: Vec<String>,
@@ -66,6 +66,37 @@ struct Inner {
     /// The URL the core has committed to but Kotlin has not yet loaded onto the
     /// platform `WebView`. Drained by [`AndroidHandle::take_pending_load`].
     pending_load: Option<String>,
+    /// The registered custom-scheme handlers, keyed by scheme (e.g. `ipfs`).
+    ///
+    /// This is what makes [`register_scheme_handler`](Renderer::register_scheme_handler)
+    /// REAL on the Android edge (it was an empty no-op before): the platform
+    /// `WebView` cannot itself load an `ipfs://` URL (`ERR_UNKNOWN_URL_SCHEME`),
+    /// so Kotlin's `shouldInterceptRequest` intercepts the request and drives it
+    /// through [`AndroidHandle::resolve_scheme`], which dispatches to the handler
+    /// stored here. The `ipfs` handler is wired by the session's `install_ipfs`
+    /// (the twin of the desktop backend's `install_ipfs`), routing each request
+    /// through the SAME `werust_core::ipfs::resolve_ipfs_request` path desktop
+    /// uses, so the same content resolution + fail-closed trust posture apply.
+    scheme_handlers: HashMap<String, SchemeHandler>,
+}
+
+// A `SchemeHandler` is a boxed `FnMut` and cannot derive `Debug`; hand-write it
+// so the surrounding session types can still be `Debug` (the handler map is
+// summarised by its registered scheme names).
+impl std::fmt::Debug for Inner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Inner")
+            .field("history", &self.history)
+            .field("cursor", &self.cursor)
+            .field("state", &self.state)
+            .field("events", &self.events)
+            .field("pending_load", &self.pending_load)
+            .field(
+                "scheme_handlers",
+                &self.scheme_handlers.keys().collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl Inner {
@@ -129,6 +160,29 @@ impl AndroidHandle {
     /// (navigate/back/forward/reload) and calls `WebView.loadUrl` with the result.
     pub fn take_pending_load(&self) -> Option<String> {
         self.inner.borrow_mut().pending_load.take()
+    }
+
+    /// Resolve an intercepted `<scheme>://…` request through the handler the
+    /// session registered for that scheme, or `None` if no handler is registered.
+    ///
+    /// This is the Android edge's stand-in for WebKitGTK's `register_uri_scheme`
+    /// callback: the platform `WebView` cannot load an `ipfs://` URL itself, so
+    /// Kotlin's `WebViewClient.shouldInterceptRequest` calls this with the
+    /// intercepted URI, gets back the verified bytes + MIME type (or a
+    /// fail-closed error), and answers the `WebView` with a `WebResourceResponse`.
+    /// The handler routes through the SAME core resolve path desktop uses, so the
+    /// content resolution + trust posture + fail-closed reasons match desktop.
+    ///
+    /// `None` means the scheme was never registered (Kotlin then lets the
+    /// `WebView` handle the URL normally); `Some(Err(..))` is a real, honest
+    /// resolution failure that must FAIL the load, never render unverified bytes.
+    pub fn resolve_scheme(&self, uri: &str) -> Option<Result<SchemeResponse, RendererError>> {
+        let scheme = uri.split_once("://").map(|(s, _)| s.to_string())?;
+        let mut b = self.inner.borrow_mut();
+        let handler = b.scheme_handlers.get_mut(&scheme)?;
+        Some(handler(SchemeRequest {
+            uri: uri.to_string(),
+        }))
     }
 
     /// Report that the platform `WebView` committed the load on `url` (the
@@ -252,7 +306,17 @@ impl Renderer for AndroidBackend {
 
     fn register_script_message_handler(&mut self, _name: &str, _handler: ScriptMessageHandler) {}
     fn inject_script(&mut self, _script: &str) {}
-    fn register_scheme_handler(&mut self, _scheme: &str, _handler: SchemeHandler) {}
+
+    fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler) {
+        // Store the handler so the Android edge can dispatch to it from
+        // `shouldInterceptRequest` via [`AndroidHandle::resolve_scheme`]. This is
+        // the seam method that used to be a silent no-op — the exact gap the
+        // platform-capability parity guard exists to forbid; it is now real.
+        self.inner
+            .borrow_mut()
+            .scheme_handlers
+            .insert(scheme.to_string(), handler);
+    }
 }
 
 #[cfg(test)]
@@ -381,6 +445,71 @@ mod tests {
 
         b.stop();
         assert_eq!(b.load_state(), LoadState::Idle);
+    }
+
+    #[test]
+    fn a_registered_scheme_handler_is_reachable_from_the_edge() {
+        // The seam method that used to be a silent no-op is now real: a handler
+        // registered for `ipfs` is stored and dispatched when the Android edge
+        // (`shouldInterceptRequest`) resolves an intercepted `ipfs://` request.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+
+        // A canned handler standing in for the real `install_ipfs` resolver, so
+        // this stays network-isolated: it echoes the intercepted URI back as the
+        // body and pins a MIME type, exactly as a verified resolution would.
+        b.register_scheme_handler(
+            "ipfs",
+            Box::new(|request: SchemeRequest| {
+                Ok(SchemeResponse {
+                    mime_type: "text/html".to_string(),
+                    body: request.uri.into_bytes(),
+                })
+            }),
+        );
+
+        let resolved = h
+            .resolve_scheme("ipfs://bafycid/index.html")
+            .expect("the ipfs scheme is registered, so it routes to the handler")
+            .expect("the canned handler resolves successfully");
+        assert_eq!(resolved.mime_type, "text/html");
+        assert_eq!(resolved.body, b"ipfs://bafycid/index.html");
+    }
+
+    #[test]
+    fn an_unregistered_scheme_is_not_intercepted() {
+        // A scheme with no registered handler returns `None` so the Android edge
+        // lets the platform `WebView` handle the URL normally (e.g. `https://`).
+        let b = AndroidBackend::new();
+        let h = b.handle();
+        assert!(h.resolve_scheme("https://example.com/").is_none());
+        assert!(h.resolve_scheme("ipfs://bafycid/").is_none());
+    }
+
+    #[test]
+    fn a_scheme_handler_error_is_surfaced_fail_closed() {
+        // A resolution failure (a hash mismatch, an unverifiable CID, a source
+        // error on the shared core path) is surfaced as `Some(Err(..))` so the
+        // edge FAILS the load with an honest reason — never renders unverified
+        // bytes. This is the fail-closed parity the desktop path has.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.register_scheme_handler(
+            "ipfs",
+            Box::new(|_request: SchemeRequest| {
+                Err(RendererError::Backend(
+                    "ipfs:// load failed: hash mismatch".to_string(),
+                ))
+            }),
+        );
+        let err = h
+            .resolve_scheme("ipfs://tampered/")
+            .expect("registered, so it routes to the handler")
+            .expect_err("the handler fails the load");
+        assert_eq!(
+            err,
+            RendererError::Backend("ipfs:// load failed: hash mismatch".to_string())
+        );
     }
 
     #[test]

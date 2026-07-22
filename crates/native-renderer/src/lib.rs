@@ -65,6 +65,7 @@ pub mod pipeline;
 pub mod shape;
 pub mod tokenizer;
 pub mod tree;
+pub mod wpt_meter;
 
 pub use backend::NativeRenderer;
 pub use html5ever_parser::Html5everParser;

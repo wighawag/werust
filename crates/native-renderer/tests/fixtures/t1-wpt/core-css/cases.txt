@@ -1,0 +1,237 @@
+# T1 core-CSS computed-value cases (pinned WPT-area subset).
+#
+# One `#test` block per case. Each block:
+#   #test  <short name>
+#   #area  <one of: css/CSS2/normal-flow css/css-box css/css-color css/css-fonts css/css-text>
+#   #css   <author stylesheet text (may span the rest of the line)>
+#   #html  <html fragment>
+#   #path  <tag chain from a root to the element under test, e.g. `html body p`;
+#           append `[n]` (0-based) to pick the n-th matching sibling>
+#   #expect <property> = <value>   (one or more; property in the vocabulary below)
+#
+# Property vocabulary (mapped onto the native cascade's ComputedStyle):
+#   color, background-color        -> #rrggbb   (or `none` for no background)
+#   display                        -> block | inline | none
+#   font-size, line-height         -> a number in px
+#   font-weight                    -> bold | normal      (maps to ComputedStyle.bold)
+#   font-style                     -> italic | normal     (maps to ComputedStyle.italic)
+#   text-decoration                -> underline | none    (maps to ComputedStyle.underline)
+#   margin-top/right/bottom/left   -> a number in px
+#   padding-top/right/bottom/left  -> a number in px
+#   font-family                    -> comma-joined family list (or `default` when empty)
+#
+# Blank lines and `#`-comment lines outside a block are ignored.
+
+# --- css/css-color -----------------------------------------------------------
+
+#test color-hex-longhand
+#area css/css-color
+#css p { color: #ff0000 }
+#html <p>x</p>
+#path html body p
+#expect color = #ff0000
+
+#test color-hex-shorthand
+#area css/css-color
+#css p { color: #0f0 }
+#html <p>x</p>
+#path html body p
+#expect color = #00ff00
+
+#test color-named
+#area css/css-color
+#css p { color: rebeccapurple }
+#html <p>x</p>
+#path html body p
+#expect color = #663399
+
+#test color-rgb-function
+#area css/css-color
+#css p { color: rgb(0, 100, 0) }
+#html <p>x</p>
+#path html body p
+#expect color = #006400
+
+#test color-inherits-to-child
+#area css/css-color
+#css body { color: #123456 }
+#html <p><em>x</em></p>
+#path html body p em
+#expect color = #123456
+
+#test background-color-cascades
+#area css/css-color
+#css div { background-color: #eeeeee }
+#html <div>x</div>
+#path html body div
+#expect background-color = #eeeeee
+
+# --- css/css-fonts -----------------------------------------------------------
+
+#test font-size-em-of-parent
+#area css/css-fonts
+#css body { font-size: 20px } h1 { font-size: 2em }
+#html <h1>x</h1>
+#path html body h1
+#expect font-size = 40
+
+#test font-size-px-absolute
+#area css/css-fonts
+#css p { font-size: 18px }
+#html <p>x</p>
+#path html body p
+#expect font-size = 18
+
+#test font-weight-bold-keyword
+#area css/css-fonts
+#css p { font-weight: bold }
+#html <p>x</p>
+#path html body p
+#expect font-weight = bold
+
+#test font-weight-numeric-700
+#area css/css-fonts
+#css p { font-weight: 700 }
+#html <p>x</p>
+#path html body p
+#expect font-weight = bold
+
+#test font-style-italic
+#area css/css-fonts
+#css p { font-style: italic }
+#html <p>x</p>
+#path html body p
+#expect font-style = italic
+
+#test font-family-list
+#area css/css-fonts
+#css p { font-family: "DejaVu Sans", Arial, sans-serif }
+#html <p>x</p>
+#path html body p
+#expect font-family = DejaVu Sans,Arial,sans-serif
+
+#test font-size-percentage-of-parent
+#area css/css-fonts
+#css body { font-size: 20px } p { font-size: 150% }
+#html <p>x</p>
+#path html body p
+#expect font-size = 30
+
+# --- css/css-box -------------------------------------------------------------
+
+#test margin-shorthand-one-value
+#area css/css-box
+#css p { margin: 10px }
+#html <p>x</p>
+#path html body p
+#expect margin-top = 10
+#expect margin-right = 10
+#expect margin-bottom = 10
+#expect margin-left = 10
+
+#test margin-shorthand-two-values
+#area css/css-box
+#css p { margin: 5px 12px }
+#html <p>x</p>
+#path html body p
+#expect margin-top = 5
+#expect margin-right = 12
+#expect margin-bottom = 5
+#expect margin-left = 12
+
+#test margin-longhand-side
+#area css/css-box
+#css p { margin-left: 24px }
+#html <p>x</p>
+#path html body p
+#expect margin-left = 24
+
+#test padding-shorthand-four-values
+#area css/css-box
+#css p { padding: 1px 2px 3px 4px }
+#html <p>x</p>
+#path html body p
+#expect padding-top = 1
+#expect padding-right = 2
+#expect padding-bottom = 3
+#expect padding-left = 4
+
+#test padding-em-resolves-against-font-size
+#area css/css-box
+#css p { font-size: 10px; padding: 2em }
+#html <p>x</p>
+#path html body p
+#expect padding-top = 20
+
+# --- css/CSS2/normal-flow ----------------------------------------------------
+
+#test display-block-default-for-div
+#area css/CSS2/normal-flow
+#css
+#html <div>x</div>
+#path html body div
+#expect display = block
+
+#test display-inline-default-for-span
+#area css/CSS2/normal-flow
+#css
+#html <span>x</span>
+#path html body span
+#expect display = inline
+
+#test display-none-hides-element
+#area css/CSS2/normal-flow
+#css .hidden { display: none }
+#html <p class="hidden">x</p>
+#path html body p
+#expect display = none
+
+#test display-block-override-on-span
+#area css/CSS2/normal-flow
+#css span { display: block }
+#html <span>x</span>
+#path html body span
+#expect display = block
+
+#test child-combinator-specificity
+#area css/CSS2/normal-flow
+#css body > p { color: #010203 } p { color: #999999 }
+#html <p>x</p>
+#path html body p
+#expect color = #010203
+
+# --- css/css-text ------------------------------------------------------------
+
+#test text-decoration-underline
+#area css/css-text
+#css a { text-decoration: underline }
+#html <a>x</a>
+#path html body a
+#expect text-decoration = underline
+
+#test text-decoration-none-removes-ua-underline
+#area css/css-text
+#css a { text-decoration: none }
+#html <a>x</a>
+#path html body a
+#expect text-decoration = none
+
+#test line-height-px-absolute
+#area css/css-text
+#css p { line-height: 24px }
+#html <p>x</p>
+#path html body p
+#expect line-height = 24
+
+# A unitless line-height MUST inherit as the MULTIPLIER and recompute against the
+# child's own font-size (per CSS). The native T1 cascade currently inherits the
+# RESOLVED px instead (see
+# work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md), so
+# this case legitimately FAILS the meter today -- it is a real, known regression
+# surface the WPT bar is meant to expose, not tune away.
+#test line-height-unitless-inherits-as-multiplier
+#area css/css-text
+#css body { font-size: 20px; line-height: 1.5 } small { font-size: 10px }
+#html <p><small>x</small></p>
+#path html body p small
+#expect line-height = 15

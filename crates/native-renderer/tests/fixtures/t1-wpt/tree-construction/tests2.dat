@@ -1,0 +1,94 @@
+#data
+<span>a<span>b</span>c</span>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <span>
+|       "a"
+|       <span>
+|         "b"
+|       "c"
+
+#data
+<p><strong>bold</strong> and <em>em</em></p>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       <strong>
+|         "bold"
+|       " and "
+|       <em>
+|         "em"
+
+#data
+<section><h2>Sub</h2><p>x<br>y</p></section>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <section>
+|       <h2>
+|         "Sub"
+|       <p>
+|         "x"
+|         <br>
+|         "y"
+
+#data
+<blockquote><p>quoted</p></blockquote>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <blockquote>
+|       <p>
+|         "quoted"
+
+#data
+<nav><ul><li><a href="#a">A</a></li></ul></nav>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <nav>
+|       <ul>
+|         <li>
+|           <a>
+|             href="#a"
+|             "A"
+
+#data
+<b>1<p>2</b>3</p>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <b>
+|       "1"
+|     <p>
+|       <b>
+|         "2"
+|       "3"
+
+#data
+<table>x<td>y</td></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     "x"
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "y"

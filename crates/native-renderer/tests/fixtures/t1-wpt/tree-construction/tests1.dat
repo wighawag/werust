@@ -1,0 +1,120 @@
+#data
+<p>Hello</p>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "Hello"
+
+#data
+<p>One<p>Two
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "One"
+|     <p>
+|       "Two"
+
+#data
+<a href="/x">link</a>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <a>
+|       href="/x"
+|       "link"
+
+#data
+<b>bold <i>both</b> italic</i>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <b>
+|       "bold "
+|       <i>
+|         "both"
+|     <i>
+|       " italic"
+
+#data
+<DIV CLASS="x">t</DIV>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <div>
+|       class="x"
+|       "t"
+
+#data
+<table><tr><td>c</td></tr></table>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <table>
+|       <tbody>
+|         <tr>
+|           <td>
+|             "c"
+
+#data
+<!doctype html><html><head><title>T</title></head><body><h1>H</h1></body></html>
+#errors
+#document
+| <!DOCTYPE html>
+| <html>
+|   <head>
+|     <title>
+|       "T"
+|   <body>
+|     <h1>
+|       "H"
+
+#data
+<p>a &amp; b &copy; c</p>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <p>
+|       "a & b © c"
+
+#data
+<ul><li>one<li>two</ul>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <ul>
+|       <li>
+|         "one"
+|       <li>
+|         "two"
+
+#data
+<article><header><h1>Title</h1></header><p>Body</p></article>
+#errors
+#document
+| <html>
+|   <head>
+|   <body>
+|     <article>
+|       <header>
+|         <h1>
+|           "Title"
+|       <p>
+|         "Body"

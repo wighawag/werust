@@ -340,6 +340,17 @@ impl Renderer for WebViewRenderer {
         self.life.borrow().posture()
     }
 
+    fn mark_ens_origin(&mut self) {
+        // Flag the current load as ENS-originated on the SHARED lifecycle (the
+        // same one the `install_ipfs` scheme handler marks on the GTK loop). The
+        // front door calls this right after starting the `ipfs://<cid>` load, so
+        // when the scheme handler later verifies the bytes and calls
+        // `mark_content_verified`, the lifecycle surfaces `NameViaTrustedRpc`
+        // instead of the plain `ContentVerified` — the ENS-origin posture winning
+        // over the handler's unconditional mark. A fresh `begin` clears the flag.
+        self.life.borrow_mut().mark_ens_origin();
+    }
+
     fn current_url(&self) -> Option<String> {
         // The lifecycle lives behind interior mutability (the load signals mutate
         // it from the GTK main loop), so the URL is returned owned rather than

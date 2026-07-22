@@ -24,11 +24,65 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
+use crate::contenthash::DecodedContenthash;
+use crate::ethereum::{EthereumProvider, RpcProvider};
+
 pub mod contenthash;
 pub mod ens;
 pub mod ethereum;
 pub mod ipfs;
 pub mod provider;
+
+/// The URL-bar suffix that marks a bare entry as an ENS name to resolve: a
+/// `.eth` TLD.
+///
+/// The front door recognises a `*.eth` URL-bar entry (like Brave/Opera) as an
+/// ENS name; see [`eth_name_from_entry`]. Phase 1 supports only `.eth`
+/// (`ens-to-ipfs-resolution-phase1-rpc-skeleton`); other ENS TLDs are out of
+/// scope.
+const ETH_NAME_SUFFIX: &str = ".eth";
+
+/// Recognise a bare `.eth` URL-bar entry as an ENS name, returning the name to
+/// resolve (with any single trailing `/` stripped), or [`None`] if the entry is
+/// not a bare `.eth` name.
+///
+/// The settled `.eth`-input rule (spec Settled decisions,
+/// `ens-to-ipfs-resolution-phase1-rpc-skeleton`): treat a `*.eth` URL-bar entry
+/// on Enter (or a trailing `/`) as an ENS name — do NOT aggressively auto-resolve
+/// anything merely name-ish. Concretely a bare `.eth` entry is one that:
+///
+/// * carries NO URL scheme (no `://`): a `https://…`, `ipfs://…`, or any other
+///   explicit scheme is taken literally and never treated as a name (so this is
+///   ONLY the scheme-less front door Brave/Opera expose);
+/// * ends in `.eth` (case-insensitively), after removing at most one trailing
+///   `/` (the "or a trailing `/`" half of the rule);
+/// * has a non-empty label before that `.eth` (so a bare `".eth"` or `"/"` is not
+///   a name), and no `/` inside the remaining name (a path like `ronan.eth/x` is
+///   NOT treated as a bare name here — Phase 1 resolves the name to a CID, it
+///   does not select a sub-path via ENS).
+///
+/// Normalisation/validation of the label itself is left to the resolver
+/// ([`ens::namehash`](crate::ens::namehash) via `ens-normalize`), so this is only
+/// the cheap URL-bar recognition, not an ENS-name validity check.
+fn eth_name_from_entry(entry: &str) -> Option<&str> {
+    // An explicit scheme is taken literally: only the scheme-less front door is a
+    // name. This is what stops `ipfs://…` or `https://….eth` from being hijacked.
+    if entry.contains("://") {
+        return None;
+    }
+    // "On Enter or a trailing `/`": accept one optional trailing slash.
+    let name = entry.strip_suffix('/').unwrap_or(entry);
+    // A bare name has no path separators left (a `ronan.eth/page` entry is not a
+    // bare name in Phase 1) and ends in the `.eth` TLD (case-insensitively).
+    if name.contains('/') || !name.to_ascii_lowercase().ends_with(ETH_NAME_SUFFIX) {
+        return None;
+    }
+    // There must be a non-empty label before `.eth` (reject a bare `".eth"`).
+    if name.len() <= ETH_NAME_SUFFIX.len() {
+        return None;
+    }
+    Some(name)
+}
 
 /// The chrome state the shell reflects: everything the window must draw ABOUT the
 /// current page, distinct from the page content itself.
@@ -98,19 +152,56 @@ impl ChromeState {
 pub struct BrowserShell {
     renderer: Box<dyn Renderer>,
     chrome: ChromeState,
+    /// The [`EthereumProvider`](crate::ethereum::EthereumProvider) the front door
+    /// resolves a bare `.eth` name through (namehash -> registry -> resolver ->
+    /// contenthash). It is `Box<dyn>` so the SAME shell drives the Phase-1 trusted
+    /// [`RpcProvider`](crate::ethereum::RpcProvider) today and a Phase-2 trustless
+    /// light-client backend later, unchanged.
+    provider: Box<dyn EthereumProvider>,
+    /// The address-bar text to DISPLAY in place of the backend's underlying load
+    /// URL, when they differ.
+    ///
+    /// The ENS front door loads the resolved `ipfs://<cid>` through the seam but
+    /// must keep the `.eth` NAME the user typed in the bar (the identity they care
+    /// about) — no `https://` rewrite, no gateway redirect. So an ENS load sets
+    /// this to the `.eth` name, and [`refresh_chrome`](BrowserShell::refresh_chrome)
+    /// / [`pump`](BrowserShell::pump) show it instead of the backend's
+    /// `ipfs://<cid>` `current_url`. It is [`None`] for an ordinary load (the bar
+    /// then follows the backend's URL, including redirects/history moves), and is
+    /// cleared by any navigation that is not the ENS front door (a plain
+    /// navigate/back/forward/reload), so the name never lingers on a later page.
+    url_override: Option<String>,
 }
 
 impl BrowserShell {
-    /// Build a shell over the given rendering backend.
+    /// Build a shell over the given rendering backend, using the default trusted
+    /// [`RpcProvider`](crate::ethereum::RpcProvider) for ENS resolution.
     ///
     /// The initial chrome reflects the backend's starting state (Idle, empty URL
     /// bar, back/forward derived from the backend's session history), so a caller
-    /// can paint the window before any navigation.
+    /// can paint the window before any navigation. The ENS front door resolves
+    /// through the labelled default trusted RPC; use
+    /// [`with_provider`](BrowserShell::with_provider) to point it at a specific
+    /// endpoint or a Phase-2 backend.
     #[must_use]
     pub fn new(renderer: Box<dyn Renderer>) -> Self {
+        Self::with_provider(renderer, Box::new(RpcProvider::new()))
+    }
+
+    /// Build a shell over the given rendering backend and
+    /// [`EthereumProvider`](crate::ethereum::EthereumProvider).
+    ///
+    /// This is how a caller points the ENS front door at a specific RPC endpoint
+    /// (or, in a test, an in-process fixture provider) rather than the labelled
+    /// default — mirroring `RpcProvider::new` / `with_endpoint`, with no config
+    /// subsystem to chase.
+    #[must_use]
+    pub fn with_provider(renderer: Box<dyn Renderer>, provider: Box<dyn EthereumProvider>) -> Self {
         let mut shell = Self {
             renderer,
             chrome: ChromeState::default(),
+            provider,
+            url_override: None,
         };
         shell.refresh_chrome();
         shell
@@ -122,7 +213,24 @@ impl BrowserShell {
         &self.chrome
     }
 
+    /// The backend's underlying current-load URL, for tests that assert the
+    /// front door fed the resolved `ipfs://<cid>` into the seam (distinct from the
+    /// `.eth` name displayed in the bar). Test-only: production reads the bar via
+    /// [`chrome`](BrowserShell::chrome).
+    #[cfg(test)]
+    fn current_url_for_test(&self) -> Option<String> {
+        self.renderer.current_url()
+    }
+
     /// Navigate to `url` (the URL bar's Enter action), through the seam.
+    ///
+    /// A bare `.eth` URL-bar entry (no scheme, like Brave/Opera — see
+    /// [`eth_name_from_entry`]) is the ENS FRONT DOOR: it is resolved to an
+    /// immutable `ipfs://<cid>` and loaded through the existing verified `ipfs://`
+    /// path via [`navigate_ens_name`](BrowserShell::navigate_ens_name), keeping the
+    /// `.eth` name in the address bar and marking the load's trust posture
+    /// "content-verified, name via trusted RPC". Any other entry is navigated
+    /// literally through the seam.
     ///
     /// On success the URL bar immediately reflects the target and any prior
     /// failure is cleared; an unusable URL is rejected by the backend with
@@ -130,10 +238,112 @@ impl BrowserShell {
     /// stays for the user to fix). The load lifecycle then advances via
     /// [`pump`](BrowserShell::pump).
     pub fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
+        if let Some(name) = eth_name_from_entry(url) {
+            return self.navigate_ens_name(name);
+        }
         self.renderer.navigate(url)?;
+        // A plain navigation follows the backend's URL: drop any ENS name that was
+        // pinned in the bar so it never lingers on a later page.
+        self.url_override = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
         Ok(())
+    }
+
+    /// Resolve a bare `.eth` `name` through the ENS front door and load the
+    /// content it points to.
+    ///
+    /// This is the tracer-bullet path: it resolves `name` via the ENS core
+    /// ([`ens::resolve`](crate::ens::resolve): namehash -> registry -> resolver ->
+    /// contenthash -> ENSIP-7 decode) over the shell's
+    /// [`EthereumProvider`](crate::ethereum::EthereumProvider), then dispatches by
+    /// the DECODED contenthash's OWN type:
+    ///
+    /// * an `ipfs-ns` name feeds its `ipfs://<cid>` into the EXISTING verified
+    ///   `ipfs://` render path (the seam's scheme handler hash-verifies the
+    ///   bytes), and the load is flagged ENS-originated
+    ///   ([`Renderer::mark_ens_origin`]) so the resulting posture is
+    ///   "content-verified, name via trusted RPC" rather than plain
+    ///   `ContentVerified`;
+    /// * every OTHER type (ipns/swarm/arweave/unknown) is the decoder's graceful,
+    ///   protocol-named failure — NEVER defaulted to `ipfs://`.
+    ///
+    /// The address bar keeps `name` (the identity the user typed), not the
+    /// resolved CID: there is no `https://` rewrite and no gateway redirect.
+    ///
+    /// Fail-closed: a resolution failure or an unsupported/absent contenthash
+    /// FAILS the load with a legible reason surfaced in
+    /// [`ChromeState::last_error`], and nothing unverified is ever rendered. A
+    /// failed resolution returns `Ok(())` (the front door handled the entry and
+    /// surfaced the failure in the chrome), not an `Err`, so the URL bar keeps the
+    /// name for the user to see the reason — mirroring how a failed load surfaces
+    /// its reason rather than throwing.
+    fn navigate_ens_name(&mut self, name: &str) -> Result<(), RendererError> {
+        match crate::ens::resolve(self.provider.as_ref(), name) {
+            Ok(DecodedContenthash::Ipfs { uri, .. }) => {
+                // Feed the resolved CID into the EXISTING verified `ipfs://` path.
+                // If the backend cannot even start the load (an unusable URI), that
+                // is a hard error surfaced as a failed front-door load, never a
+                // silent success.
+                if let Err(e) = self.renderer.navigate(&uri) {
+                    self.fail_ens_load(name, &e.to_string());
+                    return Ok(());
+                }
+                // Flag the load ENS-originated so that when the `ipfs://` scheme
+                // handler verifies the bytes and marks the lifecycle, the posture
+                // surfaces `NameViaTrustedRpc` instead of plain `ContentVerified`
+                // (the ENS-origin posture winning over the handler's unconditional
+                // mark). This must come AFTER `navigate` — which resets the flag
+                // on a fresh `begin` — and only fires on a real ENS resolution.
+                self.renderer.mark_ens_origin();
+                // Keep the `.eth` name the user typed in the address bar, not the
+                // resolved CID: no `https://` rewrite, no gateway redirect. The
+                // override PERSISTS across pumps (the load-lifecycle events carry
+                // the `ipfs://<cid>` URL, which would otherwise overwrite the bar),
+                // so the name stays put for the whole ENS load.
+                self.url_override = Some(name.to_string());
+                self.chrome.last_error = None;
+                self.refresh_chrome();
+                Ok(())
+            }
+            // A well-formed but unsupported contenthash (ipns/swarm/arweave/
+            // unknown) is the decoder's named refusal. `resolve` already maps it to
+            // `Err(UnsupportedContenthash)`, so it does not surface here as an
+            // `Ok`; but should the contract ever change, dispatch is by the
+            // DECODED type's OWN kind — only `ipfs-ns` is loadable, so an
+            // `Unsupported` is fail-closed with its named reason, NEVER mis-
+            // dispatched to `ipfs://`.
+            Ok(other @ DecodedContenthash::Unsupported(_)) => {
+                let reason = other
+                    .reason()
+                    .unwrap_or_else(|| "unsupported contenthash protocol".to_string());
+                self.fail_ens_load(name, &reason);
+                Ok(())
+            }
+            // Any typed resolution failure (unnormalizable name, no resolver, no/
+            // malformed/unsupported contenthash, an RPC/seam error) is fail-closed
+            // with its distinct, legible reason — nothing unverified is rendered.
+            Err(e) => {
+                self.fail_ens_load(name, &e.to_string());
+                Ok(())
+            }
+        }
+    }
+
+    /// Fail an ENS front-door load closed: surface `reason` in the chrome and keep
+    /// the `.eth` `name` in the bar, without navigating the backend to anything.
+    ///
+    /// This is the fail-closed path (spec story 3): a resolution failure or an
+    /// unsupported/absent contenthash renders NOTHING — it only reports the
+    /// legible reason the shell surfaces via [`ChromeState::last_error`], with the
+    /// load state left settled so the chrome shows the failure rather than a
+    /// spinner. The trust posture stays untrusted (no verified load happened).
+    fn fail_ens_load(&mut self, name: &str, reason: &str) {
+        // Pin the `.eth` name in the bar (the front door did not navigate the
+        // backend anywhere, so there is no underlying URL to fall back to).
+        self.url_override = Some(name.to_string());
+        self.refresh_chrome();
+        self.chrome.last_error = Some(reason.to_string());
     }
 
     /// Go one step back in session history, through the seam.
@@ -143,6 +353,8 @@ impl BrowserShell {
     /// [`Renderer::go_back`]).
     pub fn go_back(&mut self) {
         self.renderer.go_back();
+        // History navigation follows the backend's URL, not the pinned ENS name.
+        self.url_override = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
     }
@@ -150,13 +362,22 @@ impl BrowserShell {
     /// Go one step forward in session history, through the seam.
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
+        self.url_override = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
     }
 
     /// Reload the current page, through the seam.
+    ///
+    /// A reload re-loads the backend's CURRENT underlying URL (for an ENS page,
+    /// the resolved `ipfs://<cid>`), so it drops any pinned ENS name from the bar
+    /// and follows the backend: Phase 1 does not re-resolve the name on reload
+    /// (the front-door resolution runs only on a fresh URL-bar Enter). The
+    /// reloaded content-addressed page is still hash-verified by the `ipfs://`
+    /// path, so it shows honestly as content-verified.
     pub fn reload(&mut self) -> Result<(), RendererError> {
         self.renderer.reload()?;
+        self.url_override = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
         Ok(())
@@ -190,16 +411,27 @@ impl BrowserShell {
         let mut changed = false;
         while let Some(event) = self.renderer.poll_event() {
             changed = true;
+            // While an ENS name is pinned in the bar (`url_override`), the
+            // lifecycle events carry the underlying `ipfs://<cid>` URL, which must
+            // NOT overwrite the displayed name — the user keeps seeing `ronan.eth`
+            // while the CID loads. `refresh_chrome` below re-applies the override.
+            let pinned = self.url_override.is_some();
             match event {
                 LoadEvent::Started { url } => {
-                    self.chrome.url_text = url;
+                    if !pinned {
+                        self.chrome.url_text = url;
+                    }
                     self.chrome.last_error = None;
                 }
                 LoadEvent::Committed { url } | LoadEvent::Finished { url } => {
-                    self.chrome.url_text = url;
+                    if !pinned {
+                        self.chrome.url_text = url;
+                    }
                 }
                 LoadEvent::Failed { url, reason } => {
-                    self.chrome.url_text = url;
+                    if !pinned {
+                        self.chrome.url_text = url;
+                    }
                     self.chrome.last_error = Some(reason);
                 }
             }
@@ -235,7 +467,14 @@ impl BrowserShell {
         // handler verifies the bytes mid-load, which flips the posture without a
         // queued LoadEvent.
         self.chrome.trust_posture = self.renderer.trust_posture();
-        if let Some(url) = self.renderer.current_url() {
+        // A pinned ENS name (`url_override`) is the DISPLAY identity for the bar
+        // and wins over the backend's underlying `current_url` (the resolved
+        // `ipfs://<cid>`): the user keeps seeing `ronan.eth`, never the CID or a
+        // gateway URL. Otherwise the bar follows the backend's URL (redirects,
+        // history moves).
+        if let Some(name) = &self.url_override {
+            self.chrome.url_text = name.clone();
+        } else if let Some(url) = self.renderer.current_url() {
             self.chrome.url_text = url;
         }
     }
@@ -278,6 +517,13 @@ mod tests {
         /// navigation and flipped to content-verified only when the simulated
         /// verified content-addressed path served this load's bytes.
         posture: TrustPosture,
+        /// Whether the current load was flagged ENS-originated (the shell called
+        /// `mark_ens_origin`), mirroring the real `LoadLifecycle::ens_origin`:
+        /// reset on every fresh `navigate`/`reload`/history move, and consulted by
+        /// the simulated verified content path so it surfaces `NameViaTrustedRpc`
+        /// instead of plain `ContentVerified` — exactly the real backend's
+        /// `mark_content_verified` redirect.
+        ens_origin: bool,
     }
 
     impl BackendInner {
@@ -340,23 +586,41 @@ mod tests {
         }
 
         /// Simulate the `ipfs://` scheme handler serving the current load's main
-        /// resource through the hash-verified content-addressed path: it marks the
-        /// current load content-verified exactly as the real backend does when
-        /// `resolve_ipfs_request` returns verified bytes. Only a load that actually
-        /// went through this path flips the posture — a plain served load never
-        /// calls it.
+        /// resource through the hash-verified content-addressed path: it calls the
+        /// SAME unconditional `mark_content_verified` the real scheme handler does
+        /// (via [`mark_content_verified`](BackendHandle::mark_content_verified)),
+        /// which surfaces `NameViaTrustedRpc` when the load was flagged
+        /// ENS-originated and plain `ContentVerified` otherwise. Only a load that
+        /// actually went through this path flips the posture — a plain served load
+        /// never calls it.
         fn serve_via_verified_content_path(&self) {
-            self.inner.borrow_mut().posture = TrustPosture::ContentVerified;
+            self.mark_content_verified();
         }
 
-        /// Simulate a bare `.eth` load resolving its name to a CID over the
-        /// trusted RPC and feeding it into the verified content path: it marks the
-        /// current load `NameViaTrustedRpc` exactly as the real front-door path
-        /// does on a genuine ENS trusted-RPC resolution. Only a load that actually
-        /// went through this path flips the posture — a plain served load never
-        /// calls it.
+        /// The scheme handler's UNCONDITIONAL verified mark, mirroring the real
+        /// `LoadLifecycle::mark_content_verified`: it redirects to
+        /// `NameViaTrustedRpc` when the current load was flagged ENS-originated
+        /// (`mark_ens_origin`), else plain `ContentVerified`. This is the exact
+        /// mechanism by which the ENS-origin posture WINS over the scheme handler's
+        /// mark without the handler knowing about ENS.
+        fn mark_content_verified(&self) {
+            let mut b = self.inner.borrow_mut();
+            b.posture = if b.ens_origin {
+                TrustPosture::NameViaTrustedRpc
+            } else {
+                TrustPosture::ContentVerified
+            };
+        }
+
+        /// Simulate a bare `.eth` load: flag the current load ENS-originated (as
+        /// the front door's `mark_ens_origin` does) THEN serve it through the
+        /// verified content path (the unconditional `mark_content_verified`), so
+        /// the posture surfaces `NameViaTrustedRpc` — driving the REAL mechanism,
+        /// not setting the posture directly. Only a load actually flagged
+        /// ENS-originated reaches this posture.
         fn serve_via_ens_trusted_rpc(&self) {
-            self.inner.borrow_mut().posture = TrustPosture::NameViaTrustedRpc;
+            self.inner.borrow_mut().ens_origin = true;
+            self.mark_content_verified();
         }
     }
 
@@ -379,8 +643,10 @@ mod tests {
             // A fresh load starts UNVERIFIED and is only marked verified if this
             // load's bytes actually go through the verified content path — exactly
             // the real `LoadLifecycle::begin` reset that keeps the posture tracking
-            // the CURRENT page's load path, never a stale value.
+            // the CURRENT page's load path, never a stale value. The ENS-origin
+            // flag resets too, so it never leaks onto a later load.
             b.posture = TrustPosture::UnverifiedOrigin;
+            b.ens_origin = false;
             b.events.push_back(LoadEvent::Started {
                 url: url.to_string(),
             });
@@ -395,6 +661,7 @@ mod tests {
                 .clone();
             b.state = LoadState::Started;
             b.posture = TrustPosture::UnverifiedOrigin;
+            b.ens_origin = false;
             b.events.push_back(LoadEvent::Started { url });
             Ok(())
         }
@@ -414,6 +681,7 @@ mod tests {
                     let url = b.history[c - 1].clone();
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
+                    b.ens_origin = false;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -427,6 +695,7 @@ mod tests {
                     let url = b.history[c + 1].clone();
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
+                    b.ens_origin = false;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -447,6 +716,12 @@ mod tests {
 
         fn trust_posture(&self) -> TrustPosture {
             self.inner.borrow().posture
+        }
+
+        fn mark_ens_origin(&mut self) {
+            // Flag the current load ENS-originated, exactly as the real
+            // `WebViewRenderer::mark_ens_origin` forwards to the shared lifecycle.
+            self.inner.borrow_mut().ens_origin = true;
         }
 
         fn current_url(&self) -> Option<String> {
@@ -493,6 +768,291 @@ mod tests {
     fn settle(shell: &mut BrowserShell, handle: &BackendHandle) {
         handle.drive_to_finished();
         shell.pump();
+    }
+
+    // ---- The ENS front door: bare `.eth` -> resolve -> verified `ipfs://` -----
+
+    use crate::contenthash::ContenthashError;
+    use crate::ethereum::{EthCall, EthereumProvider, ProviderError};
+    use fetcher::{cid_v1_raw_sha256, Cid};
+
+    /// An in-process [`EthereumProvider`] double answering each `eth_call` in
+    /// order from a queue of canned results — the pinned RPC fixture the front
+    /// door resolves through, off the live network (mirrors the `ens` module's
+    /// own `ScriptedProvider`). It captures the calls so a test could assert the
+    /// calldata, but the front-door tests only care that a name resolves.
+    struct ScriptedProvider {
+        answers: RefCell<VecDeque<Result<Vec<u8>, ProviderError>>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(answers: Vec<Result<Vec<u8>, ProviderError>>) -> Self {
+            Self {
+                answers: RefCell::new(answers.into_iter().collect()),
+            }
+        }
+    }
+
+    impl EthereumProvider for ScriptedProvider {
+        fn eth_call(&self, _call: &EthCall) -> Result<Vec<u8>, ProviderError> {
+            self.answers
+                .borrow_mut()
+                .pop_front()
+                .expect("the scripted provider ran out of canned answers")
+        }
+    }
+
+    /// A 32-byte ABI word holding a right-aligned 20-byte address (a
+    /// `resolver(node)` return).
+    fn address_word(addr20: &[u8; 20]) -> Vec<u8> {
+        let mut word = vec![0u8; 32];
+        word[12..32].copy_from_slice(addr20);
+        word
+    }
+
+    /// ABI-encode a dynamic `bytes` return (a `contenthash(node)` result): an
+    /// offset word (0x20), a length word, then the payload padded to 32 bytes.
+    fn abi_bytes_return(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut offset = [0u8; 32];
+        offset[31] = 0x20;
+        out.extend_from_slice(&offset);
+        let mut len = [0u8; 32];
+        len[24..32].copy_from_slice(&(payload.len() as u64).to_be_bytes());
+        out.extend_from_slice(&len);
+        out.extend_from_slice(payload);
+        let pad = (32 - payload.len() % 32) % 32;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        out
+    }
+
+    /// Encode a multicodec protoCode as an unsigned LEB128 varint (the real
+    /// on-the-wire contenthash prefix; 0xe3 etc. are multi-byte).
+    fn varint(mut code: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (code & 0x7f) as u8;
+            code >>= 7;
+            if code != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if code == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// The raw ENSIP-7 `ipfs-ns` contenthash bytes for a fixture site, plus the
+    /// canonical `ipfs://<cid>` URI they decode to — derived with the SAME
+    /// `cid_v1_raw_sha256` helper the verified path uses, so the CID that the
+    /// front door feeds into the `ipfs://` path is honest.
+    fn ipfs_contenthash_fixture(bytes: &[u8]) -> (Vec<u8>, String) {
+        let cid_str = cid_v1_raw_sha256(bytes).expect("derive fixture cid");
+        let cid_bytes = Cid::try_from(cid_str.as_str())
+            .expect("cid parses")
+            .to_bytes();
+        let mut ch = varint(0xe3); // ipfs-ns protoCode
+        ch.extend_from_slice(&cid_bytes);
+        (ch, format!("ipfs://{cid_str}"))
+    }
+
+    /// Build a shell over a fresh fake backend AND a scripted RPC fixture
+    /// provider, so the ENS front door resolves off the live network. Returns the
+    /// shell and the backend handle (for driving the simulated load signals).
+    fn shell_with_provider(
+        answers: Vec<Result<Vec<u8>, ProviderError>>,
+    ) -> (BrowserShell, BackendHandle) {
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let provider = ScriptedProvider::new(answers);
+        (
+            BrowserShell::with_provider(Box::new(backend), Box::new(provider)),
+            handle,
+        )
+    }
+
+    #[test]
+    fn a_bare_eth_entry_is_recognised_as_an_ens_name() {
+        // Acceptance: a `*.eth` URL-bar entry (no scheme), on Enter or with a
+        // trailing `/`, is recognised as a bare ENS name; anything with an
+        // explicit scheme, a path, or no `.eth` label is NOT.
+        assert_eq!(eth_name_from_entry("ronan.eth"), Some("ronan.eth"));
+        assert_eq!(eth_name_from_entry("ronan.eth/"), Some("ronan.eth"));
+        assert_eq!(eth_name_from_entry("Ronan.ETH"), Some("Ronan.ETH"));
+        assert_eq!(eth_name_from_entry("a.b.eth"), Some("a.b.eth"));
+        // An explicit scheme is literal, never a name (so `ipfs://`/`https://`
+        // are never hijacked, and `ens://` is not required in Phase 1).
+        assert_eq!(eth_name_from_entry("https://ronan.eth/"), None);
+        assert_eq!(eth_name_from_entry("ipfs://bafycid"), None);
+        assert_eq!(eth_name_from_entry("ens://ronan.eth"), None);
+        // Not name-ish enough / not `.eth`.
+        assert_eq!(eth_name_from_entry("example.com"), None);
+        assert_eq!(eth_name_from_entry(".eth"), None);
+        assert_eq!(eth_name_from_entry("ronan.eth/page"), None);
+    }
+
+    #[test]
+    fn a_bare_eth_name_resolves_and_renders_the_ipfs_site_with_the_name_in_the_bar() {
+        // Acceptance (the DONE bar, end to end, offline): a bare `ronan.eth` entry
+        // is recognised, resolved over the pinned RPC fixture to an `ipfs-ns`
+        // contenthash, and loaded through the EXISTING verified `ipfs://` path —
+        // and the address bar keeps `ronan.eth` (no https:// rewrite, no gateway
+        // redirect), while the internal load is the resolved CID. Then the trust
+        // state is "content-verified, name via trusted RPC", distinct from a plain
+        // ipfs load's ContentVerified.
+        let page = b"<!doctype html><title>ronan</title><h1>ronan.eth's immutable site</h1>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),    // registry.resolver(node)
+            Ok(abi_bytes_return(&contenthash)), // resolver.contenthash(node)
+        ]);
+
+        shell
+            .navigate("ronan.eth")
+            .expect("the front door handles a .eth entry");
+        // The bar shows the NAME, not the CID, even while the CID loads.
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert!(shell.chrome().is_loading(), "the ipfs load is in flight");
+        // The underlying load actually went to the resolved `ipfs://<cid>`.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(ipfs_uri.as_str())
+        );
+
+        // The `ipfs://` scheme handler verifies the bytes and marks the load; then
+        // it settles. The name stays pinned in the bar across the pump.
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "the .eth name stays in the bar through the whole verified load"
+        );
+        // The trust state is the DISTINCT name-via-trusted-RPC posture, NEVER the
+        // plain content-verified one (Phase 1 makes no name-verification claim).
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+        assert!(!shell.chrome().is_content_verified());
+        assert_eq!(shell.chrome().last_error, None);
+    }
+
+    #[test]
+    fn a_plain_ipfs_load_stays_content_verified_and_the_ens_posture_does_not_leak() {
+        // Acceptance: a plain (non-ENS) `ipfs://` load still shows ContentVerified,
+        // and navigating there AFTER an ENS load does not carry the ENS posture or
+        // the ENS name over — a fresh navigation resets both.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, _uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // First: a real ENS load ends in the name-via-trusted-RPC posture.
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+
+        // Then: a plain `ipfs://<cid>` load (typed directly, no ENS) is plain
+        // ContentVerified — the ENS posture does NOT leak onto it, and the bar
+        // shows the ipfs URL, not `ronan.eth`.
+        shell
+            .navigate("ipfs://bafyplaincid/index.html")
+            .expect("a plain ipfs url navigates");
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyplaincid/index.html");
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::ContentVerified,
+            "a plain ipfs load is plain content-verified, not the ENS posture"
+        );
+        assert!(shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+
+        // And a later plain served load is untrusted (neither posture leaks).
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn an_unsupported_name_fails_closed_with_its_protocol_named_reason() {
+        // Acceptance: a name whose contenthash is an unsupported protocol
+        // (swarm-ns here) FAILS the load with the decoder's distinct, protocol-
+        // named reason in the chrome — NEVER a mis-dispatch to ipfs://, never a
+        // rendered page. Fail-closed.
+        let mut swarm_ch = varint(0xe4); // swarm-ns
+        swarm_ch.extend_from_slice(b"some swarm address bytes");
+        let (mut shell, _handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x44u8; 20])),
+            Ok(abi_bytes_return(&swarm_ch)),
+        ]);
+
+        shell
+            .navigate("swarm-site.eth")
+            .expect("the front door handles the entry (and fails it closed)");
+        // Nothing was navigated to / rendered: the backend has no ipfs load.
+        assert_eq!(
+            shell.current_url_for_test(),
+            None,
+            "nothing unverified loaded"
+        );
+        // The chrome surfaces the distinct, protocol-named reason, and the name
+        // stays in the bar.
+        assert_eq!(shell.chrome().url_text, "swarm-site.eth");
+        assert_eq!(
+            shell.chrome().last_error.as_deref(),
+            Some("points to Swarm, not supported")
+        );
+        // The trust posture never became verified.
+        assert!(!shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn a_name_with_no_contenthash_fails_closed() {
+        // Fail-closed: a name whose resolver returns an empty contenthash (no site
+        // set) fails the load with the decoder's distinct "no contenthash" reason,
+        // never a guessed or unverified render.
+        let (mut shell, _handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&[])), // empty contenthash -> NoContenthash
+        ]);
+        shell.navigate("empty.eth").expect("handled, failed closed");
+        assert_eq!(shell.current_url_for_test(), None);
+        assert_eq!(
+            shell.chrome().last_error,
+            Some(ContenthashError::NoContenthash.to_string())
+        );
+        assert!(!shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn a_resolution_rpc_error_fails_closed_with_a_legible_reason() {
+        // Fail-closed: an RPC/seam error during resolution fails the load with a
+        // legible reason, never renders anything.
+        let (mut shell, _handle) = shell_with_provider(vec![Err(ProviderError::Transport(
+            "connection refused".to_string(),
+        ))]);
+        shell
+            .navigate("unreachable.eth")
+            .expect("handled, failed closed");
+        assert_eq!(shell.current_url_for_test(), None);
+        let reason = shell.chrome().last_error.clone().expect("a legible reason");
+        assert!(
+            reason.contains("connection refused"),
+            "the chrome surfaces the seam's reason: {reason}"
+        );
+        assert!(!shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
     }
 
     #[test]

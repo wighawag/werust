@@ -615,6 +615,33 @@ pub trait Renderer {
     fn trust_posture(&self) -> TrustPosture {
         TrustPosture::UnverifiedOrigin
     }
+
+    /// Flag the CURRENT load as originating from an ENS name resolved over a
+    /// TRUSTED RPC (the bare-`.eth` front door).
+    ///
+    /// This is the seam signal the front door
+    /// (`bare-eth-urlbar-front-door-end-to-end`) uses to resolve the
+    /// posture-marking clash: an ENS name resolves to an `ipfs://<cid>` that is
+    /// then loaded through the EXISTING verified `ipfs://` path, whose scheme
+    /// handler marks any verified resolution [`TrustPosture::ContentVerified`].
+    /// The shell calls this the moment it has resolved a name over the trusted
+    /// RPC and is about to feed the CID into that path, so the backend surfaces
+    /// the honest [`TrustPosture::NameViaTrustedRpc`] posture for THIS load
+    /// instead — the bytes still hash-verify, but the name->CID mapping was taken
+    /// on the RPC's word.
+    ///
+    /// It MUST track the ACTUAL load path, exactly like
+    /// [`trust_posture`](Renderer::trust_posture): a backend upgrades to the ENS
+    /// posture ONLY when this load genuinely verifies through the
+    /// content-addressed path AND was flagged here, never from a `.eth`-looking
+    /// URL, and a fresh navigation resets the flag so it never leaks onto a later
+    /// plain `ipfs://` or served load.
+    ///
+    /// The provided default is a no-op: a backend with no verified
+    /// content-addressed path (a plain renderer, a fixed-subset native path)
+    /// cannot surface the ENS posture, so flagging is simply ignored and the load
+    /// stays untrusted.
+    fn mark_ens_origin(&mut self) {}
 }
 
 #[cfg(test)]

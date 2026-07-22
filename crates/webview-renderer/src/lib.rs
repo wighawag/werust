@@ -64,6 +64,25 @@ pub struct LoadLifecycle {
     /// resource through the hash-verified content-addressed fetch path. A plain
     /// served load never calls it, so it stays untrusted.
     posture: TrustPosture,
+    /// Whether the CURRENT load originated from an ENS name resolved over the
+    /// trusted RPC (the bare-`.eth` front door).
+    ///
+    /// This is the flag that resolves the posture-marking clash the front-door
+    /// task (`bare-eth-urlbar-front-door-end-to-end`) owns. The `ipfs://` scheme
+    /// handler calls [`mark_content_verified`](LoadLifecycle::mark_content_verified)
+    /// UNCONDITIONALLY on any verified resolution and knows nothing about ENS; so
+    /// when this flag is set, that same mark surfaces
+    /// [`TrustPosture::NameViaTrustedRpc`] instead of the plain
+    /// [`TrustPosture::ContentVerified`] — the ENS-origin posture WINS over the
+    /// scheme handler's mark without the handler having to know it was ENS.
+    ///
+    /// Like [`posture`](Self::posture) it tracks the ACTUAL load path: every fresh
+    /// [`begin`](LoadLifecycle::begin) resets it to `false`, and only the
+    /// front-door path that genuinely resolved a name over the trusted RPC sets it
+    /// via [`mark_ens_origin`](LoadLifecycle::mark_ens_origin) — never a
+    /// `.eth`-looking URL on its own — so it never leaks onto a later plain
+    /// `ipfs://` or served load.
+    ens_origin: bool,
 }
 
 impl LoadLifecycle {
@@ -81,6 +100,11 @@ impl LoadLifecycle {
         self.url = Some(url.to_string());
         self.state = LoadState::Started;
         self.posture = TrustPosture::UnverifiedOrigin;
+        // A fresh load is not ENS-originated until the front door proves it is
+        // (by resolving a name over the trusted RPC and calling
+        // `mark_ens_origin`). Resetting here is what keeps the ENS posture from
+        // leaking onto a later plain `ipfs://` or served load.
+        self.ens_origin = false;
         self.events.push_back(LoadEvent::Started {
             url: url.to_string(),
         });
@@ -98,7 +122,43 @@ impl LoadLifecycle {
     /// load (the handler returns an error and never calls this), so a page that
     /// merely LOOKS content-addressed is never reported verified.
     pub fn mark_content_verified(&mut self) {
-        self.posture = TrustPosture::ContentVerified;
+        // The `ipfs://` scheme handler calls this UNCONDITIONALLY on any verified
+        // resolution. For an ENS-originated load (the front door resolved the
+        // name over the trusted RPC and fed the CID into this verified path) the
+        // honest posture is `NameViaTrustedRpc`, NOT the plain `ContentVerified`:
+        // the bytes hash-verified, but the name->CID mapping was taken on the
+        // RPC's word. Redirecting the mark here — rather than teaching the scheme
+        // handler about ENS — is how the ENS-origin posture WINS over the
+        // handler's unconditional content-verified mark.
+        self.posture = if self.ens_origin {
+            TrustPosture::NameViaTrustedRpc
+        } else {
+            TrustPosture::ContentVerified
+        };
+    }
+
+    /// Flag the CURRENT load as originating from an ENS name resolved over the
+    /// trusted RPC (the bare-`.eth` front door).
+    ///
+    /// The front-door path calls this the moment it has resolved a name to its
+    /// contenthash over the trusted RPC and is about to feed the resulting CID
+    /// into the verified `ipfs://` load. It does NOT itself claim any trust: it
+    /// only records that IF this load verifies through the content-addressed
+    /// path, the honest posture is [`TrustPosture::NameViaTrustedRpc`] rather than
+    /// [`TrustPosture::ContentVerified`] (see
+    /// [`mark_content_verified`](LoadLifecycle::mark_content_verified)). A load
+    /// that fails verification never gets marked at all, so it stays untrusted;
+    /// and a fresh [`begin`](LoadLifecycle::begin) clears the flag, so it never
+    /// leaks onto a later load.
+    pub fn mark_ens_origin(&mut self) {
+        self.ens_origin = true;
+    }
+
+    /// Whether the CURRENT load was flagged as ENS-originated (see
+    /// [`mark_ens_origin`](LoadLifecycle::mark_ens_origin)).
+    #[must_use]
+    pub fn is_ens_origin(&self) -> bool {
+        self.ens_origin
     }
 
     /// Mark the CURRENT load as content-verified-but-name-via-a-trusted-RPC: its
@@ -791,6 +851,72 @@ mod tests {
             life.borrow().posture(),
             TrustPosture::UnverifiedOrigin,
             "the name-via-trusted-RPC posture does not leak onto a later plain served load"
+        );
+    }
+
+    #[test]
+    fn the_ens_origin_flag_redirects_the_scheme_handlers_verified_mark_and_does_not_leak() {
+        // The load-bearing posture-clash mechanism the front door owns: the
+        // `ipfs://` scheme handler calls `mark_content_verified` UNCONDITIONALLY;
+        // an ENS-originated load (flagged via `mark_ens_origin`, exactly as the
+        // front door does after starting the `ipfs://<cid>` load) must surface
+        // `NameViaTrustedRpc` from that SAME unconditional mark, while a plain
+        // ipfs load surfaces plain `ContentVerified` — and neither leaks onto a
+        // later load (a fresh `begin` clears the flag).
+        let mut life = LoadLifecycle::default();
+
+        // An ENS-originated verified load: begin, flag ENS, THEN the scheme
+        // handler's unconditional verified mark redirects to the ENS posture.
+        life.begin("ipfs://bafyenscid/index.html");
+        assert!(!life.is_ens_origin(), "begin resets the flag");
+        life.mark_ens_origin();
+        assert!(life.is_ens_origin());
+        life.mark_content_verified(); // the scheme handler's UNCONDITIONAL mark
+        assert_eq!(
+            life.posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS-origin flag makes the scheme handler's mark surface the ENS posture"
+        );
+        assert!(
+            !life.posture().is_content_verified(),
+            "never labelled verified"
+        );
+
+        // A later PLAIN ipfs load: begin clears the ENS flag, so the SAME
+        // unconditional verified mark surfaces plain content-verified — the ENS
+        // posture does not leak.
+        life.begin("ipfs://bafyplaincid/index.html");
+        assert!(!life.is_ens_origin(), "a fresh begin clears the ENS flag");
+        life.mark_content_verified();
+        assert_eq!(
+            life.posture(),
+            TrustPosture::ContentVerified,
+            "a plain ipfs load is plain content-verified, not the ENS posture"
+        );
+
+        // A later plain served load (no verified mark) is untrusted.
+        life.begin("https://example.com/");
+        assert_eq!(life.posture(), TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn an_ens_flagged_load_that_fails_verification_is_never_marked() {
+        // Fail-closed at the lifecycle: an ENS-flagged load whose bytes never
+        // verify (the scheme handler returns an error and never calls
+        // `mark_content_verified`) stays untrusted — the ENS flag alone claims
+        // NOTHING.
+        let mut life = LoadLifecycle::default();
+        life.begin("ipfs://bafyenscid/");
+        life.mark_ens_origin();
+        // No verified mark: the load failed verification.
+        life.fail(
+            "ipfs://bafyenscid/",
+            "ipfs:// content-addressed load failed: hash mismatch",
+        );
+        assert_eq!(
+            life.posture(),
+            TrustPosture::UnverifiedOrigin,
+            "an ENS-flagged load that never verified is never reported trusted"
         );
     }
 

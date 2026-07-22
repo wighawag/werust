@@ -1,1 +1,10 @@
 /target
+
+# Android app module (crates/werust-android) build scratch + local config.
+# The Gradle wrapper (gradlew, gradle/wrapper/*) IS tracked; only build output
+# and machine-local config are ignored.
+crates/werust-android/.gradle/
+crates/werust-android/build/
+crates/werust-android/app/build/
+crates/werust-android/local.properties
+crates/werust-android/**/*.iml

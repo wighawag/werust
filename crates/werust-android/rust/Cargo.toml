@@ -1,0 +1,27 @@
+[package]
+name = "werust-android-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `werust_mobile` (not `werust_core`) so the cdylib/rlib output does not collide
+# with the shared `werust-core` crate's rlib in the workspace. The APK carries
+# `libwerust_mobile.so` and Kotlin loads it via System.loadLibrary("werust_mobile").
+name = "werust_mobile"
+# cdylib: the `libwerust_mobile.so` the APK carries and Kotlin loads via
+# System.loadLibrary. staticlib: the `.a` for anyone who wants to statically
+# link the core. rlib: so the host `cargo test` in the verify gate can exercise
+# the JVM-free logic (CoreSession/AndroidBackend/ffi_json) without the JNI layer.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+renderer = { path = "../../renderer" }
+werust-core = { path = "../../werust-core" }
+
+# The JNI bridge is only compiled for the Android target (the host verify gate
+# tests the JVM-free logic; it never links against the JVM). Keeping `jni`
+# Android-only keeps the always-on `cargo test` lean and JVM-free.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { version = "0.21", default-features = false }

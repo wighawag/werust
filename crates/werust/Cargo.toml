@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
 webview-renderer = { path = "../webview-renderer" }
 native-renderer = { path = "../native-renderer" }
 fetcher = { path = "../fetcher" }

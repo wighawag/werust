@@ -2,11 +2,13 @@
 resolver = "2"
 members = [
     "crates/werust",
+    "crates/werust-core",
     "crates/renderer",
     "crates/webview-renderer",
     "crates/native-renderer",
     "crates/fetcher",
     "crates/script-engine",
+    "crates/werust-android/rust",
 ]
 
 [workspace.package]

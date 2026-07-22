@@ -10,8 +10,10 @@
 //! on the GTK main loop. It never calls WebKitGTK directly; the live view is
 //! embedded via the seam's opaque [`ViewHandle`], and page interaction
 //! (scroll/click/focus/type) is served by that embedded, focused widget.
-
-mod shell;
+//!
+//! The seam-driving logic itself is NOT here: [`BrowserShell`]/[`ChromeState`]
+//! live in the shared `werust-core` crate ("the Rust core"), so the SAME core
+//! backs this GTK view, the Android Kotlin edge, and the iOS Swift edge.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -22,8 +24,8 @@ use gtk4::{
     glib, Application, ApplicationWindow, Box as GtkBox, Button, Entry, Label, Orientation, Widget,
 };
 
-use shell::{BrowserShell, ChromeState};
 use webview_renderer::WebViewRenderer;
+use werust_core::{BrowserShell, ChromeState};
 
 /// The URL werust opens when none is given on the command line.
 const DEFAULT_URL: &str = "https://example.com/";
@@ -238,9 +240,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 
 #[cfg(test)]
 mod tests {
-    use super::shell::ChromeState;
     use super::{banner, status_line, DEFAULT_URL};
     use renderer::LoadState;
+    use werust_core::ChromeState;
 
     #[test]
     fn banner_names_werust() {

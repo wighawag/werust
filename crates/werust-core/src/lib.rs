@@ -1,12 +1,15 @@
-//! The browser product shell, driven entirely through the [`Renderer`] seam.
+//! The werust **core**: the browser product shell, driven entirely through the
+//! [`Renderer`] seam.
 //!
-//! This module owns the *logic* of the shell — the URL bar, the
-//! back/forward/reload/stop controls, and the chrome that reflects load state —
-//! WITHOUT any GTK. The GTK window in [`main`](crate) is a thin view over this:
-//! it renders [`ChromeState`] into widgets and forwards button/entry actions to
-//! [`BrowserShell`]. Keeping the logic GTK-free is what lets the shell↔seam
-//! wiring be tested at the seam boundary (a `dyn Renderer`), not against GTK
-//! internals — exactly the boundary `CONTEXT.md` and the task call for.
+//! This crate is "the Rust core" `CONTEXT.md` names: the browsing *logic* — the
+//! URL bar, the back/forward/reload/stop controls, and the chrome that reflects
+//! load state — behind the seams, WITHOUT any OS toolkit. Every OS edge is a thin
+//! view over this SAME core: the desktop GTK window (`werust` binary) renders
+//! [`ChromeState`] into GTK widgets and forwards actions to [`BrowserShell`]; the
+//! Android Kotlin `Activity` and the iOS Swift shell drive the exact same shell
+//! over an FFI surface. Keeping the logic toolkit-free is what lets the shell↔seam
+//! wiring be tested at the seam boundary (a `dyn Renderer`), not against any GUI
+//! internals — exactly the boundary `CONTEXT.md` and the mobile tasks call for.
 //!
 //! All page navigation goes THROUGH the seam: [`navigate`](BrowserShell::navigate),
 //! [`go_back`](BrowserShell::go_back), [`go_forward`](BrowserShell::go_forward),

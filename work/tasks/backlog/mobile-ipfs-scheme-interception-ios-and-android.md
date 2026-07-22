@@ -2,25 +2,20 @@
 title: "Mobile ipfs:// interception on iOS (WKURLSchemeHandler) and Android (shouldInterceptRequest), routed through the werust-core resolve path"
 slug: mobile-ipfs-scheme-interception-ios-and-android
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
-needsAnswers: true
 blockedBy: []
 covers: [1]
 ---
 
-<!-- open-questions -->
+## Settled decisions (from the design discussion — DECIDED, build to them)
 
-## Open questions
-
-1. **Android custom-scheme viability.** Android's System WebView may refuse a custom TOP-LEVEL scheme (`ipfs://`) even with `WebViewClient.shouldInterceptRequest`. Confirm whether `shouldInterceptRequest` fires for a main-frame `ipfs://` navigation, or whether we must map to an internal `https://appassets.androidplatform.net/...` origin (a `WebViewAssetLoader` pattern) that the core resolves as `ipfs://` internally while the address bar still shows the `.eth` name. DECIDE which mechanism (native custom scheme vs internal-https mapping) before building; it changes the Android edge shape.
-2. **iOS `WKURLSchemeHandler` for a main-frame navigation.** Confirm a `WKURLSchemeHandler` registered for `ipfs` handles a top-level navigation (not just subresources) on the WKWebView, and that streaming the response back through `WKURLSchemeTask` from the Rust core is viable. If a top-level custom scheme is restricted, the same internal-https fallback as Android applies — keep the two platforms consistent.
-
-<!-- /open-questions -->
+1. **Interception mechanism = native custom scheme first, internal-https fallback if the platform refuses it, verified per platform AT BUILD TIME.** Prefer the native custom-scheme hook (`WebViewClient.shouldInterceptRequest` on Android; `WKURLSchemeHandler` for `ipfs` on iOS). Both have known edge cases for a TOP-LEVEL (main-frame) custom-scheme navigation (Android especially may not fire `shouldInterceptRequest` for a top-level `ipfs://`; iOS `WKURLSchemeHandler` works since iOS 11 but has main-frame caveats). So the builder VERIFIES which actually works on each platform during the build and, if the native scheme is refused for a top-level navigation, falls back to an internal `https://appassets…`/`WebViewAssetLoader`-style origin that the core resolves as `ipfs://` while the address bar still shows the `.eth` name. Record which mechanism each platform ended up using. This is a build-time engineering verification, not an open product question.
+2. **Both platforms stay consistent** (same mechanism choice where possible) and route through the SAME `werust-core` resolve path desktop uses — no forked mobile resolver. The mobile Rust backend's `register_scheme_handler` no-op must become real (or the OS edge intercepts and calls the core); a silent no-op is not acceptable (this is exactly what the parity guard forbids).
 
 ## What to build
 
 Make a resolved `ipfs://<cid>` actually load on BOTH mobile edges instead of dying with `net::ERR_UNKNOWN_URL_SCHEME`. Today `ipfs://` is intercepted only on desktop (WebKitGTK `register_uri_scheme`): the Android Rust backend's `register_scheme_handler` is an empty no-op and the Kotlin `WebViewClient` has no `shouldInterceptRequest`; iOS has no `WKURLSchemeHandler`. So on mobile the ENS front door resolves the name fine, then hands the WebView an `ipfs://` URL it cannot load.
 
-Wire real `ipfs://` interception on iOS (WKWebView via `WKURLSchemeHandler`) and Android (System WebView via `WebViewClient.shouldInterceptRequest`, or the internal-https mapping per the open questions), routing the request into the SAME `werust-core` resolve path the desktop `install_ipfs` uses, so the SAME content resolution, trust posture, and fail-closed behaviour apply on all three platforms. The mobile Rust backend's `register_scheme_handler` must stop being a silent no-op — either it becomes real, or the OS-edge (Kotlin/Swift) does the interception and calls back into the core, but EITHER way the capability is implemented, not stubbed.
+Wire real `ipfs://` interception on iOS (WKWebView via `WKURLSchemeHandler`) and Android (System WebView via `WebViewClient.shouldInterceptRequest`, or the internal-https mapping per the settled decisions), routing the request into the SAME `werust-core` resolve path the desktop `install_ipfs` uses, so the SAME content resolution, trust posture, and fail-closed behaviour apply on all three platforms. The mobile Rust backend's `register_scheme_handler` must stop being a silent no-op — either it becomes real, or the OS-edge (Kotlin/Swift) does the interception and calls back into the core, but EITHER way the capability is implemented, not stubbed.
 
 This task depends on whatever `ipfs://` resolution semantics land on desktop (single-block verified + multi-block gateway-served-with-warning, from `ipfs-render-unverified-gateway-fallback-for-multiblock-unixfs`): mobile must reuse that same core path, not fork its own.
 
@@ -36,7 +31,7 @@ This task depends on whatever `ipfs://` resolution semantics land on desktop (si
 
 ## Blocked by
 
-- None to START, but `needsAnswers: true` — the mobile interception mechanism (native custom scheme vs internal-https mapping) must be settled first, and this should build on the desktop `ipfs://` semantics from `ipfs-render-unverified-gateway-fallback-for-multiblock-unixfs` (reuse, don't fork). Do not autonomously build until the flag is cleared.
+- None to START, the design forks are settled above. Do not autonomously build until the flag is cleared.
 
 ## Prompt
 

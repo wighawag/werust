@@ -2,29 +2,21 @@
 title: "Platform-capability parity guard: no feature silently lands on one context only (verify-enforced matrix + no-silent-no-op-seam rule)"
 slug: platform-capability-parity-guard
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
-needsAnswers: true
 blockedBy: []
 covers: []
 ---
 
-<!-- open-questions -->
+## Settled decisions (from the design discussion — DECIDED, build to them)
 
-## Open questions
-
-1. **Guard shape + strictness.** Which mechanism (one, or both)?
-   - A checked-in **capability matrix** (one row per cross-cutting user-facing capability, columns = desktop / iOS / Android, each cell one of `implemented` / `stubbed` (with a REQUIRED linked follow-on task slug) / `n-a` (with a reason)), enforced by a `verify`-time test that FAILS the gate if any cell is `stubbed` without a resolvable linked task, or is missing/unknown.
-   - An **ADR + lint rule** establishing "a seam/trait method may not be silently no-op'd on any backend": an empty stub impl must be explicitly marked (a known marker/attribute) AND linked to a tracked task, and a guard test greps for unmarked empty seam impls and reds the gate.
-   DECIDE which (the matrix catches capability-level gaps; the no-op rule catches method-level gaps; they are complementary). Confirm before building.
-2. **Capability granularity + initial rows.** What counts as a "cross-cutting capability" (address bar, back/forward, `ipfs://` render, ENS `.eth` resolution, EIP-1193 provider injection, trust indicator, ...)? Seed the matrix with the current real state (e.g. `ipfs://` render = desktop `implemented`, iOS/Android `stubbed` -> linked to `mobile-ipfs-scheme-interception-ios-and-android`). Confirm the seed list.
-3. **Where enforcement runs.** Is the guard a normal `cargo test` (so it runs inside the existing `verify` = `fmt && clippy && build && test` gate automatically), or a separate script wired into `verify.yml`/`.goreleaser`? Prefer a plain test in the workspace so it rides the existing gate with no CI change; confirm.
-
-<!-- /open-questions -->
+1. **Build BOTH complementary mechanisms.** (a) A checked-in **capability matrix** (one row per cross-cutting user-facing capability; columns desktop / iOS / Android; each cell `implemented` / `stubbed`+REQUIRED-linked-follow-on-task-slug / `n-a`+reason), and (b) a **no-silent-no-op-seam rule**: an empty/no-op seam-trait impl on any backend must be explicitly marked AND task-linked. (a) catches capability-level gaps; (b) catches method-level gaps.
+2. **Enforcement = a plain workspace `cargo test`** so it rides the existing `verify` gate (`fmt && clippy && build && test`) with NO CI change. The guard test FAILS when any capability cell is `stubbed`/unknown without a resolvable linked task, or when an unmarked no-op seam impl exists.
+3. **Seed the matrix with current real state:** address bar, back/forward, ENS `.eth` resolution, EIP-1193 provider injection, trust indicator = `implemented` on all three; `ipfs://` render = desktop `implemented`, iOS/Android `stubbed` -> linked to `mobile-ipfs-scheme-interception-ios-and-android`. (Confirm/extend the row list against the code when building.) So the guard passes today ONLY because the known gap is tracked, not hidden.
 
 ## What to build
 
 A durable mechanism guaranteeing that every cross-cutting feature is EITHER implemented on all shipped contexts (desktop, iOS, Android) OR has a tracked task (an exploration task if needed) covering its completion — so a capability can never again silently ship on one platform only and be forgotten. This exists because the `ipfs://`-render gap was invisible: a seam method (`register_scheme_handler`) was silently no-op'd on the mobile backend, a whole capability shipped desktop-only, the release looked green, and nothing flagged it.
 
-Build the guard agreed in the open questions — a `verify`-enforced capability matrix and/or a no-silent-no-op-seam rule — and SEED it with the current true state so the existing known gaps (mobile `ipfs://` render) are recorded as `stubbed` with their follow-on task linked, turning "we forgot" into a gate failure. The guard must be cheap to keep honest: adding a new capability or a new platform forces a matrix row/column, and a bare unimplemented stub with no linked task reds the gate.
+Build the guard settled above — a `verify`-enforced capability matrix AND a no-silent-no-op-seam rule — and SEED it with the current true state so the existing known gaps (mobile `ipfs://` render) are recorded as `stubbed` with their follow-on task linked, turning "we forgot" into a gate failure. The guard must be cheap to keep honest: adding a new capability or a new platform forces a matrix row/column, and a bare unimplemented stub with no linked task reds the gate.
 
 ## Acceptance criteria
 
@@ -37,7 +29,7 @@ Build the guard agreed in the open questions — a `verify`-enforced capability 
 
 ## Blocked by
 
-- None to START, but `needsAnswers: true` — the guard shape/strictness, capability granularity, and enforcement location must be settled first. Do not autonomously build until the flag is cleared.
+- None to START, the design forks are settled above. Do not autonomously build until the flag is cleared.
 
 ## Prompt
 

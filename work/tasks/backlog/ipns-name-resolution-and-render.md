@@ -2,20 +2,21 @@
 title: "IPNS name resolution and render — resolve ipns-ns (mutable) pointers to their current CID via verifiable IPNS records, then render through the verified ipfs:// path"
 slug: ipns-name-resolution-and-render
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
-needsAnswers: true
 blockedBy: [verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend]
 covers: [1]
 ---
 
-<!-- open-questions -->
+## Settled decisions (from the design discussion — DECIDED, build to them)
 
-## Open questions
-
-1. **IPNS record retrieval + verification (no node).** The [Trustless Gateway spec](https://specs.ipfs.tech/http-gateways/trustless-gateway/) §1.3 exposes `GET /ipns/{key}?format=ipns-record` (`Accept: application/vnd.ipfs.ipns-record`, multicodec `0x0300`) \u2014 a VERIFIABLE IPNS record over plain HTTP, no node. DECIDE: resolve IPNS this way (record fetched from a delegated/trustless endpoint, then the record's signature + validity verified client-side against the IPNS key), reusing the same untrusted-source-plus-client-verify shape as the CAR path? Confirm the vetted Rust crate for IPNS record decode + signature verification (bind, don't hand-roll \u2014 `docs/adr/0001`). Note the two IPNS name kinds: a libp2p-key IPNS name (a public-key hash, verified by signature) vs a DNSLink name (`_dnslink` TXT -> `/ipfs/<cid>` or `/ipns/<key>`), which is a DNS lookup, NOT a signed record \u2014 decide whether DNSLink is in scope here or its own follow-on.
-2. **Trust posture for a mutable pointer.** An IPNS name is MUTABLE: even with a signature-verified record and content-verified bytes, the name->CID mapping can change and the resolver could serve a stale-but-signed or withheld record. DECIDE the honest posture: is a signature-verified IPNS record that resolves to a content-verified CID `ContentVerified` (bytes are hash-checked; the record is signed) but flagged mutable, or does it get its own distinct posture / warning (mutable name), NEVER implying the immutability an `ipfs-ns` CID has? This is a trust-honesty call like the `NameViaTrustedRpc` decision \u2014 record it (likely an ADR).
-3. **Where IPNS enters.** Two entry points: (a) an ENS `contenthash` whose protoCode is `ipns-ns` (`0xe5`) \u2014 the decoder currently NAMES this "mutable IPNS pointer, not yet supported"; (b) a direct `ipns://<name>` / a `.eth` whose contenthash is ipns-ns. DECIDE the surface (do we accept a bare `ipns://` in the URL bar, or only ipns-ns via ENS in Phase 1?) and how the front door dispatches it.
-
-<!-- /open-questions -->
+1. **Record retrieval + verification:** resolve IPNS via `GET /ipns/{key}?format=ipns-record` (`application/vnd.ipfs.ipns-record`, multicodec `0x0300`) from a trustless/delegated endpoint, then verify the record's signature + validity window CLIENT-SIDE against the IPNS key — same untrusted-source-plus-client-verify discipline as the CAR blocks. Bind a vetted IPNS-record crate for decode + signature verification (`docs/adr/0001`); do not hand-roll signature crypto.
+2. **DNSLink is OUT of scope here** (a named follow-on): it is a `_dnslink` DNS TXT lookup, a different trust story from a signed libp2p-key record. This task does libp2p-key IPNS names only.
+3. **Entry surface = ipns-ns via ENS only (Phase 1):** flip the ENSIP-7 decoder's `ipns-ns` (`0xe5`) refusal into a route into IPNS resolution, dispatched by the ENS front door. A bare `ipns://` in the URL bar is a follow-on, not this task.
+4. **Trust posture = a NEW distinct `MutableName` warning (the two-axis model).** werust's trust indicator has TWO orthogonal axes and shows the MOST IMPORTANT applicable warning (see `work/notes/observations/trust-posture-two-axes-model-2026-07-22.md`):
+   - Axis 1 resolution-trust: how the name->CID was learned (ENS Phase 1 = `NameViaTrustedRpc`; IPNS = a client-verified signed record, no RPC warning).
+   - Axis 2 mutability: can the controller repoint the name? IPNS (key holder) and ENS (owner `setContenthash`) are BOTH mutable; only a direct `ipfs://<cid>` is immutable. We cannot cheaply detect a locked/immutable ENS name yet, so mutable is the honest default.
+   - Add a NEW `TrustPosture::MutableName` ("content-verified, mutable name"): bytes hash-verified but the name is controller-repointable. Distinct from `ContentVerified` (honestly weaker) and from `UnverifiedOrigin` (the bytes DID verify). Thread it like the existing postures (renderer -> webview -> core `ChromeState` -> desktop chrome), with a legible warning label, NEVER "verified".
+   - Display rule: show the loudest applicable warning. An IPNS load shows `MutableName`. This task ALSO reframes ENS: an ENS ipfs-ns load is mutable too, but its LOUDER warning is `NameViaTrustedRpc` (a misdirecting RPC is worse than an owner repointing), so ENS Phase-1 keeps showing `NameViaTrustedRpc` — `MutableName` becomes what ENS shows once Phase-2 clears the RPC-trust warning. Keep the display precedence explicit so ENS falls back to `MutableName` with no rule change later.
+5. **TOFU (pin-and-warn-on-change) is a follow-on** (`ipns-tofu-pin-and-warn-on-change`): record a mutable name's blessed CID, warn on a later change. Needs a pin store + popup; not this task.
 
 ## What to build
 
@@ -28,14 +29,14 @@ This builds ON the verifiable-retrieval task (`verifiable-ipfs-content-retrieval
 - [ ] A libp2p-key IPNS name resolves to its current CID via a verifiable IPNS record (record fetched from an untrusted endpoint, signature + validity verified client-side against the key), NO IPFS node required.
 - [ ] The resolved CID renders through the verified `ipfs://` path (reusing the DAG/CAR retrieval task's output), so an IPNS name pointing at a real directory site renders end to end.
 - [ ] An `ipns-ns` (`0xe5`) ENS contenthash is no longer a hard "not supported" refusal: it routes into IPNS resolution (the ENSIP-7 decoder + front door are updated), while every OTHER unsupported protoCode stays a named refusal.
-- [ ] The trust posture for a resolved IPNS page is HONEST about mutability (the settled posture from the open questions), NEVER implying an ipns-ns pointer is as immutable as an ipfs-ns CID.
+- [ ] A resolved IPNS page shows the NEW `TrustPosture::MutableName` warning ("content-verified, mutable name"), threaded to a distinct legible indicator; it is NEVER `ContentVerified` and NEVER labelled "verified". ENS ipfs-ns loads keep showing `NameViaTrustedRpc` (the louder warning) per the display-precedence rule, and the precedence is explicit so ENS falls back to `MutableName` once Phase-2 clears the RPC warning.
 - [ ] Fail-closed on every failure: unresolvable name, invalid/expired/unsigned record, a record pointing at an unsupported/unverifiable contenthash \u2014 each a distinct legible reason, nothing guessed or unverified rendered.
-- [ ] (If DNSLink is in scope per the open questions) a DNSLink name resolves via its `_dnslink` TXT record to `/ipfs/<cid>` or `/ipns/<key>`; else DNSLink is explicitly deferred to a named follow-on.
+- [ ] DNSLink is explicitly deferred (a named follow-on), not built here.
 - [ ] Tests are network-isolated (pinned IPNS record + contenthash + content fixtures, loopback, no live network) and mirror the repo's test style, including the failure paths and the honest-mutability posture.
 
 ## Blocked by
 
-- Blocked by `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (this reuses its verified `ipfs://<cid>` render path for the resolved CID, and its untrusted-source-plus-client-verify shape for the IPNS record). Also `needsAnswers: true` until the record-verification approach, the mutable-name posture, and the entry surface are settled.
+- Blocked by `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (this reuses its verified `ipfs://<cid>` render path for the resolved CID, and its untrusted-source-plus-client-verify shape for the IPNS record). The design forks are settled above.
 
 ## Prompt
 
@@ -45,6 +46,6 @@ This builds ON the verifiable-retrieval task (`verifiable-ipfs-content-retrieval
 >
 > Where to look: the ENSIP-7 decoder (`werust-core` contenthash module) currently returns a distinct "mutable IPNS pointer, not yet supported" refusal for `ipns-ns` \u2014 change that to route into IPNS resolution. The ENS front door (`bare-eth-urlbar-front-door-end-to-end` in `tasks/done/`) dispatches by decoded contenthash type; add the ipns-ns branch. The verified `ipfs://<cid>` render + real directory-site rendering come from `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (the blocking task) \u2014 REUSE it for the resolved CID; do not reimplement content retrieval. Bind a vetted IPNS-record crate for decode + signature verification (`docs/adr/0001`); do not hand-roll signature crypto.
 >
-> Trust honesty (a hard requirement, like the Phase-1 `NameViaTrustedRpc` decision): an IPNS name is mutable, so even a signature-verified record + content-verified bytes must NOT be presented as immutable. Settle and record the posture (open questions) \u2014 likely an ADR.
+> Trust honesty (a hard requirement, like the Phase-1 `NameViaTrustedRpc` decision): an IPNS name is mutable, so even a signature-verified record + content-verified bytes must NOT be presented as immutable. Add the `MutableName` posture per the settled two-axis model (`work/notes/observations/trust-posture-two-axes-model-2026-07-22.md`) and record it as an ADR.
 >
 > Done = a libp2p-key IPNS name resolves via a client-verified record to a CID that renders through the verified path; an ipns-ns ENS contenthash routes here instead of refusing; the mutable-name posture is honest; every failure is distinct and fail-closed; all proven offline. FIRST re-check current reality (the decoder's ipns-ns handling, the front-door dispatch, the retrieval task's landed render API) and route to needs-attention on drift. RECORD the record-verification approach, the mutable-name posture, and the entry surface durably (findings note + ADR for the trust posture).

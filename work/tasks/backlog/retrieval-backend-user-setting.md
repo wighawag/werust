@@ -2,20 +2,16 @@
 title: "User-choosable IPFS retrieval backend: a setting to pick gateway (default) / delegated-routing / embedded-p2p / custom gateway-or-node URL"
 slug: retrieval-backend-user-setting
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
-needsAnswers: true
 blockedBy: [verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend]
 covers: [1]
 ---
 
-<!-- open-questions -->
+## Settled decisions (from the design discussion — DECIDED, build to them)
 
-## Open questions
-
-1. **Where does the settings surface live?** werust has NO settings/preferences UI yet on any platform. DECIDE the minimum viable surface for THIS setting: a small settings panel/page in the desktop chrome (and the mobile shells), or an internal `werust://settings`-style page, or (interim) a config value with a sensible default that a later general settings task exposes in the UI. Whatever it is, it must land on desktop + iOS + Android per the parity guard, or be explicitly stubbed-with-linked-task there.
-2. **Persistence.** How is the chosen backend persisted across launches (a small settings file — where, and isolated in tests per the shared-write rule)? There is no config subsystem today; decide whether this task introduces a minimal one or stays in-memory + a single override until a broader settings task lands.
-3. **Which backends are offered at ship time.** The seam supports gateway (default), delegated-routing, embedded-p2p (Phase-2 async), and a custom user URL. Only the backends that actually EXIST when this ships can be offered; the others are greyed-out/"coming soon" or omitted. Confirm the initial option set (at minimum: default trustless gateway + a custom gateway/node URL).
-
-<!-- /open-questions -->
+1. **Settings surface = an internal `werust://settings`-style page** (the first settings surface werust gets). Uniform across desktop + iOS + Android (no per-platform native settings UI to design), so it satisfies the parity guard in one shape. A richer native settings surface is a later concern.
+2. **Persistence = a minimal isolated settings file** (a small settings mechanism, NOT a config subsystem). Tests MUST isolate its location (temp/scratch via the relevant lever) and assert the real one is untouched (the shared-write rule).
+3. **Initial options = default trustless gateway + a custom gateway/local-node URL.** Delegated-routing and embedded-p2p are shown as "coming soon" / omitted until those backends exist.
+4. **Default egress is SEQUENCED, and the final-release default is a RELEASE-GATE (recorded, not silent):** Phase-1 / dev default = a public trustless gateway (labelled, overridable) for convenience. BUT the shipped FINAL-RELEASE default must NOT be a single third-party gateway (a public gateway sees every site the user visits — unacceptable as a silent default for a privacy-focused browser). Before final release the default must become EITHER werust's built-in verified retrieval (embedded-p2p / fetch-only, no third-party gateway) OR a first-run user choice from a community-provided gateway set. This is tracked as a release-blocking follow-on (`retrieval-default-egress-before-final-release`) + an ADR, so it cannot ship wrong silently. THIS task ships the public-gateway default + the selector + the custom-URL option; it does NOT decide the final shipped default.
 
 ## What to build
 
@@ -34,7 +30,7 @@ Privacy + trust framing (surface it, do not hide it): the retrieval backend is a
 
 ## Blocked by
 
-- Blocked by `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (the `ContentRetriever` seam + default backend this setting switches between). Also `needsAnswers: true` until the settings surface, persistence, and the initial option set are settled. Relates to `platform-capability-parity-guard` (this setting is a per-platform capability the guard should track).
+- Blocked by `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (the `ContentRetriever` seam + default backend this setting switches between). The design forks are settled above. Relates to `platform-capability-parity-guard` (this setting is a per-platform capability the guard should track).
 
 ## Prompt
 
@@ -42,6 +38,6 @@ Privacy + trust framing (surface it, do not hide it): the retrieval backend is a
 >
 > Domain vocabulary: retrieval is a seam with swappable backends (built in `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend`, modelled like `EthereumProvider`/`Fetcher`/`Renderer`). A trustless gateway needs no node but is an egress a third party sees; a custom/local node is the private, self-trusted choice. The RPC-endpoint default and the trust indicator are the precedents for treating such a choice as an honest product surface (`docs/adr/0001`).
 >
-> Where to look: the `ContentRetriever` seam + its `DEFAULT_*`/`with_*()` override pattern (no config crate today) from the blocking task; the desktop chrome (`crates/werust`) and the mobile shells (`crates/werust-android`, `crates/werust-ios`) for where a setting would surface — there is NO settings UI yet, so decide the minimal surface (open questions). The parity guard (`platform-capability-parity-guard`) is the mechanism that should track this setting per platform.
+> Where to look: the `ContentRetriever` seam + its `DEFAULT_*`/`with_*()` override pattern (no config crate today) from the blocking task; the desktop chrome (`crates/werust`) and the mobile shells (`crates/werust-android`, `crates/werust-ios`) for where a setting would surface — there is NO settings UI yet, so this task adds the minimal `werust://settings` page (settled). The parity guard (`platform-capability-parity-guard`) is the mechanism that should track this setting per platform.
 >
 > Done = the user can pick a retrieval backend (incl. a custom URL), the choice switches the actual load path and persists, the privacy/trust trade-off is legible, it is present-or-tracked on all three platforms, and it is proven with network-isolated tests (with shared-write isolation if it persists to disk). FIRST re-check current reality (the seam's landed shape, whether any settings surface now exists) and route to needs-attention on drift. RECORD the settings-surface + persistence decisions durably per the task template.

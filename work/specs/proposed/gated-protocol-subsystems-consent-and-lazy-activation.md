@@ -210,6 +210,18 @@ scheme model).
 - **Phase 3 \u2014 mobile consent UX** (native prompt at the OS edge) + resource/battery-aware
   auto-stop of idle subsystems.
 
+## Interaction with privacy routing (see `privacy-routing-socks5h-tor-vpn-and-profiles`)
+
+Privacy mode is a hard CONSTRAINT on this model: when a profile has an active privacy
+transport (SOCKS5h / Tor / VPN), every subsystem MUST either route its OWN network egress
+through that transport or be BLOCKED (and the user told). An embedded Freenet/IPFS node or a
+light-client RPC that dials directly while the webview is Tor'd would DEANONYMISE the user.
+So a subsystem's PROVIDER MODE is filtered by the active transport: a UDP/direct-dial P2P
+node may be `embedded` in a normal profile but DISABLED in a Tor profile; a light client's
+untrusted RPC must be a SOCKS-routable endpoint. This is why the two specs are designed
+together. Fail-closed applies here too: never a direct-connection fallback for a subsystem
+in a private profile.
+
 ## Out of Scope (for this spec)
 
 - The per-protocol backends themselves (their own specs) \u2014 this is the GATE/consent/

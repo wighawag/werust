@@ -2000,6 +2000,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "werust-ios-core"
+version = "0.0.0"
+dependencies = [
+ "renderer",
+ "werust-core",
+]
+
+[[package]]
 name = "winapi-util"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"

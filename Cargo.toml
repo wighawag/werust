@@ -9,6 +9,7 @@ members = [
     "crates/fetcher",
     "crates/script-engine",
     "crates/werust-android/rust",
+    "crates/werust-ios/rust",
 ]
 
 [workspace.package]

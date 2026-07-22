@@ -1,0 +1,23 @@
+[package]
+name = "werust-ios-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# `werust_mobile` (not `werust_core`) so the staticlib/rlib output does not
+# collide with the shared `werust-core` crate's rlib in the workspace — the SAME
+# convention the Android core crate uses. The iOS app links `libwerust_mobile.a`
+# with `-force_load` and calls its `werust_ios_*` C-ABI exports.
+name = "werust_mobile"
+# staticlib: the `libwerust_mobile.a` the Xcode app links with `-force_load`
+# (an iOS Simulator app has no runtime `dlopen` of a `.dylib` without signing,
+# so the Rust core is linked STATICALLY — the wezig-parity shape). rlib: so the
+# host `cargo test` in the verify gate can exercise the ObjC-free logic
+# (CoreSession/IosBackend/ffi_json) without the C-ABI/UIKit layer.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+renderer = { path = "../../renderer" }
+werust-core = { path = "../../werust-core" }

@@ -1,0 +1,72 @@
+name: mobile-ios
+
+# The iOS toolchain leg (task mobile-ios-shell-and-static-lib, spec story 18):
+# prove the werust Rust core cross-compiles to the iOS Simulator target, links
+# into a real WKWebView app via a normal Xcode "Build Rust static lib" build
+# phase, and LAUNCHES on an iOS 17 Simulator — all on a GitHub macos-14 runner
+# (CI is the Mac; no physical Mac needed). The direct analogue of the Android
+# `check-apk-abis` leg, and a SEPARATE leg from the pure-Rust `verify` gate
+# (which has no Xcode/SDK). It is the twin of wezig's `.github/workflows/mobile-ios.yml`,
+# swapping the Zig lib for the Rust lib.
+#
+# Runner ceiling: macos-14 ships Xcode 15.4 => iOS SDK caps at 17, so we build+run
+# against an iOS 17 SIMULATOR (deployment-target floor stays 16.0). Simulator
+# builds need NO code signing and NO Apple Developer account.
+#
+# Manual/opt-in (workflow_dispatch) plus a path-filtered push trigger so it runs
+# when the iOS shell or the shared Rust core changes, and never competes with the
+# core gate on unrelated pushes. The release/mobile job
+# (release-goreleaser-rust-desktop-and-mobile-artifacts, ADR-0002) reuses
+# build-and-run.sh's BUILD_ONLY path to package the `.app`.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/werust-ios/**"
+      - "crates/werust-core/**"
+      - "crates/renderer/**"
+      - "docs/spikes/mobile-ios-shell-and-static-lib/**"
+      - ".github/workflows/mobile-ios.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  ios-simulator:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode + available iOS runtimes
+        run: |
+          xcodebuild -version
+          xcrun simctl list runtimes
+
+      - name: Install the Rust iOS Simulator target
+        # aarch64-apple-ios-sim for the Apple-Silicon macos-14 runner. The build
+        # phase also `rustup target add`s it defensively, but do it here too so a
+        # target-add failure surfaces as its own step.
+        run: rustup target add aarch64-apple-ios-sim
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-ios-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-ios-cargo-
+
+      - name: Build + launch the iOS shell on an iOS 17 Simulator
+        run: crates/werust-ios/build-and-run.sh
+
+      - name: BUILD-leg check — the .app carries the app bundle + binary (Rust core linked)
+        # Re-produce the .app with BUILD_ONLY (no simulator boot) at the stable
+        # path, then assert the bundle + binary + linked Rust core. This is where
+        # criterion 4 actually EXECUTES.
+        run: |
+          BUILD_ONLY=1 crates/werust-ios/build-and-run.sh
+          docs/spikes/mobile-ios-shell-and-static-lib/check-app-bundle.sh

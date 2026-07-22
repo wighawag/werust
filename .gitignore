@@ -8,3 +8,10 @@ crates/werust-android/build/
 crates/werust-android/app/build/
 crates/werust-android/local.properties
 crates/werust-android/**/*.iml
+
+# iOS app (crates/werust-ios) build scratch + Xcode local/user state.
+# The Xcode project + shared scheme ARE tracked; only build output and
+# per-user Xcode state are ignored.
+crates/werust-ios/build/
+crates/werust-ios/App/**/xcuserdata/
+crates/werust-ios/App/**/*.xcworkspace/xcuserdata/

@@ -118,6 +118,50 @@ fn goreleaser_targets_desktop_linux_amd64_and_arm64() {
 }
 
 #[test]
+fn goreleaser_selects_the_werust_package_in_the_workspace() {
+    // werust is a multi-crate Cargo workspace, so GoReleaser's rust builder
+    // errors "you need to specify which workspace to build, please add
+    // '--package=[name]'" unless a package selector is passed through `flags`.
+    // GoReleaser accepts either `-p=<name>` or `--package=<name>` (its
+    // `isSettingPackage` check keys off those two prefixes), so the desktop
+    // build MUST carry one selecting the `werust` binary crate.
+    let cfg = load_yaml(".goreleaser.yaml");
+    let builds = cfg
+        .get("builds")
+        .and_then(Value::as_sequence)
+        .expect("`builds:` list");
+    let rust_build = builds
+        .iter()
+        .find(|b| b.get("builder").and_then(Value::as_str) == Some("rust"))
+        .expect("a `builder: rust` desktop build");
+    let flags: Vec<String> = rust_build
+        .get("flags")
+        .and_then(Value::as_sequence)
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|f| f.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        flags
+            .iter()
+            .any(|f| f == "--package=werust" || f == "-p=werust"),
+        "the `builder: rust` build must pass a package selector (`--package=werust` or \
+         `-p=werust`) so cargo builds the werust binary crate in the workspace; got flags {flags:?}"
+    );
+    // Keeping the release build a RELEASE build is load-bearing: setting an
+    // explicit `flags` list REPLACES GoReleaser's `--release` default, and its
+    // rust builder then copies the binary from `target/<triple>/release/`, so a
+    // debug build would leave nothing to package. Preserve `--release`.
+    assert!(
+        flags.iter().any(|f| f == "--release"),
+        "an explicit `flags` list drops GoReleaser's `--release` default; the release build \
+         must keep `--release` (the builder copies from target/<triple>/release/); got flags {flags:?}"
+    );
+}
+
+#[test]
 fn goreleaser_emits_a_checksums_file() {
     let cfg = load_yaml(".goreleaser.yaml");
     let checksum = cfg

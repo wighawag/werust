@@ -29,6 +29,18 @@ builds:
     # `cargo build` the desktop binary crate for each desktop Linux target.
     tool: cargo
     command: zigbuild
+    # werust is a multi-crate Cargo workspace, so cargo cannot disambiguate which
+    # crate to build: GoReleaser's rust builder errors "you need to specify which
+    # workspace to build, please add '--package=[name]'". Select the `werust`
+    # binary crate. GoReleaser passes `flags` straight to `cargo zigbuild` and
+    # accepts `--package=`/`-p=` as the workspace selector (its `isSettingPackage`
+    # check). Setting an explicit `flags` list REPLACES GoReleaser's `--release`
+    # default, and its rust builder then copies the artifact from
+    # `target/<triple>/release/`, so `--release` must stay or there is nothing to
+    # package.
+    flags:
+      - --release
+      - --package=werust
     # Desktop Linux amd64 + arm64 (the wezig-parity desktop floor). Rust target
     # triples, as the Rust builder expects.
     targets:

@@ -1,0 +1,102 @@
+# werust platform-capability parity matrix (the checked-in source of truth for
+# the `verify`-enforced parity guard; see docs/adr/0005-platform-capability-parity-guard.md).
+#
+# WHY THIS FILE EXISTS: werust ships three contexts (desktop WebKitGTK, iOS
+# WKWebView, Android System WebView), each an OS edge over the shared
+# `werust-core` seams. A cross-cutting user-facing CAPABILITY (address bar,
+# back/forward, `ipfs://` render, ENS `.eth` resolution, EIP-1193 provider,
+# trust indicator) can silently ship on ONE platform only when a seam method is
+# no-op'd on a backend and nothing flags it. That is exactly what hid the mobile
+# `ipfs://` gap: `register_scheme_handler` was an empty `{}` on both mobile
+# backends, the whole capability shipped desktop-only, and the release looked
+# green.
+#
+# THE RULE (enforced by crates/werust-core/tests/platform_capability_parity.rs,
+# a plain workspace `cargo test` that rides the existing `verify` gate):
+#
+#   For EVERY capability x EVERY platform in `platforms`, there MUST be an
+#   explicit cell state, one of:
+#     * "implemented"          — the capability is really wired on that platform.
+#     * "stubbed"              — a KNOWN gap; REQUIRES `task = "<slug>"` naming a
+#                                follow-on task that exists in
+#                                work/tasks/{backlog,ready,done}/ and covers its
+#                                completion. A `stubbed` cell with no resolvable
+#                                task REDS THE GATE (the whole point).
+#     * "n-a"                  — genuinely not applicable on that platform;
+#                                REQUIRES `reason = "..."`.
+#
+#   A MISSING cell (a capability that does not list every platform, or a
+#   platform not covered by a row) REDS THE GATE too: adding a capability or a
+#   platform FORCES a cell, so a gap can never be silent-by-omission.
+#
+# HOW TO ADD A CAPABILITY: add a `[[capability]]` block with a cell for EVERY
+# platform below. HOW TO ADD A PLATFORM: add it to `platforms` and add a cell
+# for it to EVERY existing capability. Either way the guard forces the cells.
+
+# The shipped contexts. Adding one here forces a cell in every capability row.
+platforms = ["desktop", "ios", "android"]
+
+# ---------------------------------------------------------------------------
+# Capabilities, seeded with CURRENT REALITY (2026-07-23). The guard passes today
+# ONLY because the known gaps are tracked (linked to a real task), not hidden.
+# ---------------------------------------------------------------------------
+
+[[capability]]
+name = "address-bar"
+description = "URL bar: type/commit a URL, reflect the current URL in the chrome."
+# Core logic (BrowserShell) driven through the seam; each backend implements
+# navigate + current_url. Verified on all three.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "back-forward"
+description = "Session history: go_back / go_forward and their availability."
+# Each backend owns its session-history truth (webview-renderer, IosBackend,
+# AndroidBackend all implement go_back/go_forward/can_go_*).
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "ens-eth-resolution"
+description = "Bare `.eth` URL-bar entry resolved namehash -> resolver -> contenthash (ENS)."
+# Toolkit-free core logic in `werust-core` (ens/contenthash/ethereum modules),
+# driven by the shell regardless of backend, so it is available on every edge.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "ipfs-render"
+description = "Intercept `ipfs://<cid>` and render hash-verified content through the shared core resolve path."
+# Desktop intercepts via WebKitGTK `install_ipfs` (register_uri_scheme). Both
+# mobile backends' `register_scheme_handler` is an empty `{}` no-op today — the
+# gap this whole guard was built to stop hiding. Tracked, not hidden.
+desktop = { state = "implemented" }
+ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+
+[[capability]]
+name = "eip1193-provider"
+description = "Inject the native EIP-1193 provider into pages via the script-message bridge."
+# Desktop wires it via `install_provider` (register_script_message_handler +
+# inject_script + response push). Both mobile backends' script-message bridge
+# methods are empty `{}` no-ops today — the SAME silent-no-op class as
+# `ipfs://`. See work/notes/observations/mobile-provider-and-trust-are-also-silent-no-ops-2026-07-23.md.
+desktop = { state = "implemented" }
+ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+
+[[capability]]
+name = "trust-indicator"
+description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / unverified) in the chrome."
+# Desktop reads the shared LoadLifecycle posture (marked by the `ipfs://` scheme
+# handler / ENS front door). Both mobile backends inherit the seam DEFAULT
+# (`UnverifiedOrigin`, no `mark_ens_origin`), so the verified/ENS posture never
+# surfaces on mobile — desktop-only today. Tracked with the mobile webview
+# integration (same observation note as above).
+desktop = { state = "implemented" }
+ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }

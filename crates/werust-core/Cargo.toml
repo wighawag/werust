@@ -36,3 +36,8 @@ ureq = "=3.3.0"
 # `tests/release_plumbing_shape.rs`. Dev-only: it never enters the shipped
 # binary, only `cargo test` (the verify gate).
 serde_yaml = "0.9"
+# Parses the checked-in platform-capability parity matrix
+# (`docs/platform-capability-matrix.toml`) for the parity guard in
+# `tests/platform_capability_parity.rs`. Dev-only, like `serde_yaml` above: it
+# never enters the shipped binary, only `cargo test` (the verify gate).
+toml = "1"

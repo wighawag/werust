@@ -68,11 +68,12 @@ The fixture viewport width is pinned in the golden test
 
 The fixtures deliberately leave `line-height` unset (lines use the font-size-relative
 `normal`), so heading and body lines differ in height by font size. A unitless
-`line-height` on `body` currently inherits as an absolute px in the T1 cascade
-(so it would flatten all line heights) — see
-`work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md`. That
-is a cascade limitation outside this task's scope; the fixtures avoid depending on
-it rather than asserting a wrong value.
+`line-height` on `body` used to inherit as an absolute px in the T1 cascade (so it
+would flatten all line heights), see
+`work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md`. Task
+`fix-unitless-line-height-inherits-as-multiplier` fixed that (a unitless value now
+inherits as the multiplier and re-resolves per element's own font-size); the
+fixtures still leave `line-height` unset, so these goldens are unaffected.
 
 ## Regenerating the goldens
 

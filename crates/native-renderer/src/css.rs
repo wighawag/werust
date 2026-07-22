@@ -174,6 +174,40 @@ pub struct Edges {
 /// The initial `font-size` in px (the CSS default medium, 16px).
 pub const INITIAL_FONT_SIZE: f32 = 16.0;
 
+/// A computed `line-height`, carried through inheritance in the form CSS mandates.
+///
+/// The three forms inherit differently, which is the whole reason this is an enum
+/// rather than a resolved `f32` (see the bug fixed in
+/// `work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md`):
+///
+/// - `Normal` — the `normal` keyword; the used px is font-size-relative per element.
+/// - `Absolute(px)` — a unit-bearing value (`24px`, `1.5em`): a FIXED px, inherited
+///   as that same px so a differently-sized child does NOT rescale it.
+/// - `Multiplier(n)` — a UNITLESS number (`1.5`): inherited as the multiplier itself,
+///   so each descendant recomputes `n * its own font-size` at use.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LineHeight {
+    /// The `normal` keyword: a font-size-relative used value resolved at shaping.
+    Normal,
+    /// A fixed px value (from a unit-bearing `line-height`), inherited unchanged.
+    Absolute(f32),
+    /// A unitless multiplier, resolved against each element's own font-size at use.
+    Multiplier(f32),
+}
+
+impl LineHeight {
+    /// The used line-height in px against `font_size`, or `None` for `Normal` (whose
+    /// used value is a shaper-side font-size-relative default, not a cascade px).
+    #[must_use]
+    pub fn resolve(self, font_size: f32) -> Option<f32> {
+        match self {
+            LineHeight::Normal => None,
+            LineHeight::Absolute(px) => Some(px),
+            LineHeight::Multiplier(n) => Some(n * font_size),
+        }
+    }
+}
+
 /// The fully-resolved style of one element after the T1 cascade.
 ///
 /// Layout + shaping + paint read exactly these fields. Inherited properties
@@ -198,8 +232,10 @@ pub struct ComputedStyle {
     pub font_size: f32,
     /// The resolved font-family list (inherited); an empty list means the default.
     pub font_family: Vec<String>,
-    /// Line height in px, or `0.0` for the `normal` keyword (inherited).
-    pub line_height: f32,
+    /// Line height (inherited). A unitless value inherits as a `Multiplier` and is
+    /// re-resolved per element's own font-size; a unit-bearing value inherits as a
+    /// fixed `Absolute` px; unset stays `Normal`.
+    pub line_height: LineHeight,
     /// Margin box edges in px (not inherited).
     pub margin: Edges,
     /// Padding box edges in px (not inherited).
@@ -219,7 +255,7 @@ impl ComputedStyle {
             underline: false,
             font_size: INITIAL_FONT_SIZE,
             font_family: Vec::new(),
-            line_height: 0.0,
+            line_height: LineHeight::Normal,
             margin: Edges::default(),
             padding: Edges::default(),
         }
@@ -245,10 +281,29 @@ enum Declaration {
     /// A font size as a length, resolved against the parent size at cascade time.
     FontSize(Length),
     FontFamily(Vec<String>),
-    /// A line height as a length (or the `normal` keyword -> `None`).
-    LineHeight(Option<Length>),
+    /// A line height in its declared form (see [`LineHeightDecl`]): `normal`, a
+    /// unit-bearing `<length>` resolved to a fixed px against the element's own
+    /// font-size at apply time, or a UNITLESS multiplier carried unresolved so each
+    /// descendant recomputes it against its own font-size.
+    LineHeight(LineHeightDecl),
     Margin([Option<Length>; 4]),
     Padding([Option<Length>; 4]),
+}
+
+/// A declared `line-height` before font-size is known.
+///
+/// A unit-bearing `<length>` still needs the element's own font-size to resolve an
+/// `em` to a fixed px, so it is carried as a [`Length`] and resolved at apply time
+/// into [`LineHeight::Absolute`]. A UNITLESS number becomes [`LineHeight::Multiplier`]
+/// directly — it must NOT be collapsed to px, so it inherits as the multiplier.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LineHeightDecl {
+    /// The `normal` keyword.
+    Normal,
+    /// A unit-bearing `<length>` (`24px`, `1.5em`), resolved to a fixed px at apply.
+    Length(Length),
+    /// A unitless number, kept as the multiplier.
+    Multiplier(f32),
 }
 
 /// A CSS length the cascade resolves to px: absolute `px` or font-relative `em`.
@@ -650,13 +705,14 @@ fn parse_declaration(prop: &str, value: &str) -> Vec<Declaration> {
         }
         "line-height" => {
             if vl == "normal" {
-                vec![Declaration::LineHeight(None)]
+                vec![Declaration::LineHeight(LineHeightDecl::Normal)]
             } else if let Ok(number) = vl.parse::<f32>() {
-                // A UNITLESS line-height is a multiple of the font size (checked
-                // before `parse_length`, which would treat a bare number as px).
-                vec![Declaration::LineHeight(Some(Length::Em(number)))]
+                // A UNITLESS line-height is the MULTIPLIER (checked before
+                // `parse_length`, which would treat a bare number as px). It is kept
+                // unresolved so it inherits as the multiplier, not a fixed px.
+                vec![Declaration::LineHeight(LineHeightDecl::Multiplier(number))]
             } else if let Some(len) = parse_length(&vl) {
-                vec![Declaration::LineHeight(Some(len))]
+                vec![Declaration::LineHeight(LineHeightDecl::Length(len))]
             } else {
                 vec![]
             }
@@ -823,10 +879,14 @@ fn apply(style: &mut ComputedStyle, declarations: &[Declaration], parent_size: f
                 style.font_size = len.resolve(parent_size);
             }
             Declaration::FontFamily(families) => style.font_family = families.clone(),
-            Declaration::LineHeight(len) => {
-                style.line_height = match len {
-                    Some(l) => l.resolve(style.font_size),
-                    None => 0.0,
+            Declaration::LineHeight(decl) => {
+                style.line_height = match decl {
+                    // `normal` and a unit-bearing `<length>` resolve to their
+                    // inheriting form now; a UNITLESS number stays the multiplier so
+                    // each descendant recomputes it against its own font-size.
+                    LineHeightDecl::Normal => LineHeight::Normal,
+                    LineHeightDecl::Length(l) => LineHeight::Absolute(l.resolve(style.font_size)),
+                    LineHeightDecl::Multiplier(n) => LineHeight::Multiplier(*n),
                 };
             }
             Declaration::Margin(sides) => apply_edges(&mut style.margin, sides, style.font_size),
@@ -1064,16 +1124,66 @@ mod tests {
 
     #[test]
     fn line_height_honours_px_unitless_and_normal() {
+        // A unit-bearing value is a FIXED px; a unitless value is the MULTIPLIER;
+        // unset stays `normal`.
         let px = root(
             &el_attr("p", "style", "line-height: 24px"),
             &Stylesheet::default(),
         );
-        assert_eq!(px.line_height, 24.0);
+        assert_eq!(px.line_height, LineHeight::Absolute(24.0));
         let unitless = root(
             &el_attr("p", "style", "font-size: 20px; line-height: 1.5"),
             &Stylesheet::default(),
         );
-        assert_eq!(unitless.line_height, 30.0, "1.5 * 20px");
+        assert_eq!(unitless.line_height, LineHeight::Multiplier(1.5));
+        assert_eq!(
+            unitless.line_height.resolve(unitless.font_size),
+            Some(30.0),
+            "1.5 * its own 20px = 30px"
+        );
+        let normal = root(&el("p"), &Stylesheet::default());
+        assert_eq!(normal.line_height, LineHeight::Normal);
+    }
+
+    #[test]
+    fn unitless_line_height_inherits_as_a_multiplier_not_a_fixed_px() {
+        // The orphaned-cascade defect: `body { font-size: 20px; line-height: 1.5 }`
+        // sets the multiplier on the body, but a child at a DIFFERENT font-size must
+        // recompute `1.5 * its own font-size`, not inherit the body's resolved 30px.
+        let sheet = Stylesheet::parse(
+            "body { font-size: 20px; line-height: 1.5 } small { font-size: 10px }",
+        );
+        let body = root(&el("body"), &sheet);
+        assert_eq!(body.line_height, LineHeight::Multiplier(1.5));
+        assert_eq!(body.line_height.resolve(body.font_size), Some(30.0));
+        // The child inherits the MULTIPLIER (not the absolute 30px) and re-resolves.
+        let small = cascade(&el("small"), &body, &[&el("body")], &sheet);
+        assert_eq!(small.font_size, 10.0);
+        assert_eq!(small.line_height, LineHeight::Multiplier(1.5));
+        assert_eq!(
+            small.line_height.resolve(small.font_size),
+            Some(15.0),
+            "1.5 * child's own 10px = 15px, NOT the body's 30px"
+        );
+    }
+
+    #[test]
+    fn unit_bearing_line_height_inherits_as_a_fixed_px_across_font_sizes() {
+        // A unit-bearing `line-height` is a fixed px and does NOT rescale per child:
+        // `24px` set on the body stays 24px on a differently-sized child.
+        let sheet = Stylesheet::parse(
+            "body { font-size: 20px; line-height: 24px } small { font-size: 10px }",
+        );
+        let body = root(&el("body"), &sheet);
+        assert_eq!(body.line_height, LineHeight::Absolute(24.0));
+        let small = cascade(&el("small"), &body, &[&el("body")], &sheet);
+        assert_eq!(small.font_size, 10.0);
+        assert_eq!(
+            small.line_height,
+            LineHeight::Absolute(24.0),
+            "a fixed px line-height is not rescaled by the child's font-size"
+        );
+        assert_eq!(small.line_height.resolve(small.font_size), Some(24.0));
     }
 
     #[test]

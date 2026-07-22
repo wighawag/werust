@@ -224,11 +224,12 @@
 #expect line-height = 24
 
 # A unitless line-height MUST inherit as the MULTIPLIER and recompute against the
-# child's own font-size (per CSS). The native T1 cascade currently inherits the
-# RESOLVED px instead (see
-# work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md), so
-# this case legitimately FAILS the meter today -- it is a real, known regression
-# surface the WPT bar is meant to expose, not tune away.
+# child's own font-size (per CSS): 1.5 set on the 20px body, used on a 10px child,
+# is 15px (not the body's resolved 30px). The native T1 cascade carries the
+# unitless value unresolved through inheritance and re-resolves per element's own
+# font-size, so this case PASSES (it previously exposed the orphaned-cascade defect
+# in work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md,
+# now fixed by task fix-unitless-line-height-inherits-as-multiplier).
 #test line-height-unitless-inherits-as-multiplier
 #area css/css-text
 #css body { font-size: 20px; line-height: 1.5 } small { font-size: 10px }

@@ -71,12 +71,13 @@ recorded in `docs/spikes/t1-wpt-subset-regression-meter/README.md` (decision D2)
   (colour parsing + inheritance, `em`/`%` font-size resolution, font weight/style,
   the box-model shorthands + longhands, `display`/normal-flow defaults + combinator
   specificity, and `text-decoration` / `line-height`). One case
-  (`line-height-unitless-inherits-as-multiplier`) documents a KNOWN cascade defect
-  (unitless `line-height` inherits as resolved px, not the multiplier — see
-  `work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md`); it
-  legitimately FAILS the meter today, which is the point: the WPT bar is meant to
-  EXPOSE such regressions, not tune them away. The meter is well above its 70 % floor
-  with that failure counted honestly.
+  (`line-height-unitless-inherits-as-multiplier`) originally documented a cascade
+  defect (unitless `line-height` inherited as resolved px, not the multiplier, see
+  `work/notes/observations/t1-unitless-line-height-inherits-as-absolute-px.md`) that
+  legitimately FAILED the meter, which was the point: the WPT bar is meant to EXPOSE
+  such regressions, not tune them away. Task
+  `fix-unitless-line-height-inherits-as-multiplier` fixed that defect, so the case
+  now PASSES; the meter remains well above its 70 % floor.
 
 ### Re-pinning to the real upstream files
 

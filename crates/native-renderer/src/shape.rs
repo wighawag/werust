@@ -184,22 +184,24 @@ impl Default for Shaper {
 
 /// Resolve the cascade's `line-height` into a parley [`LineHeight`].
 ///
-/// The cascade stores `line_height` either as an absolute px value or as `normal`
-/// (the `0.0` sentinel). An absolute value maps to [`LineHeight::Absolute`]; the
-/// `normal` keyword maps to a font-size-relative 1.2 (the conventional CSS
-/// `normal` approximation) so the line box tracks the font size.
+/// The cascade stores `line_height` as [`css::LineHeight`](crate::css::LineHeight):
+/// `Normal`, a fixed `Absolute(px)`, or a unitless `Multiplier(n)`. The unitless
+/// multiplier is resolved HERE against this element's own font-size (that is the
+/// whole point — it inherited as the multiplier, not a fixed px), so a `1.5` on a
+/// 20px body used on a 10px child yields a 15px line. `Absolute` maps straight to
+/// [`LineHeight::Absolute`]; `Normal` maps to a font-size-relative 1.2 (the
+/// conventional CSS `normal` approximation) so the line box tracks the font size.
 fn resolve_line_height(style: &ComputedStyle) -> LineHeight {
-    if style.line_height > 0.0 {
-        LineHeight::Absolute(style.line_height)
-    } else {
-        LineHeight::FontSizeRelative(1.2)
+    match style.line_height.resolve(style.font_size) {
+        Some(px) => LineHeight::Absolute(px),
+        None => LineHeight::FontSizeRelative(1.2),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::css::ComputedStyle;
+    use crate::css::{ComputedStyle, LineHeight as CssLineHeight};
 
     fn style(font_size: f32) -> ComputedStyle {
         ComputedStyle {
@@ -259,7 +261,7 @@ mod tests {
     fn explicit_line_height_is_honoured() {
         let mut shaper = Shaper::new();
         let mut tall = style(16.0);
-        tall.line_height = 40.0;
+        tall.line_height = CssLineHeight::Absolute(40.0);
         let run = shaper.measure("Hello", &tall);
         assert!(
             (run.line_height - 40.0).abs() < 1.0,

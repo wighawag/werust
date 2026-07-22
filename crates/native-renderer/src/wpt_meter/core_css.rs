@@ -158,7 +158,12 @@ fn actual_value(style: &ComputedStyle, property: &str) -> Option<String> {
         }
         .to_string(),
         "font-size" => fmt_px(style.font_size),
-        "line-height" => fmt_px(style.line_height),
+        // The USED line-height in px against this element's own font-size (a unitless
+        // multiplier resolves here); `normal` has no cascade px, reported as `normal`.
+        "line-height" => match style.line_height.resolve(style.font_size) {
+            Some(px) => fmt_px(px),
+            None => "normal".to_string(),
+        },
         "font-weight" => bool_word(style.bold, "bold", "normal"),
         "font-style" => bool_word(style.italic, "italic", "normal"),
         "text-decoration" => bool_word(style.underline, "underline", "none"),

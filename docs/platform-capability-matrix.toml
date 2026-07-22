@@ -86,8 +86,8 @@ description = "Inject the native EIP-1193 provider into pages via the script-mes
 # methods are empty `{}` no-ops today — the SAME silent-no-op class as
 # `ipfs://`. See work/notes/observations/mobile-provider-and-trust-are-also-silent-no-ops-2026-07-23.md.
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
-android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+ios = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
+android = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
 
 [[capability]]
 name = "trust-indicator"
@@ -98,5 +98,5 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # surfaces on mobile — desktop-only today. Tracked with the mobile webview
 # integration (same observation note as above).
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
-android = { state = "stubbed", task = "mobile-ipfs-scheme-interception-ios-and-android" }
+ios = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
+android = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }

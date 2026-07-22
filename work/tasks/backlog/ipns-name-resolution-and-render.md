@@ -3,7 +3,7 @@ title: "IPNS name resolution and render — resolve ipns-ns (mutable) pointers t
 slug: ipns-name-resolution-and-render
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 needsAnswers: true
-blockedBy: [explore-trustless-verifiable-ipfs-dag-car-retrieval]
+blockedBy: [verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend]
 covers: [1]
 ---
 
@@ -21,7 +21,7 @@ covers: [1]
 
 Make an IPNS-pointed name actually resolve and render, closing the `ipns-ns` gap the ENSIP-7 decoder currently names as "not yet supported". The path: resolve an IPNS name (a signature-verifiable IPNS record, or a DNSLink) to the CID it currently points at, then feed that CID into the verified `ipfs://` render path (the same path the DAG/CAR retrieval task makes work for real multi-block sites). Every failure (an unresolvable name, an invalid/expired/unsigned record, a record pointing at an unsupported contenthash) fails closed with a distinct, legible reason.
 
-This builds ON the trustless retrieval task (`explore-trustless-verifiable-ipfs-dag-car-retrieval`): it reuses that task's verified `ipfs://<cid>` render (so an IPNS name resolving to a real directory site renders like any other), and it reuses the SAME untrusted-source-plus-client-verify discipline for the IPNS RECORD (fetch the record over HTTP from a trustless/delegated endpoint, verify its signature + validity client-side against the IPNS key). It also upgrades the ENSIP-7 decoder + ENS front door: an `ipns-ns` (`0xe5`) contenthash stops being a named refusal and instead routes into IPNS resolution.
+This builds ON the verifiable-retrieval task (`verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend`): it reuses that task's verified `ipfs://<cid>` render (so an IPNS name resolving to a real directory site renders like any other), and it reuses the SAME untrusted-source-plus-client-verify discipline for the IPNS RECORD (fetch the record over HTTP from a trustless/delegated endpoint, verify its signature + validity client-side against the IPNS key). It also upgrades the ENSIP-7 decoder + ENS front door: an `ipns-ns` (`0xe5`) contenthash stops being a named refusal and instead routes into IPNS resolution.
 
 ## Acceptance criteria
 
@@ -35,7 +35,7 @@ This builds ON the trustless retrieval task (`explore-trustless-verifiable-ipfs-
 
 ## Blocked by
 
-- Blocked by `explore-trustless-verifiable-ipfs-dag-car-retrieval` (this reuses its verified `ipfs://<cid>` render path for the resolved CID, and its untrusted-source-plus-client-verify shape for the IPNS record). Also `needsAnswers: true` until the record-verification approach, the mutable-name posture, and the entry surface are settled.
+- Blocked by `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (this reuses its verified `ipfs://<cid>` render path for the resolved CID, and its untrusted-source-plus-client-verify shape for the IPNS record). Also `needsAnswers: true` until the record-verification approach, the mutable-name posture, and the entry surface are settled.
 
 ## Prompt
 
@@ -43,7 +43,7 @@ This builds ON the trustless retrieval task (`explore-trustless-verifiable-ipfs-
 >
 > Domain vocabulary: IPNS is the mutable-pointer layer of IPFS. A libp2p-key IPNS name is a public-key hash; its current value is a SIGNED IPNS record (multicodec `0x0300`) that maps the name to a `/ipfs/<cid>` (or another `/ipns/`), with a sequence number + validity \u2014 verify the signature against the key and the validity window client-side, treating the fetched record as UNTRUSTED (same discipline as the CAR blocks). A DNSLink name resolves via a `_dnslink` DNS TXT record instead (a DNS lookup, not a signed record). The ENSIP-7 `ipns-ns` protoCode is `0xe5` (the decoder already names it). The Trustless Gateway spec exposes verifiable IPNS records at `GET /ipns/{key}?format=ipns-record`.
 >
-> Where to look: the ENSIP-7 decoder (`werust-core` contenthash module) currently returns a distinct "mutable IPNS pointer, not yet supported" refusal for `ipns-ns` \u2014 change that to route into IPNS resolution. The ENS front door (`bare-eth-urlbar-front-door-end-to-end` in `tasks/done/`) dispatches by decoded contenthash type; add the ipns-ns branch. The verified `ipfs://<cid>` render + real directory-site rendering come from `explore-trustless-verifiable-ipfs-dag-car-retrieval` (the blocking task) \u2014 REUSE it for the resolved CID; do not reimplement content retrieval. Bind a vetted IPNS-record crate for decode + signature verification (`docs/adr/0001`); do not hand-roll signature crypto.
+> Where to look: the ENSIP-7 decoder (`werust-core` contenthash module) currently returns a distinct "mutable IPNS pointer, not yet supported" refusal for `ipns-ns` \u2014 change that to route into IPNS resolution. The ENS front door (`bare-eth-urlbar-front-door-end-to-end` in `tasks/done/`) dispatches by decoded contenthash type; add the ipns-ns branch. The verified `ipfs://<cid>` render + real directory-site rendering come from `verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend` (the blocking task) \u2014 REUSE it for the resolved CID; do not reimplement content retrieval. Bind a vetted IPNS-record crate for decode + signature verification (`docs/adr/0001`); do not hand-roll signature crypto.
 >
 > Trust honesty (a hard requirement, like the Phase-1 `NameViaTrustedRpc` decision): an IPNS name is mutable, so even a signature-verified record + content-verified bytes must NOT be presented as immutable. Settle and record the posture (open questions) \u2014 likely an ADR.
 >

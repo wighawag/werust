@@ -17,3 +17,13 @@ cssparser = "0.35"
 # Latin/LTR shaping. `complex-scripts` is deliberately OFF (complex-script/bidi is
 # T2). See the spike README (decision D2).
 parley = { version = "0.11", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# The T0 content-addressed floor parity test (`tests/t0_content_addressed_floor.rs`)
+# drives the SAME fixtures through the hash-verified `ipfs://` path, reusing the
+# `Fetcher` seam's content-addressed verify and the `werust-core` `ipfs://`
+# resolver, then renders the verified bytes through this crate's native T0 path
+# and asserts parity with the committed server-floor goldens. These are
+# TEST-ONLY: the T0 native backend itself has no networking / ipfs dependency.
+fetcher = { path = "../fetcher" }
+werust-core = { path = "../werust-core" }

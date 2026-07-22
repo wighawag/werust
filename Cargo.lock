@@ -1104,10 +1104,12 @@ name = "native-renderer"
 version = "0.0.0"
 dependencies = [
  "cssparser",
+ "fetcher",
  "html5ever",
  "markup5ever_rcdom",
  "parley",
  "renderer",
+ "werust-core",
 ]
 
 [[package]]

@@ -110,9 +110,14 @@ fn status_line(state: &ChromeState) -> String {
 /// directly), and starts a periodic pump that folds the seam's load-lifecycle
 /// events into the chrome.
 fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererError> {
-    let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(
-        WebViewRenderer::new()?,
-    ))));
+    // Build the webview backend and install the native EIP-1193 provider on it
+    // (the first trust hook) BEFORE handing it to the shell: pages then see a
+    // native `window.ethereum` whose `request(...)` calls round-trip across the
+    // script-message bridge to native code and back — with no keys involved (task
+    // `eip1193-provider-injection-via-script-bridge`).
+    let mut backend = WebViewRenderer::new()?;
+    backend.install_provider();
+    let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
 
     // Embed the live, interactive view. The seam hands the shell an opaque
     // pointer to the backend's native view; the shell reconstructs it as a plain

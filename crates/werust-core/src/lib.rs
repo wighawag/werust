@@ -24,6 +24,8 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError};
 
+pub mod provider;
+
 /// The chrome state the shell reflects: everything the window must draw ABOUT the
 /// current page, distinct from the page content itself.
 ///

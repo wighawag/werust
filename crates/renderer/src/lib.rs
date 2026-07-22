@@ -471,6 +471,23 @@ pub trait Renderer {
     /// bridge. Part of the trust-hook surface.
     fn inject_script(&mut self, script: &str);
 
+    /// Evaluate `script` in the CURRENT live page, now (browser -> page).
+    ///
+    /// This is the RESPONSE half of the script-message bridge:
+    /// [`register_script_message_handler`](Renderer::register_script_message_handler)
+    /// carries a message page -> browser, and this pushes a result back browser ->
+    /// page by evaluating JS in the live document. It is what lets the EIP-1193
+    /// provider round-trip: the page's `request(...)` posts up the bridge, the
+    /// native handler answers, and the answer is delivered back into the page's
+    /// pending Promise by evaluating a small settle-call here (task
+    /// `eip1193-provider-injection-via-script-bridge`).
+    ///
+    /// Fire-and-forget: evaluation is asynchronous on the backend's own loop, and
+    /// takes `&self` because a real event-driven backend (the webview) evaluates
+    /// through an interior-mutable handle. A backend with no live document (a
+    /// fixed-subset native path with no JS) may leave the provided no-op default.
+    fn evaluate_javascript(&self, _script: &str) {}
+
     /// Register a custom-scheme / request-interception handler for `scheme`.
     ///
     /// Requests to `<scheme>://…` are handed to `handler`, which resolves them

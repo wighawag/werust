@@ -117,6 +117,70 @@ impl WebViewRenderer {
     pub fn web_view(&self) -> &WebView {
         &self.view
     }
+
+    /// Install the native EIP-1193 provider into this webview, over the seam's
+    /// script-message bridge.
+    ///
+    /// This wires the FULL round-trip of werust's first trust hook (`CONTEXT.md`,
+    /// `docs/adr/0001`):
+    ///
+    /// * injects the page-side [`provider_shim`] at document start, so every page
+    ///   sees a detectable `window.ethereum` exposing the standard EIP-1193
+    ///   `request(...)` interface and event surface;
+    /// * registers the [`PROVIDER_BRIDGE`] script-message handler (page ->
+    ///   native), routing each posted envelope through a [`ProviderBridge`]
+    ///   read-only stub;
+    /// * pushes the answer BACK into the page (native -> page) by evaluating the
+    ///   settle-call JS in the live document
+    ///   ([`Renderer::evaluate_javascript`](renderer::Renderer::evaluate_javascript)),
+    ///   resolving the page's pending Promise.
+    ///
+    /// It holds NO keys: the stub answers only benign read-only methods (a
+    /// chain-id / accounts stub). The response push captures a clone of this
+    /// webview so the handler can evaluate JS on the GTK loop; that is why the
+    /// wiring lives here rather than behind the `&mut dyn Renderer` seam (the
+    /// seam's script-message handler is `Send`, which an `Rc`-shared backend is
+    /// not — the webview evaluates on its single GTK thread instead).
+    ///
+    /// [`provider_shim`]: werust_core::provider::provider_shim
+    /// [`PROVIDER_BRIDGE`]: werust_core::provider::PROVIDER_BRIDGE
+    /// [`ProviderBridge`]: werust_core::provider::ProviderBridge
+    pub fn install_provider(&mut self) {
+        use werust_core::provider::{
+            provider_shim, route_provider_message, ProviderBridge, PROVIDER_BRIDGE,
+        };
+
+        // Page -> native: register the provider channel and answer each envelope.
+        self.content_manager
+            .register_script_message_handler(PROVIDER_BRIDGE, None);
+        let bridge = ProviderBridge::new();
+        // Native -> page: the response push evaluates the settle-call JS in the
+        // live document. Capture a WebView clone (a refcounted GObject handle) so
+        // the push runs on the GTK loop the signal fires on.
+        let view_for_push = self.view.clone();
+        self.content_manager.connect_script_message_received(
+            Some(PROVIDER_BRIDGE),
+            move |_cm, value| {
+                let message = renderer::ScriptMessage {
+                    handler: PROVIDER_BRIDGE.to_string(),
+                    body: value.to_str().to_string(),
+                };
+                let view = view_for_push.clone();
+                route_provider_message(&bridge, &message, &mut |script| {
+                    view.evaluate_javascript(
+                        &script,
+                        None::<&str>,
+                        None,
+                        gtk4::gio::Cancellable::NONE,
+                        |_result| {},
+                    );
+                });
+            },
+        );
+
+        // Make the provider detectable from document start.
+        self.inject_script(&provider_shim());
+    }
 }
 
 impl Renderer for WebViewRenderer {
@@ -241,6 +305,22 @@ impl Renderer for WebViewRenderer {
             &[],
         );
         self.content_manager.add_script(&user_script);
+    }
+
+    fn evaluate_javascript(&self, script: &str) {
+        // Push JS into the live page (browser -> page): the response half of the
+        // script-message bridge that settles the EIP-1193 provider's pending
+        // Promise. WebKitGTK evaluates asynchronously on the GTK loop; we pass no
+        // completion callback (fire-and-forget, matching the seam's `&self`,
+        // no-result contract). Arguments after `script` are optional context the
+        // day-one path does not need.
+        self.view.evaluate_javascript(
+            script,
+            None::<&str>,
+            None,
+            gtk4::gio::Cancellable::NONE,
+            |_result| {},
+        );
     }
 
     fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler) {

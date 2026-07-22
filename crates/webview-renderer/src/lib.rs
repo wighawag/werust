@@ -150,6 +150,13 @@ mod tests {
         scheme_handlers: Vec<String>,
         script_handlers: Vec<String>,
         injected: Vec<String>,
+        /// The registered script-message handlers, so the harness can deliver a
+        /// page-posted message to the same handler a real backend would.
+        message_handlers: std::collections::HashMap<String, ScriptMessageHandler>,
+        /// JS the seam pushed back into the page via `evaluate_javascript` — the
+        /// browser -> page response half of the bridge, recorded so the round-trip
+        /// can be asserted headlessly.
+        evaluated: Rc<RefCell<Vec<String>>>,
     }
 
     impl Renderer for SeamHarness {
@@ -193,12 +200,17 @@ mod tests {
         fn send_scroll(&mut self, _delta: ScrollDelta) {}
         fn set_focus(&mut self, _focused: bool) {}
 
-        fn register_script_message_handler(&mut self, name: &str, _handler: ScriptMessageHandler) {
+        fn register_script_message_handler(&mut self, name: &str, handler: ScriptMessageHandler) {
             self.script_handlers.push(name.to_string());
+            self.message_handlers.insert(name.to_string(), handler);
         }
 
         fn inject_script(&mut self, script: &str) {
             self.injected.push(script.to_string());
+        }
+
+        fn evaluate_javascript(&self, script: &str) {
+            self.evaluated.borrow_mut().push(script.to_string());
         }
 
         fn register_scheme_handler(&mut self, scheme: &str, _handler: SchemeHandler) {
@@ -207,6 +219,18 @@ mod tests {
     }
 
     impl SeamHarness {
+        /// Deliver a page-posted [`ScriptMessage`] to the handler registered under
+        /// its `handler` name, exactly as WebKitGTK's
+        /// `script-message-received` signal would on the GTK loop.
+        fn deliver_message(&mut self, handler: &str, body: &str) {
+            if let Some(h) = self.message_handlers.get_mut(handler) {
+                h(renderer::ScriptMessage {
+                    handler: handler.to_string(),
+                    body: body.to_string(),
+                });
+            }
+        }
+
         /// Simulate WebKitGTK's `load-changed` signal carrying the in-flight load
         /// through commit to done, the way the real backend feeds
         /// [`LoadLifecycle`] from the webview's signals.
@@ -351,6 +375,85 @@ mod tests {
     }
 
     #[test]
+    fn eip1193_provider_request_round_trips_across_the_bridge_seam() {
+        // Acceptance (injection + round-trip at the bridge seam, headless): a page
+        // `request(...)` posted UP the script-message bridge is answered by the
+        // native provider stub and the answer is pushed BACK into the page via the
+        // seam's `evaluate_javascript` — the full page -> native -> page round-trip,
+        // with no keys. This wires the provider routing onto the seam exactly as
+        // the real `WebViewRenderer::install_provider` does, but drives it without
+        // a GTK main loop or a display.
+        use werust_core::provider::{
+            provider_shim, route_provider_message, ProviderBridge, PROVIDER_BRIDGE, STUB_CHAIN_ID,
+        };
+
+        use std::sync::{Arc, Mutex};
+
+        let mut r = SeamHarness::default();
+        // The response push sink. The seam's script-message handler is `Send`, so
+        // the collector is an `Arc<Mutex<_>>` (exactly why the REAL backend cannot
+        // capture an `Rc`-shared handle and instead pushes via a cloned WebView on
+        // its GTK thread — see `WebViewRenderer::install_provider`).
+        let pushed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        // Inject the page-side shim (detectable `window.ethereum`) and register the
+        // provider channel handler that routes each envelope and pushes the
+        // response back (the browser -> page response the real backend delivers via
+        // the seam's `evaluate_javascript`).
+        r.inject_script(&provider_shim());
+        let bridge = ProviderBridge::new();
+        let pushed_for_handler = pushed.clone();
+        r.register_script_message_handler(
+            PROVIDER_BRIDGE,
+            Box::new(move |message| {
+                let sink = pushed_for_handler.clone();
+                route_provider_message(&bridge, &message, &mut |script| {
+                    sink.lock().unwrap().push(script);
+                });
+            }),
+        );
+
+        // The provider is DETECTABLE: the shim installing `window.ethereum` with
+        // the standard `request(...)` interface was injected at document start.
+        assert!(r.injected.iter().any(|s| s.contains("\"ethereum\"")));
+        assert!(r.injected.iter().any(|s| s.contains("request: function")));
+
+        // A page-side `request({ method: 'eth_chainId' })` posts this envelope up
+        // the bridge; deliver it to the registered handler.
+        r.deliver_message(
+            PROVIDER_BRIDGE,
+            r#"{"id":11,"method":"eth_chainId","params":[]}"#,
+        );
+
+        // The native stub answered and the settle-call was pushed BACK to the
+        // page: the round-trip completed with a result, no keys involved.
+        let pushed = pushed.lock().unwrap();
+        assert_eq!(
+            pushed.len(),
+            1,
+            "exactly one response pushed back to the page"
+        );
+        assert_eq!(
+            pushed[0],
+            format!(r#"window.{PROVIDER_BRIDGE}.__resolve(11, "{STUB_CHAIN_ID}");"#),
+            "the pending Promise for id 11 is resolved with the chain id"
+        );
+    }
+
+    #[test]
+    fn evaluate_javascript_pushes_into_the_page_over_the_seam() {
+        // The browser -> page response half of the bridge is a first-class seam
+        // method: a backend can push JS into the live page. Asserted headlessly on
+        // the harness (the real backend calls WebKitGTK's evaluate_javascript).
+        let r = SeamHarness::default();
+        r.evaluate_javascript("window.werustProvider.__resolve(1, \"0x1\");");
+        assert_eq!(
+            *r.evaluated.borrow(),
+            ["window.werustProvider.__resolve(1, \"0x1\");"]
+        );
+    }
+
+    #[test]
     fn webview_backend_passes_the_trust_hook_qualification_gate() {
         // The WebKitGTK backend declares BOTH trust hooks (it inherits the
         // qualifying default of `Renderer::trust_hooks`, exactly as the real
@@ -390,6 +493,22 @@ mod tests {
     fn real_webview_backend_qualifies() {
         let r = WebViewRenderer::new().expect("gtk init on a desktop session");
         qualify(&r).expect("the real WebKitGTK backend satisfies the trust hooks");
+    }
+
+    /// End-to-end install of the REAL EIP-1193 provider on the WebKitGTK backend.
+    /// Ignored by default (constructing a `WebViewRenderer` initializes GTK, which
+    /// needs a display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. Exercising the full page ->
+    /// native -> page round-trip additionally needs a running GTK loop with a page
+    /// loaded; the headless
+    /// `eip1193_provider_request_round_trips_across_the_bridge_seam` above pins the
+    /// round-trip logic display-free. Here we only pin that installing the provider
+    /// on the real backend wires the bridge without panicking.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_installs_the_eip1193_provider() {
+        let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        r.install_provider();
     }
 
     #[test]

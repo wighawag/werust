@@ -15,6 +15,19 @@ jobs:
       - name: Install Rust toolchain
         run: rustup component add rustfmt clippy
 
+      # The verify gate builds the WHOLE workspace, including webview-renderer +
+      # the werust desktop binary, which link webkit6/gtk4/glib via pkg-config.
+      # A bare ubuntu-latest runner has none of those .pc files, so `cargo build`
+      # fails with `glib-2.0 not found`. libwebkitgtk-6.0-dev owns
+      # webkitgtk-6.0.pc and pulls in libgtk-4-dev (gtk4.pc) + libglib2.0-dev
+      # (glib-2.0.pc, gio-2.0.pc) + libjavascriptcoregtk-6.0-dev as dependencies —
+      # the full set webkit6/gtk4/glib-sys/javascriptcore6 need. Must run BEFORE
+      # the compile steps (cargo clippy/build/test).
+      - name: Install WebKitGTK/GTK4 system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libwebkitgtk-6.0-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:

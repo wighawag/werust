@@ -41,6 +41,16 @@ jobs:
       - name: Install Rust toolchain
         run: rustup component add rustfmt clippy
 
+      # Same as verify.yml: the gate builds the whole workspace (incl. the
+      # webkit6/gtk4/glib-linking crates), so the system dev libs must be present
+      # BEFORE the compile steps or `cargo build` fails with `glib-2.0 not found`.
+      # libwebkitgtk-6.0-dev pulls in libgtk-4-dev + libglib2.0-dev +
+      # libjavascriptcoregtk-6.0-dev (gtk4.pc / glib-2.0.pc / webkitgtk-6.0.pc).
+      - name: Install WebKitGTK/GTK4 system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libwebkitgtk-6.0-dev
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -76,9 +86,13 @@ jobs:
           fetch-depth: 0
 
       - name: Install the desktop build toolchain (WebKitGTK + cross targets)
+        # The desktop binary links webkit6/gtk4 (webview-renderer -> webkit6 0.5 /
+        # gtk4 0.10), which need webkitgtk-6.0.pc / gtk4.pc / glib-2.0.pc — NOT the
+        # old webkit2gtk-4.1 ABI. libwebkitgtk-6.0-dev owns webkitgtk-6.0.pc and
+        # pulls in libgtk-4-dev + libglib2.0-dev + libjavascriptcoregtk-6.0-dev.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-4-dev
+          sudo apt-get install -y --no-install-recommends pkg-config libwebkitgtk-6.0-dev
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 
       - name: Set up Zig (for cargo-zigbuild cross-compiles)

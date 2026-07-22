@@ -4,6 +4,7 @@ slug: mobile-ipfs-scheme-interception-ios-and-android
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 blockedBy: []
 covers: [1]
+needsAnswers: true
 ---
 
 ## Settled decisions (from the design discussion — DECIDED, build to them)

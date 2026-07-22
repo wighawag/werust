@@ -55,11 +55,45 @@ Each heavy backend is a `Subsystem` with:
   start), or `disabled`;
 - an **async lifecycle**: `Inactive -> Starting(progress) -> Active -> (Failed | Stopped)`,
   startable on demand and stoppable to reclaim resources;
-- a **readiness signal** the scheme handler awaits before fetching.
+- a **readiness signal** the scheme handler awaits before fetching;
+- **live resource/status telemetry** it exposes while Active (state, uptime, peers/sync
+  height where relevant, and best-effort memory / CPU / network / disk usage) for the
+  management screen;
+- a **PROVIDER MODE** (see below) — how the capability is actually reached.
 
 The existing cheap schemes (HTTP-gateway `ipfs://`) are `always-on` (no behaviour change);
 new heavy ones (embedded Freenet node, Ethereum light client, a future local IPFS node,
 Tor) are `consent-gated`.
+
+### Provider mode — embedded / external / gateway (a shared abstraction)
+
+The SAME choice recurs across IPFS, Freenet, AND Ethereum: WHERE does the capability come
+from? A user who already runs their own node wants werust to USE it, not spin up a redundant
+embedded one. So each `Subsystem` (where it makes sense) has a configurable provider mode:
+
+- **Embedded** — werust runs the node/client IN-PROCESS (the heavyweight, gated case: an
+  embedded Freenet node, a local IPFS node, the Helios light client). This is the mode that
+  needs consent + lazy start.
+- **External / local** — point at a node the USER already runs (e.g. `localhost:5001` Kubo
+  for IPFS, `127.0.0.1:50509` for a Freenet node, a local Ethereum RPC / their own light
+  client). Cheap for werust (no embedded node to start) and often the user's PREFERRED,
+  most-trusted option; typically no consent prompt (they opted in by configuring it).
+- **Gateway / remote** — a public endpoint (a `dweb.link`-class IPFS gateway, a public
+  Ethereum RPC). Cheapest and always-on, but the LEAST trustless (a trusted third party);
+  the trust indicator must reflect that.
+
+Provider mode interacts with gating: `embedded` is the consent-gated heavy case; `external`
+and `gateway` are lightweight and usually `always-on` (but the trust indicator differs).
+Defaults are a per-protocol product decision (see open Q), but the pattern is uniform, so
+the config UI and the `Subsystem` trait model it ONCE for all protocols.
+
+- **IPFS:** embedded local node | external Kubo (`localhost:5001`) | public gateway
+  (`dweb.link`, today's default). (This generalises the ipfs task's existing hardcoded
+  gateway into a user-choosable provider mode.)
+- **Freenet:** embedded `freenet-core` node | external node the user runs (`:50509`).
+- **Ethereum:** embedded Helios light client | external local RPC / user's own light client
+  | public RPC (the trusted-skeleton default). (Note: even `embedded` Helios still needs an
+  untrusted execution RPC underneath — itself a provider-mode-like endpoint choice.)
 
 ### Consent semantics (the UX contract)
 
@@ -67,6 +101,18 @@ Tor) are `consent-gated`.
   battery + a startup delay; light client = sync time + an untrusted-RPC dependency), not a
   generic "allow?".
 - **Lazy:** the subsystem starts ONLY on first consented use, never at browser startup.
+- **CONFIGURE-AT-FIRST-USE (not just yes/no):** the first-use prompt is where the user picks
+  the PROVIDER MODE for that subsystem, not merely grants a boolean. On the FIRST `ronan.eth`
+  navigation, werust asks how the user wants Ethereum resolution to happen — e.g. "Resolve
+  ENS via: [your own RPC (enter URL)] / [a public RPC (trusted)] / [the embedded light
+  client (trustless, syncs on first use)]" — with the trust/cost trade-off of each shown, and
+  a sensible default preselected. Same on first `ipfs://` (own Kubo node / public gateway /
+  embedded) and first `freenet://` (embedded node / your own node). The choice is REMEMBERED
+  and is exactly the provider-mode config the management screen later lets them change. So
+  first-use consent and provider configuration are ONE moment: the browser asks "how should
+  I do this?", the user answers once, and it proceeds. A user who just wants it to work takes
+  the default; a user who runs their own node points at it right there. Keep the prompt
+  lightweight — a good default + an "advanced/configure" affordance, not a wall of options.
 - **Remembered (policy, open Q):** does consent persist (per-scheme "always start Freenet"),
   ask every time, or per-session? A remembered "always" turns a gated subsystem effectively
   `always-on` for that user.
@@ -76,13 +122,42 @@ Tor) are `consent-gated`.
   ("Freenet subsystem not started, so freenet://... could not be opened"), consistent with
   the ipfs/ENS fail-closed posture. Never render a partial/unverified fallback.
 
+### Subsystems management screen (the control center)
+
+A dedicated settings/management surface where the user SEES and CONTROLS every subsystem —
+the visible home of the model above. It lists each registered `Subsystem` and, per entry:
+
+- **Status:** Inactive / Starting / Active / Failed / Stopped (+ error reason if failed).
+- **Resource consumption (ideally):** best-effort memory / CPU / network / disk for the
+  subsystem, plus protocol-relevant stats (Freenet/IPFS peer count; light-client sync
+  height / last-verified block; uptime). Honest "not available" where a metric can't be
+  measured rather than a fake number.
+- **Controls:** start / STOP a running subsystem (reclaim resources / battery); its gating
+  policy (allow / ask / disable); revoke a remembered consent; a warm PRE-START (start it
+  from here before navigating).
+- **Configure — provider mode + endpoint:** choose Embedded / External / Gateway and set
+  the endpoint (e.g. IPFS: embedded | `localhost:5001` | `dweb.link`; Freenet: embedded |
+  the user's node; Ethereum: embedded Helios | local RPC | public RPC, plus the underlying
+  untrusted execution-RPC URL). Plus per-subsystem config the backend exposes (data dir,
+  ports, gateway/bootstrap peers, checkpoint).
+- **Trust note:** what each provider mode means for trust (embedded/external = your own;
+  gateway/public = a trusted third party), tying into the trust indicator.
+
+This is one screen, protocol-agnostic: it renders whatever each `Subsystem` declares
+(status + telemetry + config schema), so a NEW protocol appears here automatically by
+implementing the trait — no bespoke settings page per protocol. Reachable from a settings
+entry point (and, sensibly, `about:`-style, e.g. `werust://subsystems`, if that fits the
+scheme model).
+
 ### Reuse vs new
 
 - REUSE: the `Renderer` custom-scheme hook (schemes already dispatch through it); the load-
   failure -> chrome-reason path; the trust-indicator surface; the config/settings system.
-- NEW: the `Subsystem` abstraction + registry; the consent prompt UI (desktop chrome +
-  mobile edges); the lazy async start/stop lifecycle + readiness gating in front of a
-  scheme handler; the remembered-consent policy store.
+- NEW: the `Subsystem` abstraction + registry; the provider-mode (embedded/external/gateway)
+  + endpoint config; the consent prompt UI (desktop chrome + mobile edges); the lazy async
+  start/stop lifecycle + readiness gating in front of a scheme handler; the remembered-
+  consent policy store; the SUBSYSTEMS MANAGEMENT SCREEN (status + resource telemetry +
+  controls + provider/endpoint config).
 
 ## User Stories
 
@@ -96,7 +171,17 @@ Tor) are `consent-gated`.
 5. As a user, I can stop a running subsystem and revoke a remembered consent to reclaim
    resources / battery.
 6. As a developer, adding a new heavy protocol = implement the `Subsystem` trait + register
-   the scheme; the gate/consent/lifecycle are provided, not re-implemented per protocol.
+   the scheme; the gate/consent/lifecycle/config/management-row are provided, not re-
+   implemented per protocol.
+7. As a user, on the FIRST use of a protocol, the browser asks me HOW to do it (e.g. on
+   `ronan.eth`: my own RPC / a public RPC / the embedded light client), with the trade-offs
+   shown and a sensible default — not a bare yes/no — and remembers my choice.
+8. As a user, I can open a subsystems management screen that shows every subsystem, whether
+   it is running, and (ideally) how much memory / CPU / network it is using, and stop,
+   disable, or RECONFIGURE (change provider mode/endpoint) any of them.
+9. As a user who runs my OWN node, I can point werust at it (external `localhost` / my own
+   RPC) instead of the embedded one, per protocol — or choose a public gateway — and werust
+   uses my choice and reflects its trust implication.
 
 ## How the per-protocol specs plug in
 
@@ -112,11 +197,16 @@ Tor) are `consent-gated`.
 ## Phased delivery (proposed, for review)
 
 - **Phase 1 \u2014 the framework, one gated subsystem:** the `Subsystem` trait + registry +
-  consent prompt + lazy start/stop + readiness gating, proven end-to-end on ONE real gated
+  first-use consent prompt (with a provider-mode CHOICE, not bare yes/no) + lazy start/stop
+  + readiness gating + the provider-mode field, proven end-to-end on ONE real gated
   subsystem (whichever heavy backend lands first \u2014 likely the Freenet spike or the light
   client). Existing cheap schemes stay always-on, unchanged.
-- **Phase 2 \u2014 remembered-consent policy + revocation UI** (settings: per-scheme allow/ask/
-  disable, stop-running-subsystem).
+- **Phase 2 \u2014 the management screen + provider config + remembered consent** (the subsystems control
+  center: per-subsystem status + controls + STOP + revoke remembered consent; provider-mode
+  and endpoint config, embedded | external | gateway, per protocol — starting by
+  generalising the ipfs task's hardcoded gateway into a user-choosable provider; the
+  first-use prompt writes into the SAME config this screen edits; resource telemetry
+  best-effort here, deeper metrics later).
 - **Phase 3 \u2014 mobile consent UX** (native prompt at the OS edge) + resource/battery-aware
   auto-stop of idle subsystems.
 
@@ -152,6 +242,21 @@ Tor) are `consent-gated`.
 7. **Failure vs retry.** On start FAILURE (not decline), retry/backoff UX vs a plain failed
    load with a reason. And can the user pre-start a subsystem from settings before
    navigating (warm start)?
+8. **First-use prompt weight.** How much config surfaces on first use vs. "take the default,
+   configure later in the management screen"? (Recommend: a good default preselected + a
+   compact provider choice + an "advanced" affordance — NOT a wall of endpoint fields on
+   first navigation; the management screen holds the full config.)
+9. **Default provider mode per protocol.** What ships as default? (IPFS = public gateway
+   `dweb.link` today, cheapest but least trustless; Freenet/Ethereum = embedded, or
+   gateway/public-RPC to start?) And how prominently is the trust trade-off surfaced when a
+   user is on gateway/public mode vs their own node?
+10. **Resource-telemetry depth + portability.** How deep do per-subsystem metrics go, and
+    how measured cross-platform (Linux/Android/iOS have very different per-process/thread
+    accounting)? (Recommend: best-effort with honest "unavailable", never a fabricated
+    number.)
+11. **Management-screen surface.** A native settings pane, an internal page (e.g.
+    `werust://subsystems`), or both? (An internal page dogfoods werust's own rendering; a
+    native pane is simpler on mobile.)
 
 ## Why this is the right long-run bet
 

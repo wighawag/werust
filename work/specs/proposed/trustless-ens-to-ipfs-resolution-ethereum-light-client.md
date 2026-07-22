@@ -55,13 +55,19 @@ BACKEND behind it. Two backends, delivered in phases:
   endpoint. Gets `ronan.eth -> site` working end to end EARLY so the whole path is real and
   testable. Clearly labelled trusted (the trust indicator must NOT show "verified" for a
   name resolved this way).
-> **The light-client backend is a consent-gated subsystem.** `LightClientProvider` (Helios)
-> is HEAVY (sync delay + an untrusted-RPC dependency to disclose), so it is a
-> `consent-gated` `Subsystem` under `gated-protocol-subsystems-consent-and-lazy-activation`:
-> resolving a `.eth` name via the light client triggers the consent prompt + lazy start. The
-> trusted `RpcProvider` skeleton is cheap enough to be `always-on`. Declining the light
-> client fails the name resolution cleanly (it does NOT silently fall back to the trusted RPC
-> unless the user is clearly told the resolution is then trusted-not-verified).
+> **The Ethereum access is a consent-gated subsystem, CONFIGURED at first use.** Under
+> `gated-protocol-subsystems-consent-and-lazy-activation`, the FIRST time the user opens a
+> `.eth` name werust asks HOW to resolve it (a provider-mode choice, not a bare yes/no):
+> "Resolve ENS via: [your own RPC (enter URL)] / [a public RPC — trusted] / [the embedded
+> light client — trustless, syncs on first use]", with each option's trust/cost trade-off
+> shown and a sensible default preselected, and the choice REMEMBERED (changeable later in
+> the subsystems management screen). So a user who runs their own node/RPC points werust at
+> it right there; a user who just wants it to work takes the default. The embedded
+> `LightClientProvider` (Helios) is the HEAVY, `consent-gated` mode (sync delay + an
+> untrusted execution-RPC dependency to disclose); the `RpcProvider` (own or public RPC) is
+> lightweight. Declining/failing the chosen mode fails the name resolution cleanly; werust
+> does NOT silently fall back to a more-trusted-less-verified mode without telling the user
+> the resolution is then trusted-not-verified (reflected in the trust indicator).
 
 - **`LightClientProvider` (the endgame, TRUSTLESS).** Embeds **Helios** (a16z's Rust
   trustless light client: takes an untrusted execution RPC + a weak-subjectivity checkpoint,

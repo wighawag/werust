@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
@@ -48,12 +49,18 @@ class BrowserActivity : Activity() {
         super.onCreate(savedInstanceState)
 
         val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val toolbar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        // The toolbar row is at least a touch-target tall (48dp), so even though the
+        // nav buttons render as a small square glyph they stay comfortably tappable.
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            minimumHeight = dp(TOUCH_TARGET_DP)
+        }
 
-        backButton = Button(this).apply { text = "◀"; setOnClickListener { core.goBack(); afterCoreAction() } }
-        forwardButton = Button(this).apply { text = "▶"; setOnClickListener { core.goForward(); afterCoreAction() } }
-        reloadButton = Button(this).apply { text = "⟳"; setOnClickListener { core.reload(); afterCoreAction() } }
-        stopButton = Button(this).apply { text = "✕"; setOnClickListener { core.stop(); afterCoreAction() } }
+        backButton = compactNavButton("◀") { core.goBack(); afterCoreAction() }
+        forwardButton = compactNavButton("▶") { core.goForward(); afterCoreAction() }
+        reloadButton = compactNavButton("⟳") { core.reload(); afterCoreAction() }
+        stopButton = compactNavButton("✕") { core.stop(); afterCoreAction() }
         urlBar = EditText(this).apply {
             hint = "Enter a URL and press Enter"
             layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
@@ -92,6 +99,36 @@ class BrowserActivity : Activity() {
         core.navigate(START_URL)
         afterCoreAction()
     }
+
+    /**
+     * A COMPACT nav button: a small fixed square that strips the default Android
+     * button's large min-width and horizontal insets ([minWidth]/[minimumWidth] 0,
+     * no horizontal padding), so four of them take a small fixed slice of the row
+     * and the weighted URL bar keeps the majority of the width. The button glyph is
+     * small, but the enclosing toolbar row is [TOUCH_TARGET_DP] tall so the
+     * effective touch target stays >= 48dp.
+     */
+    private fun compactNavButton(glyph: String, onClick: () -> Unit): Button =
+        Button(this).apply {
+            text = glyph
+            minWidth = 0
+            minimumWidth = 0
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(0, 0, 0, 0)
+            gravity = Gravity.CENTER
+            includeFontPadding = false
+            layoutParams = LinearLayout.LayoutParams(dp(NAV_BUTTON_DP), dp(NAV_BUTTON_DP))
+            setOnClickListener { onClick() }
+        }
+
+    /** Density-independent pixels -> device pixels, for the compact fixed sizes. */
+    private fun dp(value: Int): Int =
+        TypedValue.applyDimension(
+            TypedValue.COMPLEX_UNIT_DIP,
+            value.toFloat(),
+            resources.displayMetrics,
+        ).toInt()
 
     /** After driving the core, apply any pending load to the WebView and repaint. */
     private fun afterCoreAction() {
@@ -150,5 +187,11 @@ class BrowserActivity : Activity() {
     companion object {
         /** The URL the app opens on launch, so it shows a browsing surface. */
         private const val START_URL = "https://example.com/"
+
+        /** The compact nav-button square edge, in dp (small so the URL bar wins width). */
+        private const val NAV_BUTTON_DP = 40
+
+        /** The toolbar row's minimum height, in dp, keeping touch targets >= 48dp. */
+        private const val TOUCH_TARGET_DP = 48
     }
 }

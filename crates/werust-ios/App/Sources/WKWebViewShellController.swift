@@ -69,12 +69,26 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         reloadButton.addTarget(self, action: #selector(onReload), for: .touchUpInside)
         stopButton.addTarget(self, action: #selector(onStop), for: .touchUpInside)
 
+        // The nav buttons stay at their intrinsic (compact) width: they hug their
+        // content tightly and resist being stretched. The URL field, by contrast,
+        // hugs weakly and is the first to stretch, so it takes the MAJORITY of the
+        // row while the four buttons keep only the width their glyphs need.
+        for button in [backButton, forwardButton, reloadButton, stopButton] {
+            button.setContentHuggingPriority(.required, for: .horizontal)
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+        }
+        urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+
         let toolbar = UIStackView(arrangedSubviews: [
             backButton, forwardButton, reloadButton, stopButton, urlField,
         ])
         toolbar.axis = .horizontal
         toolbar.spacing = 8
         toolbar.alignment = .center
+        // .fill so the low-hugging URL field absorbs all the spare width (the
+        // buttons, at required hugging, stay intrinsic); no button is stretched.
+        toolbar.distribution = .fill
         toolbar.translatesAutoresizingMaskIntoConstraints = false
 
         webView = WKWebView(frame: .zero, configuration: WKWebViewConfiguration())

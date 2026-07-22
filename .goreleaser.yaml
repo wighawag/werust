@@ -1,38 +1,42 @@
-# GoReleaser config for werust — the deliberately Zig-less release path.
+# GoReleaser config for werust — the deliberately Zig-less release path, now
+# Zig-less in the FULL sense (no Zig linker either).
 #
 # This is the port of wezig's `.goreleaser.yaml`, swapping GoReleaser's
-# `builder: zig` for its native `builder: rust` (GoReleaser v2.5+, which
-# cross-compiles via cargo-zigbuild). A tag push (`v*`) cuts one GitHub Release
-# carrying the desktop Linux binaries (amd64, arm64) + checksums + a
-# conventional-commit changelog; the mobile artifacts (Android APK, iOS Simulator
-# `.app` zip) are attached by the hand-written jobs in
-# `.github/workflows/release.yml` alongside this (parity with wezig, mobile
-# included — `docs/adr/0002`, CONTEXT.md Conventions).
+# `builder: zig` for its native `builder: rust`. The desktop binary dynamically
+# links system WebKitGTK/GTK/glib; cargo-zigbuild's `zig cc` linker does NOT
+# search the host's system library paths, so it cannot link glib-2.0 /
+# gobject-2.0 / cairo even with `libwebkitgtk-6.0-dev` installed. So the desktop
+# leg is now NATIVE x86_64-only: GoReleaser's rust builder with `command: build`
+# (plain `cargo build`) drives the host system linker, which links WebKitGTK
+# fine (the `verify` job + local builds prove it). arm64 lives where it belongs
+# now — mobile (NDK/Xcode) — and desktop arm64 Linux is dropped (`docs/adr/0002`).
+#
+# A tag push (`v*`) cuts one GitHub Release carrying the desktop Linux x86_64
+# binary + checksums + a conventional-commit changelog; the mobile artifacts
+# (Android APK, iOS Simulator `.app` zip) are attached INDEPENDENTLY by the
+# hand-written jobs in `.github/workflows/release.yml` (they no longer wait on
+# this desktop leg — CONTEXT.md Conventions, `docs/adr/0002`).
 #
 # The release workflow ALSO runs this in `--snapshot` mode on a
 # `workflow_dispatch` dry-run, which builds every artifact but publishes nothing.
 version: 2
 
-# GoReleaser's Rust builder cross-compiles with cargo-zigbuild and needs the Rust
-# targets installed. The desktop binary links system WebKitGTK, so install the
-# GTK/WebKit dev libraries too. Runs on the Linux desktop leg only.
-before:
-  hooks:
-    - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-    - cargo install --locked cargo-zigbuild
-
 builds:
   - id: werust-desktop
-    # The Zig-less build path: GoReleaser's native Rust builder (cargo-zigbuild).
+    # The Zig-less build path: GoReleaser's native Rust builder driving a plain
+    # native `cargo build` (NO cargo-zigbuild, NO `zig cc` linker).
     builder: rust
     binary: werust
-    # `cargo build` the desktop binary crate for each desktop Linux target.
-    tool: cargo
-    command: zigbuild
+    # `cargo build` (native) the desktop binary crate for the host x86_64 target.
+    # `command: build` picks plain `cargo build` over the rust builder's default
+    # `zigbuild`; `tool` stays the default `cargo`. The native system linker
+    # searches the host's system lib paths, so it links WebKitGTK/GTK/glib — the
+    # exact thing `zig cc` could not do.
+    command: build
     # werust is a multi-crate Cargo workspace, so cargo cannot disambiguate which
     # crate to build: GoReleaser's rust builder errors "you need to specify which
     # workspace to build, please add '--package=[name]'". Select the `werust`
-    # binary crate. GoReleaser passes `flags` straight to `cargo zigbuild` and
+    # binary crate. GoReleaser passes `flags` straight to `cargo build` and
     # accepts `--package=`/`-p=` as the workspace selector (its `isSettingPackage`
     # check). Setting an explicit `flags` list REPLACES GoReleaser's `--release`
     # default, and its rust builder then copies the artifact from
@@ -41,13 +45,15 @@ builds:
     flags:
       - --release
       - --package=werust
-    # Desktop Linux amd64 + arm64 (the wezig-parity desktop floor). Rust target
-    # triples, as the Rust builder expects.
+    # Desktop Linux x86_64 ONLY, built natively (no cross-compile). arm64 is
+    # mobile-only now; desktop arm64 Linux is dropped (`docs/adr/0002`). Rust
+    # target triple, as the Rust builder expects. GoReleaser runs
+    # `rustup target add` for each declared target itself, so no before-hook is
+    # needed to install it.
     targets:
       - x86_64-unknown-linux-gnu
-      - aarch64-unknown-linux-gnu
 
-# One archive per desktop target so the Release carries downloadable tarballs.
+# One archive (x86_64 desktop) so the Release carries a downloadable tarball.
 archives:
   - id: werust-desktop
     formats: [tar.gz]

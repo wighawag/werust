@@ -2,25 +2,30 @@ name: release
 
 # The release pipeline — parity with wezig's `release.yml`, mobile included, on
 # the deliberately Zig-less build path (GoReleaser `builder: rust`; ADR-0002,
-# CONTEXT.md Conventions). Two paths:
+# CONTEXT.md Conventions). The desktop leg is now NATIVE x86_64-only — no Zig at
+# all (cargo-zigbuild's `zig cc` linker cannot link the binary's system
+# WebKitGTK/GTK/glib; the native system linker can). Two paths:
 #
 #   * TAG PUSH (`v*`)      — a REAL release: GoReleaser publishes a GitHub Release
-#                            with the desktop Linux binaries (amd64, arm64) +
-#                            checksums + a conventional-commit changelog, then the
-#                            Android APK + iOS Simulator `.app` zip are attached to
-#                            it with `gh release upload`.
+#                            with the desktop Linux x86_64 binary + checksums +
+#                            a conventional-commit changelog, and the Android APK
+#                            + iOS Simulator `.app` zip are attached to it with
+#                            `gh release upload` — INDEPENDENTLY of the desktop leg
+#                            (each mobile job idempotently ensures the Release
+#                            exists first, so a desktop failure never blocks them).
 #   * workflow_dispatch    — a DRY RUN: GoReleaser runs `--snapshot` (publishes
 #                            NOTHING) and every leg uploads workflow artifacts via
 #                            actions/upload-artifact instead of attaching to a
 #                            Release, so all artifacts are validated end-to-end
 #                            without cutting a release.
 #
-# Three build jobs mirror wezig's shape, gated by `verify` (the pure-Rust gate)
-# so a tag can never ship a red tree:
-#   verify -> goreleaser (Linux desktop)  ->  android-apk (Linux, SDK+NDK)
-#                                         ->  ios-simulator-app (macos-14)
-# The mobile legs `needs: goreleaser` so, on a tag, the Release already exists to
-# upload into.
+# Three build jobs mirror wezig's shape, all gated ONLY by `verify` (the
+# pure-Rust gate) so a tag can never ship a red tree, and so the mobile legs are
+# DECOUPLED from the desktop leg (a desktop build failure cannot block the APK /
+# `.app`):
+#   verify -> goreleaser (Linux desktop, native x86_64)
+#   verify -> android-apk (Linux, SDK+NDK)
+#   verify -> ios-simulator-app (macos-14)
 
 on:
   push:
@@ -71,8 +76,8 @@ jobs:
       - name: cargo test
         run: cargo test
 
-  # The desktop leg: GoReleaser's Rust builder cuts the Linux binaries +
-  # checksums + changelog. On a tag it PUBLISHES the Release; on a dispatch
+  # The desktop leg: GoReleaser's Rust builder cuts the native Linux x86_64 binary
+  # + checksums + changelog. On a tag it PUBLISHES the Release; on a dispatch
   # dry-run it runs `--snapshot` (publishes nothing) and uploads the built dist
   # as a workflow artifact.
   goreleaser:
@@ -85,24 +90,17 @@ jobs:
           # changelog; a shallow checkout would truncate it.
           fetch-depth: 0
 
-      - name: Install the desktop build toolchain (WebKitGTK + cross targets)
+      - name: Install the desktop build toolchain (WebKitGTK system deps)
         # The desktop binary links webkit6/gtk4 (webview-renderer -> webkit6 0.5 /
         # gtk4 0.10), which need webkitgtk-6.0.pc / gtk4.pc / glib-2.0.pc — NOT the
         # old webkit2gtk-4.1 ABI. libwebkitgtk-6.0-dev owns webkitgtk-6.0.pc and
         # pulls in libgtk-4-dev + libglib2.0-dev + libjavascriptcoregtk-6.0-dev.
+        # The native x86_64 build uses the host system linker, which searches
+        # these system lib paths — no Zig / cargo-zigbuild involved. GoReleaser's
+        # rust builder runs `rustup target add x86_64-unknown-linux-gnu` itself.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends pkg-config libwebkitgtk-6.0-dev
-          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
-
-      - name: Set up Zig (for cargo-zigbuild cross-compiles)
-        uses: mlugg/setup-zig@v2
-        with:
-          # Pin a REAL released Zig. An unpinned setup-zig defaults to
-          # `version: latest`, which resolved to the UNRELEASED 0.16.0 and 404'd on
-          # every mirror, failing the whole release run. 0.14.1 is a released stable
-          # that the (unpinned, latest) cargo-zigbuild installed above supports.
-          version: 0.14.1
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -147,8 +145,12 @@ jobs:
   # run the acceptance ABI check, then attach the APK to the Release (tag) or
   # upload it as a workflow artifact (dry-run). Reuses the exact contract the
   # mobile-android task landed (task DECISIONS.md; forward-pointer on this task).
+  # DECOUPLED from the desktop leg: `needs: verify` (NOT `needs: goreleaser`), so a
+  # desktop build failure cannot block the APK. On a tag the Release may not exist
+  # yet when this runs, so the attach step idempotently `gh release create`s it
+  # first (a Release-EXISTENCE guarantee, not a desktop-build dependency).
   android-apk:
-    needs: goreleaser
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -184,12 +186,18 @@ jobs:
         # deliberately NOT in the pure-Rust verify gate, which lacks the SDK/NDK).
         run: docs/spikes/mobile-android-shell-and-static-lib/check-apk-abis.sh crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
 
-      # TAG PATH: attach the APK to the Release cut by the goreleaser job.
+      # TAG PATH: attach the APK to the Release. This leg no longer `needs:
+      # goreleaser`, so the Release may not exist yet — idempotently create it
+      # first (`|| true` swallows the "already exists" error when the desktop leg
+      # or the other mobile leg got there first). This is a Release-EXISTENCE
+      # guarantee, NOT a desktop-build dependency.
       - name: Attach the APK to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" crates/werust-android/app/build/outputs/apk/debug/app-debug.apk --clobber
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" crates/werust-android/app/build/outputs/apk/debug/app-debug.apk --clobber
 
       # DRY-RUN PATH: upload the APK as a workflow artifact, publish nothing.
       - name: Upload the APK (dry-run)
@@ -203,8 +211,11 @@ jobs:
   # are macOS-only), run the acceptance bundle check, zip the `.app`, then attach
   # it to the Release (tag) or upload it as a workflow artifact (dry-run). Reuses
   # the mobile-ios task's BUILD_ONLY packaging path + check-app-bundle.sh.
+  # DECOUPLED from the desktop leg: `needs: verify` (NOT `needs: goreleaser`), so a
+  # desktop build failure cannot block the `.app`. As with android-apk, the attach
+  # step idempotently `gh release create`s the Release first on a tag.
   ios-simulator-app:
-    needs: goreleaser
+    needs: verify
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -238,12 +249,17 @@ jobs:
           cd crates/werust-ios/build
           zip -r -y WerustShell-Simulator.app.zip WerustShell.app
 
-      # TAG PATH: attach the zipped `.app` to the Release.
+      # TAG PATH: attach the zipped `.app` to the Release. This leg no longer
+      # `needs: goreleaser`, so idempotently ensure the Release exists first
+      # (`|| true` swallows the "already exists" error). A Release-EXISTENCE
+      # guarantee, NOT a desktop-build dependency.
       - name: Attach the Simulator .app zip to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${GITHUB_REF_NAME}" crates/werust-ios/build/WerustShell-Simulator.app.zip --clobber
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" crates/werust-ios/build/WerustShell-Simulator.app.zip --clobber
 
       # DRY-RUN PATH: upload the zipped `.app` as a workflow artifact, publish
       # nothing.

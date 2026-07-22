@@ -15,17 +15,26 @@
 //! it carries no GTK/SDK deps, so the assertion runs inside the pure-Rust
 //! `verify` gate (`cargo test`) with no extra toolchain.
 //!
-//! Acceptance criteria mapped to assertions below:
-//! 1. `.goreleaser.yaml` uses `builder: rust` and produces desktop Linux amd64 +
-//!    arm64 binaries + checksums.
+//! Acceptance criteria mapped to assertions below (updated by task
+//! `fix-release-native-x86-desktop-and-decouple-mobile`, human choice B+C —
+//! desktop is now native x86_64-only with NO Zig, and the mobile legs are
+//! DECOUPLED from the desktop leg; see `docs/adr/0002` "Update" section):
+//! 1. `.goreleaser.yaml` uses `builder: rust` and produces the desktop Linux
+//!    x86_64 binary NATIVELY (`command: build`, no `command: zigbuild`, no
+//!    cargo-zigbuild install, no arm64 target) + checksums.
 //! 2. The changelog is generated from conventional-commit git history (no
 //!    per-change changeset files) — `changelog.use: git` + conventional groups.
-//! 3. The release workflow also builds + attaches the Android debug APK and the
-//!    iOS Simulator `.app` zip, gated AFTER the desktop build (`needs:`).
+//! 3. The release workflow builds + attaches the Android debug APK and the iOS
+//!    Simulator `.app` zip INDEPENDENTLY of the desktop leg (`needs: verify`,
+//!    NOT `needs: goreleaser`), guaranteeing the Release exists on a tag via an
+//!    idempotent `gh release create ... || true` (a Release-EXISTENCE guarantee,
+//!    not a desktop-build dependency).
 //! 4. A `workflow_dispatch` dry-run builds everything via snapshot + uploads
 //!    workflow artifacts WITHOUT publishing a release.
 //! 5. The same `verify` gate runs before a tag build so a tag can't ship a red
 //!    tree.
+//! 6. The desktop leg carries NO Zig: no `command: zigbuild`, no cargo-zigbuild
+//!    install hook, and the release workflow has no "Set up Zig" step.
 
 use std::path::{Path, PathBuf};
 
@@ -69,7 +78,7 @@ fn contains_substr(v: &Value, needle: &str) -> bool {
     strings_of(v).iter().any(|s| s.contains(needle))
 }
 
-// --- Criterion 1: GoReleaser Rust builder, desktop Linux amd64+arm64, checksums ---
+// --- Criterion 1: GoReleaser Rust builder, native desktop Linux x86_64, checksums ---
 
 #[test]
 fn goreleaser_uses_the_rust_builder() {
@@ -87,7 +96,12 @@ fn goreleaser_uses_the_rust_builder() {
 }
 
 #[test]
-fn goreleaser_targets_desktop_linux_amd64_and_arm64() {
+fn goreleaser_targets_only_native_desktop_linux_x86_64() {
+    // Human choice B: the desktop leg is NATIVE x86_64-only. cargo-zigbuild's
+    // `zig cc` linker cannot link the binary's system WebKitGTK/GTK/glib (it does
+    // not search system lib paths), so arm64 desktop Linux is dropped and the
+    // one x86_64 target is built with the native system linker. arm64 now lives
+    // only on the mobile side (`docs/adr/0002` Update).
     let cfg = load_yaml(".goreleaser.yaml");
     let builds = cfg
         .get("builds")
@@ -109,11 +123,52 @@ fn goreleaser_targets_desktop_linux_amd64_and_arm64() {
     }
     assert!(
         targets.iter().any(|t| t == "x86_64-unknown-linux-gnu"),
-        "must build the desktop Linux amd64 target (x86_64-unknown-linux-gnu); got {targets:?}"
+        "must build the desktop Linux x86_64 target (x86_64-unknown-linux-gnu); got {targets:?}"
     );
     assert!(
-        targets.iter().any(|t| t == "aarch64-unknown-linux-gnu"),
-        "must build the desktop Linux arm64 target (aarch64-unknown-linux-gnu); got {targets:?}"
+        !targets.iter().any(|t| t == "aarch64-unknown-linux-gnu"),
+        "the desktop leg must NOT build arm64 Linux (dropped — arm64 is mobile-only now); got {targets:?}"
+    );
+}
+
+#[test]
+fn goreleaser_desktop_build_is_native_no_zig() {
+    // Criterion 6 / choice B: the desktop `builder: rust` build must use the
+    // NATIVE cargo build (`command: build`), NOT `command: zigbuild`, and there
+    // must be no cargo-zigbuild install hook anywhere in the config. The native
+    // system linker links WebKitGTK; `zig cc` cannot.
+    let cfg = load_yaml(".goreleaser.yaml");
+    let builds = cfg
+        .get("builds")
+        .and_then(Value::as_sequence)
+        .expect("`builds:` list");
+    let rust_build = builds
+        .iter()
+        .find(|b| b.get("builder").and_then(Value::as_str) == Some("rust"))
+        .expect("a `builder: rust` desktop build");
+    let command = rust_build.get("command").and_then(Value::as_str);
+    assert_ne!(
+        command,
+        Some("zigbuild"),
+        "the desktop build must NOT use `command: zigbuild` (zig cc cannot link system WebKitGTK)"
+    );
+    // The native build is either the explicit `command: build` or the default
+    // when `command` is absent — but the rust builder's DEFAULT is `zigbuild`, so
+    // to be native the config MUST set `command: build` explicitly.
+    assert_eq!(
+        command,
+        Some("build"),
+        "the desktop build must set `command: build` (plain native cargo build); got {command:?}"
+    );
+    // No cargo-zigbuild install hook anywhere (before-hooks or otherwise).
+    assert!(
+        !contains_substr(&cfg, "cargo-zigbuild"),
+        "the config must NOT install cargo-zigbuild (the desktop build is native, Zig-less)"
+    );
+    // No zig-based cross target left in the config either.
+    assert!(
+        !contains_substr(&cfg, "zigbuild"),
+        "the config must reference no `zigbuild` command (the desktop build is native)"
     );
 }
 
@@ -301,9 +356,31 @@ fn verify_gate_runs_before_the_tag_build() {
 }
 
 #[test]
-fn mobile_jobs_are_gated_after_the_desktop_goreleaser_job() {
-    // Criterion 3: the Android APK + iOS Simulator `.app` legs run AFTER the
-    // desktop build (so the Release exists to upload into).
+fn release_workflow_has_no_zig_setup_step() {
+    // Criterion 6 / choice B: with the native desktop build there is no Zig, so
+    // the workflow must not set Zig up anywhere.
+    let wf = release_workflow();
+    assert!(
+        !contains_substr(&wf, "setup-zig"),
+        "the release workflow must have NO Zig setup step (setup-zig) — the desktop build is native"
+    );
+    // The goreleaser job must still install the WebKitGTK system deps (the native
+    // linker links them).
+    let goreleaser = job("goreleaser");
+    assert!(
+        contains_substr(&goreleaser, "libwebkitgtk-6.0-dev"),
+        "the goreleaser job must still install the WebKitGTK system deps for the native build"
+    );
+}
+
+#[test]
+fn mobile_jobs_are_decoupled_from_the_desktop_leg() {
+    // Criterion 3 / choice C: the Android APK + iOS Simulator `.app` legs are
+    // DECOUPLED from the desktop leg — a desktop build failure must not block
+    // them. They gate on `verify` (the green-tree gate) and must NOT `needs:
+    // goreleaser`. On a tag they still attach to the Release, guaranteeing its
+    // existence with an idempotent `gh release create` (a Release-EXISTENCE
+    // guarantee, not a desktop-build dependency).
     for mobile in ["android-apk", "ios-simulator-app"] {
         let j = job(mobile);
         let needs = strings_of(
@@ -311,8 +388,19 @@ fn mobile_jobs_are_gated_after_the_desktop_goreleaser_job() {
                 .unwrap_or_else(|| panic!("the `{mobile}` job must declare `needs:`")),
         );
         assert!(
-            needs.iter().any(|n| n == "goreleaser"),
-            "the `{mobile}` job must `needs: goreleaser` (gated after the desktop build); got {needs:?}"
+            !needs.iter().any(|n| n == "goreleaser"),
+            "the `{mobile}` job must NOT `needs: goreleaser` (decoupled from desktop); got {needs:?}"
+        );
+        assert!(
+            needs.iter().any(|n| n == "verify"),
+            "the `{mobile}` job must `needs: verify` (gated on a green tree, independent of desktop); got {needs:?}"
+        );
+        // On a tag, guarantee the Release exists before uploading into it — an
+        // idempotent create, since this leg no longer waits on the desktop job.
+        assert!(
+            contains_substr(&j, "gh release create"),
+            "the `{mobile}` job must idempotently `gh release create` on a tag (Release-existence \
+             guarantee) since it no longer `needs: goreleaser`"
         );
     }
 }

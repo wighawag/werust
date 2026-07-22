@@ -60,3 +60,38 @@ Two reasons, and the second is the load-bearing one:
 - The changelog is generated FROM git history, so the **conventional-commit
   convention is load-bearing** (see `CONTEXT.md` Conventions) — no per-change
   changeset files.
+
+## Update: desktop is native x86_64-only (Zig-less in the FULL sense), mobile decoupled
+
+The desktop leg no longer uses **any** Zig, not even as a cross-linker. It builds
+only `x86_64-unknown-linux-gnu`, NATIVELY (`builder: rust` with `command: build`
+= plain `cargo build`, driving the host system linker). Desktop arm64 Linux is
+**dropped**; arm64 now lives only on the mobile side (Android NDK / iOS Xcode).
+The two mobile jobs are also **decoupled** from the desktop leg.
+
+**Why (the load-bearing reason).** GoReleaser's rust builder cross-compiles with
+`cargo-zigbuild`, which uses `zig cc` as the linker. `zig cc` does **not** search
+the host's system library paths, so it cannot link the desktop binary's system
+**WebKitGTK/GTK/glib** even with `libwebkitgtk-6.0-dev` installed — every dry-run
+failed with `error: unable to find dynamic system library 'glib-2.0'` (e.g. run
+29902579536). Zig-as-linker is the wrong tool for a binary that dynamically links
+system libraries. The **native system linker already links WebKitGTK fine** (the
+`verify` job + local builds prove it), so the desktop leg uses it directly. This
+supersedes the earlier framing that read Zig-less as "Zig-less for the
+language/renderer, but a Zig linker is fine": for a system-lib-linking desktop
+binary the Zig linker is not fine, and the desktop path is now Zig-less end to end.
+(arm64 desktop Linux would need an arm64 GTK/WebKit sysroot or a native arm64
+runner — an ADR-level restructure, not worth it for a desktop-Linux-first project;
+see `work/notes/observations/why-zig-in-release-and-rust-native-alternatives-2026-07-22.md`.)
+
+**Mobile decoupled from desktop.** `android-apk` and `ios-simulator-app` used to
+`needs: goreleaser` purely for ORDERING (so a tag's Release existed to upload
+into). That coupling let a desktop link failure block the APK/`.app`. Both now
+`needs: verify` (independent of the desktop leg). On a tag, each mobile job
+idempotently `gh release create "$TAG" --generate-notes 2>/dev/null || true`
+before `gh release upload --clobber` — a Release-EXISTENCE guarantee, NOT a
+desktop-build dependency. The `workflow_dispatch` snapshot dry-run is unchanged:
+it still builds every artifact and uploads workflow artifacts, publishing nothing.
+
+Implemented by task `fix-release-native-x86-desktop-and-decouple-mobile` (human
+chose B+C).

@@ -340,17 +340,19 @@ impl TrustHooks {
     }
 }
 
-/// A backend that declares every trust hook by default.
+/// A backend that declares NO trust hook by default.
 ///
-/// The DEFAULT is qualifying: a backend that implements the hook methods is
-/// presumed to satisfy them unless it overrides [`Renderer::trust_hooks`] to say
-/// otherwise. The gate's job is to reject a backend that HONESTLY reports it
-/// cannot — the render-only case — not to catch a backend lying about a hook it
-/// stubbed. (Wiring real behaviour onto the hooks, and asserting that behaviour,
-/// is the sibling provider/ipfs tasks' job.)
+/// The DEFAULT is FAIL-CLOSED: a backend declares NOTHING until it opts in, so
+/// trust is never inherited by omission. A backend that stubs the hook methods
+/// (as every `Renderer` impl must) but does not say what it actually wires is
+/// treated as satisfying no hook — and is therefore rejected by [`qualify`].
+/// Trust must be OPTED INTO, hook by hook: a backend that genuinely wires a hook
+/// declares it (via [`Renderer::trust_hooks`]), and only then does the gate
+/// accept it. (Wiring real behaviour onto the hooks, and asserting that
+/// behaviour, is the sibling provider/ipfs tasks' job.)
 impl Default for TrustHooks {
     fn default() -> Self {
-        TrustHooks::all()
+        TrustHooks::none()
     }
 }
 
@@ -553,13 +555,16 @@ pub trait Renderer {
     /// "a backend qualifies only if it satisfies the trust hooks" an enforced seam
     /// property, not a comment.
     ///
-    /// The provided default declares BOTH hooks: a backend that wires the hook
-    /// methods to real behaviour (the webview, wired by the sibling provider/ipfs
-    /// tasks) qualifies without extra ceremony. A backend that renders but cannot
-    /// satisfy a hook OVERRIDES this to drop it, and is then rejected by
-    /// [`qualify`].
+    /// The provided default is FAIL-CLOSED: it declares NO hook, so a backend
+    /// that does not override this OPTS INTO nothing and is rejected by
+    /// [`qualify`]. Trust is never inherited by omission — a backend qualifies
+    /// ONLY if it EXPLICITLY declares the trust hooks it actually wires. A
+    /// backend that genuinely wires both (the webview, wired by the sibling
+    /// provider/ipfs tasks) OVERRIDES this to return [`TrustHooks::all`]; one
+    /// that wires only some declares only those; a render-only backend leaves
+    /// the default and is disqualified.
     fn trust_hooks(&self) -> TrustHooks {
-        TrustHooks::all()
+        TrustHooks::none()
     }
 
     /// The [`TrustPosture`] of the CURRENT load: content-verified vs served by an
@@ -594,7 +599,6 @@ mod tests {
     /// loop or a display. It is NOT a rendering backend — it exists only to test
     /// that navigate/stop drive [`LoadState`] and emit the matching [`LoadEvent`]s
     /// the way any real backend must.
-    #[derive(Default)]
     struct FakeBackend {
         state: LoadState,
         url: Option<String>,
@@ -603,11 +607,32 @@ mod tests {
         script_handlers: Vec<String>,
         injected: Vec<String>,
         // Which trust hooks this backend declares it can satisfy. Defaults to all
-        // (it exposes both hooks); tests override it to model partial capability.
+        // (it models the real qualifying backend, which explicitly wires both
+        // hooks); tests override it to model partial or no capability. NOTE: this
+        // is NOT `TrustHooks::default()` (which is fail-closed `none()`) — this
+        // double stands in for a backend that has OPTED INTO both hooks, so it
+        // declares them explicitly, exactly as the real `WebViewRenderer` does.
         declares_hooks: TrustHooks,
         // The trust posture of the current load. Defaults to the untrusted origin;
         // tests set it to model a content-verified load path.
         posture: TrustPosture,
+    }
+
+    impl Default for FakeBackend {
+        fn default() -> Self {
+            FakeBackend {
+                state: LoadState::default(),
+                url: None,
+                events: std::collections::VecDeque::new(),
+                scheme_handlers: Vec::new(),
+                script_handlers: Vec::new(),
+                injected: Vec::new(),
+                // A qualifying backend explicitly declares both hooks (fail-closed
+                // default means omission would disqualify it).
+                declares_hooks: TrustHooks::all(),
+                posture: TrustPosture::default(),
+            }
+        }
     }
 
     impl Renderer for FakeBackend {
@@ -862,6 +887,83 @@ mod tests {
             vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme],
             "both trust hooks are reported missing"
         );
+    }
+
+    /// A backend that renders but does NOT override [`Renderer::trust_hooks`] at
+    /// all — it relies on the seam's provided default. Under the FAIL-CLOSED
+    /// default this backend has opted into no hook, so it must be disqualified:
+    /// trust is never inherited by omission. This is the inverse of the old
+    /// fail-open behaviour, where such a backend silently qualified.
+    #[derive(Default)]
+    struct DefaultRelyingBackend {
+        state: LoadState,
+        url: Option<String>,
+    }
+
+    impl Renderer for DefaultRelyingBackend {
+        fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
+            self.url = Some(url.to_string());
+            self.state = LoadState::Started;
+            Ok(())
+        }
+        fn reload(&mut self) -> Result<(), RendererError> {
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.state = LoadState::Idle;
+        }
+        fn load_state(&self) -> LoadState {
+            self.state
+        }
+        fn current_url(&self) -> Option<String> {
+            self.url.clone()
+        }
+        fn poll_event(&mut self) -> Option<LoadEvent> {
+            None
+        }
+        fn view_handle(&self) -> ViewHandle {
+            ViewHandle(std::ptr::null_mut())
+        }
+        fn send_pointer(&mut self, _event: PointerEvent) {}
+        fn send_key(&mut self, _event: KeyEvent) {}
+        fn send_scroll(&mut self, _delta: ScrollDelta) {}
+        fn set_focus(&mut self, _focused: bool) {}
+        fn register_script_message_handler(&mut self, _name: &str, _handler: ScriptMessageHandler) {
+        }
+        fn inject_script(&mut self, _script: &str) {}
+        fn register_scheme_handler(&mut self, _scheme: &str, _handler: SchemeHandler) {}
+        // NOTE: no `trust_hooks` override — this backend relies on the seam
+        // default, which is what this test exists to pin as fail-closed.
+    }
+
+    #[test]
+    fn qualification_gate_rejects_a_backend_relying_on_the_default() {
+        // FAIL-CLOSED: a backend that does NOT override `trust_hooks` inherits the
+        // seam default, which now declares NO hook — so it is DISQUALIFIED, naming
+        // both missing hooks. Trust must be opted into, never inherited by
+        // omission; a stub-but-undeclared backend no longer silently qualifies.
+        let backend = DefaultRelyingBackend::default();
+        assert_eq!(
+            backend.trust_hooks(),
+            TrustHooks::none(),
+            "the fail-closed default declares no trust hook"
+        );
+        let err = qualify(&backend)
+            .expect_err("a backend relying on the fail-closed default is disqualified");
+        assert_eq!(
+            err.missing,
+            vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme],
+            "an un-declared backend is missing BOTH hooks under the fail-closed default"
+        );
+    }
+
+    #[test]
+    fn trust_hooks_default_is_fail_closed() {
+        // The seam's `TrustHooks::default()` is fail-closed: it declares nothing,
+        // so it does not qualify. This is the value backing the provided
+        // `Renderer::trust_hooks` default — pinning it here guards the flip.
+        assert_eq!(TrustHooks::default(), TrustHooks::none());
+        assert!(!TrustHooks::default().is_qualifying());
     }
 
     #[test]

@@ -20,7 +20,7 @@ use webkit6::{
 
 use renderer::{
     KeyEvent, LoadEvent, LoadState, PointerEvent, Renderer, RendererError, SchemeHandler,
-    ScriptMessageHandler, ScrollDelta, ViewHandle,
+    ScriptMessageHandler, ScrollDelta, TrustHooks, ViewHandle,
 };
 
 use crate::{validate_url, LoadLifecycle, SharedLifecycle};
@@ -315,6 +315,20 @@ impl Renderer for WebViewRenderer {
 
     fn load_state(&self) -> LoadState {
         self.life.borrow().state()
+    }
+
+    fn trust_hooks(&self) -> TrustHooks {
+        // OPT IN to BOTH trust hooks: `WebViewRenderer` genuinely wires them —
+        // EIP-1193 provider injection over the script-message bridge
+        // (`install_provider`: `register_script_message_handler` +
+        // `evaluate_javascript` response push) and `ipfs://` custom-scheme
+        // resolution (`install_ipfs`: `register_uri_scheme` → hash-verified fetch).
+        // The seam default is now FAIL-CLOSED (`TrustHooks::none()`), so trust is
+        // never inherited by omission: this backend must EXPLICITLY declare the
+        // hooks it satisfies to pass `qualify`. Dropping a hook here would make the
+        // real backend render-only — the two webview qualification tests guard
+        // against exactly that.
+        TrustHooks::all()
     }
 
     fn trust_posture(&self) -> renderer::TrustPosture {

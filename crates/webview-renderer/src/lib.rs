@@ -262,6 +262,15 @@ mod tests {
             self.scheme_request_handlers
                 .insert(scheme.to_string(), handler);
         }
+
+        fn trust_hooks(&self) -> TrustHooks {
+            // Mirror the REAL `WebViewRenderer`, which OPTS INTO both trust hooks
+            // explicitly (see `backend.rs`). The seam default is now fail-closed
+            // (`TrustHooks::none()`), so a backend that genuinely wires both hooks
+            // must declare them; this harness stands in for that backend, so it
+            // declares them too rather than silently disqualifying.
+            TrustHooks::all()
+        }
     }
 
     impl SeamHarness {
@@ -741,11 +750,12 @@ mod tests {
 
     #[test]
     fn webview_backend_passes_the_trust_hook_qualification_gate() {
-        // The WebKitGTK backend declares BOTH trust hooks (it inherits the
-        // qualifying default of `Renderer::trust_hooks`, exactly as the real
-        // `WebViewRenderer` does — both share the same seam methods and neither
-        // overrides the capability), so the qualification gate accepts it. This
-        // runs headlessly: it exercises the seam contract, not a GTK main loop.
+        // The WebKitGTK backend declares BOTH trust hooks EXPLICITLY (it opts into
+        // the qualifying set via `Renderer::trust_hooks`, exactly as the real
+        // `WebViewRenderer` does now that the seam default is fail-closed — both
+        // wire the same hooks and both declare `TrustHooks::all()`), so the
+        // qualification gate accepts it. This runs headlessly: it exercises the
+        // seam contract, not a GTK main loop.
         let r = SeamHarness::default();
         assert_eq!(
             r.trust_hooks(),
@@ -758,15 +768,22 @@ mod tests {
     #[test]
     fn webview_renderer_does_not_downgrade_its_trust_hook_capability() {
         // Guard against a future edit silently making the REAL backend render-only:
-        // `WebViewRenderer` must not override `trust_hooks` to drop a hook. We can
-        // assert this display-free by pinning the qualifying set the shared seam
-        // default yields; `WebViewRenderer` uses that same default (verified by
-        // reading `backend.rs`, which adds no `trust_hooks` override). The
-        // display-bound end-to-end check lives in
+        // `WebViewRenderer` must OPT INTO both trust hooks and never drop one. The
+        // seam default is now FAIL-CLOSED (`TrustHooks::none()`), so the backend
+        // qualifies ONLY because it explicitly declares `TrustHooks::all()` (see
+        // `backend.rs`). This harness mirrors that explicit declaration, so pinning
+        // the qualifying set it yields guards the real backend's capability
+        // display-free. The display-bound end-to-end check lives in
         // `real_webview_backend_qualifies` below (ignored by default).
+        let r = SeamHarness::default();
+        assert_eq!(
+            r.trust_hooks(),
+            TrustHooks::all(),
+            "the webview backend explicitly declares both trust hooks"
+        );
         assert!(
-            TrustHooks::default().is_qualifying(),
-            "the seam default the webview backend inherits is qualifying"
+            r.trust_hooks().is_qualifying(),
+            "the explicitly-declared webview capability is qualifying"
         );
     }
 

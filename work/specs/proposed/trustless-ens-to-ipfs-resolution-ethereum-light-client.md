@@ -89,6 +89,24 @@ scheme:
   (see open Q).
 - A name with no/invalid contenthash, or one whose resolution fails verification, FAILS the
   load (never renders something unverified/guessed).
+- **Unsupported contenthash protocols must fail GRACEFULLY and SPECIFICALLY.** ENS
+  `contenthash` is multicodec-tagged (ENSIP-7); werust supports only a subset initially and
+  MUST decode the protoCode, recognise it, and reject unsupported ones with a CLEAR,
+  protocol-named error — NOT crash, NOT silently mis-dispatch to `ipfs://`, NOT fall through
+  to a default. The distinctions the resolver must make, each a DIFFERENT user-facing
+  message:
+  - `0xe3` **ipfs-ns** (IPFS, immutable CID) — SUPPORTED (the built path).
+  - `0xe5` **ipns-ns** (IPNS, mutable) — recognised but DEFERRED (Q8): fail with "this name
+    uses a mutable IPNS pointer, not yet supported".
+  - `0xe4` **swarm-ns** (Swarm) — recognised, UNSUPPORTED: "points to Swarm, not supported".
+  - **Arweave** (and `onion`/`onion3`, `skynet`, `zeronet`, DNSLink, any unknown protoCode)
+    — recognised-or-unknown, UNSUPPORTED: name the protocol if known ("points to Arweave,
+    not supported"), else "unsupported/unknown contenthash protocol (0x..)". The user asked
+    specifically for Arweave to error gracefully rather than fail obscurely.
+  So the decode result is a small typed enum: Supported(ipfs cid) | Deferred(ipns) |
+  Unsupported(named protocol) | NoContenthash | Malformed — each mapped to a distinct load
+  failure with a legible reason surfaced in the chrome, so a user learns WHY (e.g. "ronan.eth
+  points to Arweave content, which werust does not support yet") instead of a blank fail.
 - **`ens://ronan.eth` is a secondary, explicit disambiguator ONLY** (e.g. to force ENS
   resolution of an ambiguous input) — NOT the primary contract and NOT required. No other
   browser uses `ens://`; the bare name is the convention.
@@ -108,6 +126,9 @@ name-verification the light client did not prove.
    taken on a server's word (via the light-client backend).
 3. As a user, if a name has no contenthash (or resolution fails verification), the load
    fails clearly rather than showing me an unverified/guessed page.
+6. As a user, if a name points to a protocol werust does not support yet (Arweave, Swarm,
+   IPNS, …), I get a clear message naming that protocol — not a blank failure or a wrong
+   render. (werust decodes the ENS contenthash protoCode and reports the specific reason.)
 4. As a user on mobile, resolution works without running a full node (light-client sync).
 5. As a developer, the Ethereum-access trust level is a swappable backend behind one seam,
    so the trusted-RPC skeleton and the trustless light client are the same seam.
@@ -132,6 +153,12 @@ name-verification the light client did not prove.
 - Full archival node / general dapp RPC (only the reads ENS resolution needs).
 - Non-Ethereum name systems (Unstoppable, Handshake) — future.
 - L2/other-chain ENS beyond CCIP-Read awareness in Phase 3.
+- **Non-IPFS ENS contenthash protocols** (Arweave, Swarm, IPNS-mutable, onion, skynet,
+  zeronet, DNSLink) — NOT supported. BUT this is a hard requirement to handle GRACEFULLY:
+  they must be DECODED, RECOGNISED, and rejected with a specific protocol-named error, never
+  crash / mis-dispatch / blank-fail. "Out of scope to RESOLVE" is not "out of scope to
+  detect": detecting-and-erroring-clearly IS in scope. (Per the human: ENS can point to
+  other protocols like Arweave; we don't support them now but must error gracefully.)
 
 ## DECISIONS CONFIRMED BY THE HUMAN (2026-07-22)
 

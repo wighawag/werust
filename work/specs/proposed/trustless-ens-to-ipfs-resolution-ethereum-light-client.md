@@ -55,6 +55,14 @@ BACKEND behind it. Two backends, delivered in phases:
   endpoint. Gets `ronan.eth -> site` working end to end EARLY so the whole path is real and
   testable. Clearly labelled trusted (the trust indicator must NOT show "verified" for a
   name resolved this way).
+> **The light-client backend is a consent-gated subsystem.** `LightClientProvider` (Helios)
+> is HEAVY (sync delay + an untrusted-RPC dependency to disclose), so it is a
+> `consent-gated` `Subsystem` under `gated-protocol-subsystems-consent-and-lazy-activation`:
+> resolving a `.eth` name via the light client triggers the consent prompt + lazy start. The
+> trusted `RpcProvider` skeleton is cheap enough to be `always-on`. Declining the light
+> client fails the name resolution cleanly (it does NOT silently fall back to the trusted RPC
+> unless the user is clearly told the resolution is then trusted-not-verified).
+
 - **`LightClientProvider` (the endgame, TRUSTLESS).** Embeds **Helios** (a16z's Rust
   trustless light client: takes an untrusted execution RPC + a weak-subjectivity checkpoint,
   verifies state via `eth_getProof` + sync-committee proofs; compiles to WASM; light enough

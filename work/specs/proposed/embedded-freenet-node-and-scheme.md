@@ -56,6 +56,14 @@ User opens a Freenet app  (freenet://<contract-key>[/path], or a bare key \u2014
    read/create/modify contract state \u2014 real-time decentralised app behaviour
 ```
 
+> **Governed by the subsystem-consent framework.** The embedded Freenet node is a HEAVY
+> subsystem, so it is a `consent-gated` `Subsystem` under
+> `gated-protocol-subsystems-consent-and-lazy-activation`: NOT started at browser startup; a
+> `freenet://` navigation triggers the consent prompt ("this needs the Freenet subsystem: an
+> embedded P2P node, uses network + battery, takes a moment to join"), and only a user who
+> agrees starts it, after which the fetch proceeds. Decline gives a clean failed load. That
+> framework provides the start/stop/readiness lifecycle described here.
+
 ### Embedded node (the core new capability)
 
 - Run `freenet-core` IN-PROCESS (a background task/thread inside werust), NOT as a

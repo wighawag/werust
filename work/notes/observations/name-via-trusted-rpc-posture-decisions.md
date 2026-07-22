@@ -1,0 +1,10 @@
+# Decisions: name-via-trusted-RPC trust posture
+
+2026-07-22 (task `name-via-trusted-rpc-trust-state`)
+
+In-scope naming/label decisions for the third `TrustPosture` state, recorded here so they are discoverable and ratifiable (the task body flows ready->done and cannot be edited from the build).
+
+- **Enum variant name: `TrustPosture::NameViaTrustedRpc`.** Chosen to match the spec's exact phrase "name via TRUSTED RPC" and to sit alongside `ContentVerified` / `UnverifiedOrigin` at the same layer in the `renderer` seam crate. Alternative considered: `ContentVerifiedNameViaTrustedRpc` (rejected as verbose; the content-verified aspect is implied by the trust-posture context and the docs). Touches: the `bare-eth-urlbar-front-door-end-to-end` front-door task, which consumes this variant and must call the wiring hook by this name.
+- **Wiring hook: `LoadLifecycle::mark_name_via_trusted_rpc()`** in `webview-renderer`, mirroring the existing `mark_content_verified()`. This is the hook the `.eth` front-door task calls on a real ENS trusted-RPC resolution (and owns resolving the clash where `install_ipfs`'s scheme handler would otherwise mark the same load plain `ContentVerified`). This task only ADDS the hook; it does not wire it into `install_ipfs`.
+- **Helpers: `is_name_via_trusted_rpc()`** on both `TrustPosture` and `ChromeState`, mirroring `is_content_verified()`.
+- **Desktop indicator label: `"\u25c8 name via trusted RPC"`** (glyph U+25C8), tooltip explains the bytes were hash-verified but the name came from a trusted RPC and that werust makes NO name-verification claim. Deliberately never contains the word "verified" so it can never be read as "verified"/"name-verified" (Phase 1 has no light client). CSS class `trust-name-trusted-rpc` (blue `#1a5fb4`), visually distinct from the green verified (`#0a7d28`) and amber unverified-origin (`#9a6a00`) badges. Touches: the desktop chrome only; the mobile FFI (`ffi_json`) does not encode trust posture today, so it was left unchanged (out of scope).

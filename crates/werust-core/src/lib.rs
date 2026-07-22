@@ -76,6 +76,15 @@ impl ChromeState {
     pub fn is_content_verified(&self) -> bool {
         self.trust_posture.is_content_verified()
     }
+
+    /// Whether the current page's bytes were content-verified but its name->CID
+    /// mapping came from a TRUSTED RPC (an ENS-resolved Phase-1 page). A distinct
+    /// middle state the window paints as its own trust indicator: never "verified"
+    /// (Phase 1 has no light client), never merely "served" (the bytes verified).
+    #[must_use]
+    pub fn is_name_via_trusted_rpc(&self) -> bool {
+        self.trust_posture.is_name_via_trusted_rpc()
+    }
 }
 
 /// The browser shell: the seam-driven logic behind the window.
@@ -337,6 +346,16 @@ mod tests {
         /// calls it.
         fn serve_via_verified_content_path(&self) {
             self.inner.borrow_mut().posture = TrustPosture::ContentVerified;
+        }
+
+        /// Simulate a bare `.eth` load resolving its name to a CID over the
+        /// trusted RPC and feeding it into the verified content path: it marks the
+        /// current load `NameViaTrustedRpc` exactly as the real front-door path
+        /// does on a genuine ENS trusted-RPC resolution. Only a load that actually
+        /// went through this path flips the posture — a plain served load never
+        /// calls it.
+        fn serve_via_ens_trusted_rpc(&self) {
+            self.inner.borrow_mut().posture = TrustPosture::NameViaTrustedRpc;
         }
     }
 
@@ -680,6 +699,63 @@ mod tests {
             TrustPosture::UnverifiedOrigin,
             "the verified posture does not leak onto a later plain served load"
         );
+        assert!(!shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn the_chrome_shows_the_name_via_trusted_rpc_posture_for_an_ens_resolved_load() {
+        // Acceptance: an ENS-resolved Phase-1 page surfaces the DISTINCT
+        // name-via-trusted-RPC posture in the chrome — tracking the ACTUAL load
+        // path, not the URL: the posture only flips after the load actually goes
+        // through ENS trusted-RPC resolution (a `.eth`-looking URL is not enough).
+        // It is honestly NOT content-verified (Phase 1 has no light client).
+        let (mut shell, handle) = shell_with_backend();
+        shell
+            .navigate("ens://ronan.eth")
+            .expect("a name load is navigable through the seam");
+        // Before the trusted-RPC resolution feeds a CID into the verified path, the
+        // load is untrusted — the URL looking like a name is NOT enough.
+        shell.pump();
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "a name URL is not name-via-trusted-RPC until it actually resolves"
+        );
+
+        // The front door resolves the name over the trusted RPC and marks the
+        // load; then it settles.
+        handle.serve_via_ens_trusted_rpc();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS trusted-RPC resolution surfaces the name-via-trusted-RPC posture"
+        );
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+        // It is NEVER surfaced as verified: Phase 1 makes no name-verification claim.
+        assert!(!shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn the_name_via_trusted_rpc_posture_does_not_leak_into_a_later_served_load() {
+        // The indicator must track the CURRENT page: after an ENS-resolved load,
+        // navigating to a plain served origin resets the chrome to the untrusted
+        // posture (a fresh navigation begins unverified until proven otherwise).
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("ens://ronan.eth").unwrap();
+        handle.serve_via_ens_trusted_rpc();
+        settle(&mut shell, &handle);
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "the name-via-trusted-RPC posture does not leak onto a later plain served load"
+        );
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
         assert!(!shell.chrome().is_content_verified());
     }
 

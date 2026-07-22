@@ -93,18 +93,24 @@ impl Chrome {
         self.stop.set_sensitive(state.is_loading());
         self.reload.set_sensitive(!state.is_loading());
         self.status.set_text(&status_line(state));
-        // The trust indicator: a distinct, legible label for content-verified vs
-        // served-by-an-unverified-origin, plus a CSS class so the two states are
-        // visually distinct (a verified badge vs an unverified one).
+        // The trust indicator: a distinct, legible label for each of the three
+        // trust postures (content-verified / name-via-trusted-RPC / unverified
+        // origin), plus a CSS class so the states are visually distinct. Exactly
+        // one class is active at a time.
         self.trust.set_text(trust_indicator(state));
         self.trust
             .set_tooltip_text(Some(trust_indicator_detail(state)));
-        if state.is_content_verified() {
-            self.trust.remove_css_class("trust-unverified");
-            self.trust.add_css_class("trust-verified");
-        } else {
-            self.trust.remove_css_class("trust-verified");
-            self.trust.add_css_class("trust-unverified");
+        let active = trust_indicator_css_class(state);
+        for class in [
+            "trust-verified",
+            "trust-name-trusted-rpc",
+            "trust-unverified",
+        ] {
+            if class == active {
+                self.trust.add_css_class(class);
+            } else {
+                self.trust.remove_css_class(class);
+            }
         }
     }
 }
@@ -126,10 +132,17 @@ fn status_line(state: &ChromeState) -> String {
 /// (`docs/adr/0001`: the trust posture is a product surface, not a silent
 /// internal). A pure function of [`ChromeState`] so it is trivially correct and
 /// testable without a display; the label text carries a shield vs a plain-globe
-/// glyph so the two states read at a glance even before colour.
+/// glyph so the states read at a glance even before colour.
+///
+/// The name-via-trusted-RPC state (an ENS-resolved Phase-1 page: bytes verified,
+/// but the name->CID mapping came from a trusted RPC) is a DISTINCT middle badge
+/// that is deliberately NOT labelled "verified" — Phase 1 makes no
+/// name-verification claim.
 fn trust_indicator(state: &ChromeState) -> &'static str {
     if state.is_content_verified() {
         "✓ verified"
+    } else if state.is_name_via_trusted_rpc() {
+        "◈ name via trusted RPC"
     } else {
         "⚠ unverified origin"
     }
@@ -140,22 +153,40 @@ fn trust_indicator(state: &ChromeState) -> &'static str {
 fn trust_indicator_detail(state: &ChromeState) -> &'static str {
     if state.is_content_verified() {
         "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
+    } else if state.is_name_via_trusted_rpc() {
+        "This page's content was hash-verified, but its name was resolved over a TRUSTED RPC (not a light client), which could misdirect the name to different content. werust makes no name-verification claim here."
     } else {
         "This page was served by an origin werust does not trust by default; its content was not hash-verified."
     }
 }
 
-/// The stylesheet that makes the two trust-indicator states visually distinct: a
-/// green content-verified badge vs an amber unverified-origin one. Kept as one
-/// constant next to the classes the chrome toggles (`trust-verified` /
-/// `trust-unverified`).
+/// The CSS class for the current posture's badge — exactly one of the three
+/// trust classes. A pure function of [`ChromeState`] so the badge styling is
+/// testable without a display.
+fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
+    if state.is_content_verified() {
+        "trust-verified"
+    } else if state.is_name_via_trusted_rpc() {
+        "trust-name-trusted-rpc"
+    } else {
+        "trust-unverified"
+    }
+}
+
+/// The stylesheet that makes the three trust-indicator states visually distinct:
+/// a green content-verified badge, a blue name-via-trusted-RPC badge (an
+/// honest middle state), and an amber unverified-origin one. Kept as one constant
+/// next to the classes the chrome toggles (`trust-verified` /
+/// `trust-name-trusted-rpc` / `trust-unverified`).
 const TRUST_INDICATOR_CSS: &str = "\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
+.trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
 .trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
-/// `trust-verified` / `trust-unverified` classes the chrome toggles render as
-/// two visually distinct badges. A no-op if there is no display.
+/// `trust-verified` / `trust-name-trusted-rpc` / `trust-unverified` classes the
+/// chrome toggles render as visually distinct badges. A no-op if there is no
+/// display.
 fn install_trust_indicator_css() {
     let provider = CssProvider::new();
     provider.load_from_string(TRUST_INDICATOR_CSS);
@@ -328,7 +359,10 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 
 #[cfg(test)]
 mod tests {
-    use super::{banner, status_line, trust_indicator, trust_indicator_detail, DEFAULT_URL};
+    use super::{
+        banner, status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail,
+        DEFAULT_URL,
+    };
     use renderer::{LoadState, TrustPosture};
     use werust_core::ChromeState;
 
@@ -396,5 +430,50 @@ mod tests {
             trust_indicator(&ChromeState::default()),
             "⚠ unverified origin"
         );
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_distinct_name_via_trusted_rpc_badge_never_labelled_verified() {
+        // Acceptance: an ENS-resolved Phase-1 page (bytes verified, name resolved
+        // over a trusted RPC) renders as its OWN legible, visually-distinct badge
+        // — distinct from BOTH the verified and the unverified-origin badges — and
+        // it is NEVER surfaced as "verified" / "name-verified".
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        let name_via_rpc = ChromeState {
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            ..ChromeState::default()
+        };
+
+        let label = trust_indicator(&name_via_rpc);
+        assert_eq!(label, "◈ name via trusted RPC");
+        // Distinct from the other two badges.
+        assert_ne!(label, trust_indicator(&verified));
+        assert_ne!(label, trust_indicator(&served));
+        // NEVER labelled "verified" / "name-verified": Phase 1 makes no such claim.
+        assert!(
+            !label.to_lowercase().contains("verified"),
+            "the name-via-trusted-RPC badge must never read as verified: {label}"
+        );
+        assert!(!trust_indicator_detail(&name_via_rpc)
+            .to_lowercase()
+            .contains("name-verified"));
+        // The tooltip is honest that the name came from a trusted RPC.
+        assert!(trust_indicator_detail(&name_via_rpc).contains("TRUSTED RPC"));
+
+        // The badge carries its own CSS class, distinct from the other two, so the
+        // three states are visually distinct.
+        assert_eq!(
+            trust_indicator_css_class(&name_via_rpc),
+            "trust-name-trusted-rpc"
+        );
+        assert_eq!(trust_indicator_css_class(&verified), "trust-verified");
+        assert_eq!(trust_indicator_css_class(&served), "trust-unverified");
     }
 }

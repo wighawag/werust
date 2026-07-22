@@ -101,6 +101,24 @@ impl LoadLifecycle {
         self.posture = TrustPosture::ContentVerified;
     }
 
+    /// Mark the CURRENT load as content-verified-but-name-via-a-trusted-RPC: its
+    /// bytes were served through the hash-verified content-addressed path, but the
+    /// name->CID mapping that chose those bytes came from an ENS resolution over a
+    /// TRUSTED RPC (Phase 1, `ens-to-ipfs-resolution-phase1-rpc-skeleton`).
+    ///
+    /// This is the wiring hook the bare-`.eth` front-door path
+    /// (`bare-eth-urlbar-front-door-end-to-end`) calls the moment it has resolved
+    /// a name to its contenthash over the trusted RPC and fed the resulting CID
+    /// into the verified `ipfs://` render path. Like
+    /// [`mark_content_verified`](LoadLifecycle::mark_content_verified) it tracks
+    /// the REAL load path: only a load that ACTUALLY went through ENS trusted-RPC
+    /// resolution flips the posture here, never a `.eth`-looking URL on its own,
+    /// and a fresh [`begin`](LoadLifecycle::begin) resets it. It is honestly NOT
+    /// "verified": Phase 1 has no light client, so the name is not verified.
+    pub fn mark_name_via_trusted_rpc(&mut self) {
+        self.posture = TrustPosture::NameViaTrustedRpc;
+    }
+
     /// The [`TrustPosture`] of the current load (content-verified vs served by an
     /// unverified origin).
     #[must_use]
@@ -732,6 +750,47 @@ mod tests {
             life.borrow().posture(),
             TrustPosture::UnverifiedOrigin,
             "an unverified (mismatched) load is never reported content-verified"
+        );
+    }
+
+    #[test]
+    fn an_ens_resolved_load_reports_the_name_via_trusted_rpc_posture_and_does_not_leak() {
+        // Acceptance: the name-via-trusted-RPC posture tracks the ACTUAL load path
+        // (a load whose CID came from an ENS resolution over the trusted RPC), set
+        // via `mark_name_via_trusted_rpc` exactly as the front-door path will call
+        // it. It is a distinct middle state (never "verified"), and it does NOT
+        // leak onto a later plain served load: a fresh `begin` resets it.
+        let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
+
+        // A bare `.eth` load: begin resets to untrusted, THEN the front door
+        // resolves the name over the trusted RPC, feeds the CID into the verified
+        // ipfs path, and marks the load name-via-trusted-RPC.
+        life.borrow_mut().begin("ronan.eth");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "begin resets: a `.eth`-looking URL is not trusted until it actually resolves"
+        );
+        life.borrow_mut().mark_name_via_trusted_rpc();
+        life.borrow_mut().commit("ronan.eth");
+        life.borrow_mut().finish("ronan.eth");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "a real ENS trusted-RPC resolution surfaces the name-via-trusted-RPC posture"
+        );
+        // Honesty: this is NOT content-verified, so it is never labelled verified.
+        assert!(!life.borrow().posture().is_content_verified());
+
+        // A later plain served load: begin resets the posture; no hook runs. The
+        // name-via-trusted-RPC posture does not leak onto it.
+        life.borrow_mut().begin("https://example.com/");
+        life.borrow_mut().commit("https://example.com/");
+        life.borrow_mut().finish("https://example.com/");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "the name-via-trusted-RPC posture does not leak onto a later plain served load"
         );
     }
 

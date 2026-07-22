@@ -88,6 +88,23 @@ pub enum TrustPosture {
     /// `Fetcher` path). Verification moved to the hash, so the origin need not be
     /// trusted.
     ContentVerified,
+    /// The page's BYTES were content-verified (hash-checked on the
+    /// content-addressed path, exactly like [`ContentVerified`](TrustPosture::ContentVerified)),
+    /// but the NAME->CID mapping that chose which content to load was taken on a
+    /// TRUSTED RPC's word: an ENS name resolved to its contenthash over a trusted
+    /// (non-light-client) Ethereum RPC. So the RPC could have MISDIRECTED the name
+    /// to a different (still valid, still hash-consistent) CID.
+    ///
+    /// This is the honest Phase-1 middle state (`ens-to-ipfs-resolution-phase1-rpc-skeleton`):
+    /// a page here is NEITHER "verified" (Phase 1 has no light client, so the
+    /// name is NOT verified) NOR merely "served" (the bytes DID hash-verify). It
+    /// MUST never be surfaced as "verified"/"name-verified"; the name-verified
+    /// state is a Phase-2 addition once a light client removes the RPC trust.
+    ///
+    /// Like [`ContentVerified`](TrustPosture::ContentVerified) it tracks the ACTUAL
+    /// load path: it is set ONLY when a load genuinely went through ENS
+    /// trusted-RPC resolution, never inferred from a `.eth`-looking URL.
+    NameViaTrustedRpc,
 }
 
 impl TrustPosture {
@@ -96,6 +113,16 @@ impl TrustPosture {
     #[must_use]
     pub fn is_content_verified(self) -> bool {
         matches!(self, TrustPosture::ContentVerified)
+    }
+
+    /// Whether the current page's bytes were content-verified but its name->CID
+    /// mapping came from a TRUSTED RPC (an ENS-resolved Phase-1 page). This is a
+    /// distinct middle state: it is NOT [`is_content_verified`](TrustPosture::is_content_verified)
+    /// (there is no "verified" claim without a light client) and NOT the plain
+    /// unverified origin (the bytes did hash-verify).
+    #[must_use]
+    pub fn is_name_via_trusted_rpc(self) -> bool {
+        matches!(self, TrustPosture::NameViaTrustedRpc)
     }
 }
 
@@ -1062,5 +1089,38 @@ mod tests {
         let served = FakeBackend::default();
         assert_eq!(served.trust_posture(), TrustPosture::UnverifiedOrigin);
         assert!(!served.trust_posture().is_content_verified());
+    }
+
+    #[test]
+    fn the_name_via_trusted_rpc_posture_is_a_distinct_middle_state() {
+        // Acceptance: the ENS-resolved Phase-1 posture is a THIRD state, separate
+        // from both `ContentVerified` and `UnverifiedOrigin`. Its bytes verified
+        // but its name came from a trusted RPC, so it is honestly NOT "verified":
+        // `is_content_verified()` is false, and it is its own predicate.
+        let name_via_rpc = FakeBackend {
+            posture: TrustPosture::NameViaTrustedRpc,
+            ..FakeBackend::default()
+        };
+        assert_eq!(
+            name_via_rpc.trust_posture(),
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert!(name_via_rpc.trust_posture().is_name_via_trusted_rpc());
+        // It is NEVER surfaced as verified: Phase 1 makes no name-verification
+        // claim (there is no light client).
+        assert!(!name_via_rpc.trust_posture().is_content_verified());
+
+        // It is distinct from the other two postures.
+        assert_ne!(
+            TrustPosture::NameViaTrustedRpc,
+            TrustPosture::ContentVerified
+        );
+        assert_ne!(
+            TrustPosture::NameViaTrustedRpc,
+            TrustPosture::UnverifiedOrigin
+        );
+        // And the other two are not this one.
+        assert!(!TrustPosture::ContentVerified.is_name_via_trusted_rpc());
+        assert!(!TrustPosture::UnverifiedOrigin.is_name_via_trusted_rpc());
     }
 }

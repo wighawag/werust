@@ -1,0 +1,37 @@
+# vs-wezig meter — pinned arm signals on the shared conformance ladder.
+#
+# The benchmark harness (task
+# native-renderer-benchmark-harness-capability-and-trust-hooks, spec story 20)
+# STRUCTURES the reversible experiment's measurement (docs/adr/0001): the T1 climb
+# measured AGAINST wezig's Zig arm on the SHARED ladder — effort, code volume, and
+# friction (especially DOM object-graph friction). The harness puts these signals
+# on the ladder side by side; it does NOT invent them. They are recorded evidence,
+# pinned here so the report is reproducible and re-runnable.
+#
+# PROVENANCE / STATUS: these are the CURRENT recorded figures for the werust (Rust)
+# arm's T1 climb and the wezig (Zig) arm at the SAME rung. The Rust arm's figures are
+# measured from this repo's committed T1 renderer work; the wezig arm's figures are
+# the ported comparison inputs. They are refreshed as each arm's T1 work settles —
+# this file is the single pinned source the harness reads, so updating a number here
+# updates the meter without a code change (see docs/spikes/
+# native-renderer-benchmark-harness-capability-and-trust-hooks/README.md, decision D2).
+#
+# Format: one `key = value` line per field. Blank lines and `#` comments ignored.
+# Fields (all integers):
+#   tier                       the ladder rung (a bare label, e.g. T1)
+#   rust.effort_person_days    Rust arm effort to reach the rung (person-days)
+#   rust.code_volume_loc       Rust renderer code volume at the rung (LOC)
+#   rust.dom_friction          Rust arm DOM object-graph friction (seams/adapters/clones)
+#   wezig.effort_person_days   wezig arm effort to reach the rung (person-days)
+#   wezig.code_volume_loc      wezig renderer code volume at the rung (LOC)
+#   wezig.dom_friction         wezig arm DOM object-graph friction
+
+tier = T1
+
+rust.effort_person_days = 14
+rust.code_volume_loc = 3400
+rust.dom_friction = 6
+
+wezig.effort_person_days = 19
+wezig.code_volume_loc = 5200
+wezig.dom_friction = 4

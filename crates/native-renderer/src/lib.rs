@@ -56,6 +56,7 @@
 //! fail-open default (see `NativeRenderer`'s docs and `docs/adr/0001`).
 
 pub mod backend;
+pub mod benchmark;
 pub mod css;
 pub mod html5ever_parser;
 pub mod layout;
@@ -68,6 +69,11 @@ pub mod tree;
 pub mod wpt_meter;
 
 pub use backend::NativeRenderer;
+pub use benchmark::{
+    declared_candidate, score_measured_candidate, score_page_checklist, ArmSignals,
+    BenchmarkReport, Candidate, CandidateReport, CandidateScoring, CapabilityScore, ChecklistPage,
+    PageResult, TrustHookScore, VsWezigMeter,
+};
 pub use html5ever_parser::Html5everParser;
 pub use parser::{ParsedDocument, Parser, SubsetParser};
 pub use pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};

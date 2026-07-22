@@ -1,0 +1,74 @@
+{
+  "candidates": [
+    {
+      "candidate": "own-engine",
+      "scoring": "declared",
+      "capability": {
+        "pages": [
+
+        ],
+        "pages_rendered": 0,
+        "tree_construction_rate": 0.0000,
+        "tree_construction_meets_bar": false,
+        "core_css_rate": 0.0000,
+        "core_css_meets_bar": false,
+        "meets_t1_capability": false
+      },
+      "trust_hooks": { "qualifies": false, "missing": ["provider-injection", "ipfs-scheme"] },
+      "vs_wezig": {
+        "tier": "T1",
+        "capability_fraction": 0.0000,
+        "rust": { "effort_person_days": 0, "code_volume_loc": 0, "dom_object_graph_friction": 0 },
+        "wezig": { "effort_person_days": 0, "code_volume_loc": 0, "dom_object_graph_friction": 0 },
+        "dom_friction_delta": 0
+      }
+  },
+    {
+      "candidate": "servo",
+      "scoring": "declared",
+      "capability": {
+        "pages": [
+
+        ],
+        "pages_rendered": 0,
+        "tree_construction_rate": 0.0000,
+        "tree_construction_meets_bar": false,
+        "core_css_rate": 0.0000,
+        "core_css_meets_bar": false,
+        "meets_t1_capability": false
+      },
+      "trust_hooks": { "qualifies": false, "missing": ["provider-injection", "ipfs-scheme"] },
+      "vs_wezig": {
+        "tier": "T1",
+        "capability_fraction": 0.0000,
+        "rust": { "effort_person_days": 0, "code_volume_loc": 0, "dom_object_graph_friction": 0 },
+        "wezig": { "effort_person_days": 0, "code_volume_loc": 0, "dom_object_graph_friction": 0 },
+        "dom_friction_delta": 0
+      }
+  },
+    {
+      "candidate": "blitz-stylo-assembly",
+      "scoring": "measured",
+      "capability": {
+        "pages": [
+          { "page": "article", "rendered": true },
+          { "page": "blog-post", "rendered": true }
+        ],
+        "pages_rendered": 2,
+        "tree_construction_rate": 1.0000,
+        "tree_construction_meets_bar": true,
+        "core_css_rate": 0.9630,
+        "core_css_meets_bar": true,
+        "meets_t1_capability": true
+      },
+      "trust_hooks": { "qualifies": false, "missing": ["provider-injection", "ipfs-scheme"] },
+      "vs_wezig": {
+        "tier": "T1",
+        "capability_fraction": 1.0000,
+        "rust": { "effort_person_days": 14, "code_volume_loc": 3400, "dom_object_graph_friction": 6 },
+        "wezig": { "effort_person_days": 19, "code_volume_loc": 5200, "dom_object_graph_friction": 4 },
+        "dom_friction_delta": 2
+      }
+  }
+  ]
+}

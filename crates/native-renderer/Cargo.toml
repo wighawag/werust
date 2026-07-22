@@ -9,3 +9,11 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 html5ever = "0.39"
 markup5ever_rcdom = "0.39"
+# The mature Rust CSS stack: `cssparser` is the exact tokenizer/parser (and colour
+# parser) stylo parses every stylesheet with. See
+# docs/spikes/t1-core-css-stylo-and-latin-shaping-parley/README.md (decision D1).
+cssparser = "0.35"
+# The pure-Rust text-shaping stack (parley -> fontique/harfrust/skrifa): real
+# Latin/LTR shaping. `complex-scripts` is deliberately OFF (complex-script/bidi is
+# T2). See the spike README (decision D2).
+parley = { version = "0.11", default-features = false, features = ["std"] }

@@ -56,9 +56,21 @@ fn renders_a_full_v0_subset_document_via_the_seam() {
         transcript.contains("Title[b]"),
         "heading is bold: {transcript}"
     );
-    assert!(transcript.contains("bold[b]"), "strong is bold");
-    assert!(transcript.contains("italic[i]"), "em is italic");
-    assert!(transcript.contains("link[u]"), "a is underlined");
+    // The `.lead` paragraph is green (#008000), so its inline emphasis carries the
+    // inherited colour in the transcript alongside its style mark; the link keeps
+    // the UA link blue (#0000ee).
+    assert!(
+        transcript.contains("bold[b#008000]"),
+        "strong bold: {transcript}"
+    );
+    assert!(
+        transcript.contains("italic[i#008000]"),
+        "em italic: {transcript}"
+    );
+    assert!(
+        transcript.contains("link[u#0000ee]"),
+        "a underlined: {transcript}"
+    );
     assert!(transcript.contains("one"));
     assert!(transcript.contains("two"));
 

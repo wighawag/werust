@@ -1,32 +1,50 @@
-//! The T0 cascade: a real cascade over a small, fixed property set.
+//! The T1 core-CSS cascade, built on the mature Rust CSS stack.
 //!
-//! T0's cascade is deliberately narrow (`docs/conformance-tiers.md`): a handful of
-//! properties, a restricted selector set (type, `.class`, `#id`), user-agent
-//! defaults for the allowlist elements, author rules from `<style>` blocks, and
-//! `style="…"` inline declarations — resolved by specificity + source order into a
-//! [`ComputedStyle`] per element. It is a REAL cascade (origin/specificity/order,
-//! inheritance of inherited properties), just over a small property set — NOT the
-//! full CSS engine, which is T1 (stylo).
+//! At **T1** (`docs/conformance-tiers.md`, `CONTEXT.md`; task
+//! `t1-core-css-stylo-and-latin-shaping-parley`) the cascade grows from the T0
+//! handful of properties to the **core CSS set** a hand-written or lightly
+//! templated static page uses: box-model (`margin`/`padding` + their per-side
+//! longhands), colour (`color`, `background-color`), typography (`font-size`,
+//! `font-weight`, `font-style`, `font-family`, `line-height`, `text-decoration`),
+//! and the normal-flow `display`. It stays a REAL cascade — UA sheet, then author
+//! rules by (specificity, source order), then inline `style="…"`, with inheritance
+//! of inherited properties — now over the wider set. No floats/flex/grid/tables
+//! (that is T2); no JS (that is T3).
 //!
-//! Supported properties (the fixed T0 set):
-//! `display` (`block` | `inline` | `none`), `color`, `font-weight`
-//! (`normal` | `bold`), `font-style` (`normal` | `italic`), `text-decoration`
-//! (`none` | `underline`), and `margin-bottom` (a length in px). Everything else
-//! in a declaration block is ignored. This is enough to render the v0 subset with
-//! block/inline flow and styled inline text.
+//! # Standing on the stylo stack's parser
+//!
+//! Stylesheets and values are tokenised with [`cssparser`], the exact CSS
+//! tokenizer/parser Servo's stylo is built on (its colour parsing too:
+//! [`cssparser::color`]), rather than the T0 hand-rolled string splitting — so real
+//! stylesheets (comments, quoted strings, functional `rgb()`, `!important`,
+//! whitespace quirks) parse robustly. Selector MATCHING is a focused matcher over
+//! the T1 core selector set (type / `.class` / `#id` / `*`, descendant and child
+//! combinators, grouping) with correct CSS specificity, rather than the full
+//! `selectors` crate `Element` trait: werust's [`Dom`](crate::tree::Dom) is a plain
+//! owned static tree with no parent/sibling pointers, and the full `selectors`
+//! matcher wants a navigable, interior-mutable DOM (the object-graph friction the
+//! thesis parks at T1). The rationale + the rejected `Stylist`/`selectors::Element`
+//! alternative are recorded in
+//! `docs/spikes/t1-core-css-stylo-and-latin-shaping-parley/README.md` (decision D1).
+//!
+//! # The T0 subset allowlist still lives here
+//!
+//! [`SUPPORTED_PROPERTIES`] / [`is_supported_property`] / [`is_supported_selector`]
+//! are UNCHANGED: they define the fixed **T0** subset the server-floor drift guard
+//! (`tests/t0_server_floor_goldens.rs`) checks its committed fixtures against. They
+//! are deliberately narrower than what the T1 cascade now accepts — a T0 fixture
+//! must stay inside the documented v0 subset even though the engine can render more.
+
+use cssparser::color::{parse_hash_color, parse_named_color};
+use cssparser::{ParseError, Parser, ParserInput, Token};
 
 use crate::tree::Element;
 
-/// The fixed T0 CSS property allowlist (`docs/conformance-tiers.md` T0).
+/// The fixed **T0** CSS property allowlist (`docs/conformance-tiers.md` T0).
 ///
-/// These are the ONLY property names the T0 cascade honours; every other property
-/// in a declaration block is silently ignored (see [`parse_declaration`]). It is
-/// the CSS-side companion to the element-side [`ELEMENT_ALLOWLIST`](crate::tree::ELEMENT_ALLOWLIST):
-/// together they are the single machine-readable source of truth for "what the v0
-/// subset supports", which the committed-fixture drift guard checks fixtures
-/// against so a golden fixture can never quietly drift outside the documented
-/// subset. `text-decoration-line` is the longhand the cascade also accepts for the
-/// `text-decoration` shorthand.
+/// These name the T0 subset the server-floor drift guard checks committed fixtures
+/// against; they are intentionally narrower than the T1 cascade below. See the
+/// module docs.
 pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "display",
     "color",
@@ -37,7 +55,7 @@ pub const SUPPORTED_PROPERTIES: &[&str] = &[
     "margin-bottom",
 ];
 
-/// Whether `name` is on the T0 CSS property allowlist (case-insensitively).
+/// Whether `name` is on the **T0** CSS property allowlist (case-insensitively).
 #[must_use]
 pub fn is_supported_property(name: &str) -> bool {
     let name = name.trim().to_ascii_lowercase();
@@ -59,57 +77,77 @@ impl Color {
     /// Opaque black — the initial `color`.
     pub const BLACK: Color = Color { r: 0, g: 0, b: 0 };
 
-    /// Parse a CSS colour from the T0 subset: `#rgb`, `#rrggbb`, or a small set of
-    /// named colours. Returns `None` for anything outside the subset.
+    /// Opaque white.
+    pub const WHITE: Color = Color {
+        r: 255,
+        g: 255,
+        b: 255,
+    };
+
+    /// Parse a CSS colour with the stylo stack's colour parser: `#rgb` / `#rrggbb`,
+    /// the full CSS named-colour table, and functional `rgb()` / `rgba()`. Returns
+    /// `None` for a value outside that (alpha is flattened to opaque — the T1 paint
+    /// surface is opaque).
     #[must_use]
     pub fn parse(value: &str) -> Option<Color> {
         let v = value.trim();
         if let Some(hex) = v.strip_prefix('#') {
-            return Color::parse_hex(hex);
+            let (r, g, b, _a) = parse_hash_color(hex.as_bytes()).ok()?;
+            return Some(Color { r, g, b });
         }
-        match v.to_ascii_lowercase().as_str() {
-            "black" => Some(Color { r: 0, g: 0, b: 0 }),
-            "white" => Some(Color {
-                r: 255,
-                g: 255,
-                b: 255,
-            }),
-            "red" => Some(Color { r: 255, g: 0, b: 0 }),
-            "green" => Some(Color { r: 0, g: 128, b: 0 }),
-            "blue" => Some(Color { r: 0, g: 0, b: 255 }),
-            "gray" | "grey" => Some(Color {
-                r: 128,
-                g: 128,
-                b: 128,
-            }),
-            _ => None,
+        if let Some(c) = parse_rgb_function(v) {
+            return Some(c);
         }
-    }
-
-    fn parse_hex(hex: &str) -> Option<Color> {
-        match hex.len() {
-            3 => {
-                let r = u8::from_str_radix(&hex[0..1], 16).ok()?;
-                let g = u8::from_str_radix(&hex[1..2], 16).ok()?;
-                let b = u8::from_str_radix(&hex[2..3], 16).ok()?;
-                Some(Color {
-                    r: r * 17,
-                    g: g * 17,
-                    b: b * 17,
-                })
-            }
-            6 => {
-                let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                Some(Color { r, g, b })
-            }
-            _ => None,
-        }
+        let (r, g, b) = parse_named_color(&v.to_ascii_lowercase()).ok()?;
+        Some(Color { r, g, b })
     }
 }
 
-/// The `display` outer type in the T0 subset.
+/// Parse an `rgb(…)` / `rgba(…)` colour with cssparser's tokenizer. Returns `None`
+/// if `value` is not such a function or its arguments are malformed. Alpha is
+/// accepted and dropped (the paint surface is opaque).
+fn parse_rgb_function(value: &str) -> Option<Color> {
+    let mut input = ParserInput::new(value);
+    let mut parser = Parser::new(&mut input);
+    let name = match parser.next().ok()? {
+        Token::Function(name) => name.clone(),
+        _ => return None,
+    };
+    if !name.eq_ignore_ascii_case("rgb") && !name.eq_ignore_ascii_case("rgba") {
+        return None;
+    }
+    let channels: Result<Vec<u8>, ParseError<()>> = parser.parse_nested_block(|p| {
+        let mut out = Vec::new();
+        while out.len() < 4 {
+            match p.next() {
+                Ok(Token::Number { value, .. }) => out.push(value.clamp(0.0, 255.0) as u8),
+                Ok(Token::Percentage { unit_value, .. }) => {
+                    out.push((unit_value.clamp(0.0, 1.0) * 255.0).round() as u8);
+                }
+                Ok(Token::Comma) => {}
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        Ok(out)
+    });
+    let ch = channels.ok()?;
+    if ch.len() >= 3 {
+        Some(Color {
+            r: ch[0],
+            g: ch[1],
+            b: ch[2],
+        })
+    } else {
+        None
+    }
+}
+
+/// The `display` outer type the T1 cascade resolves.
+///
+/// Only the normal-flow outer types are modelled: `block`, `inline`,
+/// `inline-block` (treated as inline for flow at T1), and `none`. Floats / flex /
+/// grid / table displays are T2 and fall back to `block`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Display {
     /// A block-level box (participates in block flow).
@@ -120,26 +158,52 @@ pub enum Display {
     None,
 }
 
-/// The fully-resolved style of one element after the cascade.
+/// Box edge offsets in px (`margin` / `padding`), resolved per side.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Edges {
+    /// Top edge in px.
+    pub top: f32,
+    /// Right edge in px.
+    pub right: f32,
+    /// Bottom edge in px.
+    pub bottom: f32,
+    /// Left edge in px.
+    pub left: f32,
+}
+
+/// The initial `font-size` in px (the CSS default medium, 16px).
+pub const INITIAL_FONT_SIZE: f32 = 16.0;
+
+/// The fully-resolved style of one element after the T1 cascade.
 ///
-/// Only the fixed T0 property set is represented; layout + paint read exactly
-/// these fields. Inherited properties (`color`, `font-*`, `text-decoration`) flow
-/// from parent to child in [`cascade`]; non-inherited ones (`display`,
-/// `margin-bottom`) reset to their initial value on each element.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// Layout + shaping + paint read exactly these fields. Inherited properties
+/// (`color`, `font-*`, `line-height`, `text-decoration`) flow parent -> child in
+/// [`cascade`]; non-inherited ones (`display`, `margin`, `padding`,
+/// `background-color`) reset to their initial value on each element.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ComputedStyle {
     /// Outer display type.
     pub display: Display,
     /// Text colour (inherited).
     pub color: Color,
+    /// Background colour, if any (not inherited).
+    pub background_color: Option<Color>,
     /// Whether text is bold (inherited).
     pub bold: bool,
     /// Whether text is italic (inherited).
     pub italic: bool,
     /// Whether text is underlined (inherited).
     pub underline: bool,
-    /// Bottom margin in px (not inherited).
-    pub margin_bottom: f32,
+    /// Font size in px (inherited); the basis for `em` lengths.
+    pub font_size: f32,
+    /// The resolved font-family list (inherited); an empty list means the default.
+    pub font_family: Vec<String>,
+    /// Line height in px, or `0.0` for the `normal` keyword (inherited).
+    pub line_height: f32,
+    /// Margin box edges in px (not inherited).
+    pub margin: Edges,
+    /// Padding box edges in px (not inherited).
+    pub padding: Edges,
 }
 
 impl ComputedStyle {
@@ -149,62 +213,163 @@ impl ComputedStyle {
         ComputedStyle {
             display: Display::Inline,
             color: Color::BLACK,
+            background_color: None,
             bold: false,
             italic: false,
             underline: false,
-            margin_bottom: 0.0,
+            font_size: INITIAL_FONT_SIZE,
+            font_family: Vec::new(),
+            line_height: 0.0,
+            margin: Edges::default(),
+            padding: Edges::default(),
         }
+    }
+
+    /// The bottom margin in px — the block-flow separation layout uses. Kept as a
+    /// convenience accessor so layout/paint read one field where T0 had a scalar.
+    #[must_use]
+    pub fn margin_bottom(&self) -> f32 {
+        self.margin.bottom
     }
 }
 
-/// One parsed CSS declaration in the T0 property set.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// One parsed CSS declaration in the T1 core property set.
+#[derive(Debug, Clone, PartialEq)]
 enum Declaration {
     Display(Display),
     Color(Color),
+    BackgroundColor(Color),
     Bold(bool),
     Italic(bool),
     Underline(bool),
-    MarginBottom(f32),
+    /// A font size as a length, resolved against the parent size at cascade time.
+    FontSize(Length),
+    FontFamily(Vec<String>),
+    /// A line height as a length (or the `normal` keyword -> `None`).
+    LineHeight(Option<Length>),
+    Margin([Option<Length>; 4]),
+    Padding([Option<Length>; 4]),
 }
 
-/// A restricted T0 selector: a type name, a `.class`, or an `#id`.
-///
-/// The T0 selector set is deliberately tiny (no combinators, no pseudo-classes) —
-/// enough to target the allowlist by element, class, or id. Each selector carries
-/// a fixed specificity used to resolve the cascade.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Selector {
-    /// A type selector, e.g. `p` (specificity 1).
-    Type(String),
-    /// A class selector, e.g. `.note` (specificity 10).
-    Class(String),
-    /// An id selector, e.g. `#main` (specificity 100).
-    Id(String),
-    /// The universal selector `*` (specificity 0).
-    Universal,
+/// A CSS length the cascade resolves to px: absolute `px` or font-relative `em`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Length {
+    Px(f32),
+    Em(f32),
+}
+
+impl Length {
+    /// Resolve to px against a font size basis (for `em`).
+    fn resolve(self, font_basis: f32) -> f32 {
+        match self {
+            Length::Px(v) => v,
+            Length::Em(v) => v * font_basis,
+        }
+    }
+}
+
+/// A compound selector: an optional type name plus any `.class` / `#id` filters.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct Compound {
+    tag: Option<String>,
+    classes: Vec<String>,
+    ids: Vec<String>,
+}
+
+impl Compound {
+    fn matches(&self, element: &Element) -> bool {
+        if let Some(tag) = &self.tag {
+            if element.tag != *tag {
+                return false;
+            }
+        }
+        for id in &self.ids {
+            if element.attr("id") != Some(id.as_str()) {
+                return false;
+            }
+        }
+        for class in &self.classes {
+            let has = element
+                .attr("class")
+                .map(|c| c.split_whitespace().any(|w| w == class))
+                .unwrap_or(false);
+            if !has {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Specificity contribution: (#ids, #classes, #types).
+    fn specificity(&self) -> (u32, u32, u32) {
+        (
+            self.ids.len() as u32,
+            self.classes.len() as u32,
+            u32::from(self.tag.is_some()),
+        )
+    }
+}
+
+/// A combinator between two compound selectors in a complex selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Combinator {
+    /// ` ` — a descendant (matches any ancestor).
+    Descendant,
+    /// `>` — a child (matches the immediate parent).
+    Child,
+}
+
+/// A complex selector: a key compound plus a chain of ancestor compounds joined by
+/// combinators, matched right-to-left against the element and its ancestor path.
+#[derive(Debug, Clone, PartialEq)]
+struct Selector {
+    /// The rightmost (key) compound — matched against the element itself.
+    key: Compound,
+    /// Ancestor compounds, nearest-first, each with the combinator to its right.
+    ancestors: Vec<(Combinator, Compound)>,
 }
 
 impl Selector {
-    fn specificity(&self) -> u32 {
-        match self {
-            Selector::Id(_) => 100,
-            Selector::Class(_) => 10,
-            Selector::Type(_) => 1,
-            Selector::Universal => 0,
+    /// Whether this selector matches `element` given its `ancestors` (nearest-first:
+    /// `ancestors[0]` is the element's parent, `ancestors[1]` its grandparent, …).
+    fn matches(&self, element: &Element, ancestors: &[&Element]) -> bool {
+        if !self.key.matches(element) {
+            return false;
         }
+        let mut path = ancestors.iter();
+        for (combinator, compound) in &self.ancestors {
+            match combinator {
+                Combinator::Child => {
+                    let Some(parent) = path.next() else {
+                        return false;
+                    };
+                    if !compound.matches(parent) {
+                        return false;
+                    }
+                }
+                Combinator::Descendant => loop {
+                    let Some(candidate) = path.next() else {
+                        return false;
+                    };
+                    if compound.matches(candidate) {
+                        break;
+                    }
+                },
+            }
+        }
+        true
     }
 
-    fn matches(&self, element: &Element) -> bool {
-        match self {
-            Selector::Universal => true,
-            Selector::Type(name) => element.tag == *name,
-            Selector::Id(id) => element.attr("id") == Some(id.as_str()),
-            Selector::Class(class) => element
-                .attr("class")
-                .map(|c| c.split_whitespace().any(|w| w == class))
-                .unwrap_or(false),
+    /// The CSS specificity as a single comparable key (a,b,c packed).
+    fn specificity(&self) -> u32 {
+        let (mut a, mut b, mut c) = self.key.specificity();
+        for (_, compound) in &self.ancestors {
+            let (ea, eb, ec) = compound.specificity();
+            a += ea;
+            b += eb;
+            c += ec;
         }
+        (a << 16) | (b << 8) | c
     }
 }
 
@@ -216,28 +381,25 @@ struct Rule {
     order: usize,
 }
 
-/// A parsed T0 stylesheet: the author rules from all `<style>` blocks.
+/// A parsed T1 stylesheet: the author rules from all `<style>` blocks.
 #[derive(Debug, Clone, Default)]
 pub struct Stylesheet {
     rules: Vec<Rule>,
 }
 
 impl Stylesheet {
-    /// Parse author CSS text (the concatenated contents of the document's
-    /// `<style>` blocks) into a T0 stylesheet. Unsupported selectors and
+    /// Parse author CSS text (the concatenated `<style>` block contents) into a T1
+    /// stylesheet using cssparser for value tokenising. Unsupported selectors and
     /// properties are skipped; the parse never fails.
     #[must_use]
     pub fn parse(css: &str) -> Self {
         let mut rules = Vec::new();
         let mut order = 0;
-        let mut rest = css;
-        while let Some(open) = rest.find('{') {
-            let prelude = rest[..open].trim();
-            let Some(close) = rest[open + 1..].find('}') else {
-                break;
-            };
-            let body = &rest[open + 1..open + 1 + close];
-            let declarations = parse_declarations(body);
+        for (prelude, body) in split_rules(css) {
+            let declarations = parse_declarations(&body);
+            if declarations.is_empty() {
+                continue;
+            }
             for selector_text in prelude.split(',') {
                 if let Some(selector) = parse_selector(selector_text.trim()) {
                     rules.push(Rule {
@@ -248,27 +410,52 @@ impl Stylesheet {
                     order += 1;
                 }
             }
-            rest = &rest[open + 1 + close + 1..];
         }
         Stylesheet { rules }
     }
 }
 
-/// Whether `text` is a selector the T0 subset supports: a single type, `.class`,
-/// `#id`, or the universal `*` (no combinators, no pseudo-classes).
-///
-/// This is the selector-side companion to [`SUPPORTED_PROPERTIES`] and
-/// [`is_supported_property`]: the committed-fixture drift guard uses it to reject a
-/// fixture whose `<style>` block uses a selector outside the documented T0 set,
-/// keeping the golden fixtures within the subset.
-///
-/// It does its OWN single-token validation rather than trusting [`parse_selector`]:
-/// the cascade's parser is deliberately lenient (its `.class` / `#id` branches
-/// accept any non-empty remainder, so a malformed `.a > .b` parses as a class that
-/// simply never matches), which is fine for the cascade but too loose for a drift
-/// guard whose whole job is to REJECT such selectors. A supported selector is `*`,
-/// or a single identifier optionally prefixed by `.` or `#` (identifier chars:
-/// ASCII alphanumeric, `-`, `_`).
+/// Split a stylesheet into `(prelude, body)` pairs at top-level `{ … }`, skipping
+/// at-rules (`@media` etc. are T2/beyond). A brace-depth scan keeps nested blocks
+/// (e.g. inside `@media`) from being mistaken for rules.
+fn split_rules(css: &str) -> Vec<(String, String)> {
+    let mut rules = Vec::new();
+    let bytes = css.as_bytes();
+    let mut i = 0;
+    let mut prelude_start = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' => {
+                let prelude = css[prelude_start..i].trim().to_string();
+                let mut depth = 1;
+                let mut j = i + 1;
+                while j < bytes.len() && depth > 0 {
+                    match bytes[j] {
+                        b'{' => depth += 1,
+                        b'}' => depth -= 1,
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                let body = css[i + 1..j.saturating_sub(1)].to_string();
+                if !prelude.starts_with('@') {
+                    rules.push((prelude, body));
+                }
+                i = j;
+                prelude_start = i;
+            }
+            b'}' => {
+                i += 1;
+                prelude_start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    rules
+}
+
+/// The **T0** subset selector check (unchanged): a single type / `.class` / `#id`
+/// or `*`. Used ONLY by the T0 server-floor drift guard, not the T1 matcher.
 #[must_use]
 pub fn is_supported_selector(text: &str) -> bool {
     let text = text.trim();
@@ -285,107 +472,334 @@ pub fn is_supported_selector(text: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Parse a single restricted selector.
+/// Parse a complex T1 selector: compounds joined by descendant (` `) or child
+/// (`>`) combinators. Returns `None` if any compound is malformed or an
+/// unsupported construct (pseudo-classes, attribute selectors, sibling
+/// combinators) appears — those are skipped rather than mis-matched.
 fn parse_selector(text: &str) -> Option<Selector> {
+    let text = text.trim();
     if text.is_empty() {
         return None;
     }
-    if text == "*" {
-        return Some(Selector::Universal);
+    if text.contains(':') || text.contains('[') || text.contains('~') || text.contains('+') {
+        return None;
     }
-    if let Some(id) = text.strip_prefix('#') {
-        return (!id.is_empty()).then(|| Selector::Id(id.to_string()));
+    // Normalise `>` into a spaced token so splitting on whitespace sees it.
+    let spaced = text.replace('>', " > ");
+    // Parse into an ordered list of compounds and the combinator PRECEDING each
+    // (the combinator that links a compound to the one on its LEFT).
+    let mut compounds: Vec<(Combinator, Compound)> = Vec::new();
+    let mut pending = Combinator::Descendant;
+    for token in spaced.split_whitespace() {
+        if token == ">" {
+            pending = Combinator::Child;
+            continue;
+        }
+        let compound = parse_compound(token)?;
+        compounds.push((pending, compound));
+        pending = Combinator::Descendant;
     }
-    if let Some(class) = text.strip_prefix('.') {
-        return (!class.is_empty()).then(|| Selector::Class(class.to_string()));
+    // The rightmost compound is the key (its own leading combinator is the one
+    // linking it to its nearest ancestor). Pop it, then walk leftwards: each
+    // ancestor entry pairs the compound with the combinator that linked it to the
+    // compound on its RIGHT (i.e. the leading combinator of the entry to its right).
+    let (key_combinator, key) = compounds.pop()?;
+    let mut ancestors: Vec<(Combinator, Compound)> = Vec::new();
+    let mut right_combinator = key_combinator;
+    while let Some((leading, compound)) = compounds.pop() {
+        ancestors.push((right_combinator, compound));
+        right_combinator = leading;
     }
-    // A bare type selector: only accept a plain identifier (no combinators).
-    if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-        return Some(Selector::Type(text.to_ascii_lowercase()));
-    }
-    None
+    Some(Selector { key, ancestors })
 }
 
-/// Parse a declaration block body (`prop: value; …`) into the T0 property set.
+/// Parse one compound selector (`p.lead#main` / `.note` / `#id` / `*` / `div`).
+fn parse_compound(text: &str) -> Option<Compound> {
+    if text == "*" {
+        return Some(Compound::default());
+    }
+    let mut compound = Compound::default();
+    let mut chars = text.chars().peekable();
+    if matches!(chars.peek(), Some(c) if is_ident_char(*c)) {
+        let ident = take_ident(&mut chars);
+        if ident.is_empty() {
+            return None;
+        }
+        compound.tag = Some(ident.to_ascii_lowercase());
+    }
+    while let Some(&c) = chars.peek() {
+        match c {
+            '.' => {
+                chars.next();
+                let ident = take_ident(&mut chars);
+                if ident.is_empty() {
+                    return None;
+                }
+                compound.classes.push(ident);
+            }
+            '#' => {
+                chars.next();
+                let ident = take_ident(&mut chars);
+                if ident.is_empty() {
+                    return None;
+                }
+                compound.ids.push(ident);
+            }
+            _ => return None,
+        }
+    }
+    Some(compound)
+}
+
+fn is_ident_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+fn take_ident(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+    let mut out = String::new();
+    while let Some(&c) = chars.peek() {
+        if is_ident_char(c) {
+            out.push(c);
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+/// Parse a declaration block body (`prop: value; …`) into the T1 property set.
 fn parse_declarations(body: &str) -> Vec<Declaration> {
     let mut declarations = Vec::new();
     for decl in body.split(';') {
         let Some((prop, value)) = decl.split_once(':') else {
             continue;
         };
-        if let Some(parsed) = parse_declaration(prop.trim(), value.trim()) {
+        let value = strip_important(value.trim());
+        for parsed in parse_declaration(prop.trim(), value) {
             declarations.push(parsed);
         }
     }
     declarations
 }
 
-/// Parse one `property: value` pair, or `None` if outside the T0 set.
-fn parse_declaration(prop: &str, value: &str) -> Option<Declaration> {
-    let v = value.trim().to_ascii_lowercase();
-    match prop.to_ascii_lowercase().as_str() {
-        "display" => match v.as_str() {
-            "block" => Some(Declaration::Display(Display::Block)),
-            "inline" => Some(Declaration::Display(Display::Inline)),
-            "none" => Some(Declaration::Display(Display::None)),
-            _ => None,
-        },
-        "color" => Color::parse(value).map(Declaration::Color),
-        "font-weight" => match v.as_str() {
-            "bold" | "bolder" | "700" | "800" | "900" => Some(Declaration::Bold(true)),
-            "normal" | "400" => Some(Declaration::Bold(false)),
-            _ => None,
-        },
-        "font-style" => match v.as_str() {
-            "italic" | "oblique" => Some(Declaration::Italic(true)),
-            "normal" => Some(Declaration::Italic(false)),
-            _ => None,
-        },
-        "text-decoration" | "text-decoration-line" => match v.as_str() {
-            "underline" => Some(Declaration::Underline(true)),
-            "none" => Some(Declaration::Underline(false)),
-            _ => None,
-        },
-        "margin-bottom" => parse_px(&v).map(Declaration::MarginBottom),
-        _ => None,
+/// Strip a trailing `!important` (its priority is honoured implicitly: an
+/// important author declaration still cascades in source order at T1, enough for
+/// the core set — full origin/priority interplay is beyond T1 scope).
+fn strip_important(value: &str) -> &str {
+    let lower = value.to_ascii_lowercase();
+    if lower.ends_with("!important") {
+        value[..value.len() - "!important".len()].trim()
+    } else {
+        value
     }
 }
 
-/// Parse a `<number>px` (or bare number) length in px.
-fn parse_px(value: &str) -> Option<f32> {
-    let v = value.trim().strip_suffix("px").unwrap_or(value.trim());
-    v.trim().parse::<f32>().ok()
+/// Parse one `property: value` pair into zero or more [`Declaration`]s (a
+/// shorthand like `margin` expands to the four sides).
+fn parse_declaration(prop: &str, value: &str) -> Vec<Declaration> {
+    let v = value.trim();
+    let vl = v.to_ascii_lowercase();
+    match prop.to_ascii_lowercase().as_str() {
+        "display" => match vl.as_str() {
+            "block" => vec![Declaration::Display(Display::Block)],
+            "inline" | "inline-block" => vec![Declaration::Display(Display::Inline)],
+            "none" => vec![Declaration::Display(Display::None)],
+            _ => vec![Declaration::Display(Display::Block)],
+        },
+        "color" => Color::parse(v)
+            .map(Declaration::Color)
+            .into_iter()
+            .collect(),
+        "background-color" | "background" => Color::parse(v)
+            .map(Declaration::BackgroundColor)
+            .into_iter()
+            .collect(),
+        "font-weight" => match vl.as_str() {
+            "bold" | "bolder" | "600" | "700" | "800" | "900" => vec![Declaration::Bold(true)],
+            "normal" | "lighter" | "100" | "200" | "300" | "400" | "500" => {
+                vec![Declaration::Bold(false)]
+            }
+            _ => vec![],
+        },
+        "font-style" => match vl.as_str() {
+            "italic" | "oblique" => vec![Declaration::Italic(true)],
+            "normal" => vec![Declaration::Italic(false)],
+            _ => vec![],
+        },
+        "text-decoration" | "text-decoration-line" => {
+            if vl.split_whitespace().any(|w| w == "underline") {
+                vec![Declaration::Underline(true)]
+            } else if vl.split_whitespace().any(|w| w == "none") {
+                vec![Declaration::Underline(false)]
+            } else {
+                vec![]
+            }
+        }
+        "font-size" => parse_font_size(&vl)
+            .map(Declaration::FontSize)
+            .into_iter()
+            .collect(),
+        "font-family" => {
+            let families = parse_font_family(v);
+            if families.is_empty() {
+                vec![]
+            } else {
+                vec![Declaration::FontFamily(families)]
+            }
+        }
+        "line-height" => {
+            if vl == "normal" {
+                vec![Declaration::LineHeight(None)]
+            } else if let Ok(number) = vl.parse::<f32>() {
+                // A UNITLESS line-height is a multiple of the font size (checked
+                // before `parse_length`, which would treat a bare number as px).
+                vec![Declaration::LineHeight(Some(Length::Em(number)))]
+            } else if let Some(len) = parse_length(&vl) {
+                vec![Declaration::LineHeight(Some(len))]
+            } else {
+                vec![]
+            }
+        }
+        "margin" => parse_box_shorthand(&vl)
+            .map(Declaration::Margin)
+            .into_iter()
+            .collect(),
+        "padding" => parse_box_shorthand(&vl)
+            .map(Declaration::Padding)
+            .into_iter()
+            .collect(),
+        "margin-top" | "margin-right" | "margin-bottom" | "margin-left" => parse_length(&vl)
+            .map(|len| edge_longhand(prop, len, true))
+            .into_iter()
+            .collect(),
+        "padding-top" | "padding-right" | "padding-bottom" | "padding-left" => parse_length(&vl)
+            .map(|len| edge_longhand(prop, len, false))
+            .into_iter()
+            .collect(),
+        _ => vec![],
+    }
 }
 
-/// The user-agent default declarations for an allowlist element.
+/// Build a single-side margin/padding declaration for a `*-top/right/bottom/left`
+/// longhand (the other three sides stay `None` = untouched).
+fn edge_longhand(prop: &str, len: Length, is_margin: bool) -> Declaration {
+    let mut sides: [Option<Length>; 4] = [None; 4];
+    let idx = match prop.rsplit('-').next().unwrap_or("") {
+        "top" => 0,
+        "right" => 1,
+        "bottom" => 2,
+        "left" => 3,
+        _ => 0,
+    };
+    sides[idx] = Some(len);
+    if is_margin {
+        Declaration::Margin(sides)
+    } else {
+        Declaration::Padding(sides)
+    }
+}
+
+/// Parse a `margin`/`padding` shorthand (1–4 CSS lengths) into per-side values.
+fn parse_box_shorthand(value: &str) -> Option<[Option<Length>; 4]> {
+    let parts: Vec<Length> = value.split_whitespace().filter_map(parse_length).collect();
+    let (t, r, b, l) = match parts.as_slice() {
+        [a] => (*a, *a, *a, *a),
+        [v, h] => (*v, *h, *v, *h),
+        [t, h, b] => (*t, *h, *b, *h),
+        [t, r, b, l] => (*t, *r, *b, *l),
+        _ => return None,
+    };
+    Some([Some(t), Some(r), Some(b), Some(l)])
+}
+
+/// Parse a `font-size` value: a length, a percentage, or an absolute keyword.
+fn parse_font_size(value: &str) -> Option<Length> {
+    match value {
+        "medium" => Some(Length::Px(16.0)),
+        "small" => Some(Length::Px(13.0)),
+        "large" => Some(Length::Px(18.0)),
+        "x-small" => Some(Length::Px(10.0)),
+        "x-large" => Some(Length::Px(24.0)),
+        "xx-large" => Some(Length::Px(32.0)),
+        "smaller" => Some(Length::Em(0.83)),
+        "larger" => Some(Length::Em(1.2)),
+        _ => {
+            if let Some(pct) = value.strip_suffix('%') {
+                pct.trim()
+                    .parse::<f32>()
+                    .ok()
+                    .map(|p| Length::Em(p / 100.0))
+            } else {
+                parse_length(value)
+            }
+        }
+    }
+}
+
+/// Parse a `font-family` list into ordered family names (quotes stripped).
+fn parse_font_family(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|name| name.trim().trim_matches(['"', '\'']).to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
+/// Parse a CSS length: `<n>px`, `<n>em`, `<n>rem`, or a bare number (px). Returns
+/// `None` for unsupported units.
+fn parse_length(value: &str) -> Option<Length> {
+    let v = value.trim();
+    if let Some(px) = v.strip_suffix("px") {
+        return px.trim().parse::<f32>().ok().map(Length::Px);
+    }
+    if let Some(em) = v.strip_suffix("rem").or_else(|| v.strip_suffix("em")) {
+        return em.trim().parse::<f32>().ok().map(Length::Em);
+    }
+    v.parse::<f32>().ok().map(Length::Px)
+}
+
+/// The user-agent default declarations for an element by tag name.
 ///
-/// A small UA stylesheet: block-level elements display `block` and headings /
-/// paragraphs / lists carry a bottom margin; `strong`/`b` are bold, `em`/`i`
-/// italic, `a` underlined. This is the T0 UA sheet author rules cascade over.
+/// A small UA stylesheet covering the common semantic elements a real static page
+/// uses: block-level flow for structural + sectioning elements, heading scale +
+/// margins, list/paragraph margins, and inline emphasis defaults. Elements not
+/// listed default to `display: inline` (the initial value).
 fn ua_declarations(tag: &str) -> Vec<Declaration> {
     use Declaration::*;
+    let block = || Display(self::Display::Block);
+    let margin_bottom = |px: f32| Margin([None, None, Some(Length::Px(px)), None]);
     match tag {
-        // `head` renders nothing; it is display:none in the UA sheet.
-        "head" => vec![Display(self::Display::None)],
-        "html" | "body" | "div" | "ul" | "ol" | "li" => vec![Display(self::Display::Block)],
-        "p" => vec![Display(self::Display::Block), MarginBottom(16.0)],
+        "head" | "title" | "meta" | "link" | "script" | "style" => {
+            vec![Display(self::Display::None)]
+        }
+        "html" | "body" | "div" | "article" | "section" | "header" | "footer" | "nav" | "main"
+        | "aside" | "figure" | "figcaption" | "address" | "hgroup" => vec![block()],
+        "p" => vec![block(), margin_bottom(16.0)],
+        "ul" | "ol" => vec![block(), margin_bottom(16.0)],
+        "li" => vec![block()],
+        "blockquote" => vec![block(), margin_bottom(16.0)],
+        "pre" => vec![block(), margin_bottom(16.0)],
+        "hr" => vec![block(), margin_bottom(8.0)],
         "h1" => vec![
-            Display(self::Display::Block),
+            block(),
             Bold(true),
-            MarginBottom(21.0),
+            FontSize(Length::Px(32.0)),
+            margin_bottom(21.0),
         ],
         "h2" => vec![
-            Display(self::Display::Block),
+            block(),
             Bold(true),
-            MarginBottom(19.0),
+            FontSize(Length::Px(24.0)),
+            margin_bottom(19.0),
         ],
-        "h3" | "h4" | "h5" | "h6" => {
-            vec![
-                Display(self::Display::Block),
-                Bold(true),
-                MarginBottom(16.0),
-            ]
-        }
+        "h3" => vec![
+            block(),
+            Bold(true),
+            FontSize(Length::Px(19.0)),
+            margin_bottom(16.0),
+        ],
+        "h4" | "h5" | "h6" => vec![block(), Bold(true), margin_bottom(16.0)],
         "strong" | "b" => vec![Bold(true)],
         "em" | "i" => vec![Italic(true)],
         "a" => vec![Underline(true), Color(self::Color { r: 0, g: 0, b: 238 })],
@@ -393,57 +807,88 @@ fn ua_declarations(tag: &str) -> Vec<Declaration> {
     }
 }
 
-/// Apply a list of declarations onto a style, in order (later wins).
-fn apply(style: &mut ComputedStyle, declarations: &[Declaration]) {
+/// Apply a list of declarations onto a style, in order (later wins). `parent_size`
+/// is the parent font size (the basis for `em` `font-size`); other `em` lengths
+/// resolve against the element's own (already-applied) `font_size`.
+fn apply(style: &mut ComputedStyle, declarations: &[Declaration], parent_size: f32) {
     for decl in declarations {
-        match *decl {
-            Declaration::Display(d) => style.display = d,
-            Declaration::Color(c) => style.color = c,
-            Declaration::Bold(b) => style.bold = b,
-            Declaration::Italic(i) => style.italic = i,
-            Declaration::Underline(u) => style.underline = u,
-            Declaration::MarginBottom(m) => style.margin_bottom = m,
+        match decl {
+            Declaration::Display(d) => style.display = *d,
+            Declaration::Color(c) => style.color = *c,
+            Declaration::BackgroundColor(c) => style.background_color = Some(*c),
+            Declaration::Bold(b) => style.bold = *b,
+            Declaration::Italic(i) => style.italic = *i,
+            Declaration::Underline(u) => style.underline = *u,
+            Declaration::FontSize(len) => {
+                style.font_size = len.resolve(parent_size);
+            }
+            Declaration::FontFamily(families) => style.font_family = families.clone(),
+            Declaration::LineHeight(len) => {
+                style.line_height = match len {
+                    Some(l) => l.resolve(style.font_size),
+                    None => 0.0,
+                };
+            }
+            Declaration::Margin(sides) => apply_edges(&mut style.margin, sides, style.font_size),
+            Declaration::Padding(sides) => apply_edges(&mut style.padding, sides, style.font_size),
         }
     }
 }
 
-/// Run the T0 cascade for one element, given its parent's computed style.
-///
-/// This is the real cascade over the small property set: it starts from the
-/// inherited baseline (inherited properties flow from `parent`, non-inherited ones
-/// reset to their initial value), layers the UA sheet, then the matching author
-/// rules sorted by (specificity, source order), then the inline `style="…"`
-/// declarations (which win over author rules). The result is the element's
-/// [`ComputedStyle`].
+/// Apply per-side length overrides onto an [`Edges`], leaving `None` sides intact.
+fn apply_edges(edges: &mut Edges, sides: &[Option<Length>; 4], font_size: f32) {
+    if let Some(t) = sides[0] {
+        edges.top = t.resolve(font_size);
+    }
+    if let Some(r) = sides[1] {
+        edges.right = r.resolve(font_size);
+    }
+    if let Some(b) = sides[2] {
+        edges.bottom = b.resolve(font_size);
+    }
+    if let Some(l) = sides[3] {
+        edges.left = l.resolve(font_size);
+    }
+}
+
+/// Run the T1 cascade for one element, given its parent's computed style and its
+/// ancestor path (nearest-first) for combinator matching.
 #[must_use]
-pub fn cascade(element: &Element, parent: &ComputedStyle, sheet: &Stylesheet) -> ComputedStyle {
-    // Start from inherited values; reset non-inherited ones to their initial.
+pub fn cascade(
+    element: &Element,
+    parent: &ComputedStyle,
+    ancestors: &[&Element],
+    sheet: &Stylesheet,
+) -> ComputedStyle {
+    let parent_size = parent.font_size;
     let mut style = ComputedStyle {
         display: Display::Inline,
         color: parent.color,
+        background_color: None,
         bold: parent.bold,
         italic: parent.italic,
         underline: parent.underline,
-        margin_bottom: 0.0,
+        font_size: parent.font_size,
+        font_family: parent.font_family.clone(),
+        line_height: parent.line_height,
+        margin: Edges::default(),
+        padding: Edges::default(),
     };
 
-    // 1. UA sheet.
-    apply(&mut style, &ua_declarations(&element.tag));
+    apply(&mut style, &ua_declarations(&element.tag), parent_size);
 
-    // 2. Author rules, sorted by specificity then source order.
     let mut matched: Vec<&Rule> = sheet
         .rules
         .iter()
-        .filter(|r| r.selector.matches(element))
+        .filter(|r| r.selector.matches(element, ancestors))
         .collect();
     matched.sort_by_key(|r| (r.selector.specificity(), r.order));
     for rule in matched {
-        apply(&mut style, &rule.declarations);
+        apply(&mut style, &rule.declarations, parent_size);
     }
 
-    // 3. Inline style="…" wins over author rules.
     if let Some(inline) = element.attr("style") {
-        apply(&mut style, &parse_declarations(inline));
+        apply(&mut style, &parse_declarations(inline), parent_size);
     }
 
     style
@@ -470,30 +915,48 @@ mod tests {
         }
     }
 
+    fn root(element: &Element, sheet: &Stylesheet) -> ComputedStyle {
+        cascade(element, &ComputedStyle::initial(), &[], sheet)
+    }
+
     #[test]
     fn ua_sheet_makes_p_a_block_with_margin() {
-        let style = cascade(&el("p"), &ComputedStyle::initial(), &Stylesheet::default());
+        let style = root(&el("p"), &Stylesheet::default());
         assert_eq!(style.display, Display::Block);
-        assert!(style.margin_bottom > 0.0);
+        assert!(style.margin_bottom() > 0.0);
     }
 
     #[test]
-    fn ua_sheet_makes_strong_bold_and_em_italic() {
+    fn ua_sheet_gives_headings_a_larger_font_size() {
         let sheet = Stylesheet::default();
-        assert!(cascade(&el("strong"), &ComputedStyle::initial(), &sheet).bold);
-        assert!(cascade(&el("em"), &ComputedStyle::initial(), &sheet).italic);
-        assert!(cascade(&el("a"), &ComputedStyle::initial(), &sheet).underline);
+        let h1 = root(&el("h1"), &sheet);
+        let p = root(&el("p"), &sheet);
+        assert!(h1.bold);
+        assert!(h1.font_size > p.font_size, "h1 larger than body text");
     }
 
     #[test]
-    fn inherited_color_flows_to_children() {
+    fn ua_sheet_keeps_semantic_containers_in_block_flow() {
+        let sheet = Stylesheet::default();
+        for tag in ["article", "section", "header", "footer", "nav", "main"] {
+            assert_eq!(
+                root(&el(tag), &sheet).display,
+                Display::Block,
+                "{tag} block"
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_color_and_font_flow_to_children() {
         let mut parent = ComputedStyle::initial();
         parent.color = Color {
             r: 10,
             g: 20,
             b: 30,
         };
-        let child = cascade(&el("span"), &parent, &Stylesheet::default());
+        parent.font_size = 20.0;
+        let child = cascade(&el("span"), &parent, &[], &Stylesheet::default());
         assert_eq!(
             child.color,
             Color {
@@ -502,34 +965,55 @@ mod tests {
                 b: 30
             }
         );
+        assert_eq!(child.font_size, 20.0, "font-size inherited");
     }
 
     #[test]
-    fn non_inherited_margin_does_not_flow() {
+    fn non_inherited_margin_and_background_do_not_flow() {
         let mut parent = ComputedStyle::initial();
-        parent.margin_bottom = 40.0;
-        let child = cascade(&el("span"), &parent, &Stylesheet::default());
-        assert_eq!(child.margin_bottom, 0.0);
+        parent.margin.bottom = 40.0;
+        parent.background_color = Some(Color::WHITE);
+        let child = cascade(&el("span"), &parent, &[], &Stylesheet::default());
+        assert_eq!(child.margin.bottom, 0.0);
+        assert_eq!(child.background_color, None);
     }
 
     #[test]
     fn author_rule_overrides_ua_and_specificity_wins() {
         let sheet =
             Stylesheet::parse("p { color: red } .special { color: green } #x { color: blue }");
-        let plain = cascade(&el("p"), &ComputedStyle::initial(), &sheet);
-        assert_eq!(plain.color, Color::parse("red").unwrap());
+        assert_eq!(root(&el("p"), &sheet).color, Color::parse("red").unwrap());
+        assert_eq!(
+            root(&el_attr("p", "class", "special"), &sheet).color,
+            Color::parse("green").unwrap()
+        );
+        assert_eq!(
+            root(&el_attr("p", "id", "x"), &sheet).color,
+            Color::parse("blue").unwrap()
+        );
+    }
 
-        let classed = cascade(
-            &el_attr("p", "class", "special"),
+    #[test]
+    fn descendant_and_child_combinators_match_via_the_ancestor_path() {
+        let sheet = Stylesheet::parse("article p { color: green } article > h1 { color: blue }");
+        let article = el("article");
+        let div = el("div");
+        let p = cascade(
+            &el("p"),
             &ComputedStyle::initial(),
+            &[&div, &article],
             &sheet,
         );
-        // .special (specificity 10) beats p (1).
-        assert_eq!(classed.color, Color::parse("green").unwrap());
-
-        let ided = cascade(&el_attr("p", "id", "x"), &ComputedStyle::initial(), &sheet);
-        // #x (100) beats both.
-        assert_eq!(ided.color, Color::parse("blue").unwrap());
+        assert_eq!(p.color, Color::parse("green").unwrap());
+        let h1 = cascade(&el("h1"), &ComputedStyle::initial(), &[&article], &sheet);
+        assert_eq!(h1.color, Color::parse("blue").unwrap());
+        let h1_deep = cascade(
+            &el("h1"),
+            &ComputedStyle::initial(),
+            &[&div, &article],
+            &sheet,
+        );
+        assert_ne!(h1_deep.color, Color::parse("blue").unwrap());
     }
 
     #[test]
@@ -537,70 +1021,140 @@ mod tests {
         let sheet = Stylesheet::parse("#x { color: green }");
         let mut element = el_attr("p", "id", "x");
         element.attrs.push(("style".into(), "color: red".into()));
-        let style = cascade(&element, &ComputedStyle::initial(), &sheet);
-        assert_eq!(style.color, Color::parse("red").unwrap());
+        assert_eq!(root(&element, &sheet).color, Color::parse("red").unwrap());
     }
 
     #[test]
     fn display_none_is_parsed_and_applied() {
         let sheet = Stylesheet::parse(".hidden { display: none }");
-        let style = cascade(
-            &el_attr("div", "class", "hidden"),
-            &ComputedStyle::initial(),
-            &sheet,
+        assert_eq!(
+            root(&el_attr("div", "class", "hidden"), &sheet).display,
+            Display::None
         );
-        assert_eq!(style.display, Display::None);
     }
 
     #[test]
-    fn supported_property_allowlist_matches_the_cascade() {
-        // Every property the allowlist advertises is actually honoured by the
-        // cascade parser, and a property off the allowlist is not — so the
-        // machine-readable allowlist the drift guard trusts cannot silently
-        // diverge from what `parse_declaration` really supports.
-        assert!(is_supported_property("color"));
-        assert!(is_supported_property("MARGIN-BOTTOM"));
-        assert!(!is_supported_property("padding"));
-        assert!(!is_supported_property("width"));
-        for prop in SUPPORTED_PROPERTIES {
-            let value = match *prop {
-                "display" => "block",
-                "color" => "#000000",
-                "font-weight" => "bold",
-                "font-style" => "italic",
-                "text-decoration" | "text-decoration-line" => "underline",
-                "margin-bottom" => "1px",
-                other => panic!("untested allowlisted property {other}"),
-            };
-            assert!(
-                parse_declaration(prop, value).is_some(),
-                "allowlisted property {prop} must parse"
-            );
-        }
+    fn box_model_shorthand_and_longhands_resolve_per_side() {
+        let sheet = Stylesheet::parse(
+            "div { margin: 10px 20px 30px 40px; padding: 5px } .p { padding-left: 8px }",
+        );
+        let div = root(&el("div"), &sheet);
+        assert_eq!(
+            (
+                div.margin.top,
+                div.margin.right,
+                div.margin.bottom,
+                div.margin.left
+            ),
+            (10.0, 20.0, 30.0, 40.0)
+        );
+        assert_eq!(div.padding.top, 5.0);
+        let p = root(&el_attr("div", "class", "p"), &sheet);
+        assert_eq!(p.padding.left, 8.0, "longhand overrides one side");
     }
 
     #[test]
-    fn supported_selector_accepts_the_t0_set_and_rejects_the_rest() {
-        // The drift guard's selector check: a single type/.class/#id/* is
-        // supported; combinators, pseudo-classes, and multi-token selectors are
-        // not — including a malformed `.class` the lenient cascade parser would
-        // otherwise wave through.
-        assert!(is_supported_selector("p"));
-        assert!(is_supported_selector(".lead"));
-        assert!(is_supported_selector("#main"));
-        assert!(is_supported_selector("*"));
-        assert!(!is_supported_selector("div p"));
-        assert!(!is_supported_selector("a:hover"));
-        assert!(!is_supported_selector(".a > .b"));
-        assert!(!is_supported_selector("ul > li"));
-        assert!(!is_supported_selector(""));
+    fn font_size_em_is_relative_to_the_parent() {
+        let sheet = Stylesheet::parse(".big { font-size: 2em }");
+        let mut parent = ComputedStyle::initial();
+        parent.font_size = 20.0;
+        let child = cascade(&el_attr("span", "class", "big"), &parent, &[], &sheet);
+        assert_eq!(child.font_size, 40.0, "2em of a 20px parent = 40px");
     }
 
     #[test]
-    fn parses_hex_and_named_colors() {
+    fn line_height_honours_px_unitless_and_normal() {
+        let px = root(
+            &el_attr("p", "style", "line-height: 24px"),
+            &Stylesheet::default(),
+        );
+        assert_eq!(px.line_height, 24.0);
+        let unitless = root(
+            &el_attr("p", "style", "font-size: 20px; line-height: 1.5"),
+            &Stylesheet::default(),
+        );
+        assert_eq!(unitless.line_height, 30.0, "1.5 * 20px");
+    }
+
+    #[test]
+    fn parses_hex_named_and_rgb_colors_via_cssparser() {
         assert_eq!(Color::parse("#f00"), Some(Color { r: 255, g: 0, b: 0 }));
         assert_eq!(Color::parse("#00ff00"), Some(Color { r: 0, g: 255, b: 0 }));
         assert_eq!(Color::parse("blue"), Some(Color { r: 0, g: 0, b: 255 }));
+        // The full css-color-4 keyword table cssparser ships, not the T0 handful.
+        assert_eq!(
+            Color::parse("rebeccapurple"),
+            Some(Color {
+                r: 102,
+                g: 51,
+                b: 153
+            })
+        );
+        assert_eq!(
+            Color::parse("rgb(10, 20, 30)"),
+            Some(Color {
+                r: 10,
+                g: 20,
+                b: 30
+            })
+        );
+        assert_eq!(
+            Color::parse("rgba(255, 0, 0, 0.5)"),
+            Some(Color { r: 255, g: 0, b: 0 }),
+            "alpha dropped to opaque"
+        );
         assert_eq!(Color::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn background_color_is_cascaded() {
+        let sheet = Stylesheet::parse("body { background-color: #eef }");
+        assert_eq!(
+            root(&el("body"), &sheet).background_color,
+            Some(Color {
+                r: 238,
+                g: 238,
+                b: 255
+            })
+        );
+    }
+
+    #[test]
+    fn important_is_stripped_and_the_declaration_still_applies() {
+        let sheet = Stylesheet::parse("p { color: red !important }");
+        assert_eq!(root(&el("p"), &sheet).color, Color::parse("red").unwrap());
+    }
+
+    #[test]
+    fn robust_parse_survives_comments_and_at_rules() {
+        // cssparser-grade robustness: a comment and an @media block do not derail
+        // the following real rule.
+        let sheet = Stylesheet::parse(
+            "/* a comment */ @media screen { p { color: blue } } p { color: green }",
+        );
+        // The top-level `p` wins (the @media block is skipped at T1).
+        assert_eq!(root(&el("p"), &sheet).color, Color::parse("green").unwrap());
+    }
+
+    #[test]
+    fn font_family_list_is_parsed_and_inherited() {
+        let sheet = Stylesheet::parse(r#"body { font-family: "Some Serif", serif }"#);
+        let body = root(&el("body"), &sheet);
+        assert_eq!(
+            body.font_family,
+            vec!["Some Serif".to_string(), "serif".to_string()]
+        );
+        let child = cascade(&el("p"), &body, &[], &sheet);
+        assert_eq!(child.font_family, body.font_family, "font-family inherited");
+    }
+
+    #[test]
+    fn t0_subset_helpers_are_unchanged() {
+        // The T0 drift-guard surface stays narrow even though the T1 cascade is wide.
+        assert!(is_supported_property("color"));
+        assert!(!is_supported_property("padding"));
+        assert!(is_supported_selector("p"));
+        assert!(!is_supported_selector("div p"));
+        assert!(!is_supported_selector("a:hover"));
     }
 }

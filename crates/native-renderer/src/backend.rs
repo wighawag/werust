@@ -48,6 +48,7 @@ use renderer::{
 
 use crate::html5ever_parser::Html5everParser;
 use crate::pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};
+use crate::shape::Shaper;
 
 /// A [`Renderer`] backed by the in-process T0 native render pipeline.
 ///
@@ -57,9 +58,9 @@ use crate::pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};
 /// so the shell treats it exactly like the webview. The last render's
 /// [`RenderOutput`] is available via [`last_render`](NativeRenderer::last_render)
 /// for inspection and for the software surface a windowing layer would blit.
-#[derive(Default)]
 pub struct NativeRenderer {
     parser: Html5everParser,
+    shaper: Shaper,
     viewport_width: f32,
     state: LoadState,
     url: Option<String>,
@@ -67,22 +68,30 @@ pub struct NativeRenderer {
     last_render: Option<RenderOutput>,
 }
 
+impl Default for NativeRenderer {
+    fn default() -> Self {
+        NativeRenderer::new()
+    }
+}
+
 impl NativeRenderer {
-    /// Create a T0 native backend at the default viewport width.
+    /// Create a native backend at the default viewport width.
     #[must_use]
     pub fn new() -> Self {
-        NativeRenderer {
-            viewport_width: DEFAULT_VIEWPORT_WIDTH,
-            ..NativeRenderer::default()
-        }
+        NativeRenderer::with_viewport_width(DEFAULT_VIEWPORT_WIDTH)
     }
 
-    /// Create a T0 native backend rendering at `viewport_width` px.
+    /// Create a native backend rendering at `viewport_width` px.
     #[must_use]
     pub fn with_viewport_width(viewport_width: f32) -> Self {
         NativeRenderer {
+            parser: Html5everParser::new(),
+            shaper: Shaper::new(),
             viewport_width,
-            ..NativeRenderer::default()
+            state: LoadState::default(),
+            url: None,
+            events: VecDeque::new(),
+            last_render: None,
         }
     }
 
@@ -95,7 +104,7 @@ impl NativeRenderer {
     /// [`last_render`](NativeRenderer::last_render); `navigate` is a thin wrapper
     /// that decodes a `data:` URL and calls this.
     pub fn render_source(&mut self, source: &str) -> &RenderOutput {
-        let output = render_with(&self.parser, source, self.viewport_width);
+        let output = render_with(&self.parser, source, self.viewport_width, &mut self.shaper);
         self.last_render.insert(output)
     }
 

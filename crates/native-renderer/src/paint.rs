@@ -1,28 +1,28 @@
-//! The T0 software text stage: paint positioned runs into an in-memory surface.
+//! The T1 software text stage: paint positioned shaped runs into a surface.
 //!
-//! This is the "software text" tier of T0 (`docs/conformance-tiers.md`): no GPU,
-//! no real font backend — a deterministic software raster. Rather than hinting a
-//! real font (that fidelity is T1's parley/cosmic-text), T0 paints each glyph as a
-//! fixed monospace cell into an RGBA [`Surface`], so the render is exact,
-//! reproducible, and assertable in a headless test. The surface is the native
-//! backend's paint output; a real windowing layer blits it, but the seam and the
-//! tests only need the pixels.
+//! Like T0 this is a deterministic software raster (no GPU), but it paints the
+//! **shaped** runs layout produced: each run carries its real proportional advance
+//! and line height from the [`Shaper`](crate::shape::Shaper), so a run is drawn as
+//! a filled band the width of its shaped advance (a stand-in for the real glyph
+//! outlines — rasterising outlines is a later, vello/wgpu concern) in the run's
+//! resolved colour, plus its underline and its transcript line.
 //!
 //! A [`Surface`] also records a plain-text transcript of what was painted (the
-//! runs in flow order), which is the human-legible render assertion the T0 render
-//! tests check against — the software equivalent of a golden image, without a font
-//! dependency.
+//! runs in flow order, with style + colour marks), which is the human-legible,
+//! font-independent render assertion the T1 render tests check against — the
+//! software equivalent of a golden image without a brittle pixel dependency.
 
 use crate::css::Color;
-use crate::layout::{LayoutResult, TextRun, CHAR_WIDTH, LINE_HEIGHT};
+use crate::layout::{LayoutResult, TextRun, FALLBACK_LINE_HEIGHT};
 
 /// An in-memory RGBA8 raster surface — the native backend's paint target.
 ///
-/// Pixels are row-major RGBA (4 bytes each). T0 paints each character as a solid
-/// filled cell in the run's resolved colour (a stand-in for a real glyph; real
-/// shaping is T1), which is enough to prove the pipeline produces positioned,
-/// coloured, styled output end-to-end. The [`text`](Surface::text) transcript is
-/// the legible companion the render tests assert on.
+/// Pixels are row-major RGBA (4 bytes each). T1 paints each run as a filled band
+/// the width of its shaped advance in the run's resolved colour (a stand-in for
+/// real glyph outlines; outline rasterisation is a later vello/wgpu concern),
+/// which is enough to prove the pipeline produces positioned, shaped, coloured,
+/// styled output end to end. The [`text`](Surface::text) transcript is the legible
+/// companion the render tests assert on.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Surface {
     /// Surface width in px.
@@ -97,14 +97,14 @@ impl Surface {
 /// Paint a laid-out document into a fresh [`Surface`].
 ///
 /// The surface is sized to the layout's viewport width and content height. Each
-/// [`TextRun`] is painted as a row of filled monospace cells in its resolved
-/// colour, with an extra underline row when the style calls for it (bold widens
-/// the cell fill; italic is recorded in the transcript). This is the T0 software
-/// text output.
+/// [`TextRun`] is painted as a filled band the width of its shaped advance in its
+/// resolved colour, with an extra underline row when the style calls for it. Any
+/// run's `background-color` fills its band first. This is the T1 software text
+/// output.
 #[must_use]
 pub fn paint(layout: &LayoutResult) -> Surface {
     let width = layout.width.ceil().max(1.0) as u32;
-    let height = layout.height.ceil().max(LINE_HEIGHT) as u32;
+    let height = layout.height.ceil().max(FALLBACK_LINE_HEIGHT) as u32;
     let mut surface = Surface::new(width, height);
 
     for run in &layout.runs {
@@ -113,45 +113,74 @@ pub fn paint(layout: &LayoutResult) -> Surface {
     surface
 }
 
-/// Paint one text run: its cells, its underline, and its transcript line.
+/// Paint one text run: its background, its glyph band, its underline, and its
+/// transcript line.
 fn paint_run(surface: &mut Surface, run: &TextRun) {
-    let cell_h = LINE_HEIGHT * 0.75;
-    let mut x = run.x;
-    for ch in run.text.chars() {
-        if !ch.is_whitespace() {
-            // A bold glyph fills its whole cell; a normal glyph leaves a 1px gutter
-            // so weight is visible in the raster.
-            let inset = if run.style.bold { 0.0 } else { 1.0 };
-            surface.fill_rect(
-                x + inset,
-                run.y + inset,
-                CHAR_WIDTH - inset,
-                cell_h - inset,
-                run.style.color,
-            );
-        }
-        x += CHAR_WIDTH;
+    let line_h = if run.line_height > 0.0 {
+        run.line_height
+    } else {
+        FALLBACK_LINE_HEIGHT
+    };
+    // The glyph band is the ~75% of the line height text occupies above the
+    // descender; the underline sits just below it.
+    let glyph_h = line_h * 0.75;
+
+    // Background colour (if any) fills the whole run band first.
+    if let Some(bg) = run.style.background_color {
+        surface.fill_rect(run.x, run.y, run.advance, line_h, bg);
     }
+
+    // The glyph band: a filled band the width of the shaped advance (a stand-in
+    // for glyph outlines). Leading whitespace in the run text is not part of the
+    // ink, so inset by the space the leading char(s) occupy is approximated by
+    // trimming — the advance already includes the leading space, so start after it.
+    let leading_ws = run.text.len() - run.text.trim_start().len();
+    let ink_x = if leading_ws > 0 {
+        // Approximate the leading-space width as a fraction of the advance.
+        run.x + run.advance * (leading_ws as f32 / run.text.chars().count().max(1) as f32)
+    } else {
+        run.x
+    };
+    let ink_w = (run.x + run.advance - ink_x).max(0.0);
+    // A bold band fills its whole height; a normal band leaves a 1px gutter so
+    // weight is visible in the raster.
+    let inset = if run.style.bold { 0.0 } else { 1.0 };
+    surface.fill_rect(
+        ink_x + inset,
+        run.y + inset,
+        (ink_w - inset).max(0.0),
+        glyph_h - inset,
+        run.style.color,
+    );
+
     if run.style.underline {
-        let underline_y = run.y + cell_h;
-        let w = run.text.chars().count() as f32 * CHAR_WIDTH;
-        surface.fill_rect(run.x, underline_y, w, 1.0, run.style.color);
+        surface.fill_rect(ink_x, run.y + glyph_h, ink_w, 1.0, run.style.color);
     }
     surface.text.push(transcribe(run));
 }
 
-/// Build the transcript line for a run, annotating its active styles so the
-/// legible render assertion captures colour/weight/decoration, not just position.
+/// Build the transcript line for a run, annotating its active styles + non-default
+/// colour so the legible render assertion captures colour/weight/decoration, not
+/// just position. The colour mark closes the T0 gap where the transcript did not
+/// assert colour (task forward-pointer note): a colour-cascade regression now turns
+/// the transcript red.
 fn transcribe(run: &TextRun) -> String {
     let mut marks = Vec::new();
     if run.style.bold {
-        marks.push("b");
+        marks.push("b".to_string());
     }
     if run.style.italic {
-        marks.push("i");
+        marks.push("i".to_string());
     }
     if run.style.underline {
-        marks.push("u");
+        marks.push("u".to_string());
+    }
+    // Record a non-black colour explicitly so a colour regression is visible.
+    if run.style.color != Color::BLACK {
+        marks.push(format!(
+            "#{:02x}{:02x}{:02x}",
+            run.style.color.r, run.style.color.g, run.style.color.b
+        ));
     }
     let text = run.text.trim();
     if marks.is_empty() {
@@ -165,22 +194,23 @@ fn transcribe(run: &TextRun) -> String {
 mod tests {
     use super::*;
     use crate::css::Stylesheet;
+    use crate::html5ever_parser::Html5everParser;
     use crate::layout::layout;
-    use crate::tokenizer::{SubsetTokenizer, Tokenizer};
-    use crate::tree::{AllowlistTreeBuilder, TreeBuilder};
+    use crate::parser::Parser;
+    use crate::shape::Shaper;
 
     fn paint_html(html: &str, width: f32) -> Surface {
-        let tokens = SubsetTokenizer::new().tokenize(html);
-        let dom = AllowlistTreeBuilder::new().build(&tokens);
-        paint(&layout(&dom, &Stylesheet::default(), width))
+        let parsed = Html5everParser::new().parse(html);
+        let sheet = Stylesheet::parse(&parsed.author_css);
+        let mut shaper = Shaper::new();
+        paint(&layout(&parsed.dom, &sheet, width, &mut shaper))
     }
 
     #[test]
     fn paints_text_into_a_surface() {
         let surface = paint_html("<p>hi</p>", 400.0);
         assert_eq!(surface.width, 400);
-        assert!(surface.height >= LINE_HEIGHT as u32);
-        // Some non-white pixel was painted (the text cells).
+        assert!(surface.height >= FALLBACK_LINE_HEIGHT as u32);
         let painted = (0..surface.height)
             .any(|y| (0..surface.width).any(|x| surface.pixel(x, y) != Some([255, 255, 255, 255])));
         assert!(painted, "text was rasterized onto the surface");
@@ -190,7 +220,6 @@ mod tests {
     fn transcript_records_flow_order_and_styles() {
         let surface = paint_html("<h1>Title</h1><p>a <em>b</em></p>", 400.0);
         let transcript = surface.transcript();
-        // Heading is bold; the em fragment is italic; order is document order.
         assert!(transcript.contains("Title[b]"));
         assert!(transcript.contains("b[i]"));
         let title_at = transcript.find("Title").unwrap();
@@ -199,17 +228,41 @@ mod tests {
     }
 
     #[test]
+    fn transcript_records_cascaded_color() {
+        // The colour gap the forward-pointer flagged: colour is now in the
+        // transcript, so a colour-cascade regression turns it red.
+        let surface = paint_html(r#"<p style="color:#ff0000">x</p>"#, 400.0);
+        assert!(
+            surface.transcript().contains("x[#ff0000]"),
+            "colour recorded: {}",
+            surface.transcript()
+        );
+    }
+
+    #[test]
     fn colored_text_paints_its_color() {
         let surface = paint_html(r#"<p style="color:#ff0000">x</p>"#, 400.0);
-        // At least one pixel is pure red.
         let has_red = (0..surface.height)
             .any(|y| (0..surface.width).any(|x| surface.pixel(x, y) == Some([255, 0, 0, 255])));
         assert!(has_red, "the run painted in its cascaded color");
     }
 
     #[test]
+    fn background_color_fills_the_run_band() {
+        let surface = paint_html(r#"<p style="background-color:#00ff00">x</p>"#, 400.0);
+        let has_green = (0..surface.height)
+            .any(|y| (0..surface.width).any(|x| surface.pixel(x, y) == Some([0, 255, 0, 255])));
+        assert!(has_green, "the run painted its background colour");
+    }
+
+    #[test]
     fn underlined_link_paints_an_underline_row() {
         let surface = paint_html("<p><a>link</a></p>", 400.0);
-        assert!(surface.transcript().contains("link[u]"));
+        // <a> is underlined AND blue (UA sheet), so it carries both marks.
+        assert!(
+            surface.transcript().contains("link[u#0000ee]"),
+            "{}",
+            surface.transcript()
+        );
     }
 }

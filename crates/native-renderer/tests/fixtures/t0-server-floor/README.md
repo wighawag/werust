@@ -21,8 +21,20 @@ For each fixture `<name>`:
 
 - `<name>.html` — the authored v0-subset fragment (the input).
 - `<name>.golden.txt` — the expected render reference: the painted software-text
-  transcript (flow order + style marks `[b]`/`[i]`/`[u]`) the native T0 path must
-  reproduce, byte for byte, at the pinned viewport width.
+  transcript (flow order + style marks `[b]`/`[i]`/`[u]` and a non-black colour
+  mark `#rrggbb`) the native path must reproduce, byte for byte, at the pinned
+  viewport width. The transcript records styled WORDS + marks, not px positions, so
+  it is font-independent and stable across the T0 monospace metric and the T1 real
+  shaping metric alike.
+
+> **Colour re-baseline (T1 `t1-core-css-stylo-and-latin-shaping-parley`).** These
+> goldens were consciously regenerated when the T1 core-CSS task added a colour
+> mark to the paint transcript. The T0-server-floor Gate-3 note flagged that the
+> transcript did NOT assert colour while `paint::transcribe()` overclaimed that it
+> did; the T1 change closes that gap, so a colour-cascade regression now turns a
+> golden red. The diff is colour-only: every fixture's words + `[b]/[i]/[u]` marks
+> are byte-identical to the pre-T1 goldens; only `#rrggbb` colour marks were added.
+> See `docs/spikes/t1-core-css-stylo-and-latin-shaping-parley/README.md`.
 
 The fixture viewport width is pinned in the golden test
 (`tests/t0_server_floor_goldens.rs`) so wrapping is stable.

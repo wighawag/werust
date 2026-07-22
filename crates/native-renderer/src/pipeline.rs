@@ -19,6 +19,7 @@ use crate::css::Stylesheet;
 use crate::layout::{layout, LayoutResult};
 use crate::paint::{paint, Surface};
 use crate::parser::Parser;
+use crate::shape::Shaper;
 use crate::tree::Dom;
 
 /// The default T0 viewport width in px, used when a caller does not specify one.
@@ -40,16 +41,24 @@ pub struct RenderOutput {
     pub surface: Surface,
 }
 
-/// Render `source` HTML into a [`RenderOutput`] using the given front-end.
+/// Render `source` HTML into a [`RenderOutput`] using the given front-end and
+/// text shaper.
 ///
 /// `parser` is the [`Parser`] seam: at T0 the naive subset parser, at T1
-/// html5ever. `viewport_width` is the content width block boxes fill and inline
-/// content wraps within.
+/// html5ever. `shaper` is the T1 [`Shaper`] layout measures words with (held by
+/// the caller so the bundled font is registered once, not per render).
+/// `viewport_width` is the content width block boxes fill and inline content wraps
+/// within.
 #[must_use]
-pub fn render_with(parser: &dyn Parser, source: &str, viewport_width: f32) -> RenderOutput {
+pub fn render_with(
+    parser: &dyn Parser,
+    source: &str,
+    viewport_width: f32,
+    shaper: &mut Shaper,
+) -> RenderOutput {
     let parsed = parser.parse(source);
     let sheet = Stylesheet::parse(&parsed.author_css);
-    let layout = layout(&parsed.dom, &sheet, viewport_width);
+    let layout = layout(&parsed.dom, &sheet, viewport_width, shaper);
     let surface = paint(&layout);
     RenderOutput {
         dom: parsed.dom,
@@ -69,11 +78,18 @@ mod tests {
 
     fn render(html: &str) -> RenderOutput {
         let parser = SubsetParser::new(SubsetTokenizer::new(), AllowlistTreeBuilder::new());
-        render_with(&parser, html, DEFAULT_VIEWPORT_WIDTH)
+        let mut shaper = Shaper::new();
+        render_with(&parser, html, DEFAULT_VIEWPORT_WIDTH, &mut shaper)
     }
 
     fn render_t1(html: &str) -> RenderOutput {
-        render_with(&Html5everParser::new(), html, DEFAULT_VIEWPORT_WIDTH)
+        let mut shaper = Shaper::new();
+        render_with(
+            &Html5everParser::new(),
+            html,
+            DEFAULT_VIEWPORT_WIDTH,
+            &mut shaper,
+        )
     }
 
     #[test]
@@ -161,8 +177,16 @@ mod tests {
             "decoded entity in h1: {transcript}"
         );
         assert!(transcript.contains("Static[b]"), "h1 bold: {transcript}");
-        assert!(transcript.contains("article[i]"), "em italic: {transcript}");
-        assert!(transcript.contains("real[b]"), "strong bold: {transcript}");
+        // The `.lead` paragraph is green (#008000), so the em/strong inside it
+        // carry italic/bold AND the inherited colour in the transcript.
+        assert!(
+            transcript.contains("article[i#008000]"),
+            "em italic + inherited colour: {transcript}"
+        );
+        assert!(
+            transcript.contains("real[b#008000]"),
+            "strong bold + inherited colour: {transcript}"
+        );
         assert!(
             transcript.contains('\u{00a9}'),
             "&copy; decoded: {transcript}"

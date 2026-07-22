@@ -1,0 +1,3 @@
+# T1: `background-color` on block containers cascades but does not paint a filled box (2026-07-22)
+
+Noticed while building `t1-core-css-stylo-and-latin-shaping-parley`. The T1 cascade resolves `background-color` and paint fills a text RUN's band with it, but the layout stage emits positioned text runs (not block box rectangles), so `article { background-color: #f8f8f8 }` cascades correctly yet paints nothing behind the block's content. Filling block backgrounds needs layout to emit block box rects. Deferred as a scoped decision (see `docs/spikes/t1-core-css-stylo-and-latin-shaping-parley/README.md` D4); the natural next step is the T1 server-floor task if a pinned page's visual golden needs it, else T2.

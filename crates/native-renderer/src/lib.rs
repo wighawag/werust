@@ -31,10 +31,12 @@
 //! 3. **Cascade** — [`css::cascade`] resolves each element's
 //!    [`ComputedStyle`](css::ComputedStyle) over the small T0 property set
 //!    (UA sheet + author `<style>` rules by specificity/order + inline `style`).
-//! 4. **Layout** — [`layout::layout`] flows the styled tree into positioned
-//!    [`TextRun`](layout::TextRun)s under block/inline normal flow.
-//! 5. **Paint** — [`paint::paint`] rasterizes the runs into an in-memory software
-//!    [`Surface`](paint::Surface) (the software-text stage).
+//! 4. **Shape + Layout** — [`layout::layout`] flows the styled tree into positioned
+//!    [`TextRun`](layout::TextRun)s under block/inline normal flow, measuring each
+//!    word with the real [`Shaper`](shape::Shaper) (parley) so widths + line
+//!    heights come from real font metrics (T1 Latin/LTR shaping).
+//! 5. **Paint** — [`paint::paint`] rasterizes the shaped runs into an in-memory
+//!    software [`Surface`](paint::Surface) (the software-text stage).
 //!
 //! The [`Parser`](parser::Parser) seam (the whole HTML front-end — the
 //! `Tokenizer | TreeBuilder` seam of the conformance ladder) is the swap point T1
@@ -60,6 +62,7 @@ pub mod layout;
 pub mod paint;
 pub mod parser;
 pub mod pipeline;
+pub mod shape;
 pub mod tokenizer;
 pub mod tree;
 
@@ -67,6 +70,7 @@ pub use backend::NativeRenderer;
 pub use html5ever_parser::Html5everParser;
 pub use parser::{ParsedDocument, Parser, SubsetParser};
 pub use pipeline::{render_with, RenderOutput, DEFAULT_VIEWPORT_WIDTH};
+pub use shape::{ShapedRun, Shaper};
 pub use tokenizer::{SubsetTokenizer, Token, Tokenizer};
 pub use tree::{AllowlistTreeBuilder, Dom, Element, Node, TreeBuilder};
 

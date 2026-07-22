@@ -9,6 +9,14 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 fetcher = { path = "../fetcher" }
 serde_json = "1"
+# The bound HTTP+TLS stack the `RpcProvider` backend's own minimal synchronous
+# JSON-RPC POST transport binds (the `ethereum` module's `UreqRpcTransport`).
+# A JSON-RPC `eth_call` is a POST with a JSON body, which the GET-only `Fetcher`
+# seam cannot express, so this backend binds `ureq`'s POST behind its own
+# `RpcTransport` seam (bound, not hand-rolled) rather than widening the shared
+# `Fetcher` seam. Same vetted rustls-backed client the `fetcher` crate binds;
+# TLS is NEVER hand-written. Pinned to match the repo's exact-version style.
+ureq = "=3.3.0"
 
 [dev-dependencies]
 # Parses the release-plumbing config files (`.goreleaser.yaml` +

@@ -2023,6 +2023,7 @@ dependencies = [
  "renderer",
  "serde_json",
  "serde_yaml",
+ "ureq",
 ]
 
 [[package]]

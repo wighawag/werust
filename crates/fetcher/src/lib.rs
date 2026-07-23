@@ -56,15 +56,45 @@ pub use retriever::{
 
 /// The connect timeout the default fetcher applies.
 ///
-/// A safe default so a fetch to an unreachable or silently-dropping host fails
-/// promptly as a [`FetchError`] instead of hanging on the OS connect retry
-/// budget. It bounds only the TCP connect; the (larger) global read budget is
-/// [`DEFAULT_GLOBAL_TIMEOUT`].
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A safe, DELIBERATELY TIGHT default so a fetch to an unreachable or
+/// silently-dropping host fails promptly as a [`FetchError`] instead of hanging
+/// on the OS connect retry budget. It bounds only the TCP connect; the (larger)
+/// global read budget is [`DEFAULT_GLOBAL_TIMEOUT`]. Keeping connect tight is
+/// what lets the global read budget be raised for a slow-but-progressing fetch
+/// WITHOUT making a dead host hang: a dead/unreachable host still fails on this
+/// connect bound (~10s), never the raised global bound.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The whole-request timeout the default fetcher applies (connect + TLS + read),
-/// a safe default upper bound so a fetch cannot hang indefinitely.
-const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// The whole-request wall-clock the default fetcher applies (connect + TLS +
+/// read), a safe upper bound so a fetch cannot hang indefinitely.
+///
+/// This is the CONTENT-fetch budget: a cold trustless-gateway CAR fetch of a
+/// real multi-block site (an `index.html` + assets, each a separate
+/// `dag-scope=entity` request) can legitimately take far longer than a single
+/// server-web GET, so the old 30s killed a merely-slow-but-progressing first
+/// load (the `ronan.eth` field finding, v0.2.2). Raised to 120s so a cold,
+/// slow, PROGRESSING load completes, while the DAG bytes/blocks budgets
+/// ([`RetrievalBudget`]) remain the size ceilings and this stays a BOUNDED
+/// wall-clock (a hostile/silent host still fails eventually). The IPNS record
+/// fetch, a small single GET, uses the shorter [`DEFAULT_IPNS_RECORD_TIMEOUT`]
+/// instead. Overridable per fetcher via [`HttpFetcher::with_timeouts`]. The
+/// chosen budgets + rationale are recorded in
+/// `docs/spikes/fetch-timeout-raise-and-split-for-ipns-and-content/DECISIONS.md`.
+pub const DEFAULT_GLOBAL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The whole-request wall-clock for an IPNS RECORD fetch (connect + TLS + read).
+///
+/// An IPNS load does an EXTRA round-trip before any content: fetch + verify the
+/// signed IPNS record, THEN fetch the content. The record itself is a small,
+/// single signed blob (`GET /ipns/{name}?format=ipns-record`), so it does not
+/// need the full content budget; but a cold gateway resolving a name (a DHT /
+/// routing lookup behind the gateway) can still be slow, so this sits ABOVE the
+/// tight connect bound and BELOW the content budget. Split out from
+/// [`DEFAULT_GLOBAL_TIMEOUT`] so the record step and the content step each get a
+/// budget appropriate to their size, and neither spuriously times out the
+/// other. Overridable per fetcher via [`HttpFetcher::with_timeouts`]; the IPNS
+/// record source wires an [`HttpFetcher`] built with it.
+pub const DEFAULT_IPNS_RECORD_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A response fetched through the [`Fetcher`] seam.
 ///
@@ -160,23 +190,51 @@ pub struct HttpFetcher {
 }
 
 impl HttpFetcher {
-    /// Create a fetcher over the bound HTTP+TLS stack.
+    /// Create a fetcher over the bound HTTP+TLS stack with the default timeouts.
     ///
     /// The agent is configured so a non-2xx HTTP status is returned as a
     /// [`Response`] rather than raised as an error (the caller decides what a
     /// `404`/`500` means); TLS uses the bound rustls stack's safe default trust
     /// store; and connect / whole-request timeouts are bounded
     /// ([`DEFAULT_CONNECT_TIMEOUT`], [`DEFAULT_GLOBAL_TIMEOUT`]) so an
-    /// unreachable host fails promptly as a seam error instead of hanging.
+    /// unreachable host fails promptly as a seam error instead of hanging. This
+    /// is the CONTENT-fetch budget; the IPNS record path builds its own fetcher
+    /// with the shorter [`DEFAULT_IPNS_RECORD_TIMEOUT`] via [`with_timeouts`].
+    ///
+    /// [`with_timeouts`]: HttpFetcher::with_timeouts
     #[must_use]
     pub fn new() -> Self {
+        Self::with_timeouts(DEFAULT_CONNECT_TIMEOUT, DEFAULT_GLOBAL_TIMEOUT)
+    }
+
+    /// Create a fetcher with EXPLICIT connect + global (whole-request) timeouts,
+    /// the override lever for a step whose realistic budget differs from the
+    /// default content budget.
+    ///
+    /// Mirrors the crate's `DEFAULT_* const + with_*()` override pattern (as
+    /// [`TrustlessGatewayCarRetriever::with_gateway`] /
+    /// [`with_budget`](RetrievalBudget) do): the constants are the defaults and
+    /// this is how a caller adjusts them WITHOUT a config subsystem. The IPNS
+    /// record source uses it to fetch the small signed record on the shorter
+    /// [`DEFAULT_IPNS_RECORD_TIMEOUT`] while the content path keeps the larger
+    /// [`DEFAULT_GLOBAL_TIMEOUT`].
+    ///
+    /// BOTH timeouts must stay BOUNDED: `connect` should be the tight bound that
+    /// fails a dead host fast, and `global` the (larger) wall-clock a
+    /// slow-but-progressing fetch may take. `global` MUST be >= `connect` for
+    /// the split to make sense (the whole request includes the connect), but an
+    /// unbounded (absent) timeout is intentionally not offered here: a
+    /// hostile/silent host must always fail eventually.
+    #[must_use]
+    pub fn with_timeouts(connect: Duration, global: Duration) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             // A non-2xx status is data for the caller, not a fetch failure.
             .http_status_as_error(false)
-            // Bounded timeouts: an unreachable/silent host surfaces as a
-            // FetchError instead of blocking on the OS connect budget.
-            .timeout_connect(Some(DEFAULT_CONNECT_TIMEOUT))
-            .timeout_global(Some(DEFAULT_GLOBAL_TIMEOUT))
+            // Bounded timeouts: the tight connect bound fails an
+            // unreachable/silent host fast; the (larger) global bound is the
+            // wall-clock a slow-but-progressing fetch may take.
+            .timeout_connect(Some(connect))
+            .timeout_global(Some(global))
             .build()
             .into();
         Self { agent }
@@ -690,6 +748,179 @@ mod tests {
 
         stop.store(true, Ordering::Relaxed);
         let _ = handle.join();
+    }
+
+    // -----------------------------------------------------------------------
+    // Timeout budgets: the connect bound stays tight (a dead host fails fast);
+    // the global read budget is raised and overridable; both stay BOUNDED
+    // (`fetch-timeout-raise-and-split-for-ipns-and-content`). Network-isolated:
+    // every case drives a loopback endpoint (or a routeable-but-dead port), no
+    // live network.
+    // -----------------------------------------------------------------------
+
+    /// A throwaway loopback server that DELAYS `delay` before writing its
+    /// response, to model a slow-but-PROGRESSING host. Isolated from the live
+    /// network (binds `127.0.0.1:0`), torn down on [`Drop`].
+    struct SlowHttpServer {
+        addr: std::net::SocketAddr,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl SlowHttpServer {
+        fn start(delay: Duration, body: &[u8]) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            listener
+                .set_nonblocking(true)
+                .expect("non-blocking listener");
+            let addr = listener.local_addr().expect("local addr");
+            let body = body.to_vec();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let stop = shutdown.clone();
+            let handle = thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let mut buf = [0u8; 1024];
+                            let _ = stream.read(&mut buf);
+                            // The delay models a slow-but-progressing server: the
+                            // connect succeeded, the response is merely late.
+                            thread::sleep(delay);
+                            let head = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                                len = body.len(),
+                            );
+                            let _ = stream.write_all(head.as_bytes());
+                            let _ = stream.write_all(&body);
+                            let _ = stream.flush();
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                addr,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+
+        fn http_url(&self) -> String {
+            format!("http://{}/", self.addr)
+        }
+    }
+
+    impl Drop for SlowHttpServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn the_default_content_budget_is_raised_above_the_old_thirty_seconds() {
+        // The `ronan.eth` regression guard: a cold content fetch must have a
+        // realistic wall-clock, not the old 30s that killed a slow-but-
+        // progressing first load. The content budget is now larger, the connect
+        // bound stays tight, and the record budget sits between them. Asserting
+        // the constants (not a 120s live sleep) keeps the test fast + isolated.
+        assert!(
+            DEFAULT_GLOBAL_TIMEOUT > Duration::from_secs(30),
+            "the content budget must be raised above the old 30s that spuriously timed out"
+        );
+        // Connect stays tight so a dead host still fails fast.
+        assert!(
+            DEFAULT_CONNECT_TIMEOUT <= Duration::from_secs(10),
+            "the connect bound must stay tight so a dead host fails fast"
+        );
+        assert!(
+            DEFAULT_CONNECT_TIMEOUT < DEFAULT_GLOBAL_TIMEOUT,
+            "connect must be tighter than the whole-request budget"
+        );
+        // The record budget is its OWN, appropriately-bounded value: above the
+        // tight connect bound, at or below the content budget.
+        assert!(
+            DEFAULT_IPNS_RECORD_TIMEOUT > DEFAULT_CONNECT_TIMEOUT
+                && DEFAULT_IPNS_RECORD_TIMEOUT <= DEFAULT_GLOBAL_TIMEOUT,
+            "the ipns record budget must sit between the connect bound and the content budget"
+        );
+    }
+
+    #[test]
+    fn a_slow_but_within_budget_fetch_succeeds() {
+        // A host that connects fine but answers SLOWLY (a cold gateway) must not
+        // be killed as long as it progresses within the budget. Built with a
+        // short explicit budget so the test is fast, exercising the SAME
+        // `with_timeouts` lever the production split uses.
+        let server = SlowHttpServer::start(Duration::from_millis(300), b"slow but progressing");
+        // A budget comfortably above the server's 300ms delay.
+        let fetcher = HttpFetcher::with_timeouts(DEFAULT_CONNECT_TIMEOUT, Duration::from_secs(5));
+
+        let response = fetcher
+            .fetch(&server.http_url())
+            .expect("a slow-but-within-budget fetch succeeds");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"slow but progressing");
+    }
+
+    #[test]
+    fn a_fetch_that_exceeds_the_global_budget_fails_bounded_not_hangs() {
+        // The budget stays BOUNDED: a host that answers SLOWER than the global
+        // wall-clock is abandoned as a seam error rather than hanging forever.
+        // A tiny explicit budget vs a longer server delay proves the bound bites
+        // (and keeps the test fast), via the same `with_timeouts` lever.
+        let server = SlowHttpServer::start(Duration::from_secs(2), b"too slow");
+        let fetcher =
+            HttpFetcher::with_timeouts(DEFAULT_CONNECT_TIMEOUT, Duration::from_millis(200));
+
+        let start = std::time::Instant::now();
+        let err = fetcher
+            .fetch(&server.http_url())
+            .expect_err("a fetch past the global budget must fail, not hang");
+        // It failed WELL before the server's 2s delay: the budget bounded it.
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the global budget must bound the wall-clock, elapsed {:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(err, FetchError::Transport(_) | FetchError::Io(_)),
+            "expected a surfaced seam timeout error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_dead_host_fails_fast_on_the_tight_connect_bound_not_the_raised_budget() {
+        // The connect bound stays tight even though the global budget is raised:
+        // an unreachable host must fail on connect (fast), NOT hang until the
+        // large global budget. A routeable-but-non-listening address on the
+        // TEST-NET-1 documentation block (RFC 5737, guaranteed not to route to a
+        // live host) models a dead host with NO live-network dependency. A very
+        // short connect bound vs a large global bound proves the split: it fails
+        // on the connect bound, far under the global one.
+        let fetcher =
+            HttpFetcher::with_timeouts(Duration::from_millis(300), Duration::from_secs(120));
+
+        let start = std::time::Instant::now();
+        let err = fetcher
+            .fetch("http://192.0.2.1:9/")
+            .expect_err("a dead host must fail, not hang");
+        // It failed near the tight CONNECT bound, nowhere near the 120s global.
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "a dead host must fail fast on the connect bound, elapsed {:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(err, FetchError::Transport(_) | FetchError::Io(_)),
+            "expected a surfaced connect/transport error, got: {err:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

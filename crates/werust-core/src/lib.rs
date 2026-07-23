@@ -24,7 +24,7 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
-use fetcher::HttpFetcher;
+use fetcher::{HttpFetcher, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT};
 
 use crate::contenthash::DecodedContenthash;
 use crate::ethereum::{EthereumProvider, RpcProvider};
@@ -228,8 +228,16 @@ impl BrowserShell {
         // config). Verification of the fetched record happens client-side in
         // `ipns::resolve_ipns_name`, so this untrusted source cannot misdirect a
         // name.
+        //
+        // The record fetch is a SMALL single signed-record GET, a distinct step
+        // from the (larger, slower) content fetch it precedes, so it uses the
+        // SPLIT-OUT `DEFAULT_IPNS_RECORD_TIMEOUT` (shorter than the content
+        // path's `DEFAULT_GLOBAL_TIMEOUT`) with the SAME tight connect bound: a
+        // cold-but-progressing record lookup is not killed, a dead gateway still
+        // fails fast, and the record step does not eat the content step's budget
+        // (`fetch-timeout-raise-and-split-for-ipns-and-content`).
         let ipns_source = Box::new(GatewayIpnsRecordSource::with_gateway(
-            HttpFetcher::new(),
+            HttpFetcher::with_timeouts(DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT),
             &crate::retrieval::active_gateway_endpoint(),
         ));
         Self::with_provider_and_ipns_source(renderer, provider, ipns_source)

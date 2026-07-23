@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.TypedValue
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
@@ -46,6 +47,7 @@ class BrowserActivity : Activity() {
     private lateinit var stopButton: Button
     private lateinit var status: TextView
     private lateinit var trust: TextView
+    private lateinit var errorBanner: TextView
     private lateinit var webView: WebView
 
     /**
@@ -127,7 +129,20 @@ class BrowserActivity : Activity() {
             addView(trust, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
 
+        // The PROMINENT in-view error banner: a high-contrast red bar directly
+        // under the toolbar and ABOVE the WebView, shown ONLY on a failed load,
+        // carrying the accurate protocol-named reason so the user cannot miss why
+        // nothing rendered (the fail-closed honesty fix — the footer status was
+        // "not easily seen"). Starts hidden. The SAME surfacing desktop shows.
+        errorBanner = TextView(this).apply {
+            setBackgroundColor(0xFFC01C28.toInt())
+            setTextColor(0xFFFFFFFF.toInt())
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            visibility = View.GONE
+        }
+
         root.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(errorBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(webView)
         root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         setContentView(root)
@@ -191,6 +206,16 @@ class BrowserActivity : Activity() {
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone.
         trust.text = chrome.trustIndicator()
+        // The PROMINENT error banner: shown ONLY on a failed load, carrying the
+        // accurate protocol-named reason across the top of the view so the user
+        // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
+        // otherwise. The SAME rule desktop applies, from the same chrome fact.
+        if (chrome.errorBannerVisible()) {
+            errorBanner.text = chrome.errorBanner()
+            errorBanner.visibility = View.VISIBLE
+        } else {
+            errorBanner.visibility = View.GONE
+        }
     }
 
     /**

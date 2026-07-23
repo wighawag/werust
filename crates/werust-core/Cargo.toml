@@ -50,6 +50,22 @@ rust-ipns = "0.9.0"
 # with no skew. Default features off (no `rand`: werust only VERIFIES records,
 # never generates keys in production) plus `peerid`.
 libp2p-identity = { version = "0.2.14", default-features = false, features = ["peerid"] }
+# Wire-normalize a V2-only IPNS record (one that OMITS the deprecated top-level
+# protobuf fields, the shape modern gateways serve) into the V1+V2 shape
+# `rust-ipns 0.9.0`'s `Record::verify` requires, WITHOUT touching any crypto:
+# `quick-protobuf` re-shapes the `IpnsEntry` protobuf and `serde_ipld_dagcbor`
+# reads the signed dag-cbor `Data` the mirror fields are copied from. Both sit on
+# the SAME `quick-protobuf` / `ipld-core 0.4` lineage the `fetcher` CAR path and
+# `rust-ipns` itself already bind (no new lineage). See
+# `docs/spikes/prominent-load-failure-and-ipns-resolution-diagnosis/` and the
+# `ronan-eth-ipns-v2-only-record-verify-bug` finding for why this shim exists.
+quick-protobuf = "0.8"
+serde_ipld_dagcbor = "0.6"
+# Derive the reader for the five reserved dag-cbor `Data` fields the V2-only
+# normalization copies into the protobuf mirror. `serde` + `serde_bytes` (for the
+# CBOR byte-string `Value`/`Validity`) are the same lineage `fetcher` binds.
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
 
 [dev-dependencies]
 # Parses the release-plumbing config files (`.goreleaser.yaml` +

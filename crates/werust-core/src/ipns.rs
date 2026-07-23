@@ -51,6 +51,7 @@
 
 use fetcher::{Cid, Fetcher};
 use libp2p_identity::PeerId;
+use quick_protobuf::{BytesReader, MessageWrite, Writer};
 use rust_ipns::Record;
 
 /// The `/ipfs/` path prefix an IPNS record's value carries when it points at
@@ -328,6 +329,193 @@ fn ipfs_uri_for_value(value: &[u8]) -> Result<ResolvedIpns, IpnsError> {
     }
 }
 
+/// The dag-cbor `Data` map an IPNS record's `data` field (protobuf field 9)
+/// carries: the AUTHORITATIVE, V2-signature-covered values. The field NAMES are
+/// the reserved CBOR keys from the IPNS spec (`Value`/`ValidityType`/`Validity`/
+/// `Sequence`/`TTL`); `#[serde(deny_unknown_fields)]` is deliberately NOT set so
+/// a record carrying extra non-standard metadata keys still decodes (they are
+/// covered by the same V2 signature and are irrelevant to the mirror fields).
+///
+/// This mirrors `rust_ipns`'s own private `Data` struct: werust only reads the
+/// five reserved fields it copies into the deprecated protobuf mirror, never
+/// re-implements any crypto.
+#[derive(serde::Deserialize)]
+struct IpnsCborData {
+    #[serde(rename = "Value", with = "serde_bytes")]
+    value: Vec<u8>,
+    #[serde(rename = "ValidityType")]
+    validity_type: i32,
+    #[serde(rename = "Validity", with = "serde_bytes")]
+    validity: Vec<u8>,
+    #[serde(rename = "Sequence")]
+    sequence: u64,
+    #[serde(rename = "TTL")]
+    ttl: u64,
+}
+
+/// Normalise a raw IPNS record's bytes so `rust-ipns 0.9.0`'s `Record::verify`
+/// accepts a modern **V2-only** record, WITHOUT touching any cryptography.
+///
+/// # Why this shim exists (the real `ronan.eth` failure)
+///
+/// A V2-only IPNS record (IPIP-428, the shape modern gateways like dweb.link /
+/// trustless-gateway.link serve) OMITS the deprecated top-level protobuf fields
+/// (`value`/`signatureV1`/`validityType`/`validity`/`sequence`/`ttl`) and carries
+/// ONLY the V2 signature (field 8) and the dag-cbor `data` map (field 9). But
+/// `rust-ipns 0.9.0`'s `Record::verify` -> `verify_signature` calls `data()`,
+/// which REQUIRES those absent protobuf fields to be present and equal to the
+/// CBOR data, and so rejects a perfectly valid record with a scary
+/// `DataMismatch` ("dag-cbor data does not match the protobuf fields"). This is
+/// exactly why `ronan.eth` failed to load. See the finding
+/// `work/notes/findings/ronan-eth-ipns-v2-only-record-verify-bug-2026-07-23.md`
+/// and `docs/spikes/prominent-load-failure-and-ipns-resolution-diagnosis/`.
+///
+/// # What it does (and does NOT do)
+///
+/// If the protobuf `value` field is EMPTY but a `data` (CBOR) field is present
+/// (the V2-only shape), it decodes the signed dag-cbor `Data` map and re-encodes
+/// the `IpnsEntry` protobuf with fields 1/3/4/5/6 populated FROM that CBOR data,
+/// preserving `pubKey` (7) / `signatureV2` (8) / `data` (9) VERBATIM. The result
+/// is the V1+V2-shaped record `data()` accepts, and the crate then runs the REAL
+/// V2 signature + name-binding + validity check unchanged.
+///
+/// This copies only values the V2 signature ALREADY covers (the CBOR `data` is
+/// preserved byte-for-byte and the signature is verified over it), so the shim
+/// cannot smuggle an unsigned value past verification. A record that already
+/// carries the protobuf `value` field (a V1+V2 or legacy record) is returned
+/// untouched, so nothing changes for records the crate already handled. On any
+/// parse hiccup it returns the original bytes unchanged and lets the crate's own
+/// decode/verify produce the distinct error, never a guess.
+///
+/// ALL cryptography stays in `rust-ipns` / `libp2p-identity` (`docs/adr/0001`):
+/// this is a pure wire-format reshape, no signature or hashing logic.
+fn normalize_ipns_record_bytes(bytes: &[u8]) -> Vec<u8> {
+    // Read the `value` (1) and `data` (9) fields to detect the V2-only shape.
+    // Any parse hiccup falls back to the original bytes (the crate reports the
+    // real decode error), never a guess.
+    let (value_present, data_field) = match scan_value_and_data(bytes) {
+        Some(pair) => pair,
+        None => return bytes.to_vec(),
+    };
+    // Already carries the protobuf `value` (a V1+V2 / legacy record), or has no
+    // CBOR `data` to mirror from: nothing to normalise.
+    if value_present || data_field.is_empty() {
+        return bytes.to_vec();
+    }
+    // Decode the signed dag-cbor `Data` the mirror fields are copied from.
+    let data: IpnsCborData = match serde_ipld_dagcbor::from_slice(&data_field) {
+        Ok(d) => d,
+        // Not decodable as the reserved-field map: leave it for the crate's
+        // decode/verify to reject distinctly.
+        Err(_) => return bytes.to_vec(),
+    };
+    // Re-encode the `IpnsEntry` with the deprecated protobuf mirror fields
+    // populated from the CBOR data, preserving pubKey/signatureV2/data verbatim.
+    let entry = IpnsEntryNormalized {
+        value: data.value,
+        validity_type: data.validity_type,
+        validity: data.validity,
+        sequence: data.sequence,
+        ttl: data.ttl,
+        pub_key: read_field_bytes(bytes, 7).unwrap_or_default(),
+        signature_v2: read_field_bytes(bytes, 8).unwrap_or_default(),
+        data: data_field,
+    };
+    let mut out = Vec::with_capacity(bytes.len() + 96);
+    {
+        let mut writer = Writer::new(&mut out);
+        // On the vanishingly unlikely write failure, fall back to the original.
+        if entry.write_message(&mut writer).is_err() {
+            return bytes.to_vec();
+        }
+    }
+    out
+}
+
+/// Whether the record carries a non-empty protobuf `value` (field 1), and the raw
+/// `data` (field 9) bytes. Returns [`None`] only if the protobuf does not parse at
+/// all (the caller then leaves the bytes for the crate to reject).
+fn scan_value_and_data(bytes: &[u8]) -> Option<(bool, Vec<u8>)> {
+    let mut reader = BytesReader::from_bytes(bytes);
+    let mut value_present = false;
+    let mut data_field = Vec::new();
+    while !reader.is_eof() {
+        let tag = reader.next_tag(bytes).ok()?;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        if wire == 2 {
+            let chunk = reader.read_bytes(bytes).ok()?;
+            match field {
+                1 => value_present = !chunk.is_empty(),
+                9 => data_field = chunk.to_vec(),
+                _ => {}
+            }
+        } else {
+            reader.read_unknown(bytes, tag).ok()?;
+        }
+    }
+    Some((value_present, data_field))
+}
+
+/// Read a single length-delimited protobuf field's bytes (`pubKey` 7 /
+/// `signatureV2` 8), or [`None`] if absent / unparseable — the caller defaults to
+/// empty, matching an omitted optional field.
+fn read_field_bytes(bytes: &[u8], want: u32) -> Option<Vec<u8>> {
+    let mut reader = BytesReader::from_bytes(bytes);
+    while !reader.is_eof() {
+        let tag = reader.next_tag(bytes).ok()?;
+        let field = tag >> 3;
+        let wire = tag & 0x7;
+        if wire == 2 {
+            let chunk = reader.read_bytes(bytes).ok()?;
+            if field == want {
+                return Some(chunk.to_vec());
+            }
+        } else {
+            reader.read_unknown(bytes, tag).ok()?;
+        }
+    }
+    None
+}
+
+/// A minimal writer-only mirror of the IPNS `IpnsEntry` protobuf, carrying the
+/// fields werust re-emits when normalising a V2-only record: the deprecated
+/// mirror fields (1/3/4/5/6) populated from the CBOR data, plus `pubKey` (7) /
+/// `signatureV2` (8) / `data` (9) preserved verbatim.
+///
+/// `signatureV1` (field 2) is deliberately NOT emitted: a V2-only record has no
+/// V1 signature, and `rust-ipns`'s `verify` only checks V2. Field numbers match
+/// `rust-ipns`'s `ipns_pb.proto`.
+struct IpnsEntryNormalized {
+    value: Vec<u8>,
+    validity_type: i32,
+    validity: Vec<u8>,
+    sequence: u64,
+    ttl: u64,
+    pub_key: Vec<u8>,
+    signature_v2: Vec<u8>,
+    data: Vec<u8>,
+}
+
+impl MessageWrite for IpnsEntryNormalized {
+    fn write_message<W: quick_protobuf::writer::WriterBackend>(
+        &self,
+        w: &mut Writer<W>,
+    ) -> quick_protobuf::Result<()> {
+        w.write_with_tag(10, |w| w.write_bytes(&self.value))?; // 1: value
+        w.write_with_tag(24, |w| w.write_int32(self.validity_type))?; // 3: validityType
+        w.write_with_tag(34, |w| w.write_bytes(&self.validity))?; // 4: validity
+        w.write_with_tag(40, |w| w.write_uint64(self.sequence))?; // 5: sequence
+        w.write_with_tag(48, |w| w.write_uint64(self.ttl))?; // 6: ttl
+        if !self.pub_key.is_empty() {
+            w.write_with_tag(58, |w| w.write_bytes(&self.pub_key))?; // 7: pubKey
+        }
+        w.write_with_tag(66, |w| w.write_bytes(&self.signature_v2))?; // 8: signatureV2
+        w.write_with_tag(74, |w| w.write_bytes(&self.data))?; // 9: data
+        Ok(())
+    }
+}
+
 /// Resolve an IPNS `name` to the immutable `ipfs://<cid>` its CURRENT
 /// (client-verified) record points at, through the [`IpnsRecordSource`] seam, or
 /// a DISTINCT fail-closed [`IpnsError`].
@@ -358,10 +546,15 @@ pub fn resolve_ipns_name(
     // 2. Fetch the raw, UNTRUSTED record bytes over the seam.
     let record_bytes = source.fetch_record(name)?;
 
-    // 3. Decode the record. A record that does not decode is distinct from one
-    //    that decodes but fails verification.
+    // 3. Normalise a modern V2-only record (which OMITS the deprecated top-level
+    //    protobuf fields) into the V1+V2 shape `rust-ipns 0.9.0`'s verifier
+    //    requires, then decode. This is a pure wire reshape (no crypto): without
+    //    it, a valid V2-only record (e.g. ronan.eth's) is wrongly rejected as
+    //    `DataMismatch`. A record that does not decode is distinct from one that
+    //    decodes but fails verification.
+    let normalized = normalize_ipns_record_bytes(&record_bytes);
     let record =
-        Record::decode(&record_bytes).map_err(|e| IpnsError::MalformedRecord(e.to_string()))?;
+        Record::decode(&normalized).map_err(|e| IpnsError::MalformedRecord(e.to_string()))?;
 
     // 4. FULLY VERIFY against the key: name binding + V2 signature + EOL validity.
     //    This is the trust boundary \u2014 an unverifiable record is REJECTED, never
@@ -425,6 +618,60 @@ mod tests {
             .expect("sign an ipns record");
             record.encode().expect("encode the signed record")
         }
+
+        /// Sign a record and RE-EMIT it as a modern **V2-only** record: the exact
+        /// wire form dweb.link / trustless-gateway.link serve for `ronan.eth`,
+        /// carrying ONLY the V2 signature (protobuf field 8) and the dag-cbor
+        /// `data` (field 9), with the deprecated top-level protobuf mirror fields
+        /// (value/signatureV1/validityType/validity/sequence/ttl) OMITTED.
+        ///
+        /// This is exactly the shape `rust-ipns 0.9.0`'s `verify` wrongly rejects
+        /// as `DataMismatch` unless `resolve_ipns_name` normalises it first, so it
+        /// reproduces the real `ronan.eth` failure offline. Built by parsing the
+        /// crate's own signed encoding and keeping only fields 8 + 9, so the V2
+        /// signature over the dag-cbor data is genuine.
+        fn sign_v2_only(&self, value: &str, seq: u64, valid_for: ChronoDuration) -> Vec<u8> {
+            let full = self.sign(value, seq, valid_for);
+            v2_only_record(&full)
+        }
+    }
+
+    /// Re-emit a full (V1+V2) IPNS record's bytes as a **V2-only** record: keep
+    /// ONLY protobuf field 8 (`signatureV2`) and field 9 (`data`), dropping every
+    /// deprecated top-level mirror field. Mirrors what modern gateways serve.
+    fn v2_only_record(full: &[u8]) -> Vec<u8> {
+        use quick_protobuf::{BytesReader, Writer};
+        let mut sig_v2 = Vec::new();
+        let mut data = Vec::new();
+        let mut reader = BytesReader::from_bytes(full);
+        while !reader.is_eof() {
+            let tag = reader.next_tag(full).expect("tag");
+            let field = tag >> 3;
+            let wire = tag & 0x7;
+            if wire == 2 {
+                let chunk = reader.read_bytes(full).expect("bytes").to_vec();
+                match field {
+                    8 => sig_v2 = chunk,
+                    9 => data = chunk,
+                    _ => {}
+                }
+            } else {
+                reader.read_unknown(full, tag).expect("skip");
+            }
+        }
+        assert!(
+            !sig_v2.is_empty() && !data.is_empty(),
+            "a V2 record has 8 + 9"
+        );
+        let mut out = Vec::new();
+        {
+            let mut w = Writer::new(&mut out);
+            w.write_with_tag(66, |w| w.write_bytes(&sig_v2))
+                .expect("write 8");
+            w.write_with_tag(74, |w| w.write_bytes(&data))
+                .expect("write 9");
+        }
+        out
     }
 
     /// A pinned, in-memory [`IpnsRecordSource`] double, isolated from the live
@@ -494,6 +741,67 @@ mod tests {
         let parsed = crate::ipfs::parse_ipfs_uri(&resolved.uri)
             .expect("the resolved ipfs uri parses on the verified path");
         assert_eq!(parsed.cid, cid);
+    }
+
+    #[test]
+    fn a_modern_v2_only_record_resolves_the_ronan_eth_failure_offline() {
+        // The real `ronan.eth` failure, reproduced + fixed OFFLINE: modern
+        // gateways (dweb.link / trustless-gateway.link) serve a V2-ONLY IPNS
+        // record that OMITS the deprecated top-level protobuf fields (only the V2
+        // signature + the dag-cbor `data` are on the wire). `rust-ipns 0.9.0`'s
+        // `verify` wrongly rejects that valid record as `DataMismatch` unless
+        // `resolve_ipns_name` first normalises it (a pure wire reshape, no
+        // crypto). This proves a genuine V2-only record now RESOLVES to its
+        // signed target rather than failing closed. See the finding
+        // `ronan-eth-ipns-v2-only-record-verify-bug-2026-07-23`.
+        let key = KeyFixture::new();
+        let cid = ipfs_cid(b"ronan.eth's current immutable site, served as a V2-only record");
+        let v2_only = key.sign_v2_only(&format!("/ipfs/{cid}"), 4, ChronoDuration::hours(24));
+
+        // Sanity: the fixture really is V2-only (no protobuf `value` field 1), so
+        // it exercises the normalization, not the already-handled path.
+        assert!(
+            scan_value_and_data(&v2_only)
+                .is_some_and(|(value_present, data)| { !value_present && !data.is_empty() }),
+            "the fixture must be a V2-only record (no protobuf value, has data)"
+        );
+        // And the crate REJECTS it un-normalized, proving the shim is load-bearing
+        // (this is the exact `ronan.eth` failure).
+        assert!(
+            Record::decode(&v2_only)
+                .expect("decodes")
+                .verify(peer_id_for_name(&key.name).unwrap())
+                .is_err(),
+            "rust-ipns rejects the un-normalized V2-only record (the ronan.eth bug)"
+        );
+
+        let mut source = PinnedRecordSource::default();
+        source.put(&key.name, v2_only);
+        let resolved = resolve_ipns_name(&source, &key.name)
+            .expect("a modern V2-only record now resolves (ronan.eth fixed)");
+        assert_eq!(resolved.uri, format!("ipfs://{cid}"));
+    }
+
+    #[test]
+    fn a_v2_only_record_signed_by_the_wrong_key_still_fails_closed() {
+        // The normalization must NOT weaken verification: a V2-only record signed
+        // by a DIFFERENT key than the requested name still fails closed (a
+        // misdirecting source cannot repoint a name it does not hold the key for).
+        // The shim only reshapes the wire form; the V2 signature check is
+        // unchanged.
+        let key = KeyFixture::new();
+        let attacker = KeyFixture::new();
+        let cid = ipfs_cid(b"content the attacker wants to serve");
+        let forged = attacker.sign_v2_only(&format!("/ipfs/{cid}"), 1, ChronoDuration::hours(24));
+
+        let mut source = PinnedRecordSource::default();
+        source.put(&key.name, forged);
+        let err = resolve_ipns_name(&source, &key.name)
+            .expect_err("a wrong-key V2-only record must not verify");
+        assert!(
+            matches!(err, IpnsError::Unverifiable { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]

@@ -172,3 +172,19 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "prominent-load-failure"
+description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast in-view error banner the user cannot miss, carrying the accurate protocol-named reason), not only a subtle footer status line, on every platform — so fail-closed is honest (the user understands why nothing rendered)."
+# The reason is the SAME `last_error` the core surfaces (the resolver/decoder
+# taxonomy, e.g. "IPNS record did not verify: …"); each chrome raises a
+# high-contrast banner from the SAME fact: desktop `error_banner_visible` /
+# `error_banner_text` in crates/werust/src/main.rs (a red banner under the
+# toolbar), and the mobile `Chrome.errorBannerVisible()` / `errorBanner()`
+# (Kotlin WerustCore.kt + a banner in BrowserActivity.kt; Swift WerustCore.swift +
+# a banner in WKWebViewShellController.swift) reading the chrome JSON `error`
+# field. The subtle footer status remains too, but a failure is now unmissable.
+# Task prominent-load-failure-and-ipns-resolution-diagnosis.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

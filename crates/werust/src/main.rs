@@ -73,6 +73,13 @@ struct Chrome {
     /// (hash-checked on the content-addressed path) or served by an unverified
     /// origin (`docs/adr/0001`: the trust posture is a product surface).
     trust: Label,
+    /// The PROMINENT in-view error banner: a high-contrast bar across the top of
+    /// the view that appears ONLY when a load failed, carrying the accurate,
+    /// protocol-named reason. This is the fail-closed honesty fix — the subtle
+    /// footer [`status_line`] was "not easily seen" (a real `ronan.eth` IPNS
+    /// failure was missed), so a failed load now also raises this banner the user
+    /// cannot miss. Hidden on a loading/idle/settled-ok chrome.
+    error_banner: Label,
 }
 
 impl Chrome {
@@ -93,6 +100,15 @@ impl Chrome {
         self.stop.set_sensitive(state.is_loading());
         self.reload.set_sensitive(!state.is_loading());
         self.status.set_text(&status_line(state));
+        // The PROMINENT error banner: shown ONLY on a failed load, carrying the
+        // accurate, protocol-named reason across the top of the view so the user
+        // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
+        // otherwise, so it never nags on a normal load.
+        let show_error = error_banner_visible(state);
+        self.error_banner.set_visible(show_error);
+        if show_error {
+            self.error_banner.set_text(&error_banner_text(state));
+        }
         // The trust indicator: a distinct, legible label for each state (a
         // neutral loading badge while a load is in flight, else the trust posture:
         // content-verified / name-via-trusted-RPC / mutable-name / unverified
@@ -129,6 +145,36 @@ fn status_line(state: &ChromeState) -> String {
         "loading…".to_string()
     } else {
         "idle".to_string()
+    }
+}
+
+/// Whether the PROMINENT in-view error banner should be shown: exactly when the
+/// last load failed ([`ChromeState::last_error`] is set).
+///
+/// The whole point of fail-closed is that the user UNDERSTANDS why nothing
+/// rendered (`docs/adr/0001`: the honesty stance). The subtle one-line
+/// [`status_line`] footer was "not easily seen" (the human missed a real
+/// `ronan.eth` IPNS failure), so a failed load ALSO raises this high-contrast
+/// banner across the top of the view — an error state the user cannot miss —
+/// while a loading/idle chrome hides it. A pure function of [`ChromeState`] so it
+/// is testable without a display; the mobile shells apply the same rule from the
+/// chrome JSON.
+fn error_banner_visible(state: &ChromeState) -> bool {
+    state.last_error.is_some()
+}
+
+/// The PROMINENT error-banner text for a failed load: a protocol-named,
+/// accurate reason drawn straight from [`ChromeState::last_error`] (the decoder /
+/// resolver taxonomy — e.g. "IPNS record did not verify: …", "points to Swarm,
+/// not supported"), never a generic "failed". Empty when there is no failure (the
+/// banner is hidden then). Pure, for the same reason as [`status_line`].
+///
+/// The reason text is the SAME `last_error` the core surfaces, so the banner and
+/// the footer never disagree; it is only shown far more prominently.
+fn error_banner_text(state: &ChromeState) -> String {
+    match &state.last_error {
+        Some(reason) => format!("⚠ This page failed to load: {reason}"),
+        None => String::new(),
     }
 }
 
@@ -212,7 +258,8 @@ const TRUST_INDICATOR_CSS: &str = "\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
 .trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
-.trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }";
+.trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }\
+.error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
 /// `trust-verified` / `trust-name-trusted-rpc` / `trust-unverified` classes the
@@ -296,6 +343,18 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let trust = Label::new(Some(trust_indicator(&ChromeState::default())));
     trust.add_css_class("trust-unverified");
 
+    // The PROMINENT in-view error banner: a high-contrast red bar across the top
+    // of the view, shown ONLY on a failed load (the fail-closed honesty fix). It
+    // starts hidden and wraps its (protocol-named) reason so a long message stays
+    // legible.
+    let error_banner = Label::builder()
+        .halign(gtk4::Align::Fill)
+        .xalign(0.0)
+        .wrap(true)
+        .visible(false)
+        .build();
+    error_banner.add_css_class("error-banner");
+
     let toolbar = GtkBox::new(Orientation::Horizontal, 4);
     toolbar.append(&back);
     toolbar.append(&forward);
@@ -312,10 +371,15 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         stop: stop.clone(),
         status: status.clone(),
         trust: trust.clone(),
+        error_banner: error_banner.clone(),
     });
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&toolbar);
+    // The prominent error banner sits directly under the toolbar and ABOVE the
+    // page view, so a failed load's reason is unmissable in the content area, not
+    // buried in the footer status line.
+    root.append(&error_banner);
     root.append(&view);
     root.append(&status);
 
@@ -402,8 +466,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail,
-        DEFAULT_URL,
+        banner, error_banner_text, error_banner_visible, status_line, trust_indicator,
+        trust_indicator_css_class, trust_indicator_detail, DEFAULT_URL,
     };
     use renderer::{LoadState, TrustPosture};
     use werust_core::ChromeState;
@@ -437,6 +501,63 @@ mod tests {
             ..ChromeState::default()
         };
         assert_eq!(status_line(&failed), "failed: name not resolved");
+    }
+
+    #[test]
+    fn a_failed_load_raises_a_prominent_error_banner_with_the_accurate_protocol_named_reason() {
+        // Acceptance (the fail-closed honesty fix): a failed load raises a
+        // PROMINENT in-view error banner the user cannot miss, carrying the
+        // accurate, protocol-named reason (the resolver/decoder taxonomy verbatim),
+        // NOT only the subtle footer status line the human missed. It is hidden on
+        // an idle or an in-flight load, and only appears on a failure.
+        let idle = ChromeState::default();
+        assert!(
+            !error_banner_visible(&idle),
+            "no banner when nothing has failed"
+        );
+        assert_eq!(error_banner_text(&idle), "");
+
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            ..ChromeState::default()
+        };
+        assert!(
+            !error_banner_visible(&loading),
+            "no banner while a load is in flight"
+        );
+
+        // A real IPNS failure (the ronan.eth taxonomy): the banner is VISIBLE and
+        // carries the protocol-named reason, not a generic "failed".
+        let ipns_failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some(
+                "IPNS record did not verify: dag-cbor data does not match the protobuf fields"
+                    .into(),
+            ),
+            ..ChromeState::default()
+        };
+        assert!(
+            error_banner_visible(&ipns_failed),
+            "a failed load raises the prominent banner"
+        );
+        let text = error_banner_text(&ipns_failed);
+        assert!(
+            text.contains("IPNS record did not verify"),
+            "the banner carries the accurate protocol-named reason: {text}"
+        );
+        assert!(
+            text.contains("failed to load"),
+            "the banner reads as a load failure the user cannot miss: {text}"
+        );
+
+        // An unsupported-protocol failure likewise surfaces its named reason.
+        let unsupported = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        assert!(error_banner_visible(&unsupported));
+        assert!(error_banner_text(&unsupported).contains("points to Swarm"));
     }
 
     #[test]

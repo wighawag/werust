@@ -164,6 +164,27 @@ class WerustCore : AutoCloseable {
             else -> "⚠ unverified origin"
         }
 
+        /**
+         * Whether the PROMINENT in-view error banner should be shown: exactly when
+         * the last load failed (`error` is set). The whole point of fail-closed is
+         * that the user UNDERSTANDS why nothing rendered; the subtle footer status
+         * was "not easily seen" (a real `ronan.eth` IPNS failure was missed), so a
+         * failed load ALSO raises a high-contrast banner the user cannot miss. The
+         * SAME rule desktop applies, from the SAME chrome-JSON fact.
+         */
+        fun errorBannerVisible(): Boolean = error != null
+
+        /**
+         * The PROMINENT error-banner text for a failed load: the accurate,
+         * protocol-named reason drawn straight from `error` (the resolver/decoder
+         * taxonomy — e.g. "IPNS record did not verify: …"), never a generic
+         * "failed". Empty when there is no failure (the banner is hidden then).
+         */
+        fun errorBanner(): String = when {
+            error != null -> "⚠ This page failed to load: $error"
+            else -> ""
+        }
+
         companion object {
             fun fromJson(json: String): Chrome {
                 val o = JSONObject(json)

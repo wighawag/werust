@@ -32,6 +32,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private let stopButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let trustLabel = UILabel()
+    /// The PROMINENT in-view error banner: a high-contrast bar under the toolbar,
+    /// shown ONLY on a failed load, carrying the accurate protocol-named reason so
+    /// the user cannot miss why nothing rendered (the fail-closed honesty fix —
+    /// the footer status was "not easily seen"). Hidden otherwise. The SAME
+    /// surfacing desktop/Android show.
+    private let errorBanner = UILabel()
     private var webView: WKWebView!
 
     override func viewDidLoad() {
@@ -161,7 +167,17 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         trustLabel.setContentHuggingPriority(.required, for: .horizontal)
         trustLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        // The prominent error banner: white-on-red, wrapping (a long protocol-named
+        // reason stays legible), hidden until a load fails.
+        errorBanner.font = .boldSystemFont(ofSize: 14)
+        errorBanner.textColor = .white
+        errorBanner.backgroundColor = UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
+        errorBanner.numberOfLines = 0
+        errorBanner.isHidden = true
+        errorBanner.translatesAutoresizingMaskIntoConstraints = false
+
         view.addSubview(toolbar)
+        view.addSubview(errorBanner)
         view.addSubview(webView)
         view.addSubview(statusLabel)
         view.addSubview(trustLabel)
@@ -171,6 +187,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
             toolbar.topAnchor.constraint(equalTo: g.topAnchor, constant: 8),
             toolbar.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 8),
             toolbar.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
+
+            // Directly under the toolbar and ABOVE the web view, so a failed load's
+            // reason is unmissable in the content area, not buried in the footer.
+            errorBanner.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            errorBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            errorBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
 
             webView.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
             webView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
@@ -212,6 +234,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone.
         trustLabel.text = chrome.trustIndicator()
+        // The PROMINENT error banner: shown ONLY on a failed load, carrying the
+        // accurate protocol-named reason across the top of the view so the user
+        // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
+        // otherwise. The SAME rule desktop/Android apply, from the same chrome fact.
+        errorBanner.isHidden = !chrome.errorBannerVisible()
+        errorBanner.text = chrome.errorBanner()
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------

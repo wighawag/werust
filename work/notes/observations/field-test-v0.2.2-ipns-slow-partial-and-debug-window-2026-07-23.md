@@ -28,3 +28,10 @@ The human wants a debugging surface: shift+F12 opens a GTK-side debug view (NOT 
 
 ## Triage
 B is the highest-value fix (whole-DAG-per-request) and likely resolves A and the partial loads together; A (timeout) should still be raised/split (record fetch vs content fetch) as a safety margin. C (loading/error UX) and D (debug window) are UX/tooling. None hand-fixed here; each a scoped task.
+
+## UPDATE (2026-07-23, human): use the REAL platform web inspector, not a custom GTK window
+Correction to issue D: the shift+F12 that works on desktop today is the GTK INTERACTIVE DEBUGGER (widget tree/CSS), not web content. The human wants the real web devtools (console with a typeable JS REPL + network), like a desktop browser, and ideally the same on mobile. Every platform's WebView already ships a full inspector, so NO custom debug window is needed:
+- Desktop WebKitGTK: enable `enable-developer-extras` + show `WebInspector` in-window (real WebKit devtools: console REPL + network + DOM).
+- iOS WKWebView: `isInspectable = true` -> Safari Web Inspector over USB.
+- Android System WebView: `setWebContentsDebuggingEnabled(true)` -> chrome://inspect (Chrome DevTools) over USB.
+Re-scoped `gtk-debug-window-console-and-network` -> `enable-web-inspector-devtools-all-platforms` (enable each platform's native inspector, gated behind a debug build/setting). Much simpler + better than a hand-built window. (A werust-side network/console log for its OWN requests — CAR fetch/dag-scope/IPNS/eth_call — is a SEPARATE, optional nice-to-have, since the web inspector shows the page's network, not werust's internal ipfs:// resolution; captured but not a priority.)

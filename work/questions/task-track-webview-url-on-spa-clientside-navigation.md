@@ -29,3 +29,13 @@
 <!-- q3 fields: id=q3 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q4
+
+**'task:track-webview-url-on-spa-clientside-navigation' was bounced — how should we proceed?**
+
+> PR/code review (Gate 2) ran but its verdict could not be parsed: review verdict was not valid JSON: Bad escaped character in JSON at position 2212 (line 1 column 2213)
+
+<!-- q4 fields: id=q4 kind=stuck -->
+
+**Your answer** (write below this line):

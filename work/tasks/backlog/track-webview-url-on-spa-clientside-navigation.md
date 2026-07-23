@@ -52,3 +52,7 @@ Seam + core:
 > Where to look: `crates/webview-renderer/src/backend.rs` `connect_load_signals` (add `notify::uri` observation - WebKitGTK's `WebView::uri` fires on same-document history changes); iOS `crates/werust-ios` (KVO on `webView.url`); Android `crates/werust-android/.../BrowserActivity.kt` (`WebViewClient.doUpdateVisitedHistory`). Add a seam signal for a same-document URL change DISTINCT from a load lifecycle event (likely a `LoadEvent::UrlChanged { url }` variant so it flows through `pump()` -> `drop_pin_on_in_page_nav`; `LoadEvent::url()` already exists). In the shell, a URL change drives the SAME pin-drop/follow + `ens_pages` re-derive + posture-tracks-the-load-path logic as an in-page load event. Do NOT re-mean trust or fake a load lifecycle.
 >
 > Done = a SPA client-side nav updates the bar (drops the pin/follows, re-derives on return) on desktop + mobile; full-page loads unregressed; the FakeBackend can emit a same-document URL change without a full load (mirroring `navigate_in_page`); network-isolated tests. Composes with the `.eth/<path>` task. FIRST re-check the backend feeds LoadEvents only from load-lifecycle signals.
+
+## Requeue 2026-07-23
+
+Gate-2 verdict was unparseable JSON (a stochastic-reviewer JSON-escaping flake), NOT a real review block. The build is green and the work branch is preserved. Continue from the kept branch tip and re-run the review; no code changes needed unless the fresh review finds a genuine issue.

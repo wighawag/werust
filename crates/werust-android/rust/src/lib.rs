@@ -352,11 +352,24 @@ impl SyncSession {
 fn install_ipfs(backend: &mut AndroidBackend) {
     use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
     use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+    use werust_core::retrieval::{active_gateway_endpoint, apply_settings_request, WERUST_SCHEME};
 
-    let retriever = TrustlessGatewayCarRetriever::new(HttpFetcher::new());
+    // Point the retriever at the USER'S CHOSEN retrieval backend (persisted via
+    // `werust://settings`): a custom gateway/local-node URL if picked, else the
+    // default public trustless gateway. The same core switch desktop uses (task
+    // `retrieval-backend-user-setting`); the per-block verify is unchanged.
+    let retriever =
+        TrustlessGatewayCarRetriever::with_gateway(HttpFetcher::new(), &active_gateway_endpoint());
     backend.register_scheme_handler(
         IPFS_SCHEME,
         Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+    );
+    // The internal `werust://settings` page, resolved through the SAME scheme
+    // seam so Kotlin's `shouldInterceptRequest` for `werust` serves it and a
+    // `?backend=…` selection is applied + persisted by the shared core.
+    backend.register_scheme_handler(
+        WERUST_SCHEME,
+        Box::new(|request| apply_settings_request(&request)),
     );
 }
 

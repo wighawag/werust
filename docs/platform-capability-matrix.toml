@@ -83,6 +83,24 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "retrieval-backend"
+description = "User-choosable IPFS retrieval backend: pick the default trustless gateway or a custom gateway/local-node URL (via `werust://settings`), persisted and switching the actual `ipfs://` load path."
+# The selector + persistence + the `werust://settings` page + the custom-URL
+# validation all live in the SHARED toolkit-free core
+# (`werust-core::retrieval`), and each backend's `install_ipfs` builds its
+# `TrustlessGatewayCarRetriever` from the persisted choice and registers the
+# `werust` scheme through the SAME scheme-handler seam as `ipfs://`. So the
+# capability is wired on every context at the same level `ipfs-render` is:
+# desktop via `context.register_uri_scheme(WERUST_SCHEME, …)`, both mobile edges
+# via `register_scheme_handler(WERUST_SCHEME, …)` dispatched by the OS edge
+# (Android `shouldInterceptRequest`, iOS `WKURLSchemeHandler`) — the same
+# mechanism the (now `implemented`) mobile `ipfs://` interception uses. Task
+# `retrieval-backend-user-setting`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "eip1193-provider"
 description = "Inject the native EIP-1193 provider into pages via the script-message bridge."
 # Desktop wires it via `install_provider` (register_script_message_handler +

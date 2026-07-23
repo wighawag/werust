@@ -32,6 +32,7 @@ pub mod ens;
 pub mod ethereum;
 pub mod ipfs;
 pub mod provider;
+pub mod retrieval;
 
 /// The URL-bar suffix that marks a bare entry as an ENS name to resolve: a
 /// `.eth` TLD.

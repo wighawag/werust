@@ -215,7 +215,18 @@ impl WebViewRenderer {
         // a trustless gateway over the bound HTTP+TLS stack, each block verified
         // against its own CID and the UnixFS DAG reassembled/traversed locally
         // before any byte is handed back. Owned by the scheme handler closure.
-        let retriever = TrustlessGatewayCarRetriever::new(HttpFetcher::new());
+        //
+        // The gateway endpoint is the USER'S CHOSEN retrieval backend, read from
+        // the persisted setting (task `retrieval-backend-user-setting`): a custom
+        // gateway/local-node URL if the user picked one, else the default public
+        // trustless gateway. So switching the setting (via `werust://settings`)
+        // switches the ACTUAL load path on the next launch. The per-block verify
+        // above the gateway is unchanged: whatever endpoint the user picks, no
+        // unverified byte is ever served.
+        let retriever = TrustlessGatewayCarRetriever::with_gateway(
+            HttpFetcher::new(),
+            &werust_core::retrieval::active_gateway_endpoint(),
+        );
         // Share the load lifecycle into the scheme handler so a SUCCESSFUL verified
         // resolution can mark the current load content-verified — this is what
         // drives the chrome's trust indicator from the ACTUAL load path (every
@@ -259,6 +270,32 @@ impl WebViewRenderer {
                     // Verification failed (a hash mismatch, an unverifiable CID, a
                     // source error): fail the load WITHOUT marking it verified, so
                     // unverified bytes never render AND the posture stays untrusted.
+                    let mut error =
+                        glib::Error::new(gtk4::gio::IOErrorEnum::Failed, &e.to_string());
+                    request.finish_error(&mut error);
+                }
+            }
+        });
+
+        // The internal `werust://settings` page (task
+        // `retrieval-backend-user-setting`): registered on the SAME web context so
+        // typing `werust://settings` renders the retrieval-backend selector, and a
+        // `werust://settings?backend=…` selection is applied + persisted by the
+        // shared core `apply_settings_request`. It is a normal (unverified) internal
+        // page, so it does NOT mark the load content-verified.
+        context.register_uri_scheme(werust_core::retrieval::WERUST_SCHEME, move |request| {
+            let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
+            match werust_core::retrieval::apply_settings_request(&renderer::SchemeRequest { uri }) {
+                Ok(response) => {
+                    let bytes = glib::Bytes::from(&response.body);
+                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+                    request.finish(
+                        &stream,
+                        response.body.len() as i64,
+                        Some(&response.mime_type),
+                    );
+                }
+                Err(e) => {
                     let mut error =
                         glib::Error::new(gtk4::gio::IOErrorEnum::Failed, &e.to_string());
                     request.finish_error(&mut error);

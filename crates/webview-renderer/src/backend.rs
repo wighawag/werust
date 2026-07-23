@@ -19,8 +19,8 @@ use webkit6::{
 };
 
 use renderer::{
-    KeyEvent, LoadEvent, LoadState, PointerEvent, Renderer, RendererError, SchemeHandler,
-    ScriptMessageHandler, ScrollDelta, TrustHooks, ViewHandle,
+    KeyEvent, LoadEvent, LoadState, OsColorScheme, PointerEvent, Renderer, RendererError,
+    SchemeHandler, ScriptMessageHandler, ScrollDelta, TrustHooks, ViewHandle,
 };
 
 use crate::{validate_url, LoadLifecycle, SharedLifecycle};
@@ -326,6 +326,169 @@ impl WebViewRenderer {
                 }
             }
         });
+    }
+
+    /// Make this webview FOLLOW the OS light/dark color-scheme setting, so
+    /// `prefers-color-scheme` and UA-styled controls match the user's OS
+    /// preference instead of silently defaulting to light (task
+    /// `webview-follow-os-color-scheme`, `docs/adr/0009`).
+    ///
+    /// WHY THIS IS NEEDED (the confirmed diagnosis,
+    /// `docs/spikes/webview-follow-os-color-scheme/DIAGNOSIS.md`): WebKitGTK ties
+    /// the page color scheme + UA control theming to the GTK theme — its web
+    /// process reports `prefers-color-scheme: dark` iff
+    /// `gtk-application-prefer-dark-theme` is set (WebKit bugs 196685/197947,
+    /// changeset 255342). But a plain GTK4 app does NOT inherit the desktop dark
+    /// preference: on a dark-mode GNOME the portal reports prefer-dark while
+    /// `gtk-application-prefer-dark-theme` defaults to FALSE, so WebKitGTK reports
+    /// LIGHT UA defaults — the mandalas.eth.limo white-on-white buttons. The fix is
+    /// to read the OS preference and set that GTK flag to MATCH it.
+    ///
+    /// FOLLOW, never force (the human's scope decision, `docs/adr/0009`): the OS
+    /// signal is read from the XDG desktop portal's
+    /// `org.freedesktop.appearance color-scheme` (the cross-desktop OS preference,
+    /// not the app's own GTK theme name), mapped through the shared
+    /// [`OsColorScheme`] rule — only an explicit OS dark preference sets
+    /// prefer-dark; light / no-preference keep light. It does NOT override a
+    /// page's declared `color-scheme`: changeset 255342 keeps the page on the
+    /// light theme UNLESS the page declares dark support, so setting this flag only
+    /// supplies the OS default the page and UA styling resolve against.
+    ///
+    /// Applied at load time AND kept LIVE: it subscribes to the portal's
+    /// `SettingChanged` signal so toggling the OS light/dark setting at runtime
+    /// re-applies the matching preference to the running web process.
+    ///
+    /// A missing portal (no session bus, an older desktop) is not fatal: the read
+    /// falls back to [`OsColorScheme::NoPreference`], leaving the light CSS default
+    /// — werust never forces dark when it cannot read the OS.
+    pub fn follow_os_color_scheme(&self) {
+        // Apply the OS preference once now, at load time.
+        apply_os_color_scheme(read_portal_color_scheme());
+
+        // Then track LIVE OS changes: the portal emits `SettingChanged` when the
+        // desktop color-scheme is toggled. Re-read + re-apply so a runtime OS
+        // light<->dark switch flows into the running web process.
+        let proxy = gtk4::gio::DBusProxy::for_bus_sync(
+            gtk4::gio::BusType::Session,
+            gtk4::gio::DBusProxyFlags::NONE,
+            None,
+            PORTAL_BUS_NAME,
+            PORTAL_OBJECT_PATH,
+            PORTAL_SETTINGS_INTERFACE,
+            gtk4::gio::Cancellable::NONE,
+        );
+        if let Ok(proxy) = proxy {
+            proxy.connect_local("g-signal", false, move |args| {
+                // `g-signal(sender, signal_name, parameters)`. The portal's
+                // `SettingChanged(namespace, key, value)` fires on any setting; we
+                // re-read the color-scheme rather than decode the payload shape, so
+                // one path handles the reading and the mapping consistently.
+                let signal_name = args
+                    .get(2)
+                    .and_then(|v| v.get::<String>().ok())
+                    .unwrap_or_default();
+                if signal_name == "SettingChanged" {
+                    apply_os_color_scheme(read_portal_color_scheme());
+                }
+                None
+            });
+            // Keep the proxy alive for the run of the webview so the subscription
+            // survives: leak the handle (the webview outlives the process's
+            // browsing session, so this is a one-time, bounded leak of a single
+            // proxy, not a per-navigation growth).
+            std::mem::forget(proxy);
+        }
+    }
+}
+
+/// The XDG desktop portal address for reading the OS `color-scheme` preference.
+const PORTAL_BUS_NAME: &str = "org.freedesktop.portal.Desktop";
+const PORTAL_OBJECT_PATH: &str = "/org/freedesktop/portal/desktop";
+const PORTAL_SETTINGS_INTERFACE: &str = "org.freedesktop.portal.Settings";
+
+/// Map the XDG desktop portal's `org.freedesktop.appearance color-scheme` value
+/// to the shared cross-platform [`OsColorScheme`].
+///
+/// The portal defines exactly three values (freedesktop settings spec):
+/// `0` = no preference, `1` = prefer dark, `2` = prefer light. Anything else is a
+/// value werust does not understand, treated as [`OsColorScheme::NoPreference`]
+/// so an unknown/future value can never silently flip the WebView to dark —
+/// following the OS never means guessing dark.
+///
+/// Pure so the decision is pinned display-free by
+/// `desktop_maps_the_xdg_portal_color_scheme_to_the_os_signal`; the GTK-apply
+/// half ([`apply_os_color_scheme`]) needs a display and is covered by the ignored
+/// `real_webview_follows_the_os_color_scheme`.
+pub(crate) fn os_color_scheme_from_portal(value: u32) -> OsColorScheme {
+    match value {
+        1 => OsColorScheme::Dark,
+        2 => OsColorScheme::Light,
+        // 0 (no preference) and any unknown value: supply no dark preference.
+        _ => OsColorScheme::NoPreference,
+    }
+}
+
+/// Read the OS color-scheme preference from the XDG desktop portal, returning
+/// [`OsColorScheme::NoPreference`] if the portal is unavailable (no session bus,
+/// an older desktop) — werust never forces dark when it cannot read the OS.
+fn read_portal_color_scheme() -> OsColorScheme {
+    use gtk4::glib::variant::ToVariant;
+    use gtk4::prelude::*;
+
+    let proxy = match gtk4::gio::DBusProxy::for_bus_sync(
+        gtk4::gio::BusType::Session,
+        gtk4::gio::DBusProxyFlags::NONE,
+        None,
+        PORTAL_BUS_NAME,
+        PORTAL_OBJECT_PATH,
+        PORTAL_SETTINGS_INTERFACE,
+        gtk4::gio::Cancellable::NONE,
+    ) {
+        Ok(proxy) => proxy,
+        Err(_) => return OsColorScheme::NoPreference,
+    };
+
+    // `Read(namespace, key) -> (v)`: the reply is a tuple carrying a variant that
+    // wraps (possibly nesting another variant around) the `u32` color-scheme.
+    let reply = proxy.call_sync(
+        "Read",
+        Some(&("org.freedesktop.appearance", "color-scheme").to_variant()),
+        gtk4::gio::DBusCallFlags::NONE,
+        5_000,
+        gtk4::gio::Cancellable::NONE,
+    );
+    let value = match reply {
+        Ok(v) => v,
+        Err(_) => return OsColorScheme::NoPreference,
+    };
+
+    os_color_scheme_from_portal(unwrap_portal_u32(&value))
+}
+
+/// Dig the inner `u32` out of the portal `Read` reply, unwrapping the tuple and
+/// any nested variant layers. Returns `0` (no preference) if the shape is not
+/// what we expect, so a surprising payload never forces dark.
+fn unwrap_portal_u32(value: &gtk4::glib::Variant) -> u32 {
+    // The reply is `(v)`; the boxed child is itself a variant, and in practice
+    // nests one more `v` layer (`(v)` -> `v` -> `v` -> `u32`). Peel every variant
+    // (`v`) layer by descending into its child rather than `as_variant()`, which
+    // ASSERTS (a GLib-CRITICAL) when called on a non-variant — checking the type
+    // string first keeps the read clean whatever depth the portal boxes it at.
+    let mut current = value.child_value(0);
+    while current.type_().as_str() == "v" {
+        current = current.child_value(0);
+    }
+    current.get::<u32>().unwrap_or(0)
+}
+
+/// Apply an [`OsColorScheme`] to the running WebKitGTK web process by setting
+/// `gtk-application-prefer-dark-theme` to match, the flag WebKitGTK reads for
+/// `prefers-color-scheme` (changeset 255342). A no-op if GTK settings are
+/// unavailable. Setting the flag does NOT override a page's declared
+/// `color-scheme`: it only supplies the OS default the engine resolves against.
+fn apply_os_color_scheme(scheme: OsColorScheme) {
+    if let Some(settings) = gtk4::Settings::default() {
+        settings.set_gtk_application_prefer_dark_theme(scheme.prefer_dark());
     }
 }
 

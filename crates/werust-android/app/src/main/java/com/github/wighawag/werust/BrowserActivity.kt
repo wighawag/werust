@@ -96,6 +96,17 @@ class BrowserActivity : Activity() {
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
             settings.javaScriptEnabled = true
+            // COLOR SCHEME follows the OS via the app THEME, not any WebView call
+            // here (task webview-follow-os-color-scheme, docs/adr/0009). The System
+            // WebView always sets the page's `prefers-color-scheme` from the app
+            // theme's `isLightTheme`, and `Theme.Werust` has a light variant
+            // (res/values) + a night variant (res/values-night) selected by the OS
+            // night-mode qualifier, so `prefers-color-scheme` matches the OS
+            // light/dark setting. Do NOT force-dark here (e.g.
+            // WebSettingsCompat.setForceDark / algorithmic darkening): that would
+            // override the OS-follow and the page's own declared `color-scheme`.
+            // A live OS light<->dark toggle recreates this Activity (no
+            // `configChanges` for uiMode), so the fresh WebView re-reads the theme.
             webViewClient = CoreWebViewClient()
             // Wire the EIP-1193 provider bridge: a JS interface the injected shim's
             // `postMessage` calls (page -> native), plus the document-start shim

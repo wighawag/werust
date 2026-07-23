@@ -135,6 +135,17 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
+        // COLOR SCHEME follows the OS (task webview-follow-os-color-scheme,
+        // docs/adr/0009). WKWebView reports the page's `prefers-color-scheme` from
+        // its `UITraitCollection.userInterfaceStyle`, which follows the OS
+        // light/dark setting by default. werust does NOT pin it: `Info.plist` sets
+        // no `UIUserInterfaceStyle` (which would lock the app to one appearance),
+        // and we leave `overrideUserInterfaceStyle == .unspecified` here (do NOT
+        // set it to `.dark`/`.light`) so the WebView keeps following the OS and a
+        // page's own declared `color-scheme` is respected. Setting it would FORCE a
+        // scheme, which this task explicitly rejects. iOS updates the trait
+        // collection live on an OS light<->dark toggle, so the follow is automatic.
+        webView.overrideUserInterfaceStyle = .unspecified
 
         statusLabel.text = "idle"
         statusLabel.font = .systemFont(ofSize: 13)

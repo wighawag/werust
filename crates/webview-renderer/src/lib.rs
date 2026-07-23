@@ -308,6 +308,8 @@ pub(crate) type SharedLifecycle = Rc<RefCell<LoadLifecycle>>;
 
 mod backend;
 mod offthread;
+#[cfg(test)]
+pub(crate) use backend::os_color_scheme_from_portal;
 pub use backend::WebViewRenderer;
 
 #[cfg(test)]
@@ -1052,6 +1054,61 @@ mod tests {
     fn real_webview_installs_the_ipfs_scheme() {
         let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
         r.install_ipfs();
+    }
+
+    #[test]
+    fn desktop_maps_the_xdg_portal_color_scheme_to_the_os_signal() {
+        // Acceptance (desktop follows the OS, headless): the XDG desktop portal's
+        // `org.freedesktop.appearance color-scheme` value (0 = no preference,
+        // 1 = prefer dark, 2 = prefer light) maps to the shared `OsColorScheme`
+        // the backend applies via `gtk-application-prefer-dark-theme`. This is the
+        // pure decision half of `follow_os_color_scheme`, pinned display-free (the
+        // GTK-apply half needs a display and lives in the ignored
+        // `real_webview_follows_the_os_color_scheme` below).
+        //
+        // Reproduction context: on a dark-mode GNOME the portal returns 1 while a
+        // plain GTK4 app's `gtk-application-prefer-dark-theme` defaults to FALSE,
+        // so WebKitGTK reported LIGHT (the bug). Mapping 1 -> Dark -> prefer_dark()
+        // is what makes werust follow the OS. See
+        // `docs/spikes/webview-follow-os-color-scheme/DIAGNOSIS.md`.
+        use renderer::OsColorScheme;
+        assert_eq!(
+            os_color_scheme_from_portal(1),
+            OsColorScheme::Dark,
+            "portal 1 = prefer dark -> follow the OS into dark"
+        );
+        assert!(os_color_scheme_from_portal(1).prefer_dark());
+        assert_eq!(
+            os_color_scheme_from_portal(2),
+            OsColorScheme::Light,
+            "portal 2 = prefer light -> keep light, never force dark"
+        );
+        assert!(!os_color_scheme_from_portal(2).prefer_dark());
+        assert_eq!(
+            os_color_scheme_from_portal(0),
+            OsColorScheme::NoPreference,
+            "portal 0 = no preference -> supply no dark preference (light CSS default)"
+        );
+        assert!(!os_color_scheme_from_portal(0).prefer_dark());
+        // An unknown/future value is treated as "no preference" (never forced
+        // dark): a value werust does not understand must not silently flip dark.
+        assert_eq!(os_color_scheme_from_portal(99), OsColorScheme::NoPreference);
+        assert!(!os_color_scheme_from_portal(99).prefer_dark());
+    }
+
+    /// End-to-end follow-the-OS on the REAL WebKitGTK backend. Ignored by default
+    /// (constructing a `WebViewRenderer` initializes GTK, which needs a display,
+    /// and reading the portal needs a session bus). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. The pure portal->signal
+    /// mapping is pinned display-free by
+    /// `desktop_maps_the_xdg_portal_color_scheme_to_the_os_signal` above; here we
+    /// only pin that following the OS color scheme wires without panicking (it
+    /// reads the portal and sets `gtk-application-prefer-dark-theme` to match).
+    #[test]
+    #[ignore = "needs a display + session bus: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_follows_the_os_color_scheme() {
+        let r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        r.follow_os_color_scheme();
     }
 
     #[test]

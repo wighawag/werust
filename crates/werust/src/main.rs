@@ -227,6 +227,17 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // the load rather than rendering unverified bytes (task
     // `ipfs-scheme-resolution-through-renderer-seam`).
     backend.install_ipfs();
+    // Make the webview FOLLOW the OS light/dark color-scheme setting, so
+    // `prefers-color-scheme` and UA-styled controls match the user's OS preference
+    // instead of silently defaulting to light. On a dark-mode desktop this is what
+    // makes UA-styled controls (e.g. mandalas.eth.limo's nav buttons) theme dark
+    // and readable, at parity with Firefox; on a light desktop it keeps light. It
+    // reads the OS preference from the XDG desktop portal and sets
+    // `gtk-application-prefer-dark-theme` to match (WebKitGTK ties
+    // `prefers-color-scheme` to that flag), tracking live OS changes — without
+    // forcing dark or overriding a page's own declared `color-scheme` (task
+    // `webview-follow-os-color-scheme`, `docs/adr/0009`).
+    backend.follow_os_color_scheme();
     let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
 
     // Make the two trust-indicator states VISUALLY DISTINCT: a green verified

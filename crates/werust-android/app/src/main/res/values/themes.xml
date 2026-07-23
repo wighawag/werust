@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The werust app theme, LIGHT variant (task webview-follow-os-color-scheme,
+  docs/adr/0009).
+
+  WHY A THEME PER LIGHT/NIGHT: Android's System WebView ALWAYS sets the page's
+  `prefers-color-scheme` from the app theme's `isLightTheme` attribute (Android
+  developer docs, "Darken web content in WebView"): isLightTheme=true (or unset)
+  reports `prefers-color-scheme: light`, else `dark`. The app previously used the
+  fixed LIGHT framework theme (@android:style/Theme.Material.Light.NoActionBar),
+  so the WebView reported LIGHT even in OS dark mode, mismatching the user's
+  setting and theming UA controls light on a dark page (the mandalas.eth.limo
+  white-on-white buttons).
+
+  THE FIX = FOLLOW the OS, never force: this LIGHT variant (values/) has
+  isLightTheme=true; the NIGHT variant (values-night/themes.xml) has
+  isLightTheme=false. Android selects the variant by the OS night-mode qualifier
+  (UI_MODE_NIGHT), so the WebView's `prefers-color-scheme` follows the OS
+  light/dark setting. It does NOT force dark and does NOT enable algorithmic
+  darkening, so a page's own declared `color-scheme` is still respected: we only
+  supply the OS preference as the default the page and UA styling resolve against.
+-->
+<resources>
+    <style name="Theme.Werust" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:isLightTheme">true</item>
+    </style>
+</resources>

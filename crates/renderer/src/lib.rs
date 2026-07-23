@@ -192,6 +192,65 @@ impl TrustPosture {
 /// A load-lifecycle event emitted by a backend as a load progresses.
 ///
 /// Backends push these as the underlying engine reports progress; the browser
+/// The **OS color-scheme preference** a backend follows so the WebView's
+/// `prefers-color-scheme` and UA-styled controls match the user's operating-system
+/// light/dark setting, instead of silently defaulting to light.
+///
+/// This is a first-class seam fact, modelled cross-platform so all three OS edges
+/// (desktop WebKitGTK, iOS WKWebView, Android System WebView) resolve the SAME
+/// signal through the SAME rule rather than each re-deriving it — exactly as
+/// [`TrustPosture::after_verify`] is the one shared trust rule. It exists because
+/// a WebView that ignores the OS setting reports the LIGHT UA default even in OS
+/// dark mode, so `prefers-color-scheme: dark` never matches and UA controls theme
+/// light on a dark page (the mandalas.eth.limo white-on-white buttons; task
+/// `webview-follow-os-color-scheme`, `docs/adr/0009`).
+///
+/// The contract is FOLLOW, never force:
+///
+/// * [`Dark`](OsColorScheme::Dark) — the OS is in dark mode; the backend asks the
+///   WebView to PREFER DARK so `prefers-color-scheme: dark` matches and UA
+///   controls theme dark.
+/// * [`Light`](OsColorScheme::Light) — the OS is in light mode; the backend keeps
+///   light. werust never hard-codes dark.
+/// * [`NoPreference`](OsColorScheme::NoPreference) — the OS exposes no preference
+///   (or none could be read); the backend supplies no dark preference, resolving
+///   to the light CSS default WITHOUT claiming the OS is light. The DEFAULT.
+///
+/// It is only the werust-side DEFAULT the page and UA styling resolve against: a
+/// page that declares its own `color-scheme` still wins (that resolution is the
+/// engine's, above this seam). So following the OS never overrides a page's
+/// explicit declaration — it only stops ignoring the OS setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OsColorScheme {
+    /// The OS exposes no light/dark preference, or none could be read. The
+    /// backend propagates no dark preference (resolving to the light CSS default)
+    /// WITHOUT asserting the OS is light — it simply has nothing to follow. The
+    /// DEFAULT, so an absent OS reading never forces dark.
+    #[default]
+    NoPreference,
+    /// The OS is in light mode: keep light. werust never forces dark.
+    Light,
+    /// The OS is in dark mode: prefer dark so `prefers-color-scheme: dark` matches
+    /// and UA-styled controls theme dark (parity with the OS setting).
+    Dark,
+}
+
+impl OsColorScheme {
+    /// Whether the WebView should PREFER DARK to follow this OS signal.
+    ///
+    /// Only an explicit [`Dark`](OsColorScheme::Dark) OS preference asks for dark;
+    /// [`Light`](OsColorScheme::Light) and [`NoPreference`](OsColorScheme::NoPreference)
+    /// both resolve to light (the CSS default). This is the ONE mapping every
+    /// backend applies (desktop sets `gtk-application-prefer-dark-theme` from it;
+    /// the mobile shells follow their platform night-mode flag the same way), so
+    /// "follow the OS, never force dark" is decided in ONE place rather than
+    /// re-derived per platform.
+    #[must_use]
+    pub fn prefer_dark(self) -> bool {
+        matches!(self, OsColorScheme::Dark)
+    }
+}
+
 /// pulls them with [`Renderer::poll_event`] and updates chrome (URL bar, spinner,
 /// the content-verified vs served-origin indicator, …) from them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1173,6 +1232,39 @@ mod tests {
         // It never claims verified when a warning applies.
         assert!(!TrustPosture::after_verify(true, false).is_content_verified());
         assert!(!TrustPosture::after_verify(false, true).is_content_verified());
+    }
+
+    #[test]
+    fn os_color_scheme_follows_the_os_and_never_forces_a_scheme() {
+        // The ONE cross-platform color-scheme rule every backend shares (desktop
+        // WebKitGTK, Android WebView, iOS WKWebView): map the OS light/dark signal
+        // to whether the WebView should PREFER DARK, so `prefers-color-scheme` and
+        // UA-styled controls match the user's OS setting (task
+        // `webview-follow-os-color-scheme`, `docs/adr/0009`).
+        //
+        // FOLLOW, never force: only an explicit OS dark preference asks for dark.
+        // A light OS, or NO OS preference, resolves to light (the CSS default) —
+        // werust never HARD-CODES dark. This is the werust-side default the page
+        // and UA styling resolve against; a page that declares its own
+        // `color-scheme` still wins (that resolution is the engine's, above this).
+        assert!(
+            OsColorScheme::Dark.prefer_dark(),
+            "a dark OS asks the WebView to prefer dark"
+        );
+        assert!(
+            !OsColorScheme::Light.prefer_dark(),
+            "a light OS asks for light — never forced dark"
+        );
+        assert!(
+            !OsColorScheme::NoPreference.prefer_dark(),
+            "no OS preference resolves to light (the CSS default), not forced dark"
+        );
+        // The default OS signal is "no preference": absent an OS reading, a backend
+        // must not assume dark (that would be forcing), and it must not assume the
+        // OS is light either — it simply has no preference to propagate, which
+        // resolves to the light CSS default without claiming the OS is light.
+        assert_eq!(OsColorScheme::default(), OsColorScheme::NoPreference);
+        assert!(!OsColorScheme::default().prefer_dark());
     }
 
     #[test]

@@ -128,6 +128,27 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "follow-os-color-scheme"
+description = "Follow the OS light/dark setting so `prefers-color-scheme` and UA-styled controls match the user's OS preference (never force dark, never override a page's declared `color-scheme`)."
+# Each OS edge follows its platform's OS color-scheme signal through the SAME
+# cross-platform `renderer::OsColorScheme` rule (follow, never force). Desktop:
+# `WebViewRenderer::follow_os_color_scheme` reads the XDG desktop portal
+# (`org.freedesktop.appearance color-scheme`) and sets
+# `gtk-application-prefer-dark-theme` to match, the flag WebKitGTK ties
+# `prefers-color-scheme` to (WebKit changeset 255342), tracking live changes.
+# Android: the app theme `Theme.Werust` has a light variant (res/values) + a
+# night variant (res/values-night) selected by the OS `UI_MODE_NIGHT` qualifier,
+# and the System WebView sets `prefers-color-scheme` from the theme's
+# `isLightTheme` — so it follows the OS (no force-dark / algorithmic darkening).
+# iOS: WKWebView reports `prefers-color-scheme` from `userInterfaceStyle`, which
+# follows the OS by default; the app pins no `UIUserInterfaceStyle` and leaves
+# `overrideUserInterfaceStyle == .unspecified`, so it follows the OS without
+# forcing. Task `webview-follow-os-color-scheme`, `docs/adr/0009`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "trust-indicator"
 description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / mutable-name / unverified) in the chrome."
 # Desktop reads the shared LoadLifecycle posture (marked by the `ipfs://` scheme

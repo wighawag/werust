@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The werust app theme, NIGHT variant (task webview-follow-os-color-scheme,
+  docs/adr/0009). Android selects this over values/themes.xml when the OS is in
+  dark (night) mode (the UI_MODE_NIGHT resource qualifier), so `isLightTheme` is
+  false and the System WebView reports `prefers-color-scheme: dark` to match the
+  OS setting.
+
+  Parented on the DARK framework Material theme (no androidx, matching the app's
+  deliberate no-androidx stance) so the app chrome + UA-styled WebView controls
+  theme dark alongside the page. isLightTheme=false is the load-bearing bit: the
+  WebView reads it to report `prefers-color-scheme: dark`.
+
+  FOLLOW, never force: this variant applies ONLY when the OS is in dark mode; a
+  light OS uses the light variant. Algorithmic darkening is NOT enabled, so a
+  page's own declared `color-scheme` is respected (we only supply the OS
+  preference as the default, we do not invert the page).
+-->
+<resources>
+    <style name="Theme.Werust" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:isLightTheme">false</item>
+    </style>
+</resources>

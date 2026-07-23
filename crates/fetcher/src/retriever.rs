@@ -299,24 +299,36 @@ impl<F: Fetcher> TrustlessGatewayCarRetriever<F> {
         self
     }
 
-    /// GET `<gateway>/ipfs/<cid>?format=car&dag-scope=all` and return the raw
-    /// CAR byte stream. The bytes are UNTRUSTED candidate blocks: verification
-    /// happens as the CAR is parsed.
+    /// GET `<gateway>/ipfs/<cid>[/<path>]?format=car&dag-scope=entity` and return
+    /// the raw CAR byte stream. The bytes are UNTRUSTED candidate blocks:
+    /// verification happens as the CAR is parsed.
     ///
-    /// `dag-scope=all` fetches the whole DAG under the root, which the client
-    /// then walks + verifies + path-resolves locally. (A future refinement can
-    /// narrow the fetch with `dag-scope=entity` + `entity-bytes` per resource;
-    /// the seam surface does not change.)
-    fn fetch_car(&self, root_cid: &Cid) -> Result<Vec<u8>, RetrieveError> {
+    /// PER-RESOURCE SCOPE (`docs/adr/0004`, IPIP-0402). The requested `path` goes
+    /// in the URL and `dag-scope=entity` narrows the response to ONLY the blocks
+    /// needed to traverse each path segment plus the terminating entity (a
+    /// file's blocks, or a directory's listing), NOT the whole DAG under the
+    /// root. This is the fix for the whole-DAG-per-resource refetch: a browser
+    /// makes one request for the directory root AND a separate request for each
+    /// sub-resource (css/js/images), so `dag-scope=all` meant fetching +
+    /// verifying + reassembling the ENTIRE site once PER resource (N full-site
+    /// downloads to render one page: slow, partial, timeout-prone). With
+    /// `dag-scope=entity` each request pulls only that resource's blocks. Every
+    /// returned block is still hash-verified; an incomplete scoped CAR still
+    /// fails closed. (`entity-bytes` for range/large-file reads is a named
+    /// follow-on; the whole-entity `dag-scope=entity` is the load-bearing fix.)
+    /// The scope + directory-index + deferred-cache decisions are recorded in
+    /// `docs/spikes/ipfs-per-resource-car-scope-not-whole-dag/DECISIONS.md`.
+    fn fetch_car(&self, root_cid: &Cid, path: &str) -> Result<Vec<u8>, RetrieveError> {
+        let suffix = encode_url_path(path);
         let url = format!(
-            "{gateway}/ipfs/{cid}?format=car&dag-scope=all",
+            "{gateway}/ipfs/{cid}{suffix}?format=car&dag-scope=entity",
             gateway = self.gateway,
             cid = root_cid,
         );
         let response = self.fetcher.fetch(&url).map_err(RetrieveError::Source)?;
         if !response.is_success() {
             return Err(RetrieveError::Source(FetchError::Transport(format!(
-                "gateway returned status {status} for {root_cid}",
+                "gateway returned status {status} for {root_cid}{suffix}",
                 status = response.status,
             ))));
         }
@@ -327,10 +339,70 @@ impl<F: Fetcher> TrustlessGatewayCarRetriever<F> {
 impl<F: Fetcher> ContentRetriever for TrustlessGatewayCarRetriever<F> {
     fn retrieve(&self, cid: &str, path: &str) -> Result<RetrievedContent, RetrieveError> {
         let root = Cid::try_from(cid).map_err(|_| RetrieveError::InvalidCid(cid.to_string()))?;
-        let car = self.fetch_car(&root)?;
-        let store = CarBlockStore::read_and_verify(&car, self.budget)?;
-        resolve_in_dag(&store, &root, path)
+
+        // The FIRST entity-scoped fetch: the blocks to traverse `path` plus the
+        // terminating entity. For a file path this is complete; for a directory
+        // terminus (the bare root, or a `.../` directory) it returns only the
+        // directory listing, so the walk asks for `<path>/index.html` next.
+        let mut store = CarBlockStore::read_and_verify(&self.fetch_car(&root, path)?, self.budget)?;
+
+        // Resolve within the verified blocks. When the walk lands on a directory
+        // and must read its `index.html`, it calls back here to fetch that
+        // entity's OWN scoped CAR; `resolve_in_dag` merges those verified blocks
+        // into `store` itself, so a directory root resolves index.html by
+        // fetching only what it needs, not the whole tree. (The closure returns
+        // raw CAR bytes rather than touching `store`, so there is no aliasing
+        // with the `&mut store` the resolver holds.)
+        let mut fetch_more = |entity_path: &str| -> Result<Vec<u8>, RetrieveError> {
+            self.fetch_car(&root, entity_path)
+        };
+        resolve_in_dag(&mut store, &root, path, self.budget, &mut fetch_more)
     }
+}
+
+/// Join a resolved parent `path` with a child `name` into the content path the
+/// gateway resolves for the child entity (e.g. the directory root `"/"` + child
+/// `"index.html"` -> `"/index.html"`). The result is fed to [`encode_url_path`],
+/// so it need not be pre-encoded.
+fn join_path(path: &str, name: &str) -> String {
+    let base = path.trim_end_matches('/');
+    format!("{base}/{name}")
+}
+
+/// Percent-encode a resource path into the `[/<seg>...]` suffix that follows
+/// `/ipfs/<cid>` in a gateway URL, so the gateway resolves the SAME path werust
+/// resolves locally.
+///
+/// Each non-empty segment is encoded conservatively (anything outside the
+/// unreserved set + `.`/`-`/`_`/`~` is `%`-escaped), so a segment containing a
+/// space, `?`, `#`, or `/` cannot break out of its path component or spill into
+/// the query string. An empty/root path yields an empty suffix (`/ipfs/<cid>`).
+fn encode_url_path(path: &str) -> String {
+    let mut out = String::new();
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        out.push('/');
+        for byte in segment.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    out.push(byte as char);
+                }
+                other => {
+                    out.push('%');
+                    out.push(
+                        char::from_digit((other >> 4) as u32, 16)
+                            .unwrap()
+                            .to_ascii_uppercase(),
+                    );
+                    out.push(
+                        char::from_digit((other & 0xf) as u32, 16)
+                            .unwrap()
+                            .to_ascii_uppercase(),
+                    );
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -347,12 +419,42 @@ impl<F: Fetcher> ContentRetriever for TrustlessGatewayCarRetriever<F> {
 /// reassembly.
 struct CarBlockStore {
     blocks: HashMap<Cid, Vec<u8>>,
+    /// The CUMULATIVE bytes of all blocks read into this store across every
+    /// scoped CAR merged so far, so the [`RetrievalBudget`] bounds the WHOLE
+    /// per-resource retrieval, not each scoped fetch in isolation.
+    total_bytes: u64,
+    /// The cumulative block COUNT across every merged CAR (same rationale).
+    block_count: u64,
 }
 
 impl CarBlockStore {
     /// Parse `car`, verifying each block against its CID and enforcing `budget`,
     /// into a CID-indexed store of verified blocks.
     fn read_and_verify(car: &[u8], budget: RetrievalBudget) -> Result<Self, RetrieveError> {
+        let mut store = Self {
+            blocks: HashMap::new(),
+            total_bytes: 0,
+            block_count: 0,
+        };
+        store.merge_and_verify(car, budget)?;
+        Ok(store)
+    }
+
+    /// Parse an ADDITIONAL scoped `car` into this store, verifying each block
+    /// against its CID and enforcing `budget` against the CUMULATIVE totals.
+    ///
+    /// A directory root's `index.html` (and any future scoped follow-on) lives
+    /// in a SEPARATE `dag-scope=entity` CAR; its verified blocks are merged in
+    /// here. Because blocks are content-addressed, re-seeing an already-present
+    /// CID (e.g. the directory node returned by both the directory fetch and the
+    /// index.html fetch) is a harmless idempotent overwrite with identical
+    /// verified bytes; the budget still counts every block streamed so a hostile
+    /// gateway cannot evade the ceiling by splitting a runaway DAG across fetches.
+    fn merge_and_verify(
+        &mut self,
+        car: &[u8],
+        budget: RetrievalBudget,
+    ) -> Result<(), RetrieveError> {
         let mut cursor = std::io::Cursor::new(car);
         // `validate_block_hash = true`: rs-car-sync re-hashes each block against
         // its CID as it reads. A mis-hashing block surfaces as
@@ -360,32 +462,28 @@ impl CarBlockStore {
         // fail-closed tamper error below.
         let mut reader = CarReader::new(&mut cursor, true).map_err(map_car_error)?;
 
-        let mut blocks: HashMap<Cid, Vec<u8>> = HashMap::new();
-        let mut total_bytes: u64 = 0;
-        let mut block_count: u64 = 0;
-
         for item in reader.by_ref() {
             let (cid, block) = item.map_err(map_car_error)?;
 
-            block_count += 1;
-            if block_count > budget.max_blocks {
+            self.block_count += 1;
+            if self.block_count > budget.max_blocks {
                 return Err(RetrieveError::BudgetExceeded(format!(
                     "block count exceeded {} blocks",
                     budget.max_blocks
                 )));
             }
-            total_bytes += block.len() as u64;
-            if total_bytes > budget.max_bytes {
+            self.total_bytes += block.len() as u64;
+            if self.total_bytes > budget.max_bytes {
                 return Err(RetrieveError::BudgetExceeded(format!(
                     "total block bytes exceeded {} bytes",
                     budget.max_bytes
                 )));
             }
 
-            blocks.insert(cid, block);
+            self.blocks.insert(cid, block);
         }
 
-        Ok(Self { blocks })
+        Ok(())
     }
 
     /// Fetch a verified block by CID, or the distinct [`RetrieveError::MissingBlock`]
@@ -576,9 +674,11 @@ fn decode_node(cid: &Cid, block: &[u8]) -> Result<UnixFsNode, RetrieveError> {
 /// resolves its `index.html` child (served-page parity); a file node is
 /// reassembled by concatenating its leaf blocks depth-first.
 fn resolve_in_dag(
-    store: &CarBlockStore,
+    store: &mut CarBlockStore,
     root: &Cid,
     path: &str,
+    budget: RetrievalBudget,
+    fetch_more: &mut dyn FnMut(&str) -> Result<Vec<u8>, RetrieveError>,
 ) -> Result<RetrievedContent, RetrieveError> {
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
@@ -638,7 +738,19 @@ fn resolve_in_dag(
         let index_cid = index.ok_or_else(|| RetrieveError::PathNotFound {
             path: format!("{path} (directory has no index.html)"),
         })?;
+        // Under per-resource scope (`dag-scope=entity`), the directory's scoped
+        // CAR carried only its listing, NOT index.html's file blocks. Fetch the
+        // index.html entity's OWN scoped CAR and merge its verified blocks in
+        // before reassembling: the directory root resolves index.html by
+        // fetching only what it needs, not the whole tree. (If index.html's
+        // blocks are already present, e.g. a whole-DAG fixture, the extra fetch
+        // is idempotent.)
         current = index_cid;
+        if store.get(&current).is_err() {
+            let index_path = join_path(path, "index.html");
+            let car = fetch_more(&index_path)?;
+            store.merge_and_verify(&car, budget)?;
+        }
         node = decode_node(&current, store.get(&current)?)?;
     }
 
@@ -937,6 +1049,62 @@ mod tests {
         )
     }
 
+    /// A [`Fetcher`] double that serves a DISTINCT canned CAR per requested URL
+    /// PATH (the `/ipfs/<cid>[/<path>]` portion, query stripped), and records
+    /// EVERY requested URL in order. This is how a scoped-CAR test proves the
+    /// backend requests only the blocks for the specific resource: each
+    /// `dag-scope=entity` fetch of `<cid>/<path>` gets back a CAR containing
+    /// ONLY that path's traversal + terminal-entity blocks, so a resource whose
+    /// scoped CAR omits an unrelated resource's blocks still resolves. Isolated
+    /// from the live network.
+    struct PathScopedCarFetcher {
+        /// Keyed by the URL path (`/ipfs/<cid>` or `/ipfs/<cid>/<sub>`), the CAR
+        /// a `dag-scope=entity` request for that path returns.
+        cars: HashMap<String, Vec<u8>>,
+        /// Every requested URL, in call order (query string included).
+        requested: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl PathScopedCarFetcher {
+        fn new(cars: HashMap<String, Vec<u8>>) -> Self {
+            Self {
+                cars,
+                requested: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        /// The path portion of a `<gateway>/ipfs/...` URL, query stripped.
+        fn path_of(url: &str) -> String {
+            let no_query = url.split('?').next().unwrap_or(url);
+            match no_query.find("/ipfs/") {
+                Some(i) => no_query[i..].to_string(),
+                None => no_query.to_string(),
+            }
+        }
+    }
+
+    impl Fetcher for PathScopedCarFetcher {
+        fn fetch(&self, url: &str) -> Result<Response, FetchError> {
+            self.requested.borrow_mut().push(url.to_string());
+            let key = Self::path_of(url);
+            let body = self.cars.get(&key).cloned().unwrap_or_default();
+            // A path the gateway has no scoped CAR for is a 404 (root block not
+            // in this scoped response), exactly as a trustless gateway signals a
+            // missing terminus.
+            let status = if self.cars.contains_key(&key) {
+                200
+            } else {
+                404
+            };
+            Ok(Response {
+                status,
+                content_type: Some("application/vnd.ipld.car".into()),
+                body,
+                final_url: url.to_string(),
+            })
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Acceptance: the seam + default CAR backend.
     // -----------------------------------------------------------------------
@@ -1075,6 +1243,175 @@ mod tests {
             "expected a ?format=car GET, got: {url}"
         );
         assert!(url.contains(&cid.to_string()));
+    }
+
+    #[test]
+    fn the_request_scopes_to_the_entity_not_the_whole_dag() {
+        // The scope fix: a resource request fetches the SPECIFIC entity's blocks
+        // (`dag-scope=entity`), NOT the whole DAG (`dag-scope=all`). Requesting
+        // the whole DAG per resource is what made real sites do N full-site
+        // downloads to render one page.
+        let (cid, block) = raw_block(b"x");
+        let fetcher = CannedCarFetcher::new(build_car(&cid, &[(cid, block)]));
+        let r = TrustlessGatewayCarRetriever::with_gateway(fetcher, "http://gw.test");
+        let _ = r.retrieve(&cid.to_string(), "/");
+        let url = r.fetcher.last_url.borrow().clone();
+        assert!(
+            url.contains("dag-scope=entity"),
+            "expected a dag-scope=entity GET, got: {url}"
+        );
+        assert!(
+            !url.contains("dag-scope=all"),
+            "must NOT fetch the whole DAG per resource, got: {url}"
+        );
+    }
+
+    #[test]
+    fn a_sub_resource_request_puts_its_path_in_the_url_scoped_to_that_entity() {
+        // A resource at `ipfs://<cid>/style.css` is fetched as
+        // `/ipfs/<cid>/style.css?format=car&dag-scope=entity`: the PATH goes in
+        // the URL so the gateway returns only the blocks to traverse that path
+        // plus the terminal entity, per the Trustless Gateway spec.
+        let index_html = b"<!doctype html><title>site</title>";
+        // index.html is a sibling in the directory listing but is NOT in the
+        // css resource's scoped CAR, proving per-entity scope.
+        let (index_cid, _index_block) = file_leaf(index_html);
+        let css = b"body{color:red}";
+        let (css_cid, css_block) = file_leaf(css);
+        let (dir_cid, dir_block) = directory(&[
+            ("index.html".into(), index_cid),
+            ("style.css".into(), css_cid),
+        ]);
+
+        // The scoped CAR for `<dir>/style.css`: the dir node (to traverse the
+        // path segment) + the css entity, and NOTHING of index.html.
+        let mut cars = HashMap::new();
+        cars.insert(
+            format!("/ipfs/{dir_cid}/style.css"),
+            build_car(
+                &dir_cid,
+                &[(dir_cid, dir_block.clone()), (css_cid, css_block.clone())],
+            ),
+        );
+        let r = TrustlessGatewayCarRetriever::with_gateway(
+            PathScopedCarFetcher::new(cars),
+            "http://gw.test",
+        );
+
+        let got = r
+            .retrieve(&dir_cid.to_string(), "/style.css")
+            .expect("a scoped sub-resource CAR resolves that resource");
+        assert_eq!(got.bytes, css);
+
+        let requested = r.fetcher.requested.borrow().clone();
+        assert_eq!(
+            requested.len(),
+            1,
+            "exactly one scoped fetch: {requested:?}"
+        );
+        let url = &requested[0];
+        assert!(
+            url.contains(&format!("/ipfs/{dir_cid}/style.css")),
+            "path must be in the url, got: {url}"
+        );
+        assert!(url.contains("dag-scope=entity"), "got: {url}");
+    }
+
+    #[test]
+    fn a_directory_root_resolves_index_html_by_fetching_only_what_it_needs() {
+        // The directory root resolves to index.html by fetching only what it
+        // needs, NOT the entire tree. A `dag-scope=entity` fetch of the directory
+        // returns just the directory listing; werust then fetches
+        // `<cid>/index.html` (also entity-scoped) for the index entity's blocks.
+        // A large SIBLING asset is present in the tree but must NEVER be fetched
+        // to render the root.
+        let index_html = b"<!doctype html><title>root</title><h1>hi</h1>";
+        let (index_cid, index_block) = file_leaf(index_html);
+        let heavy = vec![0u8; 4096];
+        let (heavy_cid, _heavy_block) = file_leaf(&heavy);
+        // dag-pb requires links in sorted name order (`heavy.bin` < `index.html`).
+        let (dir_cid, dir_block) = directory(&[
+            ("heavy.bin".into(), heavy_cid),
+            ("index.html".into(), index_cid),
+        ]);
+
+        let mut cars = HashMap::new();
+        // The directory entity: just the directory listing block.
+        cars.insert(
+            format!("/ipfs/{dir_cid}"),
+            build_car(&dir_cid, &[(dir_cid, dir_block.clone())]),
+        );
+        // The index.html entity: dir traversal block + the index leaf. The heavy
+        // sibling is deliberately absent from BOTH scoped CARs.
+        cars.insert(
+            format!("/ipfs/{dir_cid}/index.html"),
+            build_car(
+                &dir_cid,
+                &[
+                    (dir_cid, dir_block.clone()),
+                    (index_cid, index_block.clone()),
+                ],
+            ),
+        );
+        // `heavy.bin` is present in the tree but appears in NO scoped CAR.
+
+        let r = TrustlessGatewayCarRetriever::with_gateway(
+            PathScopedCarFetcher::new(cars),
+            "http://gw.test",
+        );
+        let got = r
+            .retrieve(&dir_cid.to_string(), "/")
+            .expect("directory root resolves index.html from scoped CARs");
+        assert_eq!(got.bytes, index_html);
+
+        // It fetched the directory then index.html, and NEVER the heavy sibling
+        // (no whole-tree fetch).
+        let requested = r.fetcher.requested.borrow().clone();
+        assert!(
+            requested.iter().any(|u| u.contains("/index.html")),
+            "expected an index.html scoped fetch, got: {requested:?}"
+        );
+        assert!(
+            requested.iter().all(|u| !u.contains("heavy.bin")),
+            "must not fetch the heavy sibling to render the root, got: {requested:?}"
+        );
+        assert!(
+            requested.iter().all(|u| !u.contains("dag-scope=all")),
+            "must not fall back to whole-DAG scope, got: {requested:?}"
+        );
+    }
+
+    #[test]
+    fn a_scoped_car_missing_the_resource_block_fails_closed() {
+        // Verification unchanged under scoping: if a scoped CAR omits a block the
+        // resource needs (a truncated/incomplete scoped response), the retrieval
+        // fails closed as MissingBlock, never a partial render.
+        let a = b"first-";
+        let b = b"second";
+        let (ca, ba) = raw_block(a);
+        let (cb, _bb) = raw_block(b);
+        let (file_cid, file_block) = chunked_file(
+            &[(ca, ba.clone()), (cb, b.to_vec())],
+            (a.len() + b.len()) as u64,
+        );
+        // The scoped CAR delivers the file node + first chunk but DROPS the
+        // second chunk (an incomplete entity response).
+        let mut cars = HashMap::new();
+        cars.insert(
+            format!("/ipfs/{file_cid}"),
+            build_car(&file_cid, &[(file_cid, file_block), (ca, ba)]),
+        );
+        let r = TrustlessGatewayCarRetriever::with_gateway(
+            PathScopedCarFetcher::new(cars),
+            "http://gw.test",
+        );
+        let err = r
+            .retrieve(&file_cid.to_string(), "/")
+            .expect_err("an incomplete scoped entity must fail closed");
+        assert!(
+            matches!(err, RetrieveError::MissingBlock { .. }),
+            "expected a distinct missing-block failure, got: {err:?}"
+        );
     }
 
     #[test]

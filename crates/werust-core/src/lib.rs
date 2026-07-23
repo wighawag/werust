@@ -91,6 +91,173 @@ fn eth_name_from_entry(entry: &str) -> Option<&str> {
     Some(name)
 }
 
+/// Which STEP of the real resolution/fetch pipeline a load is currently in, for
+/// the live loading-progress indicator.
+///
+/// This is a THIRD chrome axis, orthogonal to [`LoadState`] (the backend's
+/// lifecycle truth) and [`TrustPosture`] (the load path): it says WHICH stage of
+/// werust's own `name -> record -> content -> render` pipeline is running right
+/// now, so a slow load reads as "working: fetching content" rather than frozen.
+/// It is driven by ACTUAL lifecycle events (the ENS/IPNS resolution steps in
+/// [`BrowserShell::navigate_ens_name`], then the backend's
+/// `Started`/`Committed`/`Finished`), never faked, and is
+/// [`Idle`](LoadStep::Idle) whenever nothing is loading.
+///
+/// It deliberately does NOT re-mean [`LoadState`]: the shell's multi-stage
+/// resolution (resolve a name, fetch+verify a record) happens BEFORE the
+/// backend's single `navigate` for the resolved `ipfs://<cid>` even starts, so a
+/// name-resolution step is not a backend load-state. Loading/error stay
+/// orthogonal to the trust posture (the prior tasks' invariant). The chosen model
+/// is recorded in `docs/spikes/clearer-loading-and-error-indicator/DECISIONS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LoadStep {
+    /// No load is in flight: nothing to show a step for (a settled / idle /
+    /// failed chrome). The DEFAULT.
+    #[default]
+    Idle,
+    /// Resolving a name to its content pointer: the ENS step (namehash ->
+    /// registry -> resolver -> contenthash over the trusted RPC). The FIRST step
+    /// of a bare `.eth` load.
+    ResolvingName,
+    /// Fetching + client-verifying the signed IPNS record that maps a MUTABLE
+    /// name to its current CID (the extra round-trip an `ipns-ns` name adds
+    /// before any content). Only in an IPNS-backed load.
+    FetchingRecord,
+    /// Fetching the content itself: the resolved (or directly typed)
+    /// `ipfs://<cid>` / `http(s)://` main resource is loading through the backend
+    /// (the hash-verified content-addressed path for `ipfs://`). The backend load
+    /// has [`Started`](LoadState::Started) but not yet committed.
+    FetchingContent,
+    /// Rendering: the main resource has committed
+    /// ([`Committed`](LoadState::Committed)) and the page is being laid out /
+    /// painted, the final step before the load finishes.
+    Rendering,
+}
+
+impl LoadStep {
+    /// A short, human-readable hint for this step, for the loading indicator's
+    /// status text ("resolving name", "fetching content", …). Empty for
+    /// [`Idle`](LoadStep::Idle) (no load to describe), so a caller can append it
+    /// to a spinner only while there is a step to show.
+    #[must_use]
+    pub fn hint(self) -> &'static str {
+        match self {
+            LoadStep::Idle => "",
+            LoadStep::ResolvingName => "resolving name",
+            LoadStep::FetchingRecord => "fetching record",
+            LoadStep::FetchingContent => "fetching content",
+            LoadStep::Rendering => "rendering",
+        }
+    }
+
+    /// The stable, lower-kebab wire name of this step for the FFI chrome JSON, so
+    /// the mobile edges paint the SAME step hint from the SAME fact (mirroring the
+    /// trust-posture wire names).
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            LoadStep::Idle => "idle",
+            LoadStep::ResolvingName => "resolving-name",
+            LoadStep::FetchingRecord => "fetching-record",
+            LoadStep::FetchingContent => "fetching-content",
+            LoadStep::Rendering => "rendering",
+        }
+    }
+}
+
+/// The kind of a surfaced load failure: is it a TRANSIENT/timeout failure the
+/// user can simply RETRY, or a HARD failure (unsupported protocol, verification
+/// failure, malformed content) that a retry will not fix?
+///
+/// This is a PURE classification of the honest, protocol-named reason already in
+/// [`ChromeState::last_error`] — it does NOT re-mean or replace that reason (a
+/// hard failure keeps its exact protocol-named text). It exists so the error
+/// surface can offer a RETRY affordance for the transient case (a timeout says
+/// "timed out, reload to retry" instead of the same scary hard-fail banner),
+/// answering the field finding that a retryable timeout looked identical to a
+/// hard fail (`work/notes/observations/field-test-v0.2.2-ipns-slow-partial-and-debug-window-2026-07-23.md`,
+/// issue C).
+///
+/// It is derived from the reason STRING because that is the one denominator every
+/// failure crosses on: the shell's typed ENS/IPNS errors AND the async
+/// content/render failures the webview reports only as a
+/// [`LoadEvent::Failed`] reason string. The classifier + its rationale (why the
+/// string, not a typed error field) are recorded in
+/// `docs/spikes/clearer-loading-and-error-indicator/DECISIONS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// A transient failure a RETRY can fix: a timeout or a transport/connection
+    /// error (the field finding's `transport error: timeout: global`, the
+    /// fetcher/provider `Transport`/`Io` taxonomy, an IPNS record-fetch source
+    /// failure). The load simply did not COMPLETE; the content it was after may
+    /// well be reachable on a reload. The error surface offers a retry affordance.
+    Transient,
+    /// A hard failure a retry will NOT fix: the content is unsupported
+    /// (a non-IPFS protocol), did not VERIFY (a bad IPNS signature, a block hash
+    /// mismatch), is malformed, or names nothing loadable (no resolver, no
+    /// contenthash, an invalid CID/target). It keeps its prominent, protocol-named
+    /// reason unchanged — retrying is pointless, so no retry affordance is shown.
+    Hard,
+}
+
+impl FailureKind {
+    /// Classify a surfaced failure `reason` as [`Transient`](FailureKind::Transient)
+    /// (retryable) or [`Hard`](FailureKind::Hard).
+    ///
+    /// Keys on the TRANSIENT markers a timeout/transport failure carries in its
+    /// reason text — the ONE set of markers shared by BOTH failure paths (the
+    /// shell's typed `ProviderError::Transport` / `IpnsError::Source` /
+    /// `FetchError::Transport`|`Io`, and the webview's `LoadEvent::Failed` reason
+    /// for a page-level `http` timeout). Everything else is [`Hard`](FailureKind::Hard):
+    /// an unsupported protocol / verification / malformed / not-found reason is
+    /// never retried, so it defaults to hard. Case-insensitive so a marker in any
+    /// casing still classifies.
+    #[must_use]
+    pub fn classify(reason: &str) -> Self {
+        let r = reason.to_ascii_lowercase();
+        // A verification failure can mention "timed out"-adjacent words but is
+        // NEVER transient: an expired/invalid record does not become valid on a
+        // retry. So the hard markers are checked FIRST and win. ("did not verify"
+        // is the IPNS/verify taxonomy; "expired" its EOL case.)
+        const HARD_MARKERS: [&str; 3] = ["did not verify", "hash mismatch", "expired"];
+        if HARD_MARKERS.iter().any(|m| r.contains(m)) {
+            return FailureKind::Hard;
+        }
+        // The transient markers: a timeout or a transport/connection failure — the
+        // load did not complete, so a reload may well succeed.
+        const TRANSIENT_MARKERS: [&str; 5] = [
+            "timeout",
+            "timed out",
+            "transport error",
+            "connection",
+            "io error",
+        ];
+        if TRANSIENT_MARKERS.iter().any(|m| r.contains(m)) {
+            FailureKind::Transient
+        } else {
+            FailureKind::Hard
+        }
+    }
+
+    /// Whether this failure kind is RETRYABLE (a reload may fix it): true for
+    /// [`Transient`](FailureKind::Transient), false for [`Hard`](FailureKind::Hard).
+    #[must_use]
+    pub fn is_retryable(self) -> bool {
+        matches!(self, FailureKind::Transient)
+    }
+
+    /// The stable, lower-kebab wire name for the FFI chrome JSON, so the mobile
+    /// edges distinguish the two failure kinds from the SAME fact (mirroring the
+    /// trust-posture wire names).
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            FailureKind::Transient => "transient",
+            FailureKind::Hard => "hard",
+        }
+    }
+}
+
 /// The chrome state the shell reflects: everything the window must draw ABOUT the
 /// current page, distinct from the page content itself.
 ///
@@ -112,8 +279,16 @@ pub struct ChromeState {
     /// Whether the Forward control is enabled.
     pub can_go_forward: bool,
     /// A human-readable failure surfaced to the user when the last load failed,
-    /// cleared when a new load starts. `None` when nothing has failed.
+    /// cleared when a new load starts. `None` when nothing has failed. Carries the
+    /// honest, protocol-named reason verbatim (the resolver/decoder/fetch
+    /// taxonomy); the transient-vs-hard distinction is DERIVED from it via
+    /// [`failure_kind`](ChromeState::failure_kind), never by re-meaning this text.
     pub last_error: Option<String>,
+    /// Which step of the real `name -> record -> content -> render` pipeline the
+    /// current load is in, for the live loading-progress indicator. [`Idle`](LoadStep::Idle)
+    /// whenever nothing is loading. Driven by actual lifecycle events, so a slow
+    /// load shows genuine progress rather than reading as frozen.
+    pub load_step: LoadStep,
     /// The [`TrustPosture`] of the current page, driving the chrome's trust
     /// indicator: content-verified vs served by an unverified origin
     /// (`docs/adr/0001`: the trust posture is a product surface). Read straight
@@ -129,6 +304,31 @@ impl ChromeState {
     #[must_use]
     pub fn is_loading(&self) -> bool {
         self.load_state.is_loading()
+    }
+
+    /// The current pipeline step, for the loading-progress indicator (only
+    /// meaningful while [`is_loading`](ChromeState::is_loading)).
+    #[must_use]
+    pub fn load_step(&self) -> LoadStep {
+        self.load_step
+    }
+
+    /// The [`FailureKind`] of the surfaced failure, or `None` when nothing has
+    /// failed: the classification of [`last_error`](ChromeState::last_error) as a
+    /// TRANSIENT (retryable) timeout vs a HARD failure. A pure derivation of the
+    /// reason, so the error surface can distinguish a retryable timeout from a
+    /// scary hard fail without any new plumbing.
+    #[must_use]
+    pub fn failure_kind(&self) -> Option<FailureKind> {
+        self.last_error.as_deref().map(FailureKind::classify)
+    }
+
+    /// Whether the surfaced failure is RETRYABLE (a transient timeout a reload may
+    /// fix). `false` when nothing failed or when the failure is hard. The error
+    /// surface shows a retry affordance exactly when this is `true`.
+    #[must_use]
+    pub fn failure_is_retryable(&self) -> bool {
+        matches!(self.failure_kind(), Some(FailureKind::Transient))
     }
 
     /// Whether the current page was content-verified (its bytes hash-checked on
@@ -224,6 +424,16 @@ pub struct BrowserShell {
     /// See `work/notes/observations/reload-re-resolves-ens-name-decision-2026-07-23.md`
     /// for the reload (re-resolve) + history (re-derive) decision.
     ens_pages: HashMap<String, EnsIdentity>,
+    /// The PRE-CONTENT pipeline step the shell is currently in, if any: the
+    /// synchronous ENS/IPNS resolution stages ([`LoadStep::ResolvingName`] /
+    /// [`LoadStep::FetchingRecord`]) that run BEFORE the backend's `navigate` for
+    /// the resolved `ipfs://<cid>`. `None` once resolution hands off to the
+    /// backend (or for a plain, non-ENS load), so
+    /// [`refresh_chrome`](BrowserShell::refresh_chrome) then derives the CONTENT
+    /// step ([`FetchingContent`](LoadStep::FetchingContent) /
+    /// [`Rendering`](LoadStep::Rendering)) from the backend's load state. This is
+    /// what lets a resolution-phase FAILURE surface the step it failed at.
+    resolving_step: Option<LoadStep>,
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -307,6 +517,7 @@ impl BrowserShell {
             ipns_source,
             url_override: None,
             ens_pages: HashMap::new(),
+            resolving_step: None,
         };
         shell.refresh_chrome();
         shell
@@ -348,8 +559,11 @@ impl BrowserShell {
         }
         self.renderer.navigate(url)?;
         // A plain navigation follows the backend's URL: drop any ENS name that was
-        // pinned in the bar so it never lingers on a later page.
+        // pinned in the bar so it never lingers on a later page. It is a CONTENT
+        // load (no ENS/IPNS resolution step), so clear any pinned resolution step;
+        // `refresh_chrome` derives the content step from the backend's load state.
         self.url_override = None;
+        self.resolving_step = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
         Ok(())
@@ -391,6 +605,11 @@ impl BrowserShell {
     /// name for the user to see the reason — mirroring how a failed load surfaces
     /// its reason rather than throwing.
     fn navigate_ens_name(&mut self, name: &str) -> Result<(), RendererError> {
+        // Step 1 of the pipeline: resolving the name (namehash -> registry ->
+        // resolver -> contenthash). Pin the step so a resolution FAILURE surfaces
+        // "resolving name" as the stage it failed at, and so a caller inspecting
+        // mid-resolution sees genuine progress.
+        self.resolving_step = Some(LoadStep::ResolvingName);
         match crate::ens::resolve(self.provider.as_ref(), name) {
             Ok(DecodedContenthash::Ipfs { uri, .. }) => {
                 // The immutable `ipfs-ns` case: load the resolved CID directly. It
@@ -406,6 +625,10 @@ impl BrowserShell {
                 // client-side against the key) BEFORE loading anything. A bad
                 // record / bad target fails closed with its distinct reason —
                 // nothing unverified is rendered.
+                // Step 2 (IPNS names only): fetch + client-verify the signed
+                // record before any content. Pin the step so a record
+                // fetch/verify failure surfaces "fetching record".
+                self.resolving_step = Some(LoadStep::FetchingRecord);
                 match crate::ipns::resolve_ipns_name(self.ipns_source.as_ref(), &ipns_name) {
                     Ok(resolved) => {
                         // The name is MUTABLE, so flag the load mutable-named too:
@@ -462,7 +685,13 @@ impl BrowserShell {
     /// fresh `begin`). If the backend cannot even start the load, that is a
     /// fail-closed front-door failure, never a silent success.
     fn load_resolved_content(&mut self, name: &str, uri: &str, mutable: bool) {
+        // Resolution is done; the backend now drives the CONTENT step. Hand the
+        // step off to the backend's load state (via `refresh_chrome`).
+        self.resolving_step = None;
         if let Err(e) = self.renderer.navigate(uri) {
+            // A backend that cannot even start the content load failed at the
+            // content step, not resolution.
+            self.resolving_step = None;
             self.fail_ens_load(name, &e.to_string());
             return;
         }
@@ -502,7 +731,11 @@ impl BrowserShell {
     /// spinner. The trust posture stays untrusted (no verified load happened).
     fn fail_ens_load(&mut self, name: &str, reason: &str) {
         // Pin the `.eth` name in the bar (the front door did not navigate the
-        // backend anywhere, so there is no underlying URL to fall back to).
+        // backend anywhere, so there is no underlying URL to fall back to). The
+        // load has SETTLED (failed), so no step is in flight: clear the pinned
+        // resolution step BEFORE refreshing so the failed chrome shows the `Idle`
+        // step, and so it never lingers onto the next load.
+        self.resolving_step = None;
         self.url_override = Some(name.to_string());
         self.refresh_chrome();
         self.chrome.last_error = Some(reason.to_string());
@@ -517,6 +750,7 @@ impl BrowserShell {
         self.renderer.go_back();
         // History navigation follows the backend's URL, not the pinned ENS name.
         self.url_override = None;
+        self.resolving_step = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
     }
@@ -525,6 +759,7 @@ impl BrowserShell {
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
         self.url_override = None;
+        self.resolving_step = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
     }
@@ -570,6 +805,7 @@ impl BrowserShell {
         }
         self.renderer.reload()?;
         self.url_override = None;
+        self.resolving_step = None;
         self.chrome.last_error = None;
         self.refresh_chrome();
         Ok(())
@@ -653,6 +889,21 @@ impl BrowserShell {
         self.chrome.load_state = self.renderer.load_state();
         self.chrome.can_go_back = self.renderer.can_go_back();
         self.chrome.can_go_forward = self.renderer.can_go_forward();
+        // The live pipeline step: a pinned PRE-CONTENT resolution step
+        // (`ResolvingName` / `FetchingRecord`) wins while the shell is still
+        // resolving a name (before the backend's `navigate`); once resolution has
+        // handed off (or for a plain load), the CONTENT step is derived from the
+        // backend's load state — `Started` is fetching, `Committed` is rendering,
+        // and a settled/failed/idle load has no step. Driven by ACTUAL lifecycle,
+        // never faked, so a slow load shows genuine progress.
+        self.chrome.load_step = match self.resolving_step {
+            Some(step) => step,
+            None => match self.renderer.load_state() {
+                LoadState::Started => LoadStep::FetchingContent,
+                LoadState::Committed => LoadStep::Rendering,
+                LoadState::Idle | LoadState::Finished | LoadState::Failed => LoadStep::Idle,
+            },
+        };
         // If the backend's current entry is an ENS-originated CID we resolved
         // earlier (a reload / back / forward landed on it, so there is no active
         // `url_override` pinning the name), RE-MARK the load's ENS posture axes on
@@ -2133,6 +2384,347 @@ mod tests {
         settle(&mut shell, &handle);
         assert_eq!(shell.chrome().url_text, "https://b.example/");
         assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    // ---- Loading progress + transient-vs-hard error (task
+    // `clearer-loading-and-error-indicator`) ----------------------------------
+
+    #[test]
+    fn failure_kind_classifies_a_timeout_as_transient_and_a_protocol_reason_as_hard() {
+        // Acceptance: a transient/timeout failure is distinguished from a hard
+        // failure. The classifier keys on the transient markers the timeout /
+        // transport reasons carry (the field finding's `transport error: timeout:
+        // global`, the fetcher/provider taxonomy), and treats everything else
+        // (unsupported / verification / malformed) as hard.
+        for transient in [
+            "transport error: timeout: global",
+            "rpc transport error: connection refused",
+            "content source error: transport error: timeout",
+            "IPNS record fetch failed: connection refused",
+            "io error: read timed out",
+        ] {
+            assert_eq!(
+                FailureKind::classify(transient),
+                FailureKind::Transient,
+                "a timeout/transport reason is retryable: {transient}"
+            );
+            assert!(FailureKind::classify(transient).is_retryable());
+        }
+        for hard in [
+            "points to Swarm, not supported",
+            "IPNS record did not verify: dag-cbor data does not match the protobuf fields",
+            "block hash mismatch: bytes do not match cid bafy",
+            "this name has no ENS resolver set",
+            "this name has no contenthash set",
+            "invalid content identifier: bafybad",
+        ] {
+            assert_eq!(
+                FailureKind::classify(hard),
+                FailureKind::Hard,
+                "an unsupported/verification/malformed reason is hard: {hard}"
+            );
+            assert!(!FailureKind::classify(hard).is_retryable());
+        }
+        // A verification reason that happens to mention an expiry is STILL hard: a
+        // retry will not make an expired/invalid record valid.
+        assert_eq!(
+            FailureKind::classify("IPNS record did not verify: the record expired"),
+            FailureKind::Hard
+        );
+    }
+
+    #[test]
+    fn load_step_hint_and_wire_names_are_stable_and_idle_has_no_hint() {
+        // The step hint is empty only for Idle (no load to describe); each active
+        // step has a distinct short hint and a stable wire name for the FFI JSON.
+        assert_eq!(LoadStep::Idle.hint(), "");
+        assert_eq!(LoadStep::default(), LoadStep::Idle);
+        for step in [
+            LoadStep::ResolvingName,
+            LoadStep::FetchingRecord,
+            LoadStep::FetchingContent,
+            LoadStep::Rendering,
+        ] {
+            assert!(!step.hint().is_empty(), "{step:?} has a hint");
+        }
+        assert_eq!(LoadStep::ResolvingName.wire_name(), "resolving-name");
+        assert_eq!(LoadStep::FetchingRecord.wire_name(), "fetching-record");
+        assert_eq!(LoadStep::FetchingContent.wire_name(), "fetching-content");
+        assert_eq!(LoadStep::Rendering.wire_name(), "rendering");
+        assert_eq!(LoadStep::Idle.wire_name(), "idle");
+    }
+
+    #[test]
+    fn a_slow_load_shows_real_pipeline_progress_from_fetching_to_rendering_to_idle() {
+        // Acceptance: a slow load shows clear ongoing activity/progress driven by
+        // the REAL lifecycle, not faked. A plain content load moves
+        // FetchingContent (Started) -> Rendering (Committed) -> Idle (Finished),
+        // so the chrome reads as "working" the whole time rather than frozen.
+        let (mut shell, handle) = shell_with_backend();
+        assert_eq!(shell.chrome().load_step(), LoadStep::Idle);
+
+        shell.navigate("ipfs://bafyslowcid/index.html").unwrap();
+        // Started: the content is being fetched.
+        assert!(shell.chrome().is_loading());
+        assert_eq!(shell.chrome().load_step(), LoadStep::FetchingContent);
+
+        // Committed (first bytes arrived): the page is rendering.
+        {
+            let mut b = handle.inner.borrow_mut();
+            let url = b.current().unwrap().clone();
+            b.state = LoadState::Committed;
+            b.events.push_back(LoadEvent::Committed { url });
+        }
+        shell.pump();
+        assert!(shell.chrome().is_loading());
+        assert_eq!(shell.chrome().load_step(), LoadStep::Rendering);
+
+        // Finished: no step (the load settled), so the indicator stops.
+        {
+            let mut b = handle.inner.borrow_mut();
+            let url = b.current().unwrap().clone();
+            b.state = LoadState::Finished;
+            b.events.push_back(LoadEvent::Finished { url });
+        }
+        shell.pump();
+        assert!(!shell.chrome().is_loading());
+        assert_eq!(shell.chrome().load_step(), LoadStep::Idle);
+    }
+
+    #[test]
+    fn an_ens_load_shows_the_resolving_name_step_then_the_content_step() {
+        // Acceptance: the step reflects the REAL resolution/fetch pipeline (name ->
+        // content). During ENS resolution the front door is at ResolvingName; once
+        // it hands the resolved CID to the backend the step is the content step.
+        // Resolution is synchronous, so the observable transition is
+        // ResolvingName-on-failure vs FetchingContent-on-success; a successful
+        // resolve lands on FetchingContent.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, _uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, _handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+        shell.navigate("ronan.eth").unwrap();
+        // After a successful resolve the load handed off to the backend: the
+        // content is being fetched.
+        assert!(shell.chrome().is_loading());
+        assert_eq!(shell.chrome().load_step(), LoadStep::FetchingContent);
+    }
+
+    #[test]
+    fn an_ens_resolution_failure_reports_the_resolving_name_step_and_no_lingering_step() {
+        // A failure DURING name resolution reports ResolvingName as the stage it
+        // failed at, but a FAILED load is not "loading", so the settled chrome
+        // shows the Idle step (the indicator stops) — the step never lingers.
+        let (mut shell, _handle) = shell_with_provider(vec![Err(ProviderError::Transport(
+            "connection refused".to_string(),
+        ))]);
+        shell.navigate("unreachable.eth").unwrap();
+        assert!(!shell.chrome().is_loading());
+        assert_eq!(
+            shell.chrome().load_step(),
+            LoadStep::Idle,
+            "a settled failure shows no in-flight step"
+        );
+    }
+
+    #[test]
+    fn a_transient_content_timeout_is_retryable_while_a_hard_fail_is_not() {
+        // Acceptance: a transient/timeout content failure (the webview reports it
+        // as a `LoadEvent::Failed` reason string) is surfaced as RETRYABLE, while a
+        // hard fail keeps its protocol-named reason and is NOT retryable. The fake
+        // backend drives both failure reasons through the SAME seam path the real
+        // webview uses.
+        let (mut shell, handle) = shell_with_backend();
+
+        // A slow content load that times out: a transient failure the user can
+        // retry (a reload).
+        shell.navigate("ipfs://bafyslowcid/index.html").unwrap();
+        shell.pump();
+        handle.drive_to_failed("transport error: timeout: global");
+        shell.pump();
+        assert_eq!(shell.chrome().load_state, LoadState::Failed);
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            Some(FailureKind::Transient),
+            "a timeout content failure is transient"
+        );
+        assert!(
+            shell.chrome().failure_is_retryable(),
+            "a transient timeout offers a retry affordance"
+        );
+        // The honest reason is kept verbatim (never masked by the classification).
+        assert_eq!(
+            shell.chrome().last_error.as_deref(),
+            Some("transport error: timeout: global")
+        );
+
+        // A hard content failure (a hash mismatch): NOT retryable, keeps its
+        // protocol-named reason.
+        shell.navigate("ipfs://bafybadcid/index.html").unwrap();
+        shell.pump();
+        handle.drive_to_failed("block hash mismatch: bytes do not match cid bafybadcid");
+        shell.pump();
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            Some(FailureKind::Hard),
+            "a hash mismatch is a hard failure"
+        );
+        assert!(!shell.chrome().failure_is_retryable());
+        assert_eq!(
+            shell.chrome().last_error.as_deref(),
+            Some("block hash mismatch: bytes do not match cid bafybadcid")
+        );
+    }
+
+    #[test]
+    fn a_transient_ens_resolution_timeout_is_retryable_and_reload_re_runs_it() {
+        // Acceptance: a transient timeout during ENS resolution is retryable, and
+        // the retry affordance IS the existing reload (a failed ENS load re-runs
+        // the resolution from the pinned name). Here the first resolve times out
+        // (transient), and a reload with a now-succeeding provider completes.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            // First attempt: a transport timeout on the very first eth_call.
+            Err(ProviderError::Transport("timeout: global".to_string())),
+            // The retry (reload): a full, successful resolution.
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        shell.navigate("ronan.eth").unwrap();
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            Some(FailureKind::Transient),
+            "a resolution timeout is a retryable transient failure"
+        );
+        assert!(shell.chrome().failure_is_retryable());
+        assert_eq!(
+            shell.current_url_for_test(),
+            None,
+            "nothing loaded on timeout"
+        );
+
+        // Retry via reload: the pinned name is re-resolved, this time succeeding,
+        // and the content loads — proving the transient failure was truly
+        // retryable.
+        shell
+            .reload()
+            .expect("reload retries the failed ENS resolution");
+        assert!(shell.chrome().is_loading());
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(ipfs_uri.as_str())
+        );
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "the retry cleared the failure"
+        );
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+    }
+
+    #[test]
+    fn a_hard_ens_failure_keeps_its_protocol_named_reason_and_is_not_retryable() {
+        // Acceptance: hard failures keep their prominent protocol-named reason and
+        // are NOT offered a retry. An unsupported-protocol contenthash is hard.
+        let mut swarm_ch = varint(0xe4); // swarm-ns
+        swarm_ch.extend_from_slice(b"some swarm address bytes");
+        let (mut shell, _handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x44u8; 20])),
+            Ok(abi_bytes_return(&swarm_ch)),
+        ]);
+        shell.navigate("swarm-site.eth").unwrap();
+        assert_eq!(
+            shell.chrome().last_error.as_deref(),
+            Some("points to Swarm, not supported"),
+            "the protocol-named reason is kept verbatim"
+        );
+        assert_eq!(shell.chrome().failure_kind(), Some(FailureKind::Hard));
+        assert!(
+            !shell.chrome().failure_is_retryable(),
+            "a hard failure offers no retry"
+        );
+    }
+
+    #[test]
+    fn an_unverifiable_ipns_record_is_a_hard_failure_not_retryable() {
+        // Acceptance: a verification failure (a forged IPNS record) is HARD — a
+        // retry cannot make an unsigned/misdirecting record verify — and keeps its
+        // "did not verify" reason.
+        let key = IpnsKeyFixture::new();
+        let attacker = IpnsKeyFixture::new();
+        let target_cid = cid_v1_raw_sha256(b"content the attacker wants").expect("cid");
+        let forged = attacker.signed_record_for(&target_cid);
+        let (mut shell, _handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ],
+            PinnedIpnsSource::with_record(&key.name, forged),
+        );
+        shell.navigate("forged.eth").unwrap();
+        let reason = shell.chrome().last_error.clone().expect("a reason");
+        assert!(reason.contains("did not verify"), "{reason}");
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            Some(FailureKind::Hard),
+            "a verification failure is hard, never retryable"
+        );
+        assert!(!shell.chrome().failure_is_retryable());
+    }
+
+    #[test]
+    fn an_ipns_record_fetch_timeout_is_a_transient_retryable_failure() {
+        // Acceptance: a transient IPNS record-FETCH failure (a dead/slow gateway,
+        // an `IpnsError::Source` transport reason) is retryable — distinct from an
+        // unverifiable record (hard). This is the `fetching-record` step's
+        // transient case.
+        let key = IpnsKeyFixture::new();
+        let (mut shell, _handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ],
+            PinnedIpnsSource::failing(IpnsError::Source("connection refused".into())),
+        );
+        shell.navigate("slow-ipns.eth").unwrap();
+        let reason = shell.chrome().last_error.clone().expect("a reason");
+        assert!(reason.contains("connection refused"), "{reason}");
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            Some(FailureKind::Transient),
+            "a record-fetch transport failure is transient/retryable"
+        );
+        assert!(shell.chrome().failure_is_retryable());
+    }
+
+    #[test]
+    fn no_failure_means_no_failure_kind_and_a_fresh_navigation_clears_it() {
+        // A settled-ok / idle chrome has no failure kind, and a fresh navigation
+        // clears a prior failure kind with the error.
+        let (mut shell, handle) = shell_with_backend();
+        assert_eq!(shell.chrome().failure_kind(), None);
+        assert!(!shell.chrome().failure_is_retryable());
+
+        shell.navigate("https://example.com/").unwrap();
+        handle.drive_to_failed("transport error: timeout: global");
+        shell.pump();
+        assert_eq!(shell.chrome().failure_kind(), Some(FailureKind::Transient));
+
+        shell.navigate("https://fresh.example/").unwrap();
+        assert_eq!(
+            shell.chrome().failure_kind(),
+            None,
+            "a fresh load clears it"
+        );
+        assert!(!shell.chrome().failure_is_retryable());
     }
 
     #[test]

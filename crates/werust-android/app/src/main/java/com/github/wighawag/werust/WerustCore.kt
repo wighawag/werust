@@ -129,16 +129,42 @@ class WerustCore : AutoCloseable {
         val url: String,
         val loadState: String,
         val loading: Boolean,
+        val loadStep: String,
         val canGoBack: Boolean,
         val canGoForward: Boolean,
         val trustPosture: String,
         val error: String?,
+        val failureKind: String?,
+        val retryable: Boolean,
     ) {
-        /** The one-line status the Activity shows: a failure wins, else loading/idle. */
+        /**
+         * The one-line status the Activity shows: a failure wins, else a loading
+         * indicator that NAMES the real pipeline step (resolving name / fetching
+         * record / fetching content / rendering) so a slow load reads as working,
+         * not frozen, else idle. The step hint is the core's `loadStep` (driven by
+         * the actual lifecycle), the SAME fact desktop reads (task
+         * `clearer-loading-and-error-indicator`).
+         */
         fun statusLine(): String = when {
             error != null -> "failed: $error"
-            loading -> "loading…"
+            loading -> {
+                val hint = loadStepHint()
+                if (hint.isEmpty()) "loading…" else "loading… — $hint"
+            }
             else -> "idle"
+        }
+
+        /**
+         * The short human-readable hint for the current pipeline step, or empty for
+         * no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile status
+         * text matches desktop.
+         */
+        private fun loadStepHint(): String = when (loadStep) {
+            "resolving-name" -> "resolving name"
+            "fetching-record" -> "fetching record"
+            "fetching-content" -> "fetching content"
+            "rendering" -> "rendering"
+            else -> ""
         }
 
         /**
@@ -181,9 +207,25 @@ class WerustCore : AutoCloseable {
          * "failed". Empty when there is no failure (the banner is hidden then).
          */
         fun errorBanner(): String = when {
-            error != null -> "⚠ This page failed to load: $error"
-            else -> ""
+            error == null -> ""
+            // A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a
+            // hard failure: a softer "timed out — reload to retry" (the Reload
+            // button IS the retry — a failed ENS load re-resolves), while a hard
+            // failure keeps the prominent "failed to load" wording + its
+            // protocol-named reason. The distinction is the core's `retryable`
+            // (task `clearer-loading-and-error-indicator`), the SAME fact desktop
+            // reads, so the two never disagree.
+            retryable -> "⏳ This page timed out — reload to retry: $error"
+            else -> "⚠ This page failed to load: $error"
         }
+
+        /**
+         * Whether the surfaced failure is RETRYABLE (a transient timeout a reload
+         * may fix), so the Activity can show a retry affordance. `false` for a hard
+         * failure or when nothing failed. The core's `retryable` fact, matching
+         * desktop.
+         */
+        fun errorIsRetryable(): Boolean = error != null && retryable
 
         companion object {
             fun fromJson(json: String): Chrome {
@@ -192,10 +234,13 @@ class WerustCore : AutoCloseable {
                     url = o.getString("url"),
                     loadState = o.getString("loadState"),
                     loading = o.getBoolean("loading"),
+                    loadStep = o.optString("loadStep", "idle"),
                     canGoBack = o.getBoolean("canGoBack"),
                     canGoForward = o.getBoolean("canGoForward"),
                     trustPosture = o.optString("trustPosture", "unverified-origin"),
                     error = if (o.isNull("error")) null else o.getString("error"),
+                    failureKind = if (o.isNull("failureKind")) null else o.optString("failureKind"),
+                    retryable = o.optBoolean("retryable", false),
                 )
             }
         }

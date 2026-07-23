@@ -206,21 +206,44 @@ final class WerustCore {
         let url: String
         let loadState: String
         let loading: Bool
+        let loadStep: String
         let canGoBack: Bool
         let canGoForward: Bool
         let trustPosture: String
         let error: String?
+        let failureKind: String?
+        let retryable: Bool
 
         static let idle = Chrome(
-            url: "", loadState: "idle", loading: false,
+            url: "", loadState: "idle", loading: false, loadStep: "idle",
             canGoBack: false, canGoForward: false,
-            trustPosture: "unverified-origin", error: nil)
+            trustPosture: "unverified-origin", error: nil,
+            failureKind: nil, retryable: false)
 
-        /// The one-line status the controller shows: a failure wins, else
-        /// loading/idle.
+        /// The one-line status the controller shows: a failure wins, else a loading
+        /// indicator that NAMES the real pipeline step (resolving name / fetching
+        /// record / fetching content / rendering) so a slow load reads as working,
+        /// not frozen, else idle. The step hint is the core's `loadStep` (driven by
+        /// the actual lifecycle), the SAME fact desktop reads (task
+        /// `clearer-loading-and-error-indicator`).
         func statusLine() -> String {
             if let error = error { return "failed: \(error)" }
-            return loading ? "loading…" : "idle"
+            guard loading else { return "idle" }
+            let hint = loadStepHint()
+            return hint.isEmpty ? "loading…" : "loading… — \(hint)"
+        }
+
+        /// The short human-readable hint for the current pipeline step, or empty
+        /// for no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile
+        /// status text matches desktop.
+        private func loadStepHint() -> String {
+            switch loadStep {
+            case "resolving-name": return "resolving name"
+            case "fetching-record": return "fetching record"
+            case "fetching-content": return "fetching content"
+            case "rendering": return "rendering"
+            default: return ""
+            }
         }
 
         /// The short trust-indicator badge the controller paints from the core's
@@ -259,9 +282,23 @@ final class WerustCore {
         /// taxonomy — e.g. "IPNS record did not verify: …"), never a generic
         /// "failed". Empty when there is no failure (the banner is hidden then).
         func errorBanner() -> String {
-            if let error = error { return "⚠ This page failed to load: \(error)" }
-            return ""
+            guard let error = error else { return "" }
+            // A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a
+            // hard failure: a softer "timed out — reload to retry" (the Reload
+            // button IS the retry — a failed ENS load re-resolves), while a hard
+            // failure keeps the prominent "failed to load" wording + its
+            // protocol-named reason. The distinction is the core's `retryable`
+            // (task `clearer-loading-and-error-indicator`), the SAME fact desktop
+            // reads, so the two never disagree.
+            if retryable { return "⏳ This page timed out — reload to retry: \(error)" }
+            return "⚠ This page failed to load: \(error)"
         }
+
+        /// Whether the surfaced failure is RETRYABLE (a transient timeout a reload
+        /// may fix), so the controller can show a retry affordance. `false` for a
+        /// hard failure or when nothing failed. The core's `retryable` fact,
+        /// matching desktop.
+        func errorIsRetryable() -> Bool { error != nil && retryable }
 
         static func fromJSON(_ json: String) -> Chrome {
             guard let data = json.data(using: .utf8),
@@ -271,10 +308,13 @@ final class WerustCore {
                 url: o["url"] as? String ?? "",
                 loadState: o["loadState"] as? String ?? "idle",
                 loading: o["loading"] as? Bool ?? false,
+                loadStep: o["loadStep"] as? String ?? "idle",
                 canGoBack: o["canGoBack"] as? Bool ?? false,
                 canGoForward: o["canGoForward"] as? Bool ?? false,
                 trustPosture: o["trustPosture"] as? String ?? "unverified-origin",
-                error: o["error"] as? String)
+                error: o["error"] as? String,
+                failureKind: o["failureKind"] as? String,
+                retryable: o["retryable"] as? Bool ?? false)
         }
     }
 }

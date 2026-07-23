@@ -137,6 +137,18 @@ impl Chrome {
         self.error_banner.set_visible(show_error);
         if show_error {
             self.error_banner.set_text(&error_banner_text(state));
+            // Distinguish a transient/timeout banner (softer amber, retryable)
+            // from a hard-failure banner (prominent red): toggle exactly one
+            // class, like the trust-indicator set, so a stale class never lingers
+            // across a transition.
+            let active = error_banner_css_class(state);
+            for class in ["error-banner", "error-banner-transient"] {
+                if class == active {
+                    self.error_banner.add_css_class(class);
+                } else {
+                    self.error_banner.remove_css_class(class);
+                }
+            }
         }
         // The trust indicator: a distinct, legible label for each state (a
         // neutral loading badge while a load is in flight, else the trust posture:
@@ -166,12 +178,23 @@ impl Chrome {
 }
 
 /// The one-line status shown in the chrome: a surfaced failure wins, otherwise a
-/// loading/idle indicator. Kept pure so it is trivially correct and reusable.
+/// loading indicator that names the REAL pipeline STEP (resolving name / fetching
+/// record / fetching content / rendering) so a slow load reads as "working",
+/// otherwise idle. Kept pure so it is trivially correct and reusable.
+///
+/// The step hint is the core's [`ChromeState::load_step`] (driven by the actual
+/// lifecycle), so "loading…" gains a live "— <step>" tail while a load is in
+/// flight (task `clearer-loading-and-error-indicator`).
 fn status_line(state: &ChromeState) -> String {
     if let Some(reason) = &state.last_error {
         format!("failed: {reason}")
     } else if state.is_loading() {
-        "loading…".to_string()
+        let hint = state.load_step().hint();
+        if hint.is_empty() {
+            "loading…".to_string()
+        } else {
+            format!("loading… — {hint}")
+        }
     } else {
         "idle".to_string()
     }
@@ -200,10 +223,35 @@ fn error_banner_visible(state: &ChromeState) -> bool {
 ///
 /// The reason text is the SAME `last_error` the core surfaces, so the banner and
 /// the footer never disagree; it is only shown far more prominently.
+///
+/// A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a HARD
+/// failure (task `clearer-loading-and-error-indicator`): a transient failure
+/// reads as a softer "timed out" with an explicit "reload to retry" affordance
+/// (the Reload button IS the retry — a failed ENS load re-resolves), while a hard
+/// failure keeps the prominent "failed to load" wording with its protocol-named
+/// reason. The distinction is the core's [`ChromeState::failure_is_retryable`]
+/// (a pure classification of the reason), so the two never disagree with the
+/// footer.
 fn error_banner_text(state: &ChromeState) -> String {
     match &state.last_error {
+        Some(reason) if state.failure_is_retryable() => {
+            format!("⏳ This page timed out — reload to retry: {reason}")
+        }
         Some(reason) => format!("⚠ This page failed to load: {reason}"),
         None => String::new(),
+    }
+}
+
+/// The CSS class for the error banner, distinguishing a TRANSIENT/timeout failure
+/// (a softer, retryable amber banner) from a HARD failure (the prominent red
+/// banner). A pure function of [`ChromeState`] so the banner styling is testable
+/// without a display; the two classes are toggled in [`Chrome::refresh`] exactly
+/// like the trust-indicator classes.
+fn error_banner_css_class(state: &ChromeState) -> &'static str {
+    if state.failure_is_retryable() {
+        "error-banner-transient"
+    } else {
+        "error-banner"
     }
 }
 
@@ -288,7 +336,8 @@ const TRUST_INDICATOR_CSS: &str = "\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
 .trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
 .trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }\
-.error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }";
+.error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
+.error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
 /// `trust-verified` / `trust-name-trusted-rpc` / `trust-unverified` classes the
@@ -526,12 +575,13 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, error_banner_text, error_banner_visible, should_open_web_inspector, status_line,
-        trust_indicator, trust_indicator_css_class, trust_indicator_detail, DEFAULT_URL,
+        banner, error_banner_css_class, error_banner_text, error_banner_visible,
+        should_open_web_inspector, status_line, trust_indicator, trust_indicator_css_class,
+        trust_indicator_detail, DEFAULT_URL,
     };
     use gtk4::gdk;
     use renderer::{LoadState, TrustPosture};
-    use werust_core::ChromeState;
+    use werust_core::{ChromeState, LoadStep};
 
     #[test]
     fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
@@ -571,6 +621,110 @@ mod tests {
             gdk::Key::a,
             gdk::ModifierType::empty()
         ));
+    }
+
+    #[test]
+    fn status_line_names_the_live_pipeline_step_while_loading() {
+        // Acceptance (loading progress): while a load is in flight the status line
+        // names the REAL pipeline step (resolving name / fetching content /
+        // rendering) so a slow load reads as working, not frozen. A settled/idle
+        // load shows no step, and a failure still wins.
+        let fetching = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&fetching), "loading… — fetching content");
+
+        let resolving = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::ResolvingName,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&resolving), "loading… — resolving name");
+
+        let rendering = ChromeState {
+            load_state: LoadState::Committed,
+            load_step: LoadStep::Rendering,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&rendering), "loading… — rendering");
+
+        // A loading state with no known step (Idle step) falls back to plain
+        // "loading…" rather than a dangling dash.
+        let loading_no_step = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::Idle,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&loading_no_step), "loading…");
+
+        // A settled load shows idle; a failure still wins over any step.
+        assert_eq!(status_line(&ChromeState::default()), "idle");
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(
+            status_line(&failed),
+            "failed: points to Swarm, not supported"
+        );
+    }
+
+    #[test]
+    fn a_transient_timeout_banner_is_distinct_and_retryable_while_a_hard_fail_keeps_its_reason() {
+        // Acceptance: a transient/timeout failure is surfaced DISTINCTLY from a
+        // hard failure, with an obvious retry affordance; a hard failure keeps its
+        // prominent protocol-named reason. Both banners carry the honest reason
+        // verbatim; only the framing + the CSS class differ.
+        let transient = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("transport error: timeout: global".into()),
+            ..ChromeState::default()
+        };
+        assert!(error_banner_visible(&transient));
+        let text = error_banner_text(&transient);
+        assert!(
+            text.to_lowercase().contains("retry"),
+            "a transient failure offers a retry affordance: {text}"
+        );
+        assert!(
+            text.contains("transport error: timeout: global"),
+            "the honest reason is kept: {text}"
+        );
+        assert_eq!(error_banner_css_class(&transient), "error-banner-transient");
+
+        // A hard failure: the prominent "failed to load" wording, its
+        // protocol-named reason, and NO retry affordance.
+        let hard = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        let hard_text = error_banner_text(&hard);
+        assert!(
+            hard_text.contains("failed to load"),
+            "a hard failure reads as a load failure: {hard_text}"
+        );
+        assert!(hard_text.contains("points to Swarm, not supported"));
+        assert!(
+            !hard_text.to_lowercase().contains("retry"),
+            "a hard failure offers no retry: {hard_text}"
+        );
+        assert_eq!(error_banner_css_class(&hard), "error-banner");
+
+        // A verification failure is HARD even though it is a failure of a fetched
+        // record: retrying will not make it verify.
+        let verify_fail = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("IPNS record did not verify: bad signature".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(error_banner_css_class(&verify_fail), "error-banner");
+        assert!(!error_banner_text(&verify_fail)
+            .to_lowercase()
+            .contains("retry"));
     }
 
     #[test]

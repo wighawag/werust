@@ -228,6 +228,13 @@ class BrowserActivity : Activity() {
         // otherwise. The SAME rule desktop applies, from the same chrome fact.
         if (chrome.errorBannerVisible()) {
             errorBanner.text = chrome.errorBanner()
+            // A TRANSIENT/timeout failure (retryable) is a softer amber banner; a
+            // hard failure is the prominent red one (task
+            // `clearer-loading-and-error-indicator`). The SAME distinction desktop
+            // shows, from the core's `retryable` fact.
+            errorBanner.setBackgroundColor(
+                if (chrome.errorIsRetryable()) 0xFFB5820A.toInt() else 0xFFC01C28.toInt()
+            )
             errorBanner.visibility = View.VISIBLE
         } else {
             errorBanner.visibility = View.GONE

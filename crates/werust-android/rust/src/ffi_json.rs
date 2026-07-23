@@ -13,23 +13,34 @@ use werust_core::ChromeState;
 /// Encode a [`ChromeState`] as a compact JSON object for the Kotlin edge.
 ///
 /// The shape (stable, asserted by the tests):
-/// `{"url":..,"loadState":..,"loading":bool,"canGoBack":bool,"canGoForward":bool,"trustPosture":..,"error":..}`.
+/// `{"url":..,"loadState":..,"loading":bool,"loadStep":..,"canGoBack":bool,"canGoForward":bool,"trustPosture":..,"error":..,"failureKind":..,"retryable":bool}`.
 /// `error` is `null` when nothing has failed. `trustPosture` carries the current
 /// load's [`TrustPosture`] so the Kotlin chrome can paint the trust indicator
-/// from the core's truth (the actual load path), matching desktop.
+/// from the core's truth (the actual load path), matching desktop. `loadStep`
+/// carries the live pipeline step (name/record/content/render) so the mobile
+/// chrome shows real loading progress, and `failureKind`/`retryable` carry the
+/// transient-vs-hard distinction so a timeout is shown as retryable (task
+/// `clearer-loading-and-error-indicator`). `failureKind` is `null` when nothing
+/// has failed.
 pub fn chrome_to_json(state: &ChromeState) -> String {
     let error = match &state.last_error {
         Some(reason) => format!("\"{}\"", escape(reason)),
         None => "null".to_string(),
     };
+    let failure_kind = match state.failure_kind() {
+        Some(kind) => format!("\"{}\"", kind.wire_name()),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"canGoBack\":{back},\"canGoForward\":{forward},\"trustPosture\":\"{trust}\",\"error\":{error}}}",
+        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"loadStep\":\"{load_step}\",\"canGoBack\":{back},\"canGoForward\":{forward},\"trustPosture\":\"{trust}\",\"error\":{error},\"failureKind\":{failure_kind},\"retryable\":{retryable}}}",
         url = escape(&state.url_text),
         load_state = load_state_name(state.load_state),
         loading = state.is_loading(),
+        load_step = state.load_step().wire_name(),
         back = state.can_go_back,
         forward = state.can_go_forward,
         trust = trust_posture_name(state.trust_posture),
+        retryable = state.failure_is_retryable(),
     )
 }
 
@@ -85,8 +96,58 @@ mod tests {
         let json = chrome_to_json(&ChromeState::default());
         assert_eq!(
             json,
-            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"canGoBack\":false,\"canGoForward\":false,\"trustPosture\":\"unverified-origin\",\"error\":null}"
+            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"loadStep\":\"idle\",\"canGoBack\":false,\"canGoForward\":false,\"trustPosture\":\"unverified-origin\",\"error\":null,\"failureKind\":null,\"retryable\":false}"
         );
+    }
+
+    #[test]
+    fn encodes_the_live_pipeline_step_so_the_mobile_chrome_shows_progress() {
+        // The chrome JSON carries the live pipeline step so the mobile edge shows
+        // real loading progress (name/record/content/render), matching desktop.
+        use renderer::LoadState;
+        use werust_core::LoadStep;
+        for (step, wire) in [
+            (LoadStep::ResolvingName, "resolving-name"),
+            (LoadStep::FetchingRecord, "fetching-record"),
+            (LoadStep::FetchingContent, "fetching-content"),
+            (LoadStep::Rendering, "rendering"),
+        ] {
+            let state = ChromeState {
+                load_state: LoadState::Started,
+                load_step: step,
+                ..ChromeState::default()
+            };
+            let json = chrome_to_json(&state);
+            assert!(
+                json.contains(&format!("\"loadStep\":\"{wire}\"")),
+                "step {step:?} must serialize as {wire}: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn encodes_the_transient_vs_hard_failure_distinction_so_a_timeout_is_retryable() {
+        // The chrome JSON carries the transient-vs-hard distinction so the mobile
+        // edge can show a retry affordance for a timeout and keep the protocol-
+        // named reason for a hard fail (task `clearer-loading-and-error-indicator`).
+        use renderer::LoadState;
+        let transient = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("transport error: timeout: global".into()),
+            ..ChromeState::default()
+        };
+        let json = chrome_to_json(&transient);
+        assert!(json.contains("\"failureKind\":\"transient\""), "{json}");
+        assert!(json.contains("\"retryable\":true"), "{json}");
+
+        let hard = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        let json = chrome_to_json(&hard);
+        assert!(json.contains("\"failureKind\":\"hard\""), "{json}");
+        assert!(json.contains("\"retryable\":false"), "{json}");
     }
 
     #[test]

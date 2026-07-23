@@ -255,6 +255,13 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // otherwise. The SAME rule desktop/Android apply, from the same chrome fact.
         errorBanner.isHidden = !chrome.errorBannerVisible()
         errorBanner.text = chrome.errorBanner()
+        // A TRANSIENT/timeout failure (retryable) is a softer amber banner; a hard
+        // failure is the prominent red one (task
+        // `clearer-loading-and-error-indicator`). The SAME distinction desktop
+        // shows, from the core's `retryable` fact.
+        errorBanner.backgroundColor = chrome.errorIsRetryable()
+            ? UIColor(red: 0.71, green: 0.51, blue: 0.04, alpha: 1.0)
+            : UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------

@@ -212,3 +212,36 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "loading-progress"
+description = "Surface a LIVE loading-progress indicator tied to the real resolution/fetch pipeline step (resolving name -> fetching record -> fetching content -> rendering), driven by actual lifecycle events, so a slow/partial load reads as 'working' rather than frozen, on every platform."
+# The step is the core's `ChromeState::load_step` (`werust-core`), driven by the
+# ACTUAL lifecycle: the ENS/IPNS resolution stages in `BrowserShell::navigate_ens_name`
+# then the backend's Started/Committed load state (`refresh_chrome`). Every edge
+# names the SAME step from the SAME fact: desktop `status_line` in
+# crates/werust/src/main.rs ("loading… — <step>"), and the mobile
+# `Chrome.statusLine()` reading the chrome JSON `loadStep` field (Kotlin
+# WerustCore.kt, Swift WerustCore.swift), exactly as the trust indicator reads the
+# shared `loading`/`trustPosture` facts. Loading stays ORTHOGONAL to the trust
+# posture. Task clearer-loading-and-error-indicator.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "retryable-error-distinction"
+description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an obvious retry affordance — the Reload button, which re-resolves a failed ENS name) from a HARD failure (unsupported protocol / verification / malformed, which keeps its prominent protocol-named reason), on every platform."
+# The distinction is the core's `ChromeState::failure_kind` / `failure_is_retryable`
+# (`werust-core`), a PURE classification of the honest `last_error` reason (a
+# timeout/transport reason is transient; unsupported/verification/malformed is
+# hard) — the hard reason is kept verbatim, never re-meaned, so `prominent-load-failure`
+# is preserved. Every edge shows the SAME distinction from the SAME fact: desktop
+# `error_banner_text` / `error_banner_css_class` in crates/werust/src/main.rs (a
+# softer amber "timed out — reload to retry" vs the red "failed to load"), and the
+# mobile `Chrome.errorBanner()` / `errorIsRetryable()` reading the chrome JSON
+# `retryable` field (Kotlin WerustCore.kt, Swift WerustCore.swift). Error stays
+# ORTHOGONAL to the trust posture. Task clearer-loading-and-error-indicator.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

@@ -22,6 +22,8 @@
 //! forward-pointer in the task), so this module wires navigation + chrome and
 //! leaves raw input to the embedded widget.
 
+use std::collections::HashMap;
+
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
 use fetcher::{HttpFetcher, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT};
@@ -194,7 +196,46 @@ pub struct BrowserShell {
     /// then follows the backend's URL, including redirects/history moves), and is
     /// cleared by any navigation that is not the ENS front door (a plain
     /// navigate/back/forward/reload), so the name never lingers on a later page.
+    ///
+    /// This pins the name during an ACTIVE front-door load (the initial Enter, a
+    /// reload re-resolve, or a failed resolution where there is no backend URL to
+    /// fall back to). Preserving the name across BACK/FORWARD onto an EXISTING
+    /// history entry is the job of [`ens_pages`](BrowserShell::ens_pages) instead
+    /// (the shell keeps no URL stack, so it re-derives the name from the entry's
+    /// underlying CID).
     url_override: Option<String>,
+    /// The association from a backend underlying URL (a resolved `ipfs://<cid>`)
+    /// to the ENS identity that produced it, so reload / back / forward onto an
+    /// ENS-originated entry can RE-DERIVE the `.eth` name + its trust posture
+    /// instead of leaking the raw CID.
+    ///
+    /// The shell keeps NO URL stack of its own (session history is the backend's,
+    /// via [`Renderer::go_back`]/[`go_forward`](Renderer::go_forward)), so this is
+    /// the minimal state that lets the shell recognise, when the backend's
+    /// `current_url` lands on a CID it once resolved from a name, that the entry is
+    /// ENS-originated: [`refresh_chrome`](BrowserShell::refresh_chrome) then shows
+    /// the `.eth` name in the bar and RE-MARKS the load's ENS posture axes
+    /// ([`Renderer::mark_ens_origin`] / [`mark_mutable_name`](Renderer::mark_mutable_name))
+    /// so the verified content path surfaces `NameViaTrustedRpc` / `MutableName`,
+    /// not the plain `ContentVerified` a bare CID would show. Populated by
+    /// [`load_resolved_content`](BrowserShell::load_resolved_content); a non-ENS
+    /// entry is never in the map, so a plain page is wholly unaffected.
+    ///
+    /// See `work/notes/observations/reload-re-resolves-ens-name-decision-2026-07-23.md`
+    /// for the reload (re-resolve) + history (re-derive) decision.
+    ens_pages: HashMap<String, EnsIdentity>,
+}
+
+/// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
+/// show in the bar, and whether the name is MUTABLE (an `ipns-ns` / repointable
+/// name), so the right posture axes can be re-marked on a reload / history move.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EnsIdentity {
+    /// The `.eth` name the user typed, kept in the URL bar in place of the CID.
+    name: String,
+    /// Whether the resolved name is MUTABLE (`ipns-ns`), so a history/reload load
+    /// re-marks the mutable axis too ([`Renderer::mark_mutable_name`]).
+    mutable: bool,
 }
 
 impl BrowserShell {
@@ -265,6 +306,7 @@ impl BrowserShell {
             provider,
             ipns_source,
             url_override: None,
+            ens_pages: HashMap::new(),
         };
         shell.refresh_chrome();
         shell
@@ -428,6 +470,20 @@ impl BrowserShell {
         if mutable {
             self.renderer.mark_mutable_name();
         }
+        // Remember the CID <-> name association so a later reload / back / forward
+        // that lands the backend on this same underlying `ipfs://<cid>` can
+        // re-derive the `.eth` name + re-mark the posture axes, instead of leaking
+        // the raw CID (`refresh_chrome`). Keyed on the exact underlying URL the
+        // backend now reports as `current_url`.
+        if let Some(current) = self.renderer.current_url() {
+            self.ens_pages.insert(
+                current,
+                EnsIdentity {
+                    name: name.to_string(),
+                    mutable,
+                },
+            );
+        }
         // Keep the front-door NAME the user typed in the bar (no `https://`
         // rewrite, no gateway redirect). The override PERSISTS across pumps so the
         // name stays put for the whole load.
@@ -475,13 +531,43 @@ impl BrowserShell {
 
     /// Reload the current page, through the seam.
     ///
-    /// A reload re-loads the backend's CURRENT underlying URL (for an ENS page,
-    /// the resolved `ipfs://<cid>`), so it drops any pinned ENS name from the bar
-    /// and follows the backend: Phase 1 does not re-resolve the name on reload
-    /// (the front-door resolution runs only on a fresh URL-bar Enter). The
-    /// reloaded content-addressed page is still hash-verified by the `ipfs://`
-    /// path, so it shows honestly as content-verified.
+    /// For an ENS-originated page (a bare `.eth` that resolved to a CID) reload
+    /// RE-RESOLVES the name through the front door
+    /// ([`navigate_ens_name`](BrowserShell::navigate_ens_name)) rather than
+    /// re-loading the cached CID: reload means "get the current version", so for a
+    /// MUTABLE name (`ipns-ns`, or a repointable ENS name) it catches a changed
+    /// pointer, and for an immutable `ipfs-ns` name it re-derives the same CID.
+    /// Either way the `.eth` name stays pinned in the bar and its ENS posture
+    /// (`NameViaTrustedRpc` / `MutableName`) is preserved — never the raw
+    /// `ipfs://<cid>` or the plain `ContentVerified` a bare CID would show. (The
+    /// re-resolve + history re-derive decision, and its history side-effect, are
+    /// recorded in
+    /// `work/notes/observations/reload-re-resolves-ens-name-decision-2026-07-23.md`.)
+    ///
+    /// A plain (non-ENS) page reloads the backend's current underlying URL as
+    /// before; the reloaded content-addressed page is still hash-verified by the
+    /// `ipfs://` path, so it shows honestly as content-verified.
     pub fn reload(&mut self) -> Result<(), RendererError> {
+        // If the current entry is an ENS-originated page, re-resolve its `.eth`
+        // name (the recorded reload decision) so a mutable name refreshes and the
+        // name + posture stay in the bar. The shell keeps no URL stack, so the
+        // current entry is recognised by its underlying CID via `ens_pages`.
+        let ens_name = self
+            .renderer
+            .current_url()
+            .and_then(|url| self.ens_pages.get(&url).map(|e| e.name.clone()))
+            // A FAILED ENS load never navigated the backend (no `current_url`), but
+            // still pinned the name in the bar; reloading it re-runs the resolution
+            // from that pinned name, so a transient failure is retryable.
+            .or_else(|| {
+                self.url_override
+                    .as_deref()
+                    .and_then(eth_name_from_entry)
+                    .map(str::to_string)
+            });
+        if let Some(name) = ens_name {
+            return self.navigate_ens_name(&name);
+        }
         self.renderer.reload()?;
         self.url_override = None;
         self.chrome.last_error = None;
@@ -567,19 +653,43 @@ impl BrowserShell {
         self.chrome.load_state = self.renderer.load_state();
         self.chrome.can_go_back = self.renderer.can_go_back();
         self.chrome.can_go_forward = self.renderer.can_go_forward();
+        // If the backend's current entry is an ENS-originated CID we resolved
+        // earlier (a reload / back / forward landed on it, so there is no active
+        // `url_override` pinning the name), RE-MARK the load's ENS posture axes on
+        // the seam. The backend reset the flags on the fresh Started, so without
+        // this the verified content path would surface a bare-CID `ContentVerified`
+        // instead of the entry's real `NameViaTrustedRpc` / `MutableName`. Marking
+        // is idempotent (a plain bool set on the lifecycle), so re-marking on every
+        // pump keeps the axes set for the whole (async) reloaded/history load.
+        let ens_entry = self
+            .renderer
+            .current_url()
+            .and_then(|url| self.ens_pages.get(&url).cloned());
+        if let Some(entry) = &ens_entry {
+            self.renderer.mark_ens_origin();
+            if entry.mutable {
+                self.renderer.mark_mutable_name();
+            }
+        }
         // The trust posture is the backend's truth about the current load path
         // (content-verified vs served), pulled fresh like the load state so the
         // indicator tracks the page actually shown — including after a scheme
         // handler verifies the bytes mid-load, which flips the posture without a
-        // queued LoadEvent.
+        // queued LoadEvent. (Read AFTER any re-mark above so a re-decorated ENS
+        // history entry surfaces its ENS posture, not the bare-CID one.)
         self.chrome.trust_posture = self.renderer.trust_posture();
         // A pinned ENS name (`url_override`) is the DISPLAY identity for the bar
         // and wins over the backend's underlying `current_url` (the resolved
         // `ipfs://<cid>`): the user keeps seeing `ronan.eth`, never the CID or a
-        // gateway URL. Otherwise the bar follows the backend's URL (redirects,
-        // history moves).
+        // gateway URL. Failing that, a reload / back / forward that landed on a
+        // known ENS-originated CID re-derives the `.eth` name from `ens_pages`
+        // (the shell keeps no URL stack, so the entry's name is re-derived from its
+        // CID). Otherwise the bar follows the backend's URL (redirects, history
+        // moves onto a plain, non-ENS entry).
         if let Some(name) = &self.url_override {
             self.chrome.url_text = name.clone();
+        } else if let Some(entry) = &ens_entry {
+            self.chrome.url_text = entry.name.clone();
         } else if let Some(url) = self.renderer.current_url() {
             self.chrome.url_text = url;
         }
@@ -1799,6 +1909,230 @@ mod tests {
         );
         settle(&mut shell, &handle);
         assert_eq!(shell.chrome().url_text, "https://fresh.example/");
+    }
+
+    // ---- Reload + history keep an ENS page's `.eth` name + posture ------------
+    // (task `preserve-ens-name-in-bar-on-reload-and-history`): reload/back/forward
+    // of an ENS-resolved page must keep the `.eth` name AND its ENS posture in the
+    // bar, never leaking the underlying `ipfs://<cid>`; a non-ENS page is
+    // unaffected. The reload decision is RE-RESOLVE for an ENS page (recorded in
+    // `work/notes/observations/reload-re-resolves-ens-name-decision-2026-07-23.md`).
+
+    #[test]
+    fn reloading_an_ens_page_re_resolves_and_keeps_the_name_and_posture_in_the_bar() {
+        // Acceptance: reloading an ENS-resolved page keeps the `.eth` name in the
+        // bar (not the `ipfs://<cid>`) and keeps its `NameViaTrustedRpc` posture.
+        // The reload RE-RESOLVES the name (the recorded decision), so the provider
+        // is fed a SECOND set of resolution answers for the reload.
+        let page = b"<!doctype html><title>ronan</title><h1>ronan.eth</h1>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        // TWO resolutions worth of answers: the first Enter, then the reload.
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // First Enter: resolves, loads the CID, pins the name, verifies.
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+
+        // Reload: the name is re-resolved (not the CID reloaded blindly), and the
+        // `.eth` name stays pinned in the bar while the re-resolved CID loads.
+        shell.reload().expect("reload the settled ENS page");
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "reload keeps the `.eth` name, never the ipfs://<cid>"
+        );
+        assert!(shell.chrome().is_loading(), "reload restarts the load");
+        // The re-resolution fed the (re-derived) CID into the verified path.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(ipfs_uri.as_str())
+        );
+
+        // The scheme handler verifies the reloaded bytes; the ENS posture is back.
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "the `.eth` name survives the whole reload load"
+        );
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "reload keeps the ENS trust posture, not plain ContentVerified"
+        );
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+        assert!(!shell.chrome().is_content_verified());
+        assert_eq!(shell.chrome().last_error, None);
+    }
+
+    #[test]
+    fn reloading_a_plain_ipfs_page_is_unaffected_and_never_grows_the_eth_name() {
+        // Acceptance: a plain `ipfs://` page reloads its real URL (the CID), never
+        // gaining an `.eth` name, and stays plain ContentVerified — the ENS name
+        // never leaks onto a non-ENS page on reload.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("ipfs://bafyplaincid/index.html").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyplaincid/index.html");
+
+        shell.reload().expect("reload the plain ipfs page");
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs://bafyplaincid/index.html",
+            "a plain ipfs page reloads its CID URL, never an `.eth` name"
+        );
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyplaincid/index.html");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::ContentVerified);
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn back_and_forward_onto_an_ens_page_show_the_name_and_posture_not_the_cid() {
+        // Acceptance: navigating back/forward onto an ENS-originated history entry
+        // shows the `.eth` name + its posture (re-derived from the CID<->name
+        // association), while a non-ENS entry shows its real URL as today.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // Entry 1: an ENS page (ronan.eth -> ipfs://<cid>), verified.
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+
+        // Entry 2: a plain served page (NOT served via the verified content path,
+        // so it stays the untrusted origin — the ENS posture must not leak here).
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://example.com/");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+
+        // Back onto the ENS entry: the bar shows the NAME, not the CID, and the
+        // ENS posture is re-applied (re-marked on the seam so the verified path
+        // surfaces it), not the plain content-verified the bare CID would show.
+        shell.go_back();
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "back onto an ENS entry shows the `.eth` name, not the ipfs://<cid>"
+        );
+        // The underlying entry is still the resolved CID.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(ipfs_uri.as_str())
+        );
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "back onto an ENS page keeps its posture, not a bare-CID ContentVerified"
+        );
+
+        // Forward onto the plain page: its real URL, no `.eth` name, no ENS posture
+        // (again NOT served via the verified content path).
+        shell.go_forward();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "https://example.com/",
+            "forward onto a non-ENS entry shows its real URL"
+        );
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn back_onto_a_mutable_ipns_ens_page_keeps_the_name_and_mutable_axis() {
+        // Acceptance: the mutable axis survives history too. Back onto an ENS page
+        // that resolved via a MUTABLE ipns-ns name re-derives the `.eth` name AND
+        // re-marks the mutable axis, so once the RPC warning is not the loudest the
+        // page is still honestly mutable (here ENS keeps NameViaTrustedRpc loudest,
+        // and the mutable flag is proven re-applied by a later plain page staying
+        // clean).
+        let key = IpnsKeyFixture::new();
+        let page = b"<!doctype html><title>ipns</title>";
+        let target_cid = cid_v1_raw_sha256(page).expect("derive the target cid");
+        let record = key.signed_record_for(&target_cid);
+        let (mut shell, handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ],
+            PinnedIpnsSource::with_record(&key.name, record),
+        );
+
+        // Entry 1: a mutable ENS page (ipns-ns), verified.
+        shell.navigate("mutable.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "mutable.eth");
+
+        // Entry 2: a plain served page.
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+
+        // Back onto the mutable ENS entry: name + posture re-derived.
+        shell.go_back();
+        assert_eq!(shell.chrome().url_text, "mutable.eth");
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "mutable.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn a_non_ens_history_stack_is_wholly_unaffected_by_the_ens_association() {
+        // Acceptance: with no ENS load in the mix, reload/back/forward behave
+        // exactly as before — the ENS association never touches a plain stack.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("https://a.example/").unwrap();
+        settle(&mut shell, &handle);
+        shell.navigate("https://b.example/").unwrap();
+        settle(&mut shell, &handle);
+
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://a.example/");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+
+        shell.go_forward();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://b.example/");
+
+        shell.reload().expect("reload a plain page");
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://b.example/");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
     }
 
     #[test]

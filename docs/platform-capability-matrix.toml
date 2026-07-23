@@ -92,10 +92,19 @@ description = "User-choosable IPFS retrieval backend: pick the default trustless
 # `werust` scheme through the SAME scheme-handler seam as `ipfs://`. So the
 # capability is wired on every context at the same level `ipfs-render` is:
 # desktop via `context.register_uri_scheme(WERUST_SCHEME, …)`, both mobile edges
-# via `register_scheme_handler(WERUST_SCHEME, …)` dispatched by the OS edge
-# (Android `shouldInterceptRequest`, iOS `WKURLSchemeHandler`) — the same
-# mechanism the (now `implemented`) mobile `ipfs://` interception uses. Task
-# `retrieval-backend-user-setting`.
+# via `register_scheme_handler(WERUST_SCHEME, …)` dispatched by the OS edge —
+# Android via `WebViewClient.shouldInterceptRequest` (its generic
+# `WerustCore.resolveIpfs` dispatches ANY registered scheme, so `werust://`
+# reaches the handler), iOS via an EXPLICIT `WKURLSchemeHandler` for `werust`
+# (`configuration.setURLSchemeHandler(WerustSchemeHandler…, forURLScheme:
+# "werust")` in WKWebViewShellController.swift, routing through the
+# `werust_ios_apply_settings` FFI into the shared core) — the same mechanism the
+# mobile `ipfs://` interception uses (which required its own explicit iOS
+# `setURLSchemeHandler(forURLScheme: "ipfs")`). WKWebView will not hand an
+# unregistered custom scheme to any handler, so this per-scheme iOS registration
+# is what makes `werust://settings` actually reachable there (the requeue's Gate-2
+# fix; before it the `werust` scheme was registered Rust-side but dead on iOS).
+# Task `retrieval-backend-user-setting`.
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }

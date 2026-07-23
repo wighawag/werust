@@ -158,6 +158,39 @@ impl CoreSession {
         })
     }
 
+    /// Serve (and apply) an intercepted `werust://settings[?backend=…]` request
+    /// through the SHARED core settings path, for Swift's `WKURLSchemeHandler`
+    /// for the `werust` scheme.
+    ///
+    /// A `WKWebView` will only load a custom scheme like `werust://` if a
+    /// `WKURLSchemeHandler` is registered for it, so Swift's handler calls this:
+    /// it routes `uri` through the `werust` scheme handler installed at
+    /// [`new`](CoreSession::new) (the SAME
+    /// [`apply_settings_request`](werust_core::retrieval::apply_settings_request)
+    /// path desktop and Android use), which renders the retrieval-backend settings
+    /// page and PERSISTS a `?backend=…` selection. It returns the page HTML +
+    /// MIME type, or the fail-closed reason (a non-`settings` host). Returns `None`
+    /// if `uri` is not the registered `werust` scheme (Swift then lets the
+    /// `WKWebView` handle it normally).
+    ///
+    /// This is the twin of [`resolve_ipfs`](CoreSession::resolve_ipfs): both go
+    /// through the same generic [`IosHandle::resolve_scheme`] dispatch, but they
+    /// are kept as DISTINCT edge methods so the Swift shell registers a
+    /// `WKURLSchemeHandler` per scheme (`ipfs` and `werust`) and each is honestly
+    /// named for what it serves — the requeue's Gate-2 fix (the `werust` scheme
+    /// was dead on iOS because no Swift handler dispatched it).
+    pub fn apply_settings(&self, uri: &str) -> Option<SchemeResolution> {
+        self.backend.resolve_scheme(uri).map(|result| match result {
+            Ok(response) => SchemeResolution::Ok {
+                mime_type: response.mime_type,
+                body: response.body,
+            },
+            Err(e) => SchemeResolution::Err {
+                reason: e.to_string(),
+            },
+        })
+    }
+
     /// Report the platform `WKWebView`'s commit signal into the core, then fold
     /// the resulting lifecycle events into the chrome.
     pub fn on_page_committed(&mut self, url: &str) {
@@ -412,6 +445,34 @@ mod ffi {
     ) -> *mut super::SchemeResolution {
         let uri = read(uri);
         match session_mut(session).and_then(|s| s.resolve_ipfs(&uri)) {
+            Some(resolution) => Box::into_raw(Box::new(resolution)),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Serve (and apply) an intercepted `werust://settings[?backend=…]` request
+    /// through the shared core settings path, for Swift's `WKURLSchemeHandler` for
+    /// the `werust` scheme.
+    ///
+    /// Returns an opaque handle to a boxed [`SchemeResolution`](super::SchemeResolution)
+    /// Swift queries via the SAME `werust_ios_resolution_*` accessors the ipfs
+    /// path uses (`_is_ok` / `_mime` / `_body` + `_body_len` / `_error`) and frees
+    /// with `werust_ios_resolution_free`. A NULL return means the URI was not the
+    /// `werust` scheme (Swift lets the `WKWebView` handle it normally). This is the
+    /// requeue's Gate-2 iOS fix: the export the Swift `werust` scheme handler calls
+    /// so `werust://settings` is actually reachable on iOS (the `werust` scheme was
+    /// registered on the Rust side but had no Swift `WKURLSchemeHandler` to
+    /// dispatch it, so the page was dead).
+    ///
+    /// # Safety
+    /// `session` is a live handle; `uri` is a valid NUL-terminated C string.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_apply_settings(
+        session: *mut CoreSession,
+        uri: *const c_char,
+    ) -> *mut super::SchemeResolution {
+        let uri = read(uri);
+        match session_mut(session).and_then(|s| s.apply_settings(&uri)) {
             Some(resolution) => Box::into_raw(Box::new(resolution)),
             None => std::ptr::null_mut(),
         }
@@ -713,6 +774,43 @@ mod tests {
     }
 
     #[test]
+    fn the_werust_settings_scheme_reaches_the_shared_core_settings_page() {
+        // The requeue's Gate-2 gap, closed on the Rust side: `werust://settings`
+        // must be a REGISTERED scheme the Swift `WKURLSchemeHandler` for `werust`
+        // routes into the SHARED `apply_settings_request` core path (the same page
+        // desktop + Android serve). Here we prove the scheme is intercepted (not
+        // `None`) and reaches the core, which renders the retrieval-backend
+        // settings page. Network-isolated: the settings page is pure HTML built in
+        // `werust-core`, no fetch.
+        let s = CoreSession::new();
+        let resolution = s
+            .apply_settings("werust://settings")
+            .expect("the werust scheme is intercepted and routed to the core");
+        match resolution {
+            SchemeResolution::Ok { mime_type, body } => {
+                assert_eq!(mime_type, "text/html");
+                let html = String::from_utf8(body).expect("the page is UTF-8 HTML");
+                assert!(
+                    html.contains("IPFS retrieval backend"),
+                    "the settings page is served: {html}"
+                );
+            }
+            SchemeResolution::Err { reason } => {
+                panic!("werust://settings must render the settings page, got: {reason}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_non_werust_url_is_not_intercepted_by_apply_settings() {
+        // A plain `https://` URL is NOT the `werust` scheme, so `apply_settings`
+        // returns `None` and the edge lets the WKWebView handle it (parity with
+        // the ipfs handler's non-interception).
+        let s = CoreSession::new();
+        assert!(s.apply_settings("https://example.com/").is_none());
+    }
+
+    #[test]
     fn chrome_json_carries_every_field_the_swift_edge_paints() {
         // The JSON is the wire form Swift reads across the C-ABI; it must carry the
         // URL bar text, nav-control enablement, load state, and any failure so the
@@ -830,6 +928,59 @@ mod tests {
             assert!(!werust_ios_resolution_is_ok(std::ptr::null()));
             assert_eq!(werust_ios_resolution_body_len(std::ptr::null()), 0);
             werust_ios_resolution_free(std::ptr::null_mut());
+        }
+    }
+
+    /// Drive the `werust://settings` resolution across the raw C-ABI exports
+    /// exactly as the Swift `WKURLSchemeHandler` for `werust` does: intercept the
+    /// scheme, read the served settings page (verified-free: it is a pure-HTML
+    /// internal page, so this is network-isolated), and free the resolution +
+    /// strings. Also proves a non-`werust` URL is not intercepted (NULL handle)
+    /// and null handles are tolerated. This is the FFI half of the requeue's
+    /// Gate-2 iOS fix — the exact export the Swift edge calls.
+    #[test]
+    fn the_c_abi_applies_settings_through_the_core_and_frees_its_handle() {
+        use super::ffi::*;
+        use std::ffi::{CStr, CString};
+
+        unsafe {
+            let s = werust_ios_session_new();
+
+            // A non-werust URL is not an intercepted scheme: NULL handle.
+            let https = CString::new("https://example.com/").unwrap();
+            assert!(werust_ios_apply_settings(s, https.as_ptr()).is_null());
+
+            // A `werust://settings` URL IS intercepted and routed to the shared
+            // core path; it renders the retrieval-backend settings page.
+            let werust = CString::new("werust://settings").unwrap();
+            let res = werust_ios_apply_settings(s, werust.as_ptr());
+            assert!(!res.is_null(), "the werust scheme is intercepted");
+            assert!(
+                werust_ios_resolution_is_ok(res),
+                "the settings page renders (not a fail-closed error)"
+            );
+
+            let mime_ptr = werust_ios_resolution_mime(res);
+            assert!(!mime_ptr.is_null());
+            let mime = CStr::from_ptr(mime_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(mime_ptr);
+            assert_eq!(mime, "text/html");
+
+            let body_ptr = werust_ios_resolution_body(res);
+            let body_len = werust_ios_resolution_body_len(res);
+            assert!(!body_ptr.is_null() && body_len > 0, "the page has bytes");
+            let body = std::slice::from_raw_parts(body_ptr, body_len);
+            let html = std::str::from_utf8(body).unwrap();
+            assert!(
+                html.contains("IPFS retrieval backend"),
+                "the settings page is served: {html}"
+            );
+
+            werust_ios_resolution_free(res);
+            werust_ios_session_free(s);
+
+            // Null handles are tolerated.
+            assert!(werust_ios_apply_settings(std::ptr::null_mut(), werust.as_ptr()).is_null());
         }
     }
 }

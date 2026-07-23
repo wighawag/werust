@@ -74,6 +74,19 @@ char *werust_ios_take_pending_load(WerustCoreSession *session);
 WerustSchemeResolution *werust_ios_resolve_ipfs(WerustCoreSession *session,
                                                 const char *uri);
 
+/* Serve (and apply) an intercepted `werust://settings[?backend=...]` request
+ * through the SHARED core settings path (the same retrieval-backend settings page
+ * desktop + Android serve). The WKWebView loads `werust://` only via a
+ * WKURLSchemeHandler, so Swift's handler for the `werust` scheme calls this with
+ * the intercepted URL and answers the WKURLSchemeTask from the result: the page
+ * HTML + MIME on success, a fail-closed error (a non-`settings` host) whose reason
+ * is werust_ios_resolution_error. A `?backend=<kind>[&url=...]` selection is
+ * persisted by the shared core. Returns an opaque resolution handle (queried via
+ * the same _resolution_* accessors as the ipfs path, freed with
+ * werust_ios_resolution_free), or NULL if the URL is not the `werust` scheme. */
+WerustSchemeResolution *werust_ios_apply_settings(WerustCoreSession *session,
+                                                  const char *uri);
+
 /* True iff the resolution is a verified success (bytes to render); false is a
  * fail-closed error (a hash mismatch / unverifiable CID / source error) whose
  * reason is werust_ios_resolution_error — fail the WKURLSchemeTask, never render. */

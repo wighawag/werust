@@ -105,6 +105,18 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md.
         let configuration = WKWebViewConfiguration()
         configuration.setURLSchemeHandler(IpfsSchemeHandler(core: core), forURLScheme: "ipfs")
+        // Register the internal `werust` custom-scheme handler on the SAME
+        // configuration, the twin of the `ipfs` registration above. WKWebView will
+        // NOT hand an unregistered custom scheme to any handler, so without this
+        // `werust://settings` is unreachable on iOS even though the Rust core
+        // registers the `werust` scheme handler (the requeue's Gate-2 fix). This is
+        // the SAME mechanism the mobile `ipfs://` interception uses: a
+        // WKURLSchemeHandler routes each intercepted request through the SHARED
+        // werust-core path (here `apply_settings_request`), so the
+        // retrieval-backend selector page renders and a `?backend=...` selection is
+        // persisted — at parity with desktop (WebKitGTK `register_uri_scheme`) and
+        // Android (`shouldInterceptRequest`).
+        configuration.setURLSchemeHandler(WerustSchemeHandler(core: core), forURLScheme: "werust")
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -252,6 +264,60 @@ final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
             // Not an intercepted scheme (should not happen for the ipfs handler).
             urlSchemeTask.didFailWithError(
                 NSError(domain: "werust.ipfs", code: -2, userInfo: nil))
+        }
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
+        // The core resolution is synchronous; nothing to cancel.
+    }
+}
+
+/// The `WKURLSchemeHandler` for `werust://`: the iOS edge that serves werust's
+/// internal pages (today the `werust://settings` retrieval-backend selector) the
+/// `WKWebView` cannot load itself, from the SHARED `werust-core` settings path
+/// (the same page desktop's WebKitGTK `register_uri_scheme` and Android's
+/// `shouldInterceptRequest` serve). A rendered page is served as a `URLResponse` +
+/// data on the task; a non-`settings` host fails the task with a legible reason.
+/// A `werust://settings?backend=<kind>[&url=...]` selection is applied + persisted
+/// by the shared core, so choosing a retrieval backend on iOS switches the actual
+/// `ipfs://` load path (on the next session) exactly as on the other platforms.
+///
+/// This is the requeue's Gate-2 fix: the `werust` scheme was registered on the
+/// Rust side but had NO Swift `WKURLSchemeHandler` to dispatch it, so
+/// `werust://settings` was dead on iOS. It mirrors [IpfsSchemeHandler] so the two
+/// schemes reach the core the same way.
+final class WerustSchemeHandler: NSObject, WKURLSchemeHandler {
+    private let core: WerustCore
+
+    init(core: WerustCore) {
+        self.core = core
+    }
+
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        guard let url = urlSchemeTask.request.url else {
+            urlSchemeTask.didFailWithError(
+                NSError(domain: "werust.settings", code: -1, userInfo: nil))
+            return
+        }
+        switch core.applySettings(url.absoluteString) {
+        case .some(.success(let mimeType, let body)):
+            let response = URLResponse(
+                url: url, mimeType: mimeType,
+                expectedContentLength: body.count, textEncodingName: "utf-8")
+            urlSchemeTask.didReceive(response)
+            urlSchemeTask.didReceive(body)
+            urlSchemeTask.didFinish()
+        case .some(.failure(let reason)):
+            // Fail closed on a bad internal URL (a non-`settings` host); surface the
+            // honest reason rather than rendering nothing silently.
+            urlSchemeTask.didFailWithError(
+                NSError(
+                    domain: "werust.settings", code: -1,
+                    userInfo: [NSLocalizedDescriptionKey: reason]))
+        case nil:
+            // Not the `werust` scheme (should not happen for this handler).
+            urlSchemeTask.didFailWithError(
+                NSError(domain: "werust.settings", code: -2, userInfo: nil))
         }
     }
 

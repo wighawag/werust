@@ -93,11 +93,59 @@ final class WerustCore {
         }
     }
 
+    /// Serve (and apply) an intercepted `werust://settings[?backend=...]` request
+    /// through the SHARED `werust-core` settings path (the same retrieval-backend
+    /// settings page desktop + Android serve), for the `werust` scheme's
+    /// `WKURLSchemeHandler`.
+    ///
+    /// A `WKWebView` loads a custom scheme like `werust://` only via a registered
+    /// `WKURLSchemeHandler`, so the shell's handler for `werust` calls this and
+    /// answers the `WKURLSchemeTask` from the result: the page HTML + `text/html`
+    /// on success, a fail-closed `.failure(reason)` (a non-`settings` host) on
+    /// failure, or `nil` if the URL is not the `werust` scheme. A
+    /// `?backend=<kind>[&url=...]` selection is validated + persisted by the shared
+    /// core (the same isolated settings file the desktop chrome writes). The native
+    /// resolution handle is queried and freed here.
+    ///
+    /// This is the twin of [resolveIpfs]; it exists as a distinct method so the
+    /// shell registers a `WKURLSchemeHandler` per scheme and each is honestly named
+    /// for what it serves (the requeue's Gate-2 fix: the `werust` scheme was
+    /// unreachable on iOS with no Swift handler dispatching it).
+    func applySettings(_ uri: String) -> Resolution? {
+        guard let res = uri.withCString({ werust_ios_apply_settings(handle, $0) }) else {
+            return nil
+        }
+        defer { werust_ios_resolution_free(res) }
+        if werust_ios_resolution_is_ok(res) {
+            let mime = werust_ios_resolution_mime(res).map { c -> String in
+                defer { werust_ios_string_free(c) }
+                return String(cString: c)
+            } ?? ""
+            let ptr = werust_ios_resolution_body(res)
+            let len = werust_ios_resolution_body_len(res)
+            let body: Data
+            if let ptr = ptr, len > 0 {
+                body = Data(bytes: ptr, count: len)
+            } else {
+                body = Data()
+            }
+            return .success(mimeType: mime, body: body)
+        } else {
+            let reason = werust_ios_resolution_error(res).map { c -> String in
+                defer { werust_ios_string_free(c) }
+                return String(cString: c)
+            } ?? "settings request failed"
+            return .failure(reason: reason)
+        }
+    }
+
     /// The outcome of resolving an intercepted `ipfs://` request through the core:
     /// verified bytes + MIME type, or a fail-closed reason. Mirrors the Rust
     /// `SchemeResolution`; the `WKURLSchemeHandler` turns `.success` into a
     /// `URLResponse` + data on the task and `.failure` into `didFailWithError`,
-    /// so the desktop fail-closed posture holds on iOS.
+    /// so the desktop fail-closed posture holds on iOS. Also serves the internal
+    /// `werust://settings` page (via [applySettings]): the `.success` bytes are the
+    /// page HTML, the `.failure` reason a fail-closed host error.
     enum Resolution {
         case success(mimeType: String, body: Data)
         case failure(reason: String)

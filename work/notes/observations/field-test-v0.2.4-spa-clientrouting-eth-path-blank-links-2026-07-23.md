@@ -45,3 +45,25 @@ Fix direction: this is a DIAGNOSE task (`diagnosing-bugs`), and `../ronan-eth` i
 ## Cross-cutting note
 
 Findings A + B + D share the SPA/SvelteKit-over-ipfs:// reality: werust's model assumed navigation = a backend page load, but a modern static site does most navigation client-side. The url-tracking (A), the .eth/path entry (B), and the data-fetch-over-ipfs (D) all need werust to handle same-document/client-driven navigation and nested static-site data. A ronan-eth regression fixture would guard the whole cluster.
+
+## ADDENDUM (human clarifications, same session) — two corrections that sharpen the split
+
+### A is really SPA-only; the "external link keeps the name" symptom is actually finding C (`_blank` dropped)
+
+The human noted A "also happened on external url which should have triggered LoadEvent". Investigated: on `ronan.eth`, EVERY external link (portfolio cards, footer, blog medium links) is `target="_blank"` (confirmed in `../ronan-eth/web/src`: `+page.svelte`, `PortfolioCard.svelte`, `Footer.svelte`, `blog/[slug]/+page.svelte`, and in the built html). A `_blank` link is DROPPED (finding C: no `create`/`onCreateWindow`/`WKUIDelegate` handler), so NO navigation happens and the bar naturally stays on the name - it only LOOKS like a URL-tracking failure. So:
+- The external-link "frozen bar" is finding C. Once C makes `_blank` navigate IN-PLACE, it fires a real `load-changed`/`LoadEvent`, and the existing `urlbar-tracks-in-page-navigation` drop-pin/follow logic updates the bar correctly. C fixes the external case.
+- Finding A (genuine URL-bar-frozen-with-no-event) is the INTERNAL SvelteKit SPA nav (blog/portfolio buttons = client-side routing, no load-changed). A fixes the internal case.
+So A does NOT need special external-URL handling; C covers external, A covers internal-SPA. They are complementary, not overlapping.
+
+### The `ipfs://` STILL leaks into the bar on back/forward/reload - task-2's fix has a real hole (ens_pages is root-only)
+
+The human got `ipfs://` back in the bar via history nav without ever typing it - the `ens-history-name-rederive-async-and-normalized` fix (v0.2.4) is INCOMPLETE. ROOT CAUSE (confirmed in code): `ens_pages` is populated ONLY in `load_resolved_content` (a fresh ENS front-door load), keyed on the RESOLVED ROOT's normalized key (`normalize_ens_page_key(current_url)` = the bare `<cid>`). But after loading `ronan.eth` the user navigates IN-PAGE (SPA, or a real sub-path load) to `<cid>/blog/...`; a later back/forward/reload can land `current_url` on that SUB-PATH CID (`<cid>/blog`), whose normalized key is DIFFERENT from the stored root `<cid>` key (the normalizer PRESERVES sub-paths). So `refresh_chrome`'s `ens_pages.get(normalize(current_url))` MISSES, and the final `else if let Some(url) = current_url` branch leaks `ipfs://<cid>/blog/` into the bar. task-2 only ever remembered the ROOT entry, so any history return onto a sub-path of the same ENS site leaks the CID.
+
+Fix direction: associate the ENS name with the WHOLE SITE (the root CID), not just the root entry, so ANY `<rootcid>/<anypath>` history entry re-derives the name (displaying `ronan.eth/<path>`, or at least `ronan.eth`), never the raw `ipfs://<rootcid>/<path>`. i.e. `ens_pages` should be keyed/looked-up on the ROOT CID PREFIX of the current entry, not its exact normalized path key. This is the SAME identity-tracking machinery as finding A (track the current URL) and finding B (.eth/<path>), so they should be built COHERENTLY: the shell needs to know, for the current backend URL, "is this URL under a known ENS site's root CID, and if so what is the name + the in-site path" - then the bar shows `name[/path]` and the posture re-marks, for reload/back/forward AND SPA nav AND a typed `.eth/<path>`. Fold this root-CID-prefix association fix into finding A's task (URL tracking) since they share the mechanism, OR make it an explicit prerequisite; do NOT leave it as the root-only `ens_pages` that leaks.
+
+### Consequence for the task plan
+
+The four tasks stay, but with these couplings pinned:
+- C (`_blank` in-place) also RESOLVES the external-link frozen-bar symptom (fires a real event -> existing follow logic works).
+- A (SPA url-tracking) MUST also fix the root-CID-prefix association so `ens_pages` re-derives the name for ANY sub-path of a known ENS site (fixing the `ipfs://`-reappears leak), not just the exact root entry. A's scope grows to "track the current URL (incl. SPA) AND recognise it as under a known ENS root CID -> show name[/path] + posture; never leak the raw ipfs://".
+- B (.eth/<path>) feeds a path in at entry time and must store the association so it composes with A's root-CID-prefix lookup.

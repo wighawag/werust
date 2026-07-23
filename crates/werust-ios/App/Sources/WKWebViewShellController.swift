@@ -32,6 +32,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private let stopButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let trustLabel = UILabel()
+    /// The small "invalid URL" badge next to the URL bar, shown ONLY when the last
+    /// entry was INVALID (a scheme-less garbage entry that did not navigate). Paired
+    /// with the URL-bar text rendered invalid (red underline), it surfaces the
+    /// distinct invalid-URL state while KEEPING the typed text for the user to fix
+    /// (field finding D) — orthogonal to the trust indicator and the error banner.
+    private let invalidBadge = UILabel()
     /// The PROMINENT in-view error banner: a high-contrast bar under the toolbar,
     /// shown ONLY on a failed load, carrying the accurate protocol-named reason so
     /// the user cannot miss why nothing rendered (the fail-closed honesty fix —
@@ -87,8 +93,15 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        invalidBadge.text = "⛔ invalid URL"
+        invalidBadge.font = .systemFont(ofSize: 13)
+        invalidBadge.textColor = UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
+        invalidBadge.setContentHuggingPriority(.required, for: .horizontal)
+        invalidBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
+        invalidBadge.isHidden = true
+
         let toolbar = UIStackView(arrangedSubviews: [
-            backButton, forwardButton, reloadButton, stopButton, urlField,
+            backButton, forwardButton, reloadButton, stopButton, urlField, invalidBadge,
         ])
         toolbar.axis = .horizontal
         toolbar.spacing = 8
@@ -241,6 +254,30 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private func refreshChrome() {
         let chrome = core.chrome()
         if !urlField.isEditing, urlField.text != chrome.url { urlField.text = chrome.url }
+        // The INVALID-URL surface (field finding D): when the last entry was
+        // invalid (a scheme-less garbage entry that did not navigate) show the small
+        // badge and render the URL-bar text as invalid (red underline), keeping the
+        // typed text for the user to fix. Toggled from the orthogonal `invalidEntry`
+        // fact — distinct from the trust indicator and the load-error banner. The
+        // SAME rule desktop/Android apply, from the same chrome fact.
+        invalidBadge.isHidden = !chrome.invalidEntryVisible()
+        if chrome.invalidEntryVisible() {
+            urlField.textColor = UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
+            if let text = urlField.text {
+                urlField.attributedText = NSAttributedString(
+                    string: text,
+                    attributes: [
+                        .underlineStyle: NSUnderlineStyle.single.rawValue,
+                        .underlineColor: UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0),
+                        .foregroundColor: UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0),
+                    ])
+            }
+        } else {
+            urlField.textColor = .label
+            if let text = urlField.text {
+                urlField.attributedText = NSAttributedString(string: text)
+            }
+        }
         backButton.isEnabled = chrome.canGoBack
         forwardButton.isEnabled = chrome.canGoForward
         stopButton.isEnabled = chrome.loading
@@ -270,21 +307,23 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     @objc private func onReload() { core.reload(); afterCoreAction() }
     @objc private func onStop() { core.stop(); afterCoreAction() }
 
-    // URL field submit: normalise a bare host into an https URL, then navigate
-    // THROUGH the core (which validates + starts the load behind the seam).
+    // URL field submit: pass the RAW typed text straight to the core, which is
+    // the SINGLE front door that routes it (bare `.eth` -> ENS; a scheme-less
+    // valid host -> `https://` prepend; an explicit scheme -> literal; garbage ->
+    // the invalid-URL badge, keeping the typed text). The edge must NOT prepend a
+    // scheme itself: doing so pre-empted the core's classifier and turned a
+    // garbage entry into a doomed `https://garbage` LOAD instead of the honest
+    // invalid-URL state (task
+    // `scheme-less-entry-https-fallback-and-keep-bar-on-error`). The one shared
+    // rule lives in `werust-core`, matching desktop + Android, which also pass the
+    // raw text.
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
         textField.resignFirstResponder()
         if let raw = textField.text, !raw.isEmpty {
-            core.navigate(Self.normalizeURL(raw))
+            core.navigate(raw)
             afterCoreAction()
         }
         return true
-    }
-
-    static func normalizeURL(_ raw: String) -> String {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.contains("://") { return trimmed }
-        return "https://" + trimmed
     }
 
     // --- WKNavigationDelegate -> Rust core ------------------------------------

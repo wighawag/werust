@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
+import android.graphics.Paint
 import android.os.Bundle
 import android.util.TypedValue
 import android.view.Gravity
@@ -49,7 +50,16 @@ class BrowserActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var trust: TextView
     private lateinit var errorBanner: TextView
+    private lateinit var invalidBadge: TextView
     private lateinit var webView: WebView
+
+    /**
+     * The URL bar's DEFAULT text colour, captured once at creation so the
+     * invalid-entry red can be reverted to it (rather than hard-coding a colour
+     * that would fight the OS light/dark theme). Restored whenever the entry is
+     * valid again.
+     */
+    private var defaultUrlBarColor: Int = 0
 
     /**
      * The EIP-1193 provider bridge preamble + the `werust-core` provider shim,
@@ -90,11 +100,28 @@ class BrowserActivity : Activity() {
             }
         }
 
+        // The small "invalid URL" badge sits in the toolbar next to the URL bar,
+        // shown ONLY when the last entry was invalid (field finding D). Starts
+        // hidden; when shown it pairs with the URL bar's text rendered invalid (a
+        // red underline). The SAME surface desktop shows, from the same chrome fact.
+        invalidBadge = TextView(this).apply {
+            text = "⛔ invalid URL"
+            setTextColor(0xFFC01C28.toInt())
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+        }
+
+        // Capture the URL bar's default text colour so the invalid-entry red can be
+        // reverted to it (keeping the OS light/dark theme's colour, not a hard-coded
+        // one).
+        defaultUrlBarColor = urlBar.currentTextColor
+
         toolbar.addView(backButton)
         toolbar.addView(forwardButton)
         toolbar.addView(reloadButton)
         toolbar.addView(stopButton)
         toolbar.addView(urlBar)
+        toolbar.addView(invalidBadge)
 
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
@@ -214,6 +241,22 @@ class BrowserActivity : Activity() {
     private fun refreshChrome() {
         val chrome = core.chrome()
         if (urlBar.text.toString() != chrome.url) urlBar.setText(chrome.url)
+        // The INVALID-URL surface (field finding D): when the last entry was
+        // invalid (a scheme-less garbage entry that did not navigate) show the small
+        // badge and render the URL-bar text as invalid (red underline), keeping the
+        // typed text for the user to fix. Toggled from the orthogonal `invalidEntry`
+        // fact — distinct from the trust indicator and the load-error banner. The
+        // SAME rule desktop applies, from the same chrome fact.
+        if (chrome.invalidEntryVisible()) {
+            invalidBadge.text = chrome.invalidEntryBadge()
+            invalidBadge.visibility = View.VISIBLE
+            urlBar.setTextColor(0xFFC01C28.toInt())
+            urlBar.paintFlags = urlBar.paintFlags or Paint.UNDERLINE_TEXT_FLAG
+        } else {
+            invalidBadge.visibility = View.GONE
+            urlBar.setTextColor(defaultUrlBarColor)
+            urlBar.paintFlags = urlBar.paintFlags and Paint.UNDERLINE_TEXT_FLAG.inv()
+        }
         backButton.isEnabled = chrome.canGoBack
         forwardButton.isEnabled = chrome.canGoForward
         stopButton.isEnabled = chrome.loading

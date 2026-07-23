@@ -112,9 +112,14 @@ impl CoreSession {
         }
     }
 
-    /// Navigate to `url` (the URL bar's Enter action), through the seam. Returns
-    /// `true` on success; an unusable URL is rejected and leaves the chrome
-    /// untouched (Kotlin keeps the bad text for the user to fix).
+    /// Navigate to `url` (the URL bar's Enter action), through the seam. The core
+    /// front door routes the RAW entry (Kotlin passes the typed text verbatim):
+    /// a bare `.eth` -> ENS; a scheme-less valid host -> `https://` prepend; an
+    /// explicit scheme -> literal; an INVALID entry -> the distinct invalid-URL
+    /// state (a badge + red-underlined bar, the typed text kept, no navigation).
+    /// Returns `true` when the front door handled the entry without erroring
+    /// (including an invalid entry, which is handled and surfaced, not a load); an
+    /// invalid entry queues NO pending load, so nothing is fed to the WebView.
     pub fn navigate(&mut self, url: &str) -> bool {
         self.shell.navigate(url).is_ok()
     }
@@ -853,12 +858,32 @@ mod tests {
     }
 
     #[test]
-    fn an_unusable_url_is_rejected_and_leaves_the_chrome_untouched() {
+    fn an_invalid_entry_surfaces_the_badge_and_keeps_the_typed_text_without_loading() {
+        // Field finding D: a scheme-less GARBAGE entry does NOT navigate. The core
+        // front door handles it (surfacing the distinct invalid-URL state and
+        // keeping the typed text), so no pending load is queued for the Kotlin
+        // edge and the bar is not reset. The edge already passes the RAW typed
+        // text, so the core's classifier is what decides.
         let mut s = CoreSession::new();
-        assert!(!s.navigate("not-a-url"), "unusable url rejected");
+        s.navigate("not-a-url");
         assert_eq!(s.chrome().load_state, LoadState::Idle);
-        assert_eq!(s.chrome().url_text, "");
+        // The distinct invalid-entry axis (NOT `last_error`) drives the badge.
+        assert!(s.chrome().invalid_entry.is_some());
+        assert_eq!(s.chrome().last_error, None);
+        // The typed text is kept for the user to fix; no load was queued.
+        assert_eq!(s.chrome().url_text, "not-a-url");
         assert_eq!(s.take_pending_load(), None);
+    }
+
+    #[test]
+    fn a_scheme_less_valid_host_navigates_over_https_through_the_core() {
+        // Field finding D: a scheme-less plausible host navigates as
+        // `https://<host>` — the prepend is the CORE's job, so the Kotlin edge
+        // gets a pending `https://github.com` to load.
+        let mut s = CoreSession::new();
+        assert!(s.navigate("github.com"), "a valid host navigates");
+        assert!(s.chrome().invalid_entry.is_none());
+        assert_eq!(s.take_pending_load().as_deref(), Some("https://github.com"));
     }
 
     #[test]

@@ -109,6 +109,13 @@ struct Chrome {
     /// failure was missed), so a failed load now also raises this banner the user
     /// cannot miss. Hidden on a loading/idle/settled-ok chrome.
     error_banner: Label,
+    /// The small "invalid URL" BADGE next to the URL bar, shown ONLY when the last
+    /// URL-bar entry was INVALID (a scheme-less garbage entry that did not
+    /// navigate). Paired with the URL-bar text rendered invalid (red underline via
+    /// the `url-invalid` class), it surfaces the distinct invalid-URL state while
+    /// KEEPING the typed text for the user to fix (field finding D) — orthogonal to
+    /// the trust indicator and the error banner. Hidden on a valid entry.
+    invalid_badge: Label,
 }
 
 impl Chrome {
@@ -121,6 +128,20 @@ impl Chrome {
         // unchanged.
         if self.url_entry.text() != state.url_text {
             self.url_entry.set_text(&state.url_text);
+        }
+        // The INVALID-URL surface (field finding D): when the last entry was
+        // invalid (a scheme-less garbage entry that did not navigate), show the
+        // small badge and render the URL-bar text as invalid (red underline),
+        // keeping the typed text for the user to fix. Toggled from the orthogonal
+        // `invalid_entry` axis — distinct from the trust indicator and the load
+        // error banner — so a valid entry hides the badge and clears the class.
+        let show_invalid = invalid_entry_badge_visible(state);
+        self.invalid_badge.set_visible(show_invalid);
+        self.invalid_badge.set_text(invalid_entry_badge_text(state));
+        if show_invalid {
+            self.url_entry.add_css_class("url-invalid");
+        } else {
+            self.url_entry.remove_css_class("url-invalid");
         }
         self.back.set_sensitive(state.can_go_back);
         self.forward.set_sensitive(state.can_go_forward);
@@ -255,6 +276,31 @@ fn error_banner_css_class(state: &ChromeState) -> &'static str {
     }
 }
 
+/// Whether the small "invalid URL" BADGE should be shown: exactly when the last
+/// URL-bar entry was INVALID (a scheme-less garbage entry that did not navigate).
+///
+/// This is the field-finding-D surface (finding D,
+/// `work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`):
+/// a garbage entry does not navigate; instead of silently resetting the bar, the
+/// chrome shows a small badge and renders the URL-bar text as invalid (red
+/// underline), keeping the typed text for the user to fix. A pure read of the
+/// orthogonal [`ChromeState::has_invalid_entry`] axis — distinct from a load
+/// failure ([`error_banner_visible`]) — so it is testable without a display and
+/// the mobile shells apply the SAME rule from the chrome JSON.
+fn invalid_entry_badge_visible(state: &ChromeState) -> bool {
+    state.has_invalid_entry()
+}
+
+/// The small "invalid URL" badge text for an invalid entry, empty otherwise (the
+/// badge is hidden then). Pure, for the same reason as [`invalid_entry_badge_visible`].
+fn invalid_entry_badge_text(state: &ChromeState) -> &'static str {
+    if state.has_invalid_entry() {
+        "⛔ invalid URL"
+    } else {
+        ""
+    }
+}
+
 /// The short label the chrome's trust indicator shows: a distinct, legible badge
 /// for a content-verified load vs a served-by-an-unverified-origin load
 /// (`docs/adr/0001`: the trust posture is a product surface, not a silent
@@ -337,7 +383,9 @@ const TRUST_INDICATOR_CSS: &str = "\
 .trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
 .trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }\
 .error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
-.error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }";
+.error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
+.invalid-url-badge { color: #c01c28; font-weight: bold; padding: 0 6px; }\
+.url-invalid { color: #c01c28; text-decoration: underline; text-decoration-color: #c01c28; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
 /// `trust-verified` / `trust-name-trusted-rpc` / `trust-unverified` classes the
@@ -442,12 +490,20 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         .build();
     error_banner.add_css_class("error-banner");
 
+    // The small "invalid URL" badge sits in the toolbar next to the URL bar,
+    // shown ONLY when the last entry was invalid (field finding D). It starts
+    // hidden; when shown it pairs with the URL-bar text rendered invalid (red
+    // underline via the `url-invalid` class).
+    let invalid_badge = Label::builder().visible(false).build();
+    invalid_badge.add_css_class("invalid-url-badge");
+
     let toolbar = GtkBox::new(Orientation::Horizontal, 4);
     toolbar.append(&back);
     toolbar.append(&forward);
     toolbar.append(&reload);
     toolbar.append(&stop);
     toolbar.append(&url_entry);
+    toolbar.append(&invalid_badge);
     toolbar.append(&trust);
 
     let chrome = Rc::new(Chrome {
@@ -459,6 +515,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         status: status.clone(),
         trust: trust.clone(),
         error_banner: error_banner.clone(),
+        invalid_badge: invalid_badge.clone(),
     });
 
     let root = GtkBox::new(Orientation::Vertical, 0);
@@ -576,8 +633,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 mod tests {
     use super::{
         banner, error_banner_css_class, error_banner_text, error_banner_visible,
-        should_open_web_inspector, status_line, trust_indicator, trust_indicator_css_class,
-        trust_indicator_detail, DEFAULT_URL,
+        invalid_entry_badge_text, invalid_entry_badge_visible, should_open_web_inspector,
+        status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail,
+        DEFAULT_URL,
     };
     use gtk4::gdk;
     use renderer::{LoadState, TrustPosture};
@@ -756,6 +814,38 @@ mod tests {
             ..ChromeState::default()
         };
         assert_eq!(status_line(&failed), "failed: name not resolved");
+    }
+
+    #[test]
+    fn an_invalid_entry_shows_the_badge_distinct_from_a_load_error() {
+        // Field finding D: an INVALID URL-bar entry (a scheme-less garbage entry
+        // that did not navigate) shows the small "invalid URL" badge, distinct
+        // from a load-error banner. A valid/idle chrome hides it; a LOAD failure
+        // (`last_error`) is NOT the invalid badge (the two axes are orthogonal).
+        let idle = ChromeState::default();
+        assert!(!invalid_entry_badge_visible(&idle));
+        assert_eq!(invalid_entry_badge_text(&idle), "");
+
+        let load_failure = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("name not resolved".into()),
+            ..ChromeState::default()
+        };
+        assert!(
+            !invalid_entry_badge_visible(&load_failure),
+            "a load failure is not the invalid-entry badge"
+        );
+
+        let invalid = ChromeState {
+            url_text: "not a url".into(),
+            invalid_entry: Some("not a url".into()),
+            ..ChromeState::default()
+        };
+        assert!(invalid_entry_badge_visible(&invalid));
+        assert!(invalid_entry_badge_text(&invalid).contains("invalid URL"));
+        // The invalid-entry badge is orthogonal to a load error: it carries no
+        // `last_error`, so the error banner stays hidden.
+        assert!(!error_banner_visible(&invalid));
     }
 
     #[test]

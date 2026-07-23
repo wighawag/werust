@@ -230,6 +230,33 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "scheme-less-entry-routing"
+description = "Route a scheme-less URL-bar entry consistently: a bare `.eth` -> ENS; else a VALID host -> `https://` prepend + navigate (a load failure surfaces an in-page error keeping the URL); else an INVALID entry surfaces a distinct invalid-URL BADGE + red-underlined URL bar, keeping the typed text and never resetting the bar."
+# The three-way routing is the SHARED toolkit-free core: `werust-core`'s
+# `classify_entry` (a sibling to `eth_name_from_entry`) decides ENS / https
+# candidate / invalid, and `BrowserShell::navigate` prepends `https://` for a
+# scheme-less valid host, takes an explicit scheme literally, and surfaces the
+# orthogonal `ChromeState::invalid_entry` axis for garbage (no navigation, typed
+# text kept). So the ROUTING is available on every context at the same level
+# `ens-eth-resolution` is. The INVALID surface (a small "invalid URL" badge + the
+# URL-bar text rendered invalid/red-underlined) is painted per edge from that ONE
+# chrome fact, exactly as the trust indicator / error banner are: desktop
+# `invalid_entry_badge_visible`/`_text` + the `invalid-url-badge`/`url-invalid`
+# CSS in crates/werust/src/main.rs; the mobile edges carry the `invalidEntry`
+# field in the chrome JSON (both `ffi_json` twins) and paint the badge +
+# red-underline from it — Android `Chrome.invalidEntryVisible()`/`invalidEntryBadge()`
+# (WerustCore.kt) + the badge/underline in BrowserActivity.kt, iOS
+# `Chrome.invalidEntryVisible()`/`invalidEntryBadge()` (WerustCore.swift) + the
+# badge/underline in WKWebViewShellController.swift. The iOS edge's former
+# edge-level `normalizeURL` (which prepended `https://` before the core saw the
+# entry, pre-empting the core classifier) is GONE — all three edges pass the RAW
+# typed text so the ONE core rule decides. Task
+# `scheme-less-entry-https-fallback-and-keep-bar-on-error`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "retryable-error-distinction"
 description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an obvious retry affordance — the Reload button, which re-resolves a failed ENS name) from a HARD failure (unsupported protocol / verification / malformed, which keeps its prominent protocol-named reason), on every platform."
 # The distinction is the core's `ChromeState::failure_kind` / `failure_is_retryable`

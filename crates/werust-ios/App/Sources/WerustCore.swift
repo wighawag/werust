@@ -213,12 +213,13 @@ final class WerustCore {
         let error: String?
         let failureKind: String?
         let retryable: Bool
+        let invalidEntry: String?
 
         static let idle = Chrome(
             url: "", loadState: "idle", loading: false, loadStep: "idle",
             canGoBack: false, canGoForward: false,
             trustPosture: "unverified-origin", error: nil,
-            failureKind: nil, retryable: false)
+            failureKind: nil, retryable: false, invalidEntry: nil)
 
         /// The one-line status the controller shows: a failure wins, else a loading
         /// indicator that NAMES the real pipeline step (resolving name / fetching
@@ -300,6 +301,18 @@ final class WerustCore {
         /// matching desktop.
         func errorIsRetryable() -> Bool { error != nil && retryable }
 
+        /// Whether the small "invalid URL" BADGE should be shown: exactly when the
+        /// last URL-bar entry was INVALID (a scheme-less garbage entry that did not
+        /// navigate). A pure read of the orthogonal `invalidEntry` fact — distinct
+        /// from a load error (`error`) — so the controller paints the badge + the
+        /// red-underlined URL bar from the SAME chrome-JSON fact desktop uses (field
+        /// finding D, task `scheme-less-entry-https-fallback-and-keep-bar-on-error`).
+        func invalidEntryVisible() -> Bool { invalidEntry != nil }
+
+        /// The small "invalid URL" badge text for an invalid entry, empty otherwise
+        /// (the badge is hidden then). Matches desktop's badge wording.
+        func invalidEntryBadge() -> String { invalidEntry != nil ? "⛔ invalid URL" : "" }
+
         static func fromJSON(_ json: String) -> Chrome {
             guard let data = json.data(using: .utf8),
                   let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -314,7 +327,8 @@ final class WerustCore {
                 trustPosture: o["trustPosture"] as? String ?? "unverified-origin",
                 error: o["error"] as? String,
                 failureKind: o["failureKind"] as? String,
-                retryable: o["retryable"] as? Bool ?? false)
+                retryable: o["retryable"] as? Bool ?? false,
+                invalidEntry: o["invalidEntry"] as? String)
         }
     }
 }

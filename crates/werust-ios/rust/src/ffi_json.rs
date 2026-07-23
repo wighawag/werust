@@ -16,7 +16,7 @@ use werust_core::ChromeState;
 /// Encode a [`ChromeState`] as a compact JSON object for the Swift edge.
 ///
 /// The shape (stable, asserted by the tests):
-/// `{"url":..,"loadState":..,"loading":bool,"loadStep":..,"canGoBack":bool,"canGoForward":bool,"trustPosture":..,"error":..,"failureKind":..,"retryable":bool}`.
+/// `{"url":..,"loadState":..,"loading":bool,"loadStep":..,"canGoBack":bool,"canGoForward":bool,"trustPosture":..,"error":..,"failureKind":..,"retryable":bool,"invalidEntry":..}`.
 /// `error` is `null` when nothing has failed. `trustPosture` carries the current
 /// load's [`TrustPosture`] so the Swift chrome can paint the trust indicator from
 /// the core's truth (the actual load path), matching desktop. `loadStep` carries
@@ -24,7 +24,12 @@ use werust_core::ChromeState;
 /// real loading progress, and `failureKind`/`retryable` carry the
 /// transient-vs-hard distinction so a timeout is shown as retryable (task
 /// `clearer-loading-and-error-indicator`). `failureKind` is `null` when nothing
-/// has failed. The byte-for-byte twin of the Android core's `ffi_json`.
+/// has failed. `invalidEntry` carries the typed text of an INVALID URL-bar entry
+/// (a scheme-less garbage entry that did not navigate) so the mobile chrome
+/// paints the "invalid URL" badge + red-underlined URL bar from the SAME
+/// orthogonal fact desktop uses (`null` when the entry is valid; task
+/// `scheme-less-entry-https-fallback-and-keep-bar-on-error`). The byte-for-byte
+/// twin of the Android core's `ffi_json`.
 pub fn chrome_to_json(state: &ChromeState) -> String {
     let error = match &state.last_error {
         Some(reason) => format!("\"{}\"", escape(reason)),
@@ -34,8 +39,12 @@ pub fn chrome_to_json(state: &ChromeState) -> String {
         Some(kind) => format!("\"{}\"", kind.wire_name()),
         None => "null".to_string(),
     };
+    let invalid_entry = match &state.invalid_entry {
+        Some(entry) => format!("\"{}\"", escape(entry)),
+        None => "null".to_string(),
+    };
     format!(
-        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"loadStep\":\"{load_step}\",\"canGoBack\":{back},\"canGoForward\":{forward},\"trustPosture\":\"{trust}\",\"error\":{error},\"failureKind\":{failure_kind},\"retryable\":{retryable}}}",
+        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"loadStep\":\"{load_step}\",\"canGoBack\":{back},\"canGoForward\":{forward},\"trustPosture\":\"{trust}\",\"error\":{error},\"failureKind\":{failure_kind},\"retryable\":{retryable},\"invalidEntry\":{invalid_entry}}}",
         url = escape(&state.url_text),
         load_state = load_state_name(state.load_state),
         loading = state.is_loading(),
@@ -99,7 +108,7 @@ mod tests {
         let json = chrome_to_json(&ChromeState::default());
         assert_eq!(
             json,
-            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"loadStep\":\"idle\",\"canGoBack\":false,\"canGoForward\":false,\"trustPosture\":\"unverified-origin\",\"error\":null,\"failureKind\":null,\"retryable\":false}"
+            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"loadStep\":\"idle\",\"canGoBack\":false,\"canGoForward\":false,\"trustPosture\":\"unverified-origin\",\"error\":null,\"failureKind\":null,\"retryable\":false,\"invalidEntry\":null}"
         );
     }
 
@@ -151,6 +160,27 @@ mod tests {
         let json = chrome_to_json(&hard);
         assert!(json.contains("\"failureKind\":\"hard\""), "{json}");
         assert!(json.contains("\"retryable\":false"), "{json}");
+    }
+
+    #[test]
+    fn encodes_an_invalid_entry_so_the_mobile_chrome_paints_the_badge() {
+        // The chrome JSON carries the typed text of an INVALID URL-bar entry (a
+        // scheme-less garbage entry that did not navigate) so the Swift edge
+        // paints the "invalid URL" badge + red-underlined URL bar from the SAME
+        // orthogonal fact desktop uses (task
+        // `scheme-less-entry-https-fallback-and-keep-bar-on-error`). Distinct from
+        // `error` (a load failure).
+        let valid = chrome_to_json(&ChromeState::default());
+        assert!(valid.contains("\"invalidEntry\":null"), "{valid}");
+        let invalid = ChromeState {
+            url_text: "not a url".into(),
+            invalid_entry: Some("not a url".into()),
+            ..ChromeState::default()
+        };
+        let json = chrome_to_json(&invalid);
+        assert!(json.contains("\"invalidEntry\":\"not a url\""), "{json}");
+        // An invalid entry is NOT a load error: `error` stays null.
+        assert!(json.contains("\"error\":null"), "{json}");
     }
 
     #[test]

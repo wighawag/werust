@@ -91,6 +91,120 @@ fn eth_name_from_entry(entry: &str) -> Option<&str> {
     Some(name)
 }
 
+/// How the scheme-less URL-bar front door should route a NON-`.eth` entry: a
+/// plausible host/URL werust should TRY, or garbage it should REFUSE without
+/// navigating.
+///
+/// This is the shared, unit-tested classification the field finding
+/// (`work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`,
+/// finding D) calls for: a scheme-less `github.com` must NAVIGATE (as
+/// `https://github.com`, the browser-idiomatic default), while stray garbage must
+/// surface a distinct invalid-URL state rather than silently resetting the bar.
+/// It lives in the toolkit-free core, a sibling to [`eth_name_from_entry`], so
+/// every OS edge (desktop + the two mobile edges) shares ONE rule and it is
+/// testable at the seam boundary — mirroring the `.eth`-recognition placement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRoute {
+    /// The entry already carries an explicit scheme (`https://…`, `ipfs://…`,
+    /// `http://…`, …): take it LITERALLY, never prepend or hijack a scheme.
+    ExplicitScheme,
+    /// A scheme-less string that parses as a plausible host/authority (`github.com`,
+    /// `example.com/path`, `localhost:8080`, an IP): navigate it with `https://`
+    /// prepended (the browser-idiomatic default for a bare host).
+    HttpsCandidate,
+    /// Neither a bare `.eth` name nor a parseable host/URL (a stray token, a
+    /// string with whitespace, empty): do NOT navigate — surface the invalid-URL
+    /// state and keep the typed text for the user to fix.
+    Invalid,
+}
+
+/// Classify a NON-`.eth` URL-bar `entry` (the caller has already peeled off the
+/// bare-`.eth` name via [`eth_name_from_entry`]) into an [`EntryRoute`].
+///
+/// The rule is deliberately CONSERVATIVE and HONEST, not a full URL-spec parser
+/// (recorded in `docs/spikes/scheme-less-entry-https-fallback-and-keep-bar-on-error/DECISIONS.md`):
+///
+/// * An entry with an explicit `scheme://` is [`ExplicitScheme`](EntryRoute::ExplicitScheme):
+///   taken literally so `ipfs://…`/`http://…`/`https://…` are never re-prefixed
+///   or hijacked. (A bare `scheme://` with an empty scheme or empty rest is NOT
+///   an explicit scheme — it falls through to the host check, which rejects it.)
+/// * A scheme-less entry is a [`HttpsCandidate`](EntryRoute::HttpsCandidate) iff
+///   its AUTHORITY (the part before the first `/`, `?`, or `#`) is a plausible
+///   host: `localhost` (optionally `:port`), or a dotted host (`a.b`, at least
+///   one internal `.` with non-empty labels on both sides — so `github.com` and
+///   `example.com` pass, a bare `garbage` does not). No spaces anywhere in the
+///   entry, no control characters.
+/// * Everything else is [`Invalid`](EntryRoute::Invalid): empty, whitespace, a
+///   bare single token with no dot, or a malformed authority.
+fn classify_entry(entry: &str) -> EntryRoute {
+    // An explicit scheme wins and is taken literally (never re-prefixed): a
+    // non-empty scheme followed by `://` and a non-empty rest, matching the
+    // backends' `validate_url` shape so an entry that already passes there is
+    // routed here as an explicit scheme.
+    if let Some((scheme, rest)) = entry.split_once("://") {
+        if !scheme.is_empty() && !rest.is_empty() {
+            return EntryRoute::ExplicitScheme;
+        }
+    }
+    // A scheme-less entry: it must have no whitespace/control chars (a URL never
+    // does; a string with a space is a search/garbage token, not a host).
+    if entry.is_empty() || entry.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return EntryRoute::Invalid;
+    }
+    // The AUTHORITY is the part before the first path/query/fragment separator.
+    let authority = entry
+        .split(['/', '?', '#'])
+        .next()
+        .expect("split always yields at least one element");
+    if is_plausible_authority(authority) {
+        EntryRoute::HttpsCandidate
+    } else {
+        EntryRoute::Invalid
+    }
+}
+
+/// Whether `authority` (a scheme-less entry's host[:port], userinfo already
+/// disallowed by the no-`@` check) is a PLAUSIBLE host to try over `https://`.
+///
+/// Conservative and honest (see [`classify_entry`]): `localhost` (bare or with a
+/// numeric port), or a DOTTED host (`example.com`, an IPv4 literal) — at least
+/// one internal `.` with a non-empty label on each side. A bare single token with
+/// no dot (`garbage`) is rejected so a typo does not silently become
+/// `https://garbage`. Kept intentionally pragmatic; it is not a hostname-grammar
+/// validator (the backend + the network are the final arbiters of a real host).
+fn is_plausible_authority(authority: &str) -> bool {
+    if authority.is_empty() {
+        return false;
+    }
+    // Split off an optional `:port`; reject userinfo (`user@host`) and any other
+    // stray `@`/`:` shapes so only a clean `host[:port]` passes.
+    if authority.contains('@') {
+        return false;
+    }
+    let (host, port) = match authority.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    // A port, when present, must be a non-empty run of ASCII digits.
+    if let Some(port) = port {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    if host.is_empty() {
+        return false;
+    }
+    // `localhost` is the one dotless host we accept (the common local dev target).
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Otherwise require a dotted host: at least one internal `.` with a non-empty
+    // label on both sides (so `a.b` passes, `.com`/`example.`/`example` do not).
+    let mut labels = host.split('.');
+    let has_multiple = host.contains('.');
+    has_multiple && labels.all(|label| !label.is_empty())
+}
+
 /// Which STEP of the real resolution/fetch pipeline a load is currently in, for
 /// the live loading-progress indicator.
 ///
@@ -296,6 +410,22 @@ pub struct ChromeState {
     /// path (a page whose bytes came back through the hash-verified
     /// content-addressed path), not the URL string.
     pub trust_posture: TrustPosture,
+    /// The INVALID URL-bar entry (the garbage the user typed) when the last Enter
+    /// was neither a bare `.eth` name nor a parseable host/URL, `None` otherwise.
+    ///
+    /// This is a NEW, ORTHOGONAL chrome axis — distinct from
+    /// [`last_error`](ChromeState::last_error) (a LOAD failure of a valid target)
+    /// and from the [`trust_posture`](ChromeState::trust_posture) — so a
+    /// scheme-less GARBAGE entry can be surfaced as a small "invalid URL" BADGE
+    /// with the URL-bar text rendered invalid (red underline), while the typed
+    /// text is KEPT for the user to fix and NO navigation happens and the bar is
+    /// never silently reset (field finding D,
+    /// `work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`).
+    /// It is set by [`navigate`](BrowserShell::navigate) on an invalid entry and
+    /// cleared by any navigation that DOES proceed (a valid host / `.eth` /
+    /// explicit scheme / back / forward / reload), so it never lingers onto a
+    /// later page. Loading/error/validity stay orthogonal to trust.
+    pub invalid_entry: Option<String>,
 }
 
 impl ChromeState {
@@ -358,6 +488,17 @@ impl ChromeState {
     #[must_use]
     pub fn is_mutable_name(&self) -> bool {
         self.trust_posture.is_mutable_name()
+    }
+
+    /// Whether the last URL-bar entry was INVALID (not a bare `.eth` name, not a
+    /// parseable host/URL), so the chrome should show the invalid-URL badge and
+    /// render the URL-bar text as invalid (red underline). A pure read of the
+    /// orthogonal [`invalid_entry`](ChromeState::invalid_entry) axis — the window
+    /// (and each mobile edge) paints the badge + red-underline from THIS one fact,
+    /// exactly as it paints the trust indicator from the posture.
+    #[must_use]
+    pub fn has_invalid_entry(&self) -> bool {
+        self.invalid_entry.is_some()
     }
 }
 
@@ -538,33 +679,67 @@ impl BrowserShell {
         self.renderer.current_url()
     }
 
-    /// Navigate to `url` (the URL bar's Enter action), through the seam.
+    /// Navigate to `url` (the URL bar's Enter action), through the seam, routing a
+    /// scheme-less entry three ways: ENS name, `https://` candidate, or invalid.
     ///
-    /// A bare `.eth` URL-bar entry (no scheme, like Brave/Opera — see
-    /// [`eth_name_from_entry`]) is the ENS FRONT DOOR: it is resolved to an
-    /// immutable `ipfs://<cid>` and loaded through the existing verified `ipfs://`
-    /// path via [`navigate_ens_name`](BrowserShell::navigate_ens_name), keeping the
-    /// `.eth` name in the address bar and marking the load's trust posture
-    /// "content-verified, name via trusted RPC". Any other entry is navigated
-    /// literally through the seam.
+    /// The single front door applies the shared, unit-tested routing so it is
+    /// consistent across all platforms (field finding D,
+    /// `work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`):
     ///
-    /// On success the URL bar immediately reflects the target and any prior
-    /// failure is cleared; an unusable URL is rejected by the backend with
-    /// [`RendererError::InvalidUrl`] and leaves the chrome untouched (the bad text
-    /// stays for the user to fix). The load lifecycle then advances via
-    /// [`pump`](BrowserShell::pump).
+    /// 1. A bare `.eth` URL-bar entry (no scheme, like Brave/Opera — see
+    ///    [`eth_name_from_entry`]) is the ENS FRONT DOOR: it is resolved to an
+    ///    immutable `ipfs://<cid>` and loaded through the existing verified
+    ///    `ipfs://` path via
+    ///    [`navigate_ens_name`](BrowserShell::navigate_ens_name), keeping the
+    ///    `.eth` name in the bar and marking the load "content-verified, name via
+    ///    trusted RPC". Unchanged.
+    /// 2. Else a VALID host/URL ([`classify_entry`]): an explicit-scheme entry is
+    ///    navigated LITERALLY (no double scheme, no `ipfs://`/`http://` hijack); a
+    ///    scheme-less plausible host (`github.com`, `localhost:8080`) is navigated
+    ///    with `https://` PREPENDED (the browser-idiomatic default). If the LOAD
+    ///    then fails (DNS/unreachable), that surfaces as a normal in-page browser
+    ///    error via [`last_error`](ChromeState::last_error) while the bar KEEPS the
+    ///    attempted URL — a load failure of a valid target, handled by
+    ///    [`pump`](BrowserShell::pump), not here.
+    /// 3. Else INVALID (a stray token, whitespace, garbage): do NOT navigate.
+    ///    Surface the distinct invalid-URL state
+    ///    ([`invalid_entry`](ChromeState::invalid_entry)) so the chrome shows an
+    ///    "invalid URL" badge + the URL-bar text rendered invalid (red underline),
+    ///    KEEPING the typed text for the user to fix. The bar is NEVER silently
+    ///    reset to the previous page, and `navigate` returns `Ok(())` (the front
+    ///    door handled the entry and surfaced the state in the chrome), not an
+    ///    `Err`.
     pub fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
         if let Some(name) = eth_name_from_entry(url) {
             return self.navigate_ens_name(name);
         }
-        self.renderer.navigate(url)?;
+        // A NON-`.eth` entry: classify it into try-it (explicit scheme or a
+        // scheme-less plausible host) vs refuse-it (garbage).
+        let target = match classify_entry(url) {
+            // Take an explicit scheme literally: no re-prefixing, no hijack of
+            // `ipfs://`/`http://`/`https://`.
+            EntryRoute::ExplicitScheme => url.to_string(),
+            // A scheme-less plausible host: prepend the browser-idiomatic
+            // `https://` default (so `github.com` loads `https://github.com`).
+            EntryRoute::HttpsCandidate => format!("https://{url}"),
+            // Garbage: do NOT navigate. Surface the distinct invalid-URL state and
+            // KEEP the typed text in the bar for the user to fix — never reset the
+            // bar to the previous page.
+            EntryRoute::Invalid => {
+                self.fail_invalid_entry(url);
+                return Ok(());
+            }
+        };
+        self.renderer.navigate(&target)?;
         // A plain navigation follows the backend's URL: drop any ENS name that was
         // pinned in the bar so it never lingers on a later page. It is a CONTENT
         // load (no ENS/IPNS resolution step), so clear any pinned resolution step;
         // `refresh_chrome` derives the content step from the backend's load state.
+        // A proceeding navigation also clears any prior invalid-entry state.
         self.url_override = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
+        self.chrome.invalid_entry = None;
         self.refresh_chrome();
         Ok(())
     }
@@ -605,6 +780,9 @@ impl BrowserShell {
     /// name for the user to see the reason — mirroring how a failed load surfaces
     /// its reason rather than throwing.
     fn navigate_ens_name(&mut self, name: &str) -> Result<(), RendererError> {
+        // The ENS front door proceeds, so any prior invalid-entry state is cleared
+        // (a valid route never leaves the badge showing).
+        self.chrome.invalid_entry = None;
         // Step 1 of the pipeline: resolving the name (namehash -> registry ->
         // resolver -> contenthash). Pin the step so a resolution FAILURE surfaces
         // "resolving name" as the stage it failed at, and so a caller inspecting
@@ -746,6 +924,32 @@ impl BrowserShell {
         self.chrome.last_error = Some(reason.to_string());
     }
 
+    /// Refuse an INVALID URL-bar `entry` without navigating: surface the distinct
+    /// invalid-URL state and KEEP the typed text in the bar for the user to fix.
+    ///
+    /// This is the field-finding-D refusal (finding D,
+    /// `work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`):
+    /// a scheme-less GARBAGE entry (neither a bare `.eth` name nor a parseable
+    /// host/URL) does NOT navigate the backend to anything. It sets the orthogonal
+    /// [`invalid_entry`](ChromeState::invalid_entry) axis so the chrome paints the
+    /// "invalid URL" badge + the red-underlined URL-bar text, PINS the typed text
+    /// via `url_override` so it stays in the bar (the bar is never silently reset
+    /// to the previous page), and leaves [`last_error`](ChromeState::last_error)
+    /// UNTOUCHED — an invalid entry is NOT a load failure (the two axes stay
+    /// distinct). No backend navigation happened, so the load state / trust
+    /// posture keep the previous page's settled values.
+    fn fail_invalid_entry(&mut self, entry: &str) {
+        // No load: clear any in-flight resolution step. Pin the typed text so the
+        // bar keeps it (there is no backend URL, and no reset to the prior page).
+        self.resolving_step = None;
+        self.url_override = Some(entry.to_string());
+        self.refresh_chrome();
+        // Set the invalid-entry axis AFTER refresh (like `fail_ens_load` sets
+        // `last_error`), so `refresh_chrome`'s URL logic runs with the pinned text
+        // and the badge fact is the final word.
+        self.chrome.invalid_entry = Some(entry.to_string());
+    }
+
     /// Go one step back in session history, through the seam.
     ///
     /// A no-op when [`ChromeState::can_go_back`] is `false`. Delegates to the
@@ -757,6 +961,8 @@ impl BrowserShell {
         self.url_override = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
+        // A history move proceeds, so any prior invalid-entry badge is cleared.
+        self.chrome.invalid_entry = None;
         self.refresh_chrome();
     }
 
@@ -766,6 +972,7 @@ impl BrowserShell {
         self.url_override = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
+        self.chrome.invalid_entry = None;
         self.refresh_chrome();
     }
 
@@ -816,6 +1023,8 @@ impl BrowserShell {
         self.url_override = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
+        // A reload proceeds, so any prior invalid-entry badge is cleared.
+        self.chrome.invalid_entry = None;
         self.refresh_chrome();
         Ok(())
     }
@@ -1598,6 +1807,57 @@ mod tests {
     }
 
     #[test]
+    fn classify_entry_routes_explicit_scheme_valid_host_and_garbage() {
+        // The shared, conservative scheme-less classifier (field finding D): an
+        // explicit scheme is literal; a scheme-less plausible host is an https
+        // candidate; everything else is invalid.
+        //
+        // Explicit scheme -> literal (never re-prefixed / hijacked).
+        assert_eq!(
+            classify_entry("https://example.com/"),
+            EntryRoute::ExplicitScheme
+        );
+        assert_eq!(
+            classify_entry("http://example.com"),
+            EntryRoute::ExplicitScheme
+        );
+        assert_eq!(classify_entry("ipfs://bafycid"), EntryRoute::ExplicitScheme);
+        assert_eq!(
+            classify_entry("ens://ronan.eth"),
+            EntryRoute::ExplicitScheme
+        );
+        // Scheme-less plausible host -> https candidate.
+        assert_eq!(classify_entry("github.com"), EntryRoute::HttpsCandidate);
+        assert_eq!(
+            classify_entry("example.com/path"),
+            EntryRoute::HttpsCandidate
+        );
+        assert_eq!(
+            classify_entry("example.com/a/b?q=1#frag"),
+            EntryRoute::HttpsCandidate
+        );
+        assert_eq!(classify_entry("localhost:8080"), EntryRoute::HttpsCandidate);
+        assert_eq!(classify_entry("localhost"), EntryRoute::HttpsCandidate);
+        assert_eq!(classify_entry("127.0.0.1:3000"), EntryRoute::HttpsCandidate);
+        assert_eq!(
+            classify_entry("a.b.c.example.com"),
+            EntryRoute::HttpsCandidate
+        );
+        // Garbage -> invalid (no dot, whitespace, empty, malformed authority).
+        assert_eq!(classify_entry("garbage"), EntryRoute::Invalid);
+        assert_eq!(classify_entry("not a url"), EntryRoute::Invalid);
+        assert_eq!(classify_entry(""), EntryRoute::Invalid);
+        assert_eq!(classify_entry("   "), EntryRoute::Invalid);
+        assert_eq!(classify_entry(".com"), EntryRoute::Invalid);
+        assert_eq!(classify_entry("example."), EntryRoute::Invalid);
+        assert_eq!(classify_entry("host:notaport"), EntryRoute::Invalid);
+        assert_eq!(classify_entry("user@host.com"), EntryRoute::Invalid);
+        // A bare `://` shape with empty scheme/rest is NOT an explicit scheme;
+        // it falls to the host check, which rejects the malformed authority.
+        assert_eq!(classify_entry("://nowhere"), EntryRoute::Invalid);
+    }
+
+    #[test]
     fn a_bare_eth_name_resolves_and_renders_the_ipfs_site_with_the_name_in_the_bar() {
         // Acceptance (the DONE bar, end to end, offline): a bare `ronan.eth` entry
         // is recognised, resolved over the pinned RPC fixture to an `ipfs-ns`
@@ -1924,15 +2184,132 @@ mod tests {
     }
 
     #[test]
-    fn navigate_rejects_an_unusable_url_and_leaves_the_chrome_untouched() {
+    fn navigate_refuses_an_invalid_entry_without_navigating_and_keeps_the_typed_text() {
+        // Field finding D: a scheme-less GARBAGE entry (not a bare `.eth` name,
+        // not a parseable host/URL) does NOT navigate. The front door now handles
+        // it (returns `Ok`, not an `Err`), surfacing the distinct invalid-URL
+        // state and KEEPING the typed text in the bar for the user to fix — never
+        // resetting the bar to the previous page.
         let (mut shell, _handle) = shell_with_backend();
-        let err = shell
+        shell
             .navigate("not-a-url")
-            .expect_err("unusable url rejected");
-        assert_eq!(err, RendererError::InvalidUrl("not-a-url".into()));
-        // A rejected navigation does not start a load or move the chrome.
+            .expect("the front door handles an invalid entry without erroring");
+        // No load started and no backend navigation happened.
         assert_eq!(shell.chrome().load_state, LoadState::Idle);
-        assert_eq!(shell.chrome().url_text, "");
+        // The distinct invalid-entry axis is set (NOT `last_error`, which is a
+        // load failure): the badge fact, orthogonal to a load error.
+        assert!(shell.chrome().has_invalid_entry());
+        assert_eq!(shell.chrome().invalid_entry.as_deref(), Some("not-a-url"));
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "an invalid entry is NOT a load failure"
+        );
+        // The typed text is KEPT in the bar (never reset to the previous page).
+        assert_eq!(shell.chrome().url_text, "not-a-url");
+        // The backend was never navigated.
+        assert_eq!(shell.current_url_for_test(), None);
+    }
+
+    #[test]
+    fn a_scheme_less_valid_host_navigates_over_https() {
+        // Field finding D (the desired behaviour): a scheme-less plausible host
+        // like `github.com` navigates as `https://github.com` (the
+        // browser-idiomatic default), keeping the bar on the attempted URL.
+        let (mut shell, handle) = shell_with_backend();
+        shell
+            .navigate("github.com")
+            .expect("a scheme-less valid host navigates");
+        // The `https://` was prepended for the backend load.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some("https://github.com")
+        );
+        assert!(shell.chrome().is_loading(), "the https load is in flight");
+        assert!(
+            !shell.chrome().has_invalid_entry(),
+            "a valid host is not an invalid entry"
+        );
+        settle(&mut shell, &handle);
+        // The bar follows the backend's attempted URL, not a reset to the prior
+        // page.
+        assert_eq!(shell.chrome().url_text, "https://github.com");
+    }
+
+    #[test]
+    fn an_explicit_scheme_is_taken_literally_without_a_double_prepend_or_hijack() {
+        // Field finding D: an entry that already carries a scheme is navigated
+        // LITERALLY — no `https://` double-prepend, no hijack of `ipfs://` /
+        // `http://` / `https://`.
+        for url in [
+            "https://example.com/",
+            "http://example.com/",
+            "ipfs://bafyexamplecid/index.html",
+        ] {
+            let (mut shell, _handle) = shell_with_backend();
+            shell.navigate(url).expect("an explicit scheme navigates");
+            assert_eq!(
+                shell.current_url_for_test().as_deref(),
+                Some(url),
+                "an explicit scheme is taken literally, never re-prefixed"
+            );
+            assert!(!shell.chrome().has_invalid_entry());
+        }
+    }
+
+    #[test]
+    fn a_valid_hosts_load_failure_keeps_the_url_in_the_bar_with_an_in_page_error() {
+        // Field finding D: when a VALID target's LOAD fails (DNS/unreachable), the
+        // failure surfaces as a normal in-page browser error (`last_error`) and
+        // the bar KEEPS the attempted URL — it does NOT reset to the previous
+        // page, and it is NOT the invalid-entry badge (a load failure, not a
+        // malformed entry).
+        let (mut shell, handle) = shell_with_backend();
+        // A first good page so there IS a "previous page" to (not) reset to.
+        shell.navigate("https://good.example/").unwrap();
+        settle(&mut shell, &handle);
+        // Now a scheme-less valid host whose load will fail.
+        shell
+            .navigate("nope.invalid")
+            .expect("a valid-looking host");
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some("https://nope.invalid")
+        );
+        assert!(shell.pump()); // drain the Started event
+        handle.drive_to_failed("name not resolved");
+        assert!(shell.pump());
+        assert_eq!(shell.chrome().load_state, LoadState::Failed);
+        assert_eq!(
+            shell.chrome().last_error.as_deref(),
+            Some("name not resolved"),
+            "a valid target's load failure is an in-page error"
+        );
+        assert!(
+            !shell.chrome().has_invalid_entry(),
+            "a load failure is NOT the invalid-entry badge"
+        );
+        assert_eq!(
+            shell.chrome().url_text,
+            "https://nope.invalid",
+            "the bar keeps the attempted URL, not the previous page"
+        );
+    }
+
+    #[test]
+    fn a_proceeding_navigation_clears_a_prior_invalid_entry_badge() {
+        // The invalid-entry axis must never linger onto a later page: a valid
+        // navigation after an invalid one clears the badge.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("garbage token").unwrap();
+        assert!(shell.chrome().has_invalid_entry());
+        shell.navigate("github.com").expect("a valid host");
+        assert!(
+            !shell.chrome().has_invalid_entry(),
+            "a proceeding navigation clears the badge"
+        );
+        settle(&mut shell, &handle);
+        assert!(!shell.chrome().has_invalid_entry());
     }
 
     #[test]

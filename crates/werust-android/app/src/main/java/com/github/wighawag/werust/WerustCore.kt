@@ -136,6 +136,7 @@ class WerustCore : AutoCloseable {
         val error: String?,
         val failureKind: String?,
         val retryable: Boolean,
+        val invalidEntry: String?,
     ) {
         /**
          * The one-line status the Activity shows: a failure wins, else a loading
@@ -227,6 +228,22 @@ class WerustCore : AutoCloseable {
          */
         fun errorIsRetryable(): Boolean = error != null && retryable
 
+        /**
+         * Whether the small "invalid URL" BADGE should be shown: exactly when the
+         * last URL-bar entry was INVALID (a scheme-less garbage entry that did not
+         * navigate). A pure read of the orthogonal `invalidEntry` fact — distinct
+         * from a load error (`error`) — so the Activity paints the badge + the
+         * red-underlined URL bar from the SAME chrome-JSON fact desktop uses (field
+         * finding D, task `scheme-less-entry-https-fallback-and-keep-bar-on-error`).
+         */
+        fun invalidEntryVisible(): Boolean = invalidEntry != null
+
+        /**
+         * The small "invalid URL" badge text for an invalid entry, empty otherwise
+         * (the badge is hidden then). Matches desktop's badge wording.
+         */
+        fun invalidEntryBadge(): String = if (invalidEntry != null) "⛔ invalid URL" else ""
+
         companion object {
             fun fromJson(json: String): Chrome {
                 val o = JSONObject(json)
@@ -241,6 +258,7 @@ class WerustCore : AutoCloseable {
                     error = if (o.isNull("error")) null else o.getString("error"),
                     failureKind = if (o.isNull("failureKind")) null else o.optString("failureKind"),
                     retryable = o.optBoolean("retryable", false),
+                    invalidEntry = if (o.isNull("invalidEntry")) null else o.getString("invalidEntry"),
                 )
             }
         }

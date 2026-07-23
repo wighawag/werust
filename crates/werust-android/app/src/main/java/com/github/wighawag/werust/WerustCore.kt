@@ -69,6 +69,27 @@ class WerustCore : AutoCloseable {
         }
     }
 
+    /**
+     * The document-start script (the EIP-1193 provider shim) to install onto the
+     * platform `WebView` so a page's `window.ethereum` is the injected native
+     * provider. Routed through the SAME `werust-core` provider path desktop uses.
+     * Empty string means nothing to inject.
+     */
+    fun documentStartScript(): String = nativeDocumentStartScript(handle)
+
+    /**
+     * Dispatch an EIP-1193 envelope a page posted on the provider channel through
+     * the shared `werust-core` provider path and return the response JS to run in
+     * the live page (via [android.webkit.WebView.evaluateJavascript]) to settle
+     * the page's pending Promise. Empty string means nothing to run. This is the
+     * page -> native -> page provider round-trip on Android; it is called from the
+     * `@JavascriptInterface` bridge (a WebView JS-interface thread), serialized by
+     * the native `SyncSession` mutex against the UI thread exactly like
+     * [resolveIpfs].
+     */
+    fun handleProviderMessage(name: String, body: String): String =
+        nativeHandleProviderMessage(handle, name, body)
+
     /** Report the platform `WebView`'s commit signal into the core. */
     fun onPageCommitted(url: String) = nativeOnPageCommitted(handle, url)
 
@@ -110,6 +131,7 @@ class WerustCore : AutoCloseable {
         val loading: Boolean,
         val canGoBack: Boolean,
         val canGoForward: Boolean,
+        val trustPosture: String,
         val error: String?,
     ) {
         /** The one-line status the Activity shows: a failure wins, else loading/idle. */
@@ -117,6 +139,19 @@ class WerustCore : AutoCloseable {
             error != null -> "failed: $error"
             loading -> "loading…"
             else -> "idle"
+        }
+
+        /**
+         * The short trust-indicator badge the Activity paints from the core's
+         * posture (the ACTUAL load path, not the URL) — the SAME four states the
+         * desktop chrome shows. Never labels a name-resolved or mutable page
+         * "verified" (only a direct `ipfs://<cid>` earns that).
+         */
+        fun trustIndicator(): String = when (trustPosture) {
+            "content-verified" -> "✓ verified"
+            "name-via-trusted-rpc" -> "◈ name via trusted RPC"
+            "mutable-name" -> "◇ content verified, mutable name"
+            else -> "⚠ unverified origin"
         }
 
         companion object {
@@ -128,6 +163,7 @@ class WerustCore : AutoCloseable {
                     loading = o.getBoolean("loading"),
                     canGoBack = o.getBoolean("canGoBack"),
                     canGoForward = o.getBoolean("canGoForward"),
+                    trustPosture = o.optString("trustPosture", "unverified-origin"),
                     error = if (o.isNull("error")) null else o.getString("error"),
                 )
             }
@@ -142,6 +178,8 @@ class WerustCore : AutoCloseable {
     private external fun nativeReload(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
     private external fun nativeTakePendingLoad(handle: Long): String
+    private external fun nativeDocumentStartScript(handle: Long): String
+    private external fun nativeHandleProviderMessage(handle: Long, name: String, body: String): String
     private external fun nativeResolveIpfs(handle: Long, uri: String): Long
     private external fun nativeResolutionIsOk(resolution: Long): Boolean
     private external fun nativeResolutionMime(resolution: Long): String

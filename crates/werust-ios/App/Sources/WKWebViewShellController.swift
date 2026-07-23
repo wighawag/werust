@@ -31,6 +31,7 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private let reloadButton = UIButton(type: .system)
     private let stopButton = UIButton(type: .system)
     private let statusLabel = UILabel()
+    private let trustLabel = UILabel()
     private var webView: WKWebView!
 
     override func viewDidLoad() {
@@ -117,6 +118,20 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // persisted — at parity with desktop (WebKitGTK `register_uri_scheme`) and
         // Android (`shouldInterceptRequest`).
         configuration.setURLSchemeHandler(WerustSchemeHandler(core: core), forURLScheme: "werust")
+        // Wire the EIP-1193 provider bridge: register the provider script-message
+        // channel (a `WKScriptMessageHandler` the shared shim posts to at
+        // `window.webkit.messageHandlers.werustProvider`) and inject the
+        // `werust-core` provider shim as a document-start `WKUserScript`, so a
+        // page's `window.ethereum` is the injected native provider — routed through
+        // the SAME provider path desktop uses. The handler answers each envelope
+        // keylessly and evaluates the response JS back in the page.
+        let providerHandler = ProviderBridgeHandler(core: core, webViewRef: { [weak self] in self?.webView })
+        configuration.userContentController.add(providerHandler, name: Self.providerChannel)
+        let shim = core.documentStartScript()
+        if !shim.isEmpty {
+            configuration.userContentController.addUserScript(
+                WKUserScript(source: shim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
@@ -126,9 +141,19 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         statusLabel.textColor = .secondaryLabel
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
+        // The trust indicator, at the footer next to the status: painted from the
+        // core's posture (the ACTUAL load path), the SAME four states desktop shows.
+        trustLabel.text = "⚠ unverified origin"
+        trustLabel.font = .systemFont(ofSize: 13)
+        trustLabel.textColor = .secondaryLabel
+        trustLabel.textAlignment = .right
+        trustLabel.setContentHuggingPriority(.required, for: .horizontal)
+        trustLabel.translatesAutoresizingMaskIntoConstraints = false
+
         view.addSubview(toolbar)
         view.addSubview(webView)
         view.addSubview(statusLabel)
+        view.addSubview(trustLabel)
 
         let g = view.safeAreaLayoutGuide
         NSLayoutConstraint.activate([
@@ -142,8 +167,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
             statusLabel.topAnchor.constraint(equalTo: webView.bottomAnchor, constant: 4),
             statusLabel.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 8),
-            statusLabel.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
             statusLabel.bottomAnchor.constraint(equalTo: g.bottomAnchor, constant: -4),
+
+            trustLabel.centerYAnchor.constraint(equalTo: statusLabel.centerYAnchor),
+            trustLabel.leadingAnchor.constraint(
+                greaterThanOrEqualTo: statusLabel.trailingAnchor, constant: 8),
+            trustLabel.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
         ])
     }
 
@@ -169,6 +198,9 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         stopButton.isEnabled = chrome.loading
         reloadButton.isEnabled = !chrome.loading
         statusLabel.text = chrome.statusLine()
+        // The trust indicator tracks the core's posture (the real load path),
+        // matching desktop; the seam-default no-op is gone.
+        trustLabel.text = chrome.trustIndicator()
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------
@@ -224,6 +256,38 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
     /// The URL the app opens on launch, so it shows a browsing surface.
     private static let startURL = "https://example.com/"
+
+    /// The EIP-1193 provider script-message channel (matches `werust-core`).
+    fileprivate static let providerChannel = "werustProvider"
+}
+
+/// The `WKScriptMessageHandler` for the EIP-1193 provider channel: the iOS edge
+/// that receives a page-posted envelope (page -> native), hands it to the shared
+/// `werust-core` provider path, and evaluates the response JS back in the page
+/// (native -> page) to settle the page's pending Promise. The shared provider shim
+/// posts to `window.webkit.messageHandlers.werustProvider`, which WKWebView routes
+/// here because the channel is registered on the `WKUserContentController`. The
+/// bridge holds NO keys (a read-only stub), the same posture as desktop.
+final class ProviderBridgeHandler: NSObject, WKScriptMessageHandler {
+    private let core: WerustCore
+    private let webViewRef: () -> WKWebView?
+
+    init(core: WerustCore, webViewRef: @escaping () -> WKWebView?) {
+        self.core = core
+        self.webViewRef = webViewRef
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        // The shared shim posts the envelope as a JSON string.
+        let body = message.body as? String ?? ""
+        let response = core.handleProviderMessage(WKWebViewShellController.providerChannel, body)
+        guard !response.isEmpty else { return }
+        // Push the response back into the live page to settle the pending Promise.
+        webViewRef()?.evaluateJavaScript(response, completionHandler: nil)
+    }
 }
 
 /// The `WKURLSchemeHandler` for `ipfs://`: the iOS edge that intercepts an

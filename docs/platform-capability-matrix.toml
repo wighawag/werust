@@ -113,21 +113,33 @@ android = { state = "implemented" }
 name = "eip1193-provider"
 description = "Inject the native EIP-1193 provider into pages via the script-message bridge."
 # Desktop wires it via `install_provider` (register_script_message_handler +
-# inject_script + response push). Both mobile backends' script-message bridge
-# methods are empty `{}` no-ops today — the SAME silent-no-op class as
-# `ipfs://`. See work/notes/observations/mobile-provider-and-trust-are-also-silent-no-ops-2026-07-23.md.
+# inject_script + response push). Both mobile backends now wire it too (task
+# mobile-provider-injection-and-trust-indicator): their `register_script_message_handler`
+# + `inject_script` no-ops are GONE (they store the handler + document-start
+# script), each mobile `CoreSession`'s `install_provider` registers the
+# `werustProvider` channel + injects the SAME `werust_core::provider` shim desktop
+# uses, and the OS edge drives the round-trip — Android via `addJavascriptInterface`
+# + `WebView.evaluateJavascript`, iOS via a `WKScriptMessageHandler` +
+# `WKWebView.evaluateJavaScript`. So a page's `window.ethereum` works on mobile
+# through the SAME keyless read-only path desktop uses. The former silent no-op is
+# gone.
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
-android = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
 
 [[capability]]
 name = "trust-indicator"
-description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / unverified) in the chrome."
+description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / mutable-name / unverified) in the chrome."
 # Desktop reads the shared LoadLifecycle posture (marked by the `ipfs://` scheme
-# handler / ENS front door). Both mobile backends inherit the seam DEFAULT
-# (`UnverifiedOrigin`, no `mark_ens_origin`), so the verified/ENS posture never
-# surfaces on mobile — desktop-only today. Tracked with the mobile webview
-# integration (same observation note as above).
+# handler / ENS front door). Both mobile backends now surface it too (task
+# mobile-provider-injection-and-trust-indicator): their `Inner` tracks the same
+# two trust axes (reset on `begin`, `mark_content_verified` on a verified `ipfs`
+# resolve, `mark_ens_origin` / `mark_mutable_name` from the front door) and reports
+# the honest posture through the seam's `trust_posture` via the ONE shared
+# `TrustPosture::after_verify` rule desktop uses — so the seam-DEFAULT
+# `UnverifiedOrigin` is no longer inherited. The chrome JSON carries `trustPosture`
+# and the mobile chrome paints the indicator (content-verified / name-via-trusted-rpc
+# / mutable-name / unverified) from it, matching desktop for the same load.
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
-android = { state = "stubbed", task = "mobile-provider-injection-and-trust-indicator" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

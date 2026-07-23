@@ -162,13 +162,10 @@ impl LoadLifecycle {
         // repointing — so it wins over `mutable_name`; a mutable name with no RPC
         // trust (a client-verified IPNS record) shows `MutableName`; an immutable,
         // RPC-free load is plain `ContentVerified`.
-        self.posture = if self.ens_origin {
-            TrustPosture::NameViaTrustedRpc
-        } else if self.mutable_name {
-            TrustPosture::MutableName
-        } else {
-            TrustPosture::ContentVerified
-        };
+        // Delegate to the ONE shared two-axis rule (`TrustPosture::after_verify`)
+        // so desktop and both mobile backends surface the SAME posture from the
+        // SAME source of truth rather than each re-deriving the loudest-wins order.
+        self.posture = TrustPosture::after_verify(self.ens_origin, self.mutable_name);
     }
 
     /// Flag the CURRENT load as originating from an ENS name resolved over the

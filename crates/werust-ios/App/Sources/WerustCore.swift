@@ -151,6 +151,31 @@ final class WerustCore {
         case failure(reason: String)
     }
 
+    /// The document-start script (the EIP-1193 provider shim) to install onto the
+    /// platform `WKWebView` as a `WKUserScript` so a page's `window.ethereum` is
+    /// the injected native provider. Routed through the SAME `werust-core` provider
+    /// path desktop uses. `nil` / empty means nothing to inject.
+    func documentStartScript() -> String {
+        guard let c = werust_ios_document_start_script(handle) else { return "" }
+        defer { werust_ios_string_free(c) }
+        return String(cString: c)
+    }
+
+    /// Dispatch an EIP-1193 envelope a page posted on the provider channel through
+    /// the shared `werust-core` provider path and return the response JS to run in
+    /// the live page (via `WKWebView.evaluateJavaScript`) to settle the page's
+    /// pending Promise. Empty means nothing to run. This is the page -> native ->
+    /// page provider round-trip on iOS, called from the `WKScriptMessageHandler`.
+    func handleProviderMessage(_ name: String, _ body: String) -> String {
+        name.withCString { n in
+            body.withCString { b in
+                guard let c = werust_ios_handle_provider_message(handle, n, b) else { return "" }
+                defer { werust_ios_string_free(c) }
+                return String(cString: c)
+            }
+        }
+    }
+
     /// Report the platform `WKWebView`'s commit signal into the core.
     func onPageCommitted(_ url: String) {
         url.withCString { werust_ios_on_page_committed(handle, $0) }
@@ -183,17 +208,32 @@ final class WerustCore {
         let loading: Bool
         let canGoBack: Bool
         let canGoForward: Bool
+        let trustPosture: String
         let error: String?
 
         static let idle = Chrome(
             url: "", loadState: "idle", loading: false,
-            canGoBack: false, canGoForward: false, error: nil)
+            canGoBack: false, canGoForward: false,
+            trustPosture: "unverified-origin", error: nil)
 
         /// The one-line status the controller shows: a failure wins, else
         /// loading/idle.
         func statusLine() -> String {
             if let error = error { return "failed: \(error)" }
             return loading ? "loading…" : "idle"
+        }
+
+        /// The short trust-indicator badge the controller paints from the core's
+        /// posture (the ACTUAL load path, not the URL) — the SAME four states the
+        /// desktop chrome shows. Never labels a name-resolved or mutable page
+        /// "verified" (only a direct `ipfs://<cid>` earns that).
+        func trustIndicator() -> String {
+            switch trustPosture {
+            case "content-verified": return "✓ verified"
+            case "name-via-trusted-rpc": return "◈ name via trusted RPC"
+            case "mutable-name": return "◇ content verified, mutable name"
+            default: return "⚠ unverified origin"
+            }
         }
 
         static func fromJSON(_ json: String) -> Chrome {
@@ -206,6 +246,7 @@ final class WerustCore {
                 loading: o["loading"] as? Bool ?? false,
                 canGoBack: o["canGoBack"] as? Bool ?? false,
                 canGoForward: o["canGoForward"] as? Bool ?? false,
+                trustPosture: o["trustPosture"] as? String ?? "unverified-origin",
                 error: o["error"] as? String)
         }
     }

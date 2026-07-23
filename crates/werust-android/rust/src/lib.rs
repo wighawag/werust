@@ -98,6 +98,14 @@ impl CoreSession {
         // `shouldInterceptRequest` drives the intercepted request through
         // [`resolve_ipfs`](CoreSession::resolve_ipfs) into this handler.
         install_ipfs(&mut backend);
+        // Wire the FIRST trust hook exactly as the desktop backend's
+        // `install_provider` does: register the EIP-1193 provider bridge handler
+        // and inject the page-side provider shim at document start, both routed
+        // through the SAME `werust_core::provider` path desktop uses. The platform
+        // `WebView` bridges the channel (`addJavascriptInterface`) and runs the
+        // shim + the response push, driving
+        // [`handle_provider_message`](CoreSession::handle_provider_message).
+        install_provider(&mut backend);
         Self {
             shell: BrowserShell::new(Box::new(backend)),
             backend: handle,
@@ -149,15 +157,57 @@ impl CoreSession {
     /// MIME type, or the fail-closed reason. Returns `None` if `uri` is not a
     /// registered scheme (Kotlin then lets the `WebView` handle it normally).
     pub fn resolve_ipfs(&self, uri: &str) -> Option<SchemeResolution> {
+        // Only the `ipfs` scheme's success is a hash-verified content load that
+        // earns the content-verified posture. Kotlin's `shouldInterceptRequest`
+        // routes EVERY intercepted scheme through this one method (the generic
+        // `resolve_scheme` dispatches `ipfs` AND `werust`), so a `werust://settings`
+        // page must NOT be marked content-verified — it is an internal chrome page,
+        // not hash-verified content. Scope the mark to the `ipfs` scheme.
+        let is_ipfs = uri
+            .split_once("://")
+            .is_some_and(|(scheme, _)| scheme == werust_core::ipfs::IPFS_SCHEME);
         self.backend.resolve_scheme(uri).map(|result| match result {
-            Ok(response) => SchemeResolution::Ok {
-                mime_type: response.mime_type,
-                body: response.body,
-            },
+            Ok(response) => {
+                if is_ipfs {
+                    // The bytes verified against their CID on the shared core path:
+                    // mark the current load content-verified so the chrome's trust
+                    // indicator reflects the REAL (hash-verified) load path — the
+                    // same thing the desktop `install_ipfs` scheme handler does on
+                    // success. A fail-closed error (below) never reaches this, so an
+                    // unverified load is never marked verified. The two-axis flags
+                    // (`mark_ens_origin`/`mark_mutable_name`) set by the ENS/IPNS
+                    // front door then decide the honest posture surfaced.
+                    self.backend.mark_content_verified();
+                }
+                SchemeResolution::Ok {
+                    mime_type: response.mime_type,
+                    body: response.body,
+                }
+            }
             Err(e) => SchemeResolution::Err {
                 reason: e.to_string(),
             },
         })
+    }
+
+    /// The scripts to inject at document start (the EIP-1193 provider shim), so
+    /// Kotlin installs them onto the platform `WebView` as page-start user
+    /// scripts. This is the `inject_script` half of the provider bridge, made real
+    /// on the Android edge.
+    #[must_use]
+    pub fn document_start_scripts(&self) -> Vec<String> {
+        self.backend.document_start_scripts()
+    }
+
+    /// Dispatch a page-posted EIP-1193 envelope on script-message channel `name`
+    /// through the registered provider handler and return the response JS Kotlin
+    /// must run in the live page (via `WebView.evaluateJavascript`) to settle the
+    /// page's pending Promise. Routed through the SAME `werust_core::provider` path
+    /// desktop uses; `None`/empty means the channel is unregistered or the message
+    /// needed no response.
+    #[must_use]
+    pub fn handle_provider_message(&self, name: &str, body: &str) -> Vec<String> {
+        self.backend.handle_script_message(name, body)
     }
 
     /// Report the platform `WebView`'s commit signal into the core, then fold the
@@ -305,6 +355,22 @@ impl SyncSession {
         self.with(|s| s.resolve_ipfs(uri))
     }
 
+    /// The document-start provider scripts, under the lock. See
+    /// [`CoreSession::document_start_scripts`].
+    #[must_use]
+    pub fn document_start_scripts(&self) -> Vec<String> {
+        self.with(|s| s.document_start_scripts())
+    }
+
+    /// Dispatch an EIP-1193 provider envelope, under the lock. This is called from
+    /// the WebView WORKER/JS-interface thread, so the lock serializes it against
+    /// the UI thread's navigate / load-signal calls exactly as `resolve_ipfs` is.
+    /// See [`CoreSession::handle_provider_message`].
+    #[must_use]
+    pub fn handle_provider_message(&self, name: &str, body: &str) -> Vec<String> {
+        self.with(|s| s.handle_provider_message(name, body))
+    }
+
     /// Report the commit signal, under the lock. See
     /// [`CoreSession::on_page_committed`].
     pub fn on_page_committed(&self, url: &str) {
@@ -371,6 +437,51 @@ fn install_ipfs(backend: &mut AndroidBackend) {
         WERUST_SCHEME,
         Box::new(|request| apply_settings_request(&request)),
     );
+}
+
+/// Install the native EIP-1193 provider bridge on `backend`, the twin of the
+/// desktop backend's `install_provider`.
+///
+/// It registers the provider script-message channel through the seam's
+/// [`register_script_message_handler`](Renderer::register_script_message_handler)
+/// and injects the page-side provider shim at document start through
+/// [`inject_script`](Renderer::inject_script), both routed through the SAME
+/// `werust_core::provider` path desktop uses (`provider_shim` /
+/// `route_provider_message` / the keyless read-only [`ProviderBridge`]). So a
+/// page's `window.ethereum` sees the SAME injected EIP-1193 provider on Android
+/// as on desktop.
+///
+/// Unlike desktop (which pushes the response by evaluating JS on its GTK loop),
+/// the mobile backend owns no live view, so the handler QUEUES the response JS
+/// via the backend handle's `queue_eval`; Kotlin drains it (through
+/// [`CoreSession::handle_provider_message`]) and runs it with
+/// `WebView.evaluateJavascript`. The bridge holds NO keys (a read-only stub), the
+/// same security posture as desktop.
+fn install_provider(backend: &mut AndroidBackend) {
+    use werust_core::provider::{
+        provider_shim, route_provider_message, ProviderBridge, PROVIDER_BRIDGE,
+    };
+
+    // The response-push sink is JUST the backend's eval queue (a `Send`
+    // `Arc<Mutex<_>>` clone — the mobile twin of the desktop `evaluate_javascript`
+    // capturing a cloneable view handle), so the seam's `Send`
+    // `ScriptMessageHandler` can own it without capturing the `!Send` backend
+    // handle. Each page envelope's response-delivery JS is queued for the OS edge
+    // to run via `handle_provider_message`.
+    let eval_sink = backend.handle().eval_sink();
+    let bridge = ProviderBridge::new();
+    backend.register_script_message_handler(
+        PROVIDER_BRIDGE,
+        Box::new(move |message| {
+            route_provider_message(&bridge, &message, &mut |script| {
+                if let Ok(mut queue) = eval_sink.lock() {
+                    queue.push(script);
+                }
+            });
+        }),
+    );
+    // Make the provider detectable from document start, exactly as desktop does.
+    backend.inject_script(&provider_shim());
 }
 
 // ---------------------------------------------------------------------------
@@ -609,6 +720,49 @@ mod jni_exports {
         }
     }
 
+    /// The document-start scripts (the EIP-1193 provider shim) as a single string
+    /// Kotlin injects onto the platform `WebView` at page start (they are all
+    /// document-start user scripts run in order, so concatenation is equivalent).
+    /// Empty string means nothing to inject.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeDocumentStartScript(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let script = unsafe { session(handle) }
+            .document_start_scripts()
+            .join("\n");
+        env.new_string(script)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Dispatch an EIP-1193 provider envelope posted from the page on the provider
+    /// channel `name` and return the response JS Kotlin must run in the live page
+    /// (via `WebView.evaluateJavascript`) to settle the page's pending Promise, as
+    /// a single string (the response-delivery calls joined; empty means nothing to
+    /// run). This is the page -> native -> page provider round-trip on Android; it
+    /// runs on the JS-interface thread, serialized by the `SyncSession` mutex
+    /// against the UI thread exactly like `nativeResolveIpfs`.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeHandleProviderMessage(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        name: JString,
+        body: JString,
+    ) -> jstring {
+        let name = read(&mut env, &name);
+        let body = read(&mut env, &body);
+        let script = unsafe { session(handle) }
+            .handle_provider_message(&name, &body)
+            .join("\n");
+        env.new_string(script)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
     #[no_mangle]
     pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeOnPageCommitted(
         mut env: JNIEnv,
@@ -798,6 +952,111 @@ mod tests {
         // platform WebView load it normally (no interception).
         let s = CoreSession::new();
         assert!(s.resolve_ipfs("https://example.com/").is_none());
+    }
+
+    #[test]
+    fn the_eip1193_provider_bridge_reaches_the_shared_core_through_the_session() {
+        // The provider bridge is wired on the Android edge (the seam no-op is
+        // gone): the session injects the provider shim at document start, and a
+        // page envelope posted on the provider channel round-trips through the SAME
+        // `werust_core::provider` path desktop uses to a response push Kotlin runs
+        // in the page. Network-isolated: the read-only stub answers keylessly.
+        let s = CoreSession::new();
+
+        // The shim is injected so a page's `window.ethereum` is detectable.
+        let scripts = s.document_start_scripts();
+        assert_eq!(
+            scripts.len(),
+            1,
+            "the provider shim is injected at document start"
+        );
+        assert!(
+            scripts[0].contains("isWerust: true"),
+            "the injected shim is the provider shim"
+        );
+        assert!(scripts[0].contains("ethereum"));
+
+        // A page `eth_chainId` request round-trips to the keyless stub and back:
+        // the response push settles the page's pending Promise with the chain id.
+        let pushed = s.handle_provider_message(
+            "werustProvider",
+            r#"{"id":7,"method":"eth_chainId","params":[]}"#,
+        );
+        assert_eq!(
+            pushed.len(),
+            1,
+            "the request yields exactly one response push"
+        );
+        assert!(
+            pushed[0].contains("__resolve(7") && pushed[0].contains("0x1"),
+            "the response settles Promise 7 with the stub chain id: {}",
+            pushed[0]
+        );
+
+        // A message on any other channel is ignored (no response to run).
+        assert!(s
+            .handle_provider_message("someOtherChannel", r#"{"id":1,"method":"eth_chainId"}"#)
+            .is_empty());
+    }
+
+    #[test]
+    fn the_chrome_trust_posture_reaches_the_kotlin_edge_from_the_core() {
+        // The trust indicator is wired on the Android edge (the seam-default
+        // `UnverifiedOrigin` was inherited before): the chrome JSON Kotlin paints
+        // carries the current load's REAL posture. A fresh load is untrusted; a
+        // verified `ipfs` resolution (marked via the session's `resolve_ipfs`
+        // success path) surfaces content-verified — matching desktop.
+        let mut s = CoreSession::new();
+        assert!(s
+            .chrome_json()
+            .contains("\"trustPosture\":\"unverified-origin\""));
+
+        // Drive a direct `ipfs://<cid>` load and mark it verified the way the OS
+        // edge does when the shared `resolve_ipfs` path returns Ok. (We mark via
+        // the handle directly to stay network-isolated — a real resolve needs the
+        // gateway; the posture PLUMBING is what this asserts.)
+        assert!(s.navigate("ipfs://bafycid/"));
+        assert!(
+            s.chrome_json()
+                .contains("\"trustPosture\":\"unverified-origin\""),
+            "untrusted until the bytes verify"
+        );
+        // The OS edge intercepts the request, the shared resolve verifies the
+        // bytes (marking the load), then the WebView reports its commit/finish
+        // signals which pump the shell and refresh the chrome from the seam's
+        // posture — exactly the real Android signal flow.
+        s.backend.mark_content_verified();
+        let url = s.take_pending_load().expect("the ipfs load is pending");
+        s.on_page_committed(&url);
+        s.on_page_finished(&url);
+        assert!(
+            s.chrome_json()
+                .contains("\"trustPosture\":\"content-verified\""),
+            "a verified load surfaces content-verified in the chrome: {}",
+            s.chrome_json()
+        );
+    }
+
+    #[test]
+    fn an_internal_werust_settings_page_is_not_marked_content_verified() {
+        // Kotlin's `shouldInterceptRequest` routes EVERY intercepted scheme through
+        // `resolve_ipfs` (the generic dispatch serves `ipfs` AND `werust`), so the
+        // internal `werust://settings` chrome page must NOT earn the
+        // content-verified posture — it is not hash-verified content. Only the
+        // `ipfs` scheme's success marks the load verified.
+        let s = CoreSession::new();
+        let resolution = s
+            .resolve_ipfs("werust://settings")
+            .expect("the werust scheme is intercepted and served");
+        assert!(
+            matches!(resolution, SchemeResolution::Ok { .. }),
+            "the settings page is served"
+        );
+        assert_eq!(
+            s.chrome().trust_posture,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "an internal settings page is never marked content-verified"
+        );
     }
 
     #[test]

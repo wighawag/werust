@@ -110,6 +110,22 @@ char *werust_ios_resolution_error(const WerustSchemeResolution *resolution);
 /* Free a resolution handle from werust_ios_resolve_ipfs (NULL tolerated). */
 void werust_ios_resolution_free(WerustSchemeResolution *resolution);
 
+/* The document-start scripts (the EIP-1193 provider shim) as a single heap C
+ * string Swift installs onto the WKWebView as a WKUserScript at document start,
+ * so a page's `window.ethereum` is the injected native provider (routed through
+ * the SAME werust-core provider path desktop uses). Free with
+ * werust_ios_string_free; empty string means nothing to inject. */
+char *werust_ios_document_start_script(WerustCoreSession *session);
+
+/* Dispatch an EIP-1193 envelope a page posted on the provider channel `name`
+ * through the shared werust-core provider path and return the response JS Swift
+ * runs in the live page (via WKWebView.evaluateJavaScript) to settle the page's
+ * pending Promise, as a single heap C string (empty means nothing to run). Free
+ * with werust_ios_string_free. This is the page -> native -> page provider
+ * round-trip on iOS, called from the WKScriptMessageHandler. */
+char *werust_ios_handle_provider_message(WerustCoreSession *session,
+                                         const char *name, const char *body);
+
 /* Report the WKWebView's real load-lifecycle signals back into the core (from the
  * WKNavigationDelegate). `url` / `reason` are borrowed C strings. */
 void werust_ios_on_page_committed(WerustCoreSession *session, const char *url);
@@ -118,8 +134,9 @@ void werust_ios_on_page_failed(WerustCoreSession *session, const char *url,
                                const char *reason);
 
 /* The current chrome as a heap C string (JSON: url / loadState / loading /
- * canGoBack / canGoForward / error), for Swift to paint the URL bar, nav-control
- * enablement, and status line. Free with werust_ios_string_free. */
+ * canGoBack / canGoForward / trustPosture / error), for Swift to paint the URL
+ * bar, nav-control enablement, status line, and the trust indicator. Free with
+ * werust_ios_string_free. */
 char *werust_ios_chrome_json(WerustCoreSession *session);
 
 #ifdef __cplusplus

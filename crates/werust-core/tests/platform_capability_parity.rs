@@ -40,9 +40,14 @@
 //!    are tracked (not hidden)
 //!    (`the_real_matrix_passes_because_gaps_are_tracked`,
 //!    `the_mobile_ipfs_gap_is_now_implemented_on_every_platform`).
-//! 4. The no-op-seam rule: an unmarked silent no-op reds the gate; the current
-//!    mobile no-ops are marked+linked
-//!    (`no_op_seam_methods_on_mobile_are_represented_as_tracked_stubs`).
+//! 4. The no-op-seam rule: an unmarked silent no-op reds the gate. The three
+//!    once-mobile seam no-ops the guard was seeded to catch (`ipfs://`, the
+//!    EIP-1193 provider bridge, the trust indicator) are all CLOSED now — real on
+//!    every context, not silent-`implemented` over a live no-op
+//!    (`the_mobile_ipfs_gap_is_now_implemented_on_every_platform`,
+//!    `the_mobile_provider_and_trust_gaps_are_now_implemented_on_every_platform`).
+//!    The FAIL-side of the rule (an untracked/unmarked stub reds the gate) stays
+//!    covered by the `fixture` tests below.
 //! 5. The guard runs inside the gate (this file is a plain `cargo test`).
 //! 6. Tests cover the guard itself: a fixture with an untracked stub FAILS, a
 //!    fully-implemented-or-tracked fixture PASSES, network-isolated (the
@@ -365,44 +370,40 @@ fn the_mobile_ipfs_gap_is_now_implemented_on_every_platform() {
 }
 
 #[test]
-fn no_op_seam_methods_on_mobile_are_represented_as_tracked_stubs() {
-    // Criterion 4 (the no-silent-no-op-seam rule, expressed through the matrix):
-    // the seam methods that are STILL empty `{}` no-ops on the mobile backends
-    // (`register_script_message_handler` + `inject_script` -> eip1193-provider;
-    // the default `trust_posture` -> trust-indicator) MUST each show up as a
-    // marked + task-linked `stubbed` cell on mobile, never as a silent
-    // `implemented`. If any is flipped to `implemented` while the backend still
-    // no-ops it, or dropped, this reds. (`register_scheme_handler` -> ipfs-render
-    // is NO LONGER a no-op — it is implemented on mobile now, asserted by
-    // `the_mobile_ipfs_gap_is_now_implemented_on_every_platform` — so it is not in
-    // this list anymore.)
+fn the_mobile_provider_and_trust_gaps_are_now_implemented_on_every_platform() {
+    // Criterion 3/4 (the two remaining mobile seam no-ops, now CLOSED by task
+    // `mobile-provider-injection-and-trust-indicator`): the EIP-1193 provider
+    // bridge (`register_script_message_handler` + `inject_script`) and the trust
+    // indicator (`trust_posture` / `mark_ens_origin` / `mark_mutable_name`) are
+    // implemented on ALL three contexts now — the mobile backends store the
+    // handler + document-start script and drive the provider round-trip through
+    // the OS edge, and they track + report the real two-axis trust posture the
+    // chrome paints. This pins the resolution so a regression that re-stubs a
+    // mobile edge (or drops a row) breaks this test, exactly as the sibling
+    // `the_mobile_ipfs_gap_is_now_implemented_on_every_platform` does for
+    // `ipfs://`.
     let matrix = load_real_matrix();
-    for (capability, platform) in [
-        ("eip1193-provider", "ios"),
-        ("eip1193-provider", "android"),
-        ("trust-indicator", "ios"),
-        ("trust-indicator", "android"),
-    ] {
-        let cap = matrix
+    let cell = |capability: &str, platform: &str| {
+        matrix
             .capabilities
             .iter()
             .find(|c| c.name == capability)
-            .unwrap_or_else(|| panic!("matrix must carry `{capability}`"));
-        let cell = cap
+            .unwrap_or_else(|| panic!("matrix must carry `{capability}`"))
             .cells
             .iter()
             .find(|(p, _)| p == platform)
             .and_then(|(_, c)| c.clone())
-            .unwrap_or_else(|| panic!("`{capability}` must have a `{platform}` cell"));
-        match cell {
-            CellState::Stubbed { task } => assert!(
-                real_task_exists(&task),
-                "`{capability}` on {platform} is a stub linked to `{task}`, which must be a real task"
-            ),
-            other => panic!(
-                "`{capability}` on {platform} is a mobile seam no-op today, so it MUST be a \
-                 tracked `stubbed` cell, not {other:?} — do not mark a silent no-op implemented"
-            ),
+            .unwrap_or_else(|| panic!("`{capability}` must have a `{platform}` cell"))
+    };
+    for capability in ["eip1193-provider", "trust-indicator"] {
+        for platform in ["desktop", "ios", "android"] {
+            assert_eq!(
+                cell(capability, platform),
+                CellState::Implemented,
+                "`{capability}` must be implemented on {platform} (desktop via install_provider / \
+                 the shared LoadLifecycle posture, mobile via the real script-message bridge + \
+                 OS-edge round-trip and the seam trust_posture the chrome paints)"
+            );
         }
     }
 }

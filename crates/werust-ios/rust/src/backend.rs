@@ -37,10 +37,12 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 use renderer::{
     KeyEvent, LoadEvent, LoadState, PointerEvent, Renderer, RendererError, SchemeHandler,
-    SchemeRequest, SchemeResponse, ScriptMessageHandler, ScrollDelta, ViewHandle,
+    SchemeRequest, SchemeResponse, ScriptMessage, ScriptMessageHandler, ScrollDelta, TrustPosture,
+    ViewHandle,
 };
 
 /// Validate a URL for [`Renderer::navigate`], rejecting unusable ones.
@@ -82,6 +84,59 @@ struct Inner {
     /// path desktop uses, so the same content resolution + fail-closed trust
     /// posture apply.
     scheme_handlers: HashMap<String, SchemeHandler>,
+    /// The registered script-message-bridge handlers, keyed by channel name (e.g.
+    /// `werustProvider`).
+    ///
+    /// This is what makes [`register_script_message_handler`](Renderer::register_script_message_handler)
+    /// REAL on the iOS edge (it was an empty no-op before): a `WKWebView` posts
+    /// page messages to a `WKScriptMessageHandler` registered on its
+    /// `WKUserContentController`, so Swift bridges the channel and drives each
+    /// posted envelope through [`IosHandle::handle_script_message`], which
+    /// dispatches to the handler stored here. The `werustProvider` handler is
+    /// wired by the session's `install_provider` (the twin of the desktop
+    /// backend's `install_provider`), routing each envelope through the SAME
+    /// `werust_core::provider` EIP-1193 path desktop uses.
+    script_handlers: HashMap<String, ScriptMessageHandler>,
+    /// The scripts injected at document start (e.g. the EIP-1193 provider shim),
+    /// in injection order. Read by [`IosHandle::document_start_scripts`] so Swift
+    /// can install them onto the platform `WKWebView` as `WKUserScript`s at
+    /// document start. This is the iOS stand-in for WebKitGTK's
+    /// `UserContentManager::add_script` (`inject_script` was an empty no-op
+    /// before).
+    injected_scripts: Vec<String>,
+    /// Response JS the browser must evaluate back in the live page (browser ->
+    /// page), queued by a script-message handler (the EIP-1193 provider's response
+    /// push that settles a page's pending Promise). This is the iOS stand-in for
+    /// the desktop backend's `evaluate_javascript`: the mobile backend owns no live
+    /// view, so the response JS is queued here and drained by
+    /// [`IosHandle::take_pending_eval`] for Swift to run via
+    /// `WKWebView.evaluateJavaScript`.
+    ///
+    /// Held behind an [`Arc<Mutex<_>>`](std::sync::Arc) (not the surrounding
+    /// `Rc<RefCell>`) so the provider bridge handler can own a `Send` clone of
+    /// JUST this queue: the seam's [`ScriptMessageHandler`] is `Send`, but the
+    /// backend's shared `Inner` is `!Send` (it holds `Rc`s), so the provider
+    /// closure captures this `Send` eval sink alone rather than the whole handle —
+    /// the mobile twin of how the desktop `install_provider` closure captures a
+    /// cloneable view handle for its response push.
+    pending_eval: Arc<Mutex<Vec<String>>>,
+    /// The [`TrustPosture`] of the CURRENT load: the same shared-`LoadLifecycle`
+    /// posture the desktop backend surfaces, made real on the iOS edge (the seam
+    /// default `UnverifiedOrigin` was inherited before). Reset to
+    /// `UnverifiedOrigin` on every fresh [`begin`](Inner::begin) and upgraded ONLY
+    /// when the `ipfs` scheme handler verifies this load's bytes
+    /// ([`mark_content_verified`](Inner::mark_content_verified)).
+    posture: TrustPosture,
+    /// Whether the CURRENT load originated from an ENS name resolved over a
+    /// trusted RPC (the bare-`.eth` front door), mirroring the desktop
+    /// `LoadLifecycle::ens_origin`. Set by the shell via
+    /// [`mark_ens_origin`](Renderer::mark_ens_origin); reset on `begin`.
+    ens_origin: bool,
+    /// Whether the CURRENT load points at a MUTABLE name (an IPNS name, or a later
+    /// ENS name), mirroring the desktop `LoadLifecycle::mutable_name`. Set by the
+    /// shell via [`mark_mutable_name`](Renderer::mark_mutable_name); reset on
+    /// `begin`.
+    mutable_name: bool,
 }
 
 // A `SchemeHandler` is a boxed `FnMut` and cannot derive `Debug`; hand-write it
@@ -99,6 +154,18 @@ impl std::fmt::Debug for Inner {
                 "scheme_handlers",
                 &self.scheme_handlers.keys().collect::<Vec<_>>(),
             )
+            .field(
+                "script_handlers",
+                &self.script_handlers.keys().collect::<Vec<_>>(),
+            )
+            .field("injected_scripts", &self.injected_scripts.len())
+            .field(
+                "pending_eval",
+                &self.pending_eval.lock().map(|q| q.len()).unwrap_or(0),
+            )
+            .field("posture", &self.posture)
+            .field("ens_origin", &self.ens_origin)
+            .field("mutable_name", &self.mutable_name)
             .finish()
     }
 }
@@ -111,12 +178,33 @@ impl Inner {
     /// Begin a load of `url`: record it as the pending load for Swift to apply to
     /// the platform `WKWebView`, move to [`LoadState::Started`], and emit
     /// [`LoadEvent::Started`].
+    ///
+    /// A fresh load starts UNVERIFIED and un-flagged, exactly like the desktop
+    /// `LoadLifecycle::begin`: the trust posture resets to
+    /// [`TrustPosture::UnverifiedOrigin`] and both trust-axis flags clear, so a
+    /// stale verified/ENS/mutable posture never leaks from a prior load onto this
+    /// one. The posture is only upgraded again if THIS load's bytes verify
+    /// ([`mark_content_verified`](Inner::mark_content_verified)).
     fn begin(&mut self, url: &str) {
         self.pending_load = Some(url.to_string());
         self.state = LoadState::Started;
+        self.posture = TrustPosture::UnverifiedOrigin;
+        self.ens_origin = false;
+        self.mutable_name = false;
         self.events.push_back(LoadEvent::Started {
             url: url.to_string(),
         });
+    }
+
+    /// Mark the CURRENT load content-verified: its bytes came back through the
+    /// hash-verified content-addressed path (the `ipfs` scheme handler resolved
+    /// them successfully). Surfaces the honest two-axis posture via the ONE shared
+    /// rule [`TrustPosture::after_verify`], exactly as the desktop
+    /// `LoadLifecycle::mark_content_verified` does: `NameViaTrustedRpc` if
+    /// ENS-originated (loudest), else `MutableName` if mutable, else plain
+    /// `ContentVerified`.
+    fn mark_content_verified(&mut self) {
+        self.posture = TrustPosture::after_verify(self.ens_origin, self.mutable_name);
     }
 }
 
@@ -187,6 +275,87 @@ impl IosHandle {
         Some(handler(SchemeRequest {
             uri: uri.to_string(),
         }))
+    }
+
+    /// Mark the CURRENT load content-verified from the OS edge: its bytes came
+    /// back through the hash-verified `ipfs` resolve path. This is the iOS
+    /// stand-in for the desktop `install_ipfs` scheme handler calling
+    /// `life.borrow_mut().mark_content_verified()` on a verified resolution: the
+    /// mobile backend owns no live `LoadLifecycle`, so the session's `resolve_ipfs`
+    /// calls this the moment a resolution succeeds, and the trust indicator then
+    /// surfaces the honest two-axis posture (`NameViaTrustedRpc` / `MutableName` /
+    /// `ContentVerified`) for THIS load instead of the served default.
+    pub fn mark_content_verified(&self) {
+        self.inner.borrow_mut().mark_content_verified();
+    }
+
+    /// The scripts to inject at document start (the EIP-1193 provider shim), in
+    /// injection order, so Swift can install them onto the platform `WKWebView` as
+    /// `WKUserScript`s at document start. This is the read half of the iOS
+    /// `inject_script` bridge, which used to be an empty no-op.
+    #[must_use]
+    pub fn document_start_scripts(&self) -> Vec<String> {
+        self.inner.borrow().injected_scripts.clone()
+    }
+
+    /// Dispatch a page-posted script-message envelope on channel `name` to the
+    /// registered handler (the EIP-1193 provider bridge), then drain and return
+    /// the response JS (if any) the browser must evaluate back in the page to
+    /// settle the page's pending Promise.
+    ///
+    /// This is the iOS edge's stand-in for WebKitGTK's
+    /// `connect_script_message_received` + `evaluate_javascript` round-trip: the
+    /// `WKWebView` posts page messages to a `WKScriptMessageHandler`, so Swift
+    /// bridges the channel and calls this with each posted body; the handler
+    /// answers it (queuing the response JS via `evaluate_javascript`) and this
+    /// returns that JS for Swift to run with `WKWebView.evaluateJavaScript`.
+    /// `None` (empty vec) means the channel is unregistered or the message needed
+    /// no response.
+    #[must_use]
+    pub fn handle_script_message(&self, name: &str, body: &str) -> Vec<String> {
+        // Take the handler OUT of the map for the duration of the call so the
+        // `RefCell` is not borrowed across the handler body: the handler is a
+        // `FnMut` capturing its own response sink (`evaluate_javascript`, which
+        // borrows the same `Inner` to queue into `pending_eval`), so holding the
+        // borrow here would be a re-entrant `borrow_mut` panic. Re-insert it after.
+        let taken = self.inner.borrow_mut().script_handlers.remove(name);
+        if let Some(mut handler) = taken {
+            handler(ScriptMessage {
+                handler: name.to_string(),
+                body: body.to_string(),
+            });
+            self.inner
+                .borrow_mut()
+                .script_handlers
+                .insert(name.to_string(), handler);
+        }
+        self.take_pending_eval()
+    }
+
+    /// Drain the response JS the browser must evaluate back in the live page
+    /// (browser -> page), queued by a script-message handler's response push. The
+    /// iOS stand-in for the desktop `evaluate_javascript` immediate eval: the
+    /// backend owns no live view, so Swift runs these with
+    /// `WKWebView.evaluateJavaScript`.
+    #[must_use]
+    pub fn take_pending_eval(&self) -> Vec<String> {
+        let queue = self.inner.borrow().pending_eval.clone();
+        let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
+        std::mem::take(&mut *q)
+    }
+
+    /// A `Send` clone of JUST the response-JS eval queue (browser -> page), for the
+    /// session's `install_provider` to hand
+    /// [`route_provider_message`](werust_core::provider::route_provider_message)
+    /// as its `respond` sink: the provider handler pushes each response-delivery
+    /// call here, and [`take_pending_eval`](IosHandle::take_pending_eval) drains it
+    /// for `WKWebView.evaluateJavaScript`. Cloning JUST this `Arc` (not the
+    /// `!Send` backend handle) is what lets the seam's `Send`
+    /// [`ScriptMessageHandler`] capture the sink — the mobile twin of the desktop
+    /// `install_provider` closure capturing a cloneable view handle.
+    #[must_use]
+    pub fn eval_sink(&self) -> Arc<Mutex<Vec<String>>> {
+        self.inner.borrow().pending_eval.clone()
     }
 
     /// Report that the platform `WKWebView` committed the load on `url` (the
@@ -308,8 +477,79 @@ impl Renderer for IosBackend {
     fn send_scroll(&mut self, _delta: ScrollDelta) {}
     fn set_focus(&mut self, _focused: bool) {}
 
-    fn register_script_message_handler(&mut self, _name: &str, _handler: ScriptMessageHandler) {}
-    fn inject_script(&mut self, _script: &str) {}
+    fn register_script_message_handler(&mut self, name: &str, handler: ScriptMessageHandler) {
+        // Store the handler so the iOS edge can dispatch page-posted envelopes to
+        // it from its `WKScriptMessageHandler` via
+        // [`IosHandle::handle_script_message`]. This is the seam method that used
+        // to be a silent no-op — the exact gap the platform-capability parity
+        // guard exists to forbid; it is now real. It is the channel the EIP-1193
+        // provider is injected over (`install_provider`).
+        self.inner
+            .borrow_mut()
+            .script_handlers
+            .insert(name.to_string(), handler);
+    }
+
+    fn inject_script(&mut self, script: &str) {
+        // Record the document-start script (the EIP-1193 provider shim) so the iOS
+        // edge can install it onto the platform `WKWebView` as a `WKUserScript` at
+        // document start via [`IosHandle::document_start_scripts`]. The seam method
+        // that used to be a silent no-op is now real.
+        self.inner
+            .borrow_mut()
+            .injected_scripts
+            .push(script.to_string());
+    }
+
+    fn evaluate_javascript(&self, script: &str) {
+        // Queue the response JS (browser -> page) for the iOS edge to run in the
+        // live page via `WKWebView.evaluateJavaScript`. The backend owns no live
+        // view, so unlike the desktop backend (which evaluates immediately on the
+        // GTK loop) the JS is queued and drained by
+        // [`IosHandle::take_pending_eval`]. This is the RESPONSE half of the
+        // provider round-trip that settles a page's pending Promise.
+        if let Ok(mut queue) = self.inner.borrow().pending_eval.lock() {
+            queue.push(script.to_string());
+        }
+    }
+
+    fn trust_hooks(&self) -> renderer::TrustHooks {
+        // OPT IN to BOTH trust hooks, exactly as the desktop `WebViewRenderer`
+        // does: this backend genuinely wires EIP-1193 provider injection
+        // (`register_script_message_handler` + `inject_script` + the
+        // `evaluate_javascript` response push, driven by the OS edge) AND `ipfs://`
+        // custom-scheme resolution (`register_scheme_handler` -> the hash-verified
+        // core path). The seam default is FAIL-CLOSED (`TrustHooks::none()`), so a
+        // backend must EXPLICITLY declare the hooks it satisfies to qualify; the
+        // mobile no-ops these methods USED to be would have disqualified it.
+        renderer::TrustHooks::all()
+    }
+
+    fn trust_posture(&self) -> TrustPosture {
+        // The current load's posture, the SAME source the desktop chrome reads:
+        // `ContentVerified` (or the louder ENS/mutable variant) iff this load's
+        // bytes came back through the hash-verified `ipfs` path (marked by
+        // `mark_content_verified`), else the served-origin default. This is what
+        // makes the mobile trust indicator reflect the real load posture rather
+        // than the inherited seam default.
+        self.inner.borrow().posture
+    }
+
+    fn mark_ens_origin(&mut self) {
+        // Flag the current load ENS-originated (the front door resolved the name
+        // over the trusted RPC), so when the `ipfs` handler later verifies the
+        // bytes the posture surfaces `NameViaTrustedRpc`. A fresh `begin` clears
+        // the flag. The twin of the desktop backend's `mark_ens_origin`.
+        self.inner.borrow_mut().ens_origin = true;
+    }
+
+    fn mark_mutable_name(&mut self) {
+        // Flag the current load's name MUTABLE (an IPNS resolution), so a verified
+        // load surfaces at most `MutableName` (or the louder `NameViaTrustedRpc` if
+        // also ENS-originated), never immutable `ContentVerified`. A fresh `begin`
+        // clears the flag. The twin of the desktop backend's `mark_mutable_name`.
+        self.inner.borrow_mut().mutable_name = true;
+    }
 
     fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler) {
         // Store the handler so the iOS edge can dispatch to it from its
@@ -532,5 +772,99 @@ mod tests {
                 reason: "name not resolved".into(),
             })
         );
+    }
+
+    #[test]
+    fn the_script_bridge_round_trips_a_page_message_to_a_response_push() {
+        // The seam method that used to be a silent no-op is now real: a registered
+        // script-message handler receives a page-posted envelope, and its response
+        // push (via `evaluate_javascript`) is queued for the OS edge to run in the
+        // page. This is the mechanism the EIP-1193 provider round-trips over.
+        let mut b = IosBackend::new();
+        let h = b.handle();
+
+        let sink = h.eval_sink();
+        b.register_script_message_handler(
+            "werustProvider",
+            Box::new(move |message| {
+                sink.lock()
+                    .unwrap()
+                    .push(format!("__settle({});", message.body));
+            }),
+        );
+
+        let pushed = h.handle_script_message("werustProvider", "42");
+        assert_eq!(
+            pushed,
+            vec!["__settle(42);".to_string()],
+            "the page message reaches the handler and its response is queued to eval"
+        );
+        assert!(
+            h.take_pending_eval().is_empty(),
+            "handle_script_message drained the queue"
+        );
+    }
+
+    #[test]
+    fn an_unregistered_script_channel_yields_no_response() {
+        // A message on a channel with no registered handler produces nothing to
+        // evaluate (the provider bridge only answers its own channel).
+        let b = IosBackend::new();
+        let h = b.handle();
+        assert!(h.handle_script_message("nope", "{}").is_empty());
+    }
+
+    #[test]
+    fn inject_script_is_surfaced_for_the_os_edge_to_install() {
+        // The `inject_script` seam no-op is gone: injected document-start scripts
+        // are recorded so the OS edge can install them as `WKUserScript`s.
+        let mut b = IosBackend::new();
+        let h = b.handle();
+        assert!(h.document_start_scripts().is_empty());
+        b.inject_script("window.__shim = 1;");
+        assert_eq!(h.document_start_scripts(), vec!["window.__shim = 1;"]);
+    }
+
+    #[test]
+    fn the_backend_opts_into_both_trust_hooks() {
+        // The backend genuinely wires BOTH trust hooks now (provider + ipfs), so
+        // it declares them explicitly and passes the qualifying gate — the mobile
+        // no-ops would have left it fail-closed disqualified.
+        let b = IosBackend::new();
+        assert!(renderer::qualify(&b).is_ok(), "a real backend qualifies");
+    }
+
+    #[test]
+    fn trust_posture_tracks_the_verified_load_path_and_the_two_axes() {
+        // The trust indicator source, made real on the iOS edge (it inherited the
+        // seam default before). A fresh load is untrusted; a verified load is
+        // content-verified; the two-axis front-door flags surface the louder
+        // warning; and a fresh navigation resets it so no posture leaks.
+        let mut b = IosBackend::new();
+        assert_eq!(b.trust_posture(), TrustPosture::UnverifiedOrigin);
+
+        b.navigate("ipfs://bafycid/").unwrap();
+        assert_eq!(b.trust_posture(), TrustPosture::UnverifiedOrigin);
+
+        b.handle().mark_content_verified();
+        assert_eq!(b.trust_posture(), TrustPosture::ContentVerified);
+
+        b.navigate("ipfs://enscid/").unwrap();
+        assert_eq!(
+            b.trust_posture(),
+            TrustPosture::UnverifiedOrigin,
+            "reset on begin"
+        );
+        b.mark_ens_origin();
+        b.handle().mark_content_verified();
+        assert_eq!(b.trust_posture(), TrustPosture::NameViaTrustedRpc);
+
+        b.navigate("ipfs://ipnscid/").unwrap();
+        b.mark_mutable_name();
+        b.handle().mark_content_verified();
+        assert_eq!(b.trust_posture(), TrustPosture::MutableName);
+
+        b.navigate("https://example.com/").unwrap();
+        assert_eq!(b.trust_posture(), TrustPosture::UnverifiedOrigin);
     }
 }

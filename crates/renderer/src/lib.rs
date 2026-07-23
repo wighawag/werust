@@ -160,6 +160,33 @@ impl TrustPosture {
     pub fn is_mutable_name(self) -> bool {
         matches!(self, TrustPosture::MutableName)
     }
+
+    /// The honest posture for a load whose bytes JUST verified on the
+    /// content-addressed path, given the two trust axes of the current load: was
+    /// the name learned over a trusted RPC (`ens_origin`), and is the name mutable
+    /// (`mutable_name`).
+    ///
+    /// This is the ONE two-axis "show the LOUDEST applicable warning" rule
+    /// (`work/notes/observations/trust-posture-two-axes-model-2026-07-22.md`,
+    /// `docs/adr/0006`), lifted here so every backend that verifies bytes surfaces
+    /// the SAME posture from the SAME rule rather than each re-deriving it: the
+    /// desktop `LoadLifecycle::mark_content_verified` and both mobile backends'
+    /// scheme-handler `mark_content_verified` all call this. `ens_origin` (a
+    /// misdirecting trusted RPC) is the loudest and wins over `mutable_name` (an
+    /// honest controller repointing); a mutable name with no RPC trust (a
+    /// client-verified IPNS record) is [`MutableName`](TrustPosture::MutableName);
+    /// an immutable, RPC-free load is plain
+    /// [`ContentVerified`](TrustPosture::ContentVerified).
+    #[must_use]
+    pub fn after_verify(ens_origin: bool, mutable_name: bool) -> Self {
+        if ens_origin {
+            TrustPosture::NameViaTrustedRpc
+        } else if mutable_name {
+            TrustPosture::MutableName
+        } else {
+            TrustPosture::ContentVerified
+        }
+    }
 }
 
 /// A load-lifecycle event emitted by a backend as a load progresses.
@@ -1114,6 +1141,38 @@ mod tests {
         assert!(one.contains(TrustHook::ProviderInjection));
         assert!(!one.contains(TrustHook::IpfsScheme));
         assert!(!one.is_qualifying());
+    }
+
+    #[test]
+    fn after_verify_encodes_the_two_axis_loudest_wins_rule() {
+        // The ONE two-axis posture rule every verifying backend shares: given a
+        // load whose bytes just verified, the LOUDEST applicable warning wins.
+        // An immutable, RPC-free load is plain content-verified.
+        assert_eq!(
+            TrustPosture::after_verify(false, false),
+            TrustPosture::ContentVerified
+        );
+        // A mutable name with no RPC trust (a client-verified IPNS record) is the
+        // quieter mutable-name warning.
+        assert_eq!(
+            TrustPosture::after_verify(false, true),
+            TrustPosture::MutableName
+        );
+        // An ENS-originated load (name learned over a trusted RPC) is the louder
+        // name-via-trusted-RPC warning, and it WINS over mutability: a misdirecting
+        // RPC is worse than an honest controller repointing.
+        assert_eq!(
+            TrustPosture::after_verify(true, false),
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert_eq!(
+            TrustPosture::after_verify(true, true),
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS-origin (trusted-RPC) axis is the loudest and wins over mutability"
+        );
+        // It never claims verified when a warning applies.
+        assert!(!TrustPosture::after_verify(true, false).is_content_verified());
+        assert!(!TrustPosture::after_verify(false, true).is_content_verified());
     }
 
     #[test]

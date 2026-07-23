@@ -9,6 +9,7 @@ import android.view.Gravity
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
+import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -44,7 +45,16 @@ class BrowserActivity : Activity() {
     private lateinit var reloadButton: Button
     private lateinit var stopButton: Button
     private lateinit var status: TextView
+    private lateinit var trust: TextView
     private lateinit var webView: WebView
+
+    /**
+     * The EIP-1193 provider bridge preamble + the `werust-core` provider shim,
+     * bundled once and injected at document start on every page so a page's
+     * `window.ethereum` is the injected native provider. Empty if the core has no
+     * provider shim to inject.
+     */
+    private var providerScript: String = ""
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -87,13 +97,28 @@ class BrowserActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
             settings.javaScriptEnabled = true
             webViewClient = CoreWebViewClient()
+            // Wire the EIP-1193 provider bridge: a JS interface the injected shim's
+            // `postMessage` calls (page -> native), plus the document-start shim
+            // itself (the SAME `werust-core` provider shim desktop injects). The
+            // native side answers each envelope keylessly and the bridge evaluates
+            // the response JS back in the page to settle its pending Promise.
+            addJavascriptInterface(ProviderBridge(), PROVIDER_INTERFACE)
         }
+        providerScript = buildProviderScript()
 
+        // The trust indicator, at the footer next to the status: painted from the
+        // core's posture (the ACTUAL load path), the SAME four states desktop shows.
+        trust = TextView(this).apply { text = "⚠ unverified origin"; gravity = Gravity.END }
         status = TextView(this).apply { text = "idle"; gravity = Gravity.START }
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(status, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(trust, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
+        }
 
         root.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         root.addView(webView)
-        root.addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         setContentView(root)
 
         // Launch a browsing surface: drive the core to the start URL, then let the
@@ -152,6 +177,54 @@ class BrowserActivity : Activity() {
         stopButton.isEnabled = chrome.loading
         reloadButton.isEnabled = !chrome.loading
         status.text = chrome.statusLine()
+        // The trust indicator tracks the core's posture (the real load path),
+        // matching desktop; the seam-default no-op is gone.
+        trust.text = chrome.trustIndicator()
+    }
+
+    /**
+     * Build the document-start provider script: a small preamble that defines
+     * `window.webkit.messageHandlers.<channel>.postMessage` (the channel the
+     * shared provider shim posts to) so it forwards to the `@JavascriptInterface`
+     * [ProviderBridge] and evaluates the synchronous native response, followed by
+     * the `werust-core` provider shim itself. Injected at document start (see
+     * [CoreWebViewClient.onPageStarted]) so a page's `window.ethereum` is the
+     * injected native provider from the first script. Empty if the core has no
+     * shim to inject.
+     */
+    private fun buildProviderScript(): String {
+        val shim = core.documentStartScript()
+        if (shim.isEmpty()) return ""
+        // The `window.webkit.messageHandlers.<channel>` shape the shared shim posts
+        // to, bridged to the Android JS interface. The native resolve is
+        // synchronous, so the bridge evals the returned response JS inline to
+        // settle the page's pending Promise.
+        val preamble = """
+            (function () {
+              window.webkit = window.webkit || {};
+              window.webkit.messageHandlers = window.webkit.messageHandlers || {};
+              window.webkit.messageHandlers.$PROVIDER_CHANNEL = {
+                postMessage: function (m) {
+                  var out = $PROVIDER_INTERFACE.postMessage(String(m));
+                  if (out) { try { window.eval(out); } catch (e) {} }
+                }
+              };
+            })();
+        """.trimIndent()
+        return "$preamble\n$shim"
+    }
+
+    /**
+     * The `@JavascriptInterface` the provider bridge preamble calls: it hands a
+     * page-posted EIP-1193 envelope to the Rust core and returns the response JS
+     * the page evaluates to settle its pending Promise. Runs on a WebView
+     * JS-interface thread; the native `SyncSession` mutex serializes it against
+     * the UI thread exactly as the `ipfs://` interception is.
+     */
+    private inner class ProviderBridge {
+        @JavascriptInterface
+        fun postMessage(body: String): String =
+            core.handleProviderMessage(PROVIDER_CHANNEL, body)
     }
 
     override fun onDestroy() {
@@ -234,6 +307,11 @@ class BrowserActivity : Activity() {
         }
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
+            // Install the EIP-1193 provider shim as the FIRST script the document
+            // runs, so `window.ethereum` is the injected native provider before any
+            // page script. (WebView has no exact document-start user-script hook
+            // without androidx; `onPageStarted` is the earliest edge hook.)
+            if (providerScript.isNotEmpty()) view.evaluateJavascript(providerScript, null)
             core.onPageCommitted(url)
             refreshChrome()
         }
@@ -258,6 +336,12 @@ class BrowserActivity : Activity() {
     companion object {
         /** The URL the app opens on launch, so it shows a browsing surface. */
         private const val START_URL = "https://example.com/"
+
+        /** The EIP-1193 provider script-message channel (matches `werust-core`). */
+        private const val PROVIDER_CHANNEL = "werustProvider"
+
+        /** The `@JavascriptInterface` name the provider bridge preamble calls. */
+        private const val PROVIDER_INTERFACE = "werustProviderBridge"
 
         /** The compact nav-button square edge, in dp (small so the URL bar wins width). */
         private const val NAV_BUTTON_DP = 40

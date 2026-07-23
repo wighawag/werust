@@ -7,27 +7,42 @@
 //! the load state, and any surfaced failure), so the cdylib stays dependency-light
 //! (no serde) and the wire shape is pinned by the tests below.
 
-use renderer::LoadState;
+use renderer::{LoadState, TrustPosture};
 use werust_core::ChromeState;
 
 /// Encode a [`ChromeState`] as a compact JSON object for the Kotlin edge.
 ///
 /// The shape (stable, asserted by the tests):
-/// `{"url":..,"loadState":..,"loading":bool,"canGoBack":bool,"canGoForward":bool,"error":..}`.
-/// `error` is `null` when nothing has failed.
+/// `{"url":..,"loadState":..,"loading":bool,"canGoBack":bool,"canGoForward":bool,"trustPosture":..,"error":..}`.
+/// `error` is `null` when nothing has failed. `trustPosture` carries the current
+/// load's [`TrustPosture`] so the Kotlin chrome can paint the trust indicator
+/// from the core's truth (the actual load path), matching desktop.
 pub fn chrome_to_json(state: &ChromeState) -> String {
     let error = match &state.last_error {
         Some(reason) => format!("\"{}\"", escape(reason)),
         None => "null".to_string(),
     };
     format!(
-        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"canGoBack\":{back},\"canGoForward\":{forward},\"error\":{error}}}",
+        "{{\"url\":\"{url}\",\"loadState\":\"{load_state}\",\"loading\":{loading},\"canGoBack\":{back},\"canGoForward\":{forward},\"trustPosture\":\"{trust}\",\"error\":{error}}}",
         url = escape(&state.url_text),
         load_state = load_state_name(state.load_state),
         loading = state.is_loading(),
         back = state.can_go_back,
         forward = state.can_go_forward,
+        trust = trust_posture_name(state.trust_posture),
     )
+}
+
+/// The stable, wire name of a [`TrustPosture`] the Kotlin edge paints its trust
+/// indicator from. Kept lower-kebab so the wire form is stable across platforms
+/// (the iOS `ffi_json` uses the SAME names).
+fn trust_posture_name(posture: TrustPosture) -> &'static str {
+    match posture {
+        TrustPosture::UnverifiedOrigin => "unverified-origin",
+        TrustPosture::ContentVerified => "content-verified",
+        TrustPosture::NameViaTrustedRpc => "name-via-trusted-rpc",
+        TrustPosture::MutableName => "mutable-name",
+    }
 }
 
 /// The stable, lower-case name of a [`LoadState`] for the wire form.
@@ -70,8 +85,32 @@ mod tests {
         let json = chrome_to_json(&ChromeState::default());
         assert_eq!(
             json,
-            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"canGoBack\":false,\"canGoForward\":false,\"error\":null}"
+            "{\"url\":\"\",\"loadState\":\"idle\",\"loading\":false,\"canGoBack\":false,\"canGoForward\":false,\"trustPosture\":\"unverified-origin\",\"error\":null}"
         );
+    }
+
+    #[test]
+    fn encodes_each_trust_posture_so_the_kotlin_chrome_paints_the_indicator() {
+        // The chrome JSON carries the current load's trust posture so the Kotlin
+        // edge can paint the trust indicator from the core's truth (the actual
+        // load path), matching desktop — including the ENS `NameViaTrustedRpc` and
+        // the `MutableName` states. A distinct, stable wire name per posture.
+        for (posture, name) in [
+            (TrustPosture::UnverifiedOrigin, "unverified-origin"),
+            (TrustPosture::ContentVerified, "content-verified"),
+            (TrustPosture::NameViaTrustedRpc, "name-via-trusted-rpc"),
+            (TrustPosture::MutableName, "mutable-name"),
+        ] {
+            let state = ChromeState {
+                trust_posture: posture,
+                ..ChromeState::default()
+            };
+            let json = chrome_to_json(&state);
+            assert!(
+                json.contains(&format!("\"trustPosture\":\"{name}\"")),
+                "posture {posture:?} must serialize as {name}: {json}"
+            );
+        }
     }
 
     #[test]

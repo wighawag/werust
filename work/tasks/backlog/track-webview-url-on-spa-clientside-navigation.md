@@ -8,7 +8,13 @@ covers: [2]
 
 ## What to build
 
-FIELD FINDING (v0.2.4, human): "on both we still do not have the url match the navigation state, even clicking on a external link it will keep the original name." Root-cause source: `work/notes/observations/field-test-v0.2.4-spa-clientrouting-eth-path-blank-links-2026-07-23.md` (finding A).
+FIELD FINDING (v0.2.4, human): "on both we still do not have the url match the navigation state" (the URL bar stays frozen). Plus, the `ipfs://` CID STILL leaks back into the bar on back/forward/reload despite the v0.2.4 `ens-history-name-rederive-async-and-normalized` fix. Root-cause source: `work/notes/observations/field-test-v0.2.4-spa-clientrouting-eth-path-blank-links-2026-07-23.md` (finding A + the ADDENDUM).
+
+THIS TASK HAS TWO COUPLED PARTS (same identity-tracking machinery):
+
+**Part 1 - track SPA client-side URL changes** (the frozen-bar-on-internal-nav). (The EXTERNAL-link frozen-bar symptom is a DIFFERENT bug - `target=_blank` links are dropped; that is fixed by `blank-and-window-open-links-navigate-in-place`, which makes them fire a real load event so the existing follow logic works. This task covers the INTERNAL SvelteKit SPA case only, which fires no event.)
+
+**Part 2 - fix the `ipfs://`-reappears leak by making the ENS association ROOT-CID-PREFIX, not root-entry-only** (the ADDENDUM finding). This is REQUIRED here because it shares the mechanism: `ens_pages` today is populated only in `load_resolved_content` keyed on the exact resolved ROOT normalized key (the bare `<cid>`). After loading `ronan.eth` the user navigates in-page (SPA, or a real sub-path load) to `<cid>/blog/...`; a later back/forward/reload can land `current_url` on that SUB-PATH CID (`<cid>/blog`), whose normalized key DIFFERS from the stored root `<cid>` (the normalizer preserves sub-paths), so `refresh_chrome`'s `ens_pages.get(normalize(current_url))` MISSES and the final `else if let Some(url) = current_url` branch leaks `ipfs://<cid>/blog/` into the bar. FIX: recognise the current backend URL as being UNDER a known ENS site's ROOT CID (a prefix match on the root CID), and re-derive the name (display `ronan.eth/<in-site-path>`, or at least `ronan.eth`) + re-mark the posture for ANY `<rootcid>/<anypath>` entry - never the raw `ipfs://<rootcid>/<path>`. So the association is with the WHOLE SITE (root CID), not just the exact root entry.
 
 READ-FIRST / drift check: this is the DEEPER layer beneath `urlbar-tracks-in-page-navigation-not-just-pinned-name` (done). That task drops the pin / follows the URL when `pump()` drains a `LoadEvent` for a new URL. But `ronan.eth` is a SvelteKit SPA: link clicks are CLIENT-SIDE `pushState` navigations that do NOT trigger a full page load, so WebKitGTK's `connect_load_changed` NEVER fires (`crates/webview-renderer/src/backend.rs` only feeds `LoadEvent`s from `load-changed`/`load-failed`). The 50ms desktop pump runs but has no events to drain, so `drop_pin_on_in_page_nav` never runs and the bar stays frozen. Confirm the backend still feeds `LoadEvent`s ONLY from the load-lifecycle signals (no same-document/URL-change observation yet).
 
@@ -26,6 +32,7 @@ Seam + core:
 
 ## Acceptance criteria
 
+- [ ] (Part 2, the leak) After loading an ENS site and navigating to a SUB-PATH within it, a back / forward / reload that lands on ANY `<rootcid>/<path>` of that site shows the `.eth` name (as `ronan.eth/<path>` or at least `ronan.eth`) + its ENS posture in the bar - NEVER the raw `ipfs://<rootcid>/<path>`. The `ens_pages` association is matched on the ROOT CID PREFIX of the current entry, not only its exact normalized key. This closes the v0.2.4 `ipfs://`-reappears leak.
 - [ ] Clicking a link that navigates CLIENT-SIDE (SvelteKit/SPA pushState, same-document) updates the URL bar to the new location on desktop and mobile, instead of freezing on the pinned `.eth` name.
 - [ ] A same-document URL change is modelled as a distinct signal (not a faked load lifecycle event); the decision (new `LoadEvent` variant vs separate poll) is recorded.
 - [ ] The pin-drop/follow + `ens_pages` re-derive + posture logic runs for a SPA URL change exactly as for a backend in-page load event: off-root -> follow the URL; back onto a known ENS root -> re-derive the name; posture tracks the actual origin/verification of the current document.
@@ -39,7 +46,7 @@ Seam + core:
 
 ## Prompt
 
-> Goal: make the URL bar track SPA client-side navigation (SvelteKit pushState/replaceState, same-document history), which today fires NO WebKitGTK `load-changed`, so the pump sees no event and the bar stays frozen on `ronan.eth`. This is the deeper layer under `urlbar-tracks-in-page-navigation-not-just-pinned-name` (which only handles backend-delivered LoadEvents).
+> Goal: TWO coupled fixes. (1) Make the URL bar track SPA client-side navigation (SvelteKit pushState/replaceState, same-document history), which fires NO WebKitGTK `load-changed`, so the bar freezes on `ronan.eth` for INTERNAL nav (external-link freeze is the separate `_blank`-dropped bug, fixed elsewhere). (2) FIX the `ipfs://`-STILL-reappears leak: `ens_pages` is populated root-only, so a back/forward/reload landing on a SUB-PATH `<cid>/blog` of a known ENS site MISSES the exact-key lookup and leaks the raw CID. Make the ENS association ROOT-CID-PREFIX: recognise any `<rootcid>/<path>` as under a known ENS site -> show `ronan.eth/<path>` (or `ronan.eth`) + posture, never `ipfs://<rootcid>/<path>`.
 >
 > Where to look: `crates/webview-renderer/src/backend.rs` `connect_load_signals` (add `notify::uri` observation - WebKitGTK's `WebView::uri` fires on same-document history changes); iOS `crates/werust-ios` (KVO on `webView.url`); Android `crates/werust-android/.../BrowserActivity.kt` (`WebViewClient.doUpdateVisitedHistory`). Add a seam signal for a same-document URL change DISTINCT from a load lifecycle event (likely a `LoadEvent::UrlChanged { url }` variant so it flows through `pump()` -> `drop_pin_on_in_page_nav`; `LoadEvent::url()` already exists). In the shell, a URL change drives the SAME pin-drop/follow + `ens_pages` re-derive + posture-tracks-the-load-path logic as an in-page load event. Do NOT re-mean trust or fake a load lifecycle.
 >

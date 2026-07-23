@@ -4,6 +4,7 @@ slug: retrieval-backend-user-setting
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 blockedBy: [verifiable-ipfs-content-retrieval-seam-and-gateway-car-backend]
 covers: [1]
+needsAnswers: true
 ---
 
 ## Settled decisions (from the design discussion — DECIDED, build to them)

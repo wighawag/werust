@@ -342,6 +342,65 @@ impl WebViewRenderer {
         });
     }
 
+    /// Wire WebKitGTK's new-window (`create`) hook so a `target="_blank"` link /
+    /// `window.open(url)` navigates IN THE CURRENT view instead of being dropped
+    /// (task `blank-and-window-open-links-navigate-in-place`, field finding C,
+    /// `docs/adr/0010`).
+    ///
+    /// WHY THIS IS NEEDED: werust has NO tab/window model yet. WebKitGTK emits the
+    /// `create` signal for a `_blank`/`window.open`/new-window request; the
+    /// builder wired `connect_load_changed`/`connect_load_failed` but NO
+    /// `connect_create`, so such a request was UNHANDLED and the navigation
+    /// silently DROPPED (every external `ronan.eth` link is `target="_blank"`, so
+    /// they all did nothing). The recorded decision (in-place until a tab/window
+    /// model exists, `docs/adr/0010`) is to load the requested URI in the EXISTING
+    /// view, so a `_blank` link behaves like an ordinary in-view navigation.
+    ///
+    /// HOW: the handler reads the target URI from the `create` signal's
+    /// [`NavigationAction`](webkit6::NavigationAction) request, applies the ONE
+    /// shared [`renderer::new_window_action`] rule (the same rule the mobile hooks
+    /// mirror), and on [`NavigateInPlace`](renderer::NewWindowAction::NavigateInPlace)
+    /// loads that URI into `self.view` via the SAME `load_uri` the seam's
+    /// [`navigate`](Renderer::navigate) drives — so an `ipfs://`/ENS `_blank`
+    /// target still flows through the hash-verified `ipfs://` scheme handler
+    /// (`install_ipfs`) and an unsupported scheme is still refused: the hook is a
+    /// ROUTER, not a trust bypass. It then returns the EXISTING view widget so
+    /// WebKitGTK creates NO second WebView (no real new window/tab), and
+    /// optimistically begins the lifecycle so the shell's URL bar follows the new
+    /// URL exactly as a normal navigation does.
+    ///
+    /// It is registered directly on `self.view` (not through the seam) for the
+    /// same reason `install_provider`/`install_ipfs` are: the handler captures a
+    /// clone of the `Rc`-shared, non-`Send` lifecycle and the (non-`Send`) view,
+    /// and runs only on the single GTK loop the `create` signal fires on.
+    pub fn install_new_window_in_place(&mut self) {
+        use renderer::{new_window_action, NewWindowAction};
+
+        // Capture a WebView clone (a refcounted GObject handle) + the shared
+        // lifecycle so the handler can load in place and reflect the started load
+        // on the GTK loop the `create` signal fires on.
+        let view_for_create = self.view.clone();
+        let life = self.life.clone();
+        self.view.connect_create(move |_view, navigation_action| {
+            // The target URI comes from the navigation action's request (the
+            // `_blank`/`window.open` destination). `NavigationAction::request`
+            // takes `&mut`, so clone the action to read it.
+            let mut action = navigation_action.clone();
+            let target = action.request().and_then(|req| req.uri());
+            if let NewWindowAction::NavigateInPlace { url } = new_window_action(target.as_deref()) {
+                // Load in the EXISTING view via the SAME path `navigate` drives, so
+                // the normal navigation/scheme handling (ipfs:// verification,
+                // unsupported-scheme refusal) applies — no trust bypass. Reflect the
+                // started load on the shared lifecycle so the shell follows the URL.
+                life.borrow_mut().begin(&url);
+                view_for_create.load_uri(&url);
+            }
+            // Return the EXISTING view: WebKitGTK creates NO new WebView, so there
+            // is no second window/tab — the navigation happened in place above.
+            view_for_create.clone().upcast::<gtk4::Widget>()
+        });
+    }
+
     /// Make this webview FOLLOW the OS light/dark color-scheme setting, so
     /// `prefers-color-scheme` and UA-styled controls match the user's OS
     /// preference instead of silently defaulting to light (task

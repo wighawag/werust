@@ -566,6 +566,65 @@ pub fn qualify(backend: &dyn Renderer) -> Result<(), Disqualified> {
     }
 }
 
+/// The in-place navigation a NEW-WINDOW request resolves to, until werust has a
+/// tab/window model.
+///
+/// werust has NO tab or window model yet, so a page's request to open a new
+/// window (a `target="_blank"` link or a `window.open(url)` call) has nowhere to
+/// go: on every platform the webview's native new-window hook (WebKitGTK's
+/// `create` signal, iOS `WKUIDelegate.webView(_:createWebViewWith:...)`, Android
+/// `WebChromeClient.onCreateWindow`) fires, and if the platform does not handle
+/// it the navigation is silently DROPPED (field finding C,
+/// `work/notes/observations/field-test-v0.2.4-spa-clientrouting-eth-path-blank-links-2026-07-23.md`).
+///
+/// The recorded decision (in-place until a tab/window model exists,
+/// `docs/adr/0010`): a new-window request navigates IN THE CURRENT view instead
+/// of being dropped, so a `_blank` link behaves like an ordinary in-view
+/// navigation. This is the ONE shared rule every platform's new-window hook
+/// applies, lifted here so all three OS edges route the request the SAME way
+/// rather than each re-deriving it (exactly as [`TrustPosture::after_verify`] is
+/// the one shared trust rule) — and so the decision is asserted headlessly at the
+/// seam, not only at the display-bound platform hooks.
+///
+/// It returns the target URI to load in the CURRENT view (never spawning a second
+/// view), or [`None`] when the request carried no usable target (a bare
+/// `window.open()` with no URL) — in which case the hook opens no new window and
+/// loads nothing. Crucially it does NOT bypass trust: the returned target is fed
+/// back into the platform's NORMAL load path (the same `navigate` / webview load
+/// that routes `ipfs://` through the hash-verified custom-scheme handler and
+/// refuses an unsupported scheme), so a `_blank` link to an `ipfs://`/ENS target
+/// is still hash-verified and an unsupported one still refused — the new-window
+/// hook is a router, not a new trust boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewWindowAction {
+    /// Load `url` in the CURRENT view via the normal navigation/scheme path; do
+    /// NOT create a second view.
+    NavigateInPlace { url: String },
+    /// The request carried no usable target: open no new window and load nothing.
+    Ignore,
+}
+
+/// Resolve a new-window / `create` request carrying an optional `target_uri`
+/// into the in-place action every platform's new-window hook applies.
+///
+/// This is the seam-level realisation of the in-place decision (`docs/adr/0010`):
+/// a non-empty target navigates the CURRENT view ([`NewWindowAction::NavigateInPlace`]),
+/// a missing/empty target is ignored ([`NewWindowAction::Ignore`]). The caller
+/// (each backend's native new-window hook) then feeds a
+/// [`NavigateInPlace`](NewWindowAction::NavigateInPlace) url into its NORMAL load
+/// path so verification is preserved, and returns no new view. Pure and
+/// toolkit-free so the routing is pinned display-free at the seam, then reused by
+/// the desktop `connect_create` handler and mirrored by the mobile hooks.
+#[must_use]
+pub fn new_window_action(target_uri: Option<&str>) -> NewWindowAction {
+    match target_uri {
+        Some(uri) if !uri.trim().is_empty() => NewWindowAction::NavigateInPlace {
+            url: uri.to_string(),
+        },
+        _ => NewWindowAction::Ignore,
+    }
+}
+
 /// A callback invoked with a [`ScriptMessage`] posted by an injected page script.
 pub type ScriptMessageHandler = Box<dyn FnMut(ScriptMessage) + Send>;
 
@@ -1107,6 +1166,46 @@ mod tests {
             vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme],
             "both trust hooks are reported missing"
         );
+    }
+
+    #[test]
+    fn a_new_window_request_navigates_the_current_view_in_place() {
+        // Acceptance (the in-place decision, headless, `docs/adr/0010`): a
+        // new-window / `create` request carrying a target URI resolves to an
+        // IN-PLACE navigation of the CURRENT view — never a second view — so a
+        // `_blank`/`window.open(url)` link behaves like an ordinary in-view
+        // navigation instead of being dropped. This is the ONE shared rule every
+        // platform's new-window hook applies; here it is pinned display-free at
+        // the seam.
+        assert_eq!(
+            new_window_action(Some("https://example.com/opened")),
+            NewWindowAction::NavigateInPlace {
+                url: "https://example.com/opened".to_string(),
+            },
+            "a `_blank` https target loads in the current view"
+        );
+        // Trust is NOT bypassed by the hook: an `ipfs://`/ENS target is passed
+        // through VERBATIM so the caller feeds it into the NORMAL load path (the
+        // hash-verified custom-scheme handler / ENS front door), keeping
+        // verification intact — the hook routes, it does not re-decide trust.
+        assert_eq!(
+            new_window_action(Some("ipfs://bafyexamplecid/index.html")),
+            NewWindowAction::NavigateInPlace {
+                url: "ipfs://bafyexamplecid/index.html".to_string(),
+            },
+            "an ipfs:// `_blank` target is routed unchanged into the verified path"
+        );
+    }
+
+    #[test]
+    fn a_new_window_request_with_no_target_opens_no_window_and_loads_nothing() {
+        // A bare `window.open()` with no usable URL carries no target: the hook
+        // must open NO new window and load NOTHING (not navigate the current view
+        // to an empty/garbage URL). Both an absent and an empty/whitespace target
+        // resolve to `Ignore`.
+        assert_eq!(new_window_action(None), NewWindowAction::Ignore);
+        assert_eq!(new_window_action(Some("")), NewWindowAction::Ignore);
+        assert_eq!(new_window_action(Some("   ")), NewWindowAction::Ignore);
     }
 
     /// A backend that renders but does NOT override [`Renderer::trust_hooks`] at

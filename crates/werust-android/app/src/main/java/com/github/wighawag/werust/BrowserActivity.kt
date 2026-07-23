@@ -6,6 +6,7 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Paint
 import android.os.Bundle
+import android.os.Message
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -16,6 +17,7 @@ import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
+import android.webkit.WebChromeClient
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import java.io.ByteArrayInputStream
@@ -183,6 +185,23 @@ class BrowserActivity : Activity() {
                 WebView.setWebContentsDebuggingEnabled(true)
             }
             webViewClient = CoreWebViewClient()
+            // Route NEW-WINDOW requests (a `target="_blank"` link / `window.open`)
+            // INTO THIS SAME WebView instead of dropping them: werust has no
+            // tab/window model yet (task
+            // blank-and-window-open-links-navigate-in-place, field finding C,
+            // docs/adr/0010). `setSupportMultipleWindows(true)` makes the System
+            // WebView fire `WebChromeClient.onCreateWindow` for such a request
+            // (rather than silently dropping it); [CoreWebChromeClient] handles it
+            // by loading the target URL back into THIS WebView. Loading it through
+            // the WebView's NORMAL path keeps trust intact: an `ipfs://` target
+            // still reaches `shouldInterceptRequest` (hash-verified) and an
+            // unsupported scheme is still refused — the hook is a router, not a
+            // trust bypass. Mirrors the desktop `connect_create` and iOS
+            // `createWebViewWith` hooks; the shared in-place rule is
+            // `renderer::new_window_action`.
+            settings.setSupportMultipleWindows(true)
+            settings.javaScriptCanOpenWindowsAutomatically = true
+            webChromeClient = CoreWebChromeClient()
             // Wire the EIP-1193 provider bridge: a JS interface the injected shim's
             // `postMessage` calls (page -> native), plus the document-start shim
             // itself (the SAME `werust-core` provider shim desktop injects). The
@@ -380,6 +399,60 @@ class BrowserActivity : Activity() {
         @JavascriptInterface
         fun postMessage(body: String): String =
             core.handleProviderMessage(PROVIDER_CHANNEL, body)
+    }
+
+    /**
+     * Routes NEW-WINDOW requests (a `target="_blank"` link / `window.open(url)`)
+     * into the SAME [webView], since werust has no tab/window model yet (task
+     * `blank-and-window-open-links-navigate-in-place`, field finding C,
+     * `docs/adr/0010`). The recorded decision is to navigate IN-PLACE until tabs
+     * exist, so a `_blank` link behaves like an ordinary in-view navigation
+     * instead of doing nothing.
+     *
+     * MECHANISM: with `setSupportMultipleWindows(true)` the System WebView fires
+     * [onCreateWindow] with a transport [Message] instead of dropping the request.
+     * The System WebView does NOT expose the requested URL directly here; the
+     * idiomatic way to recover it is a throwaway transport `WebView` whose
+     * [WebViewClient] receives the target URL as its first navigation. We hand
+     * that URL to the MAIN WebView's normal [WebView.loadUrl] (so an `ipfs://`
+     * target still routes through [CoreWebViewClient.shouldInterceptRequest] and
+     * an unsupported scheme is still refused — a router, not a trust bypass) and
+     * create NO real second window.
+     *
+     * Manual verification steps:
+     * docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.
+     */
+    private inner class CoreWebChromeClient : WebChromeClient() {
+        override fun onCreateWindow(
+            view: WebView,
+            isDialog: Boolean,
+            isUserGesture: Boolean,
+            resultMsg: Message,
+        ): Boolean {
+            // A throwaway transport WebView: its only job is to catch the target
+            // URL of the new-window request (delivered as its first navigation),
+            // then load it into the MAIN WebView in place and discard itself.
+            val transport = WebView(this@BrowserActivity)
+            transport.webViewClient = object : WebViewClient() {
+                override fun shouldOverrideUrlLoading(
+                    v: WebView,
+                    request: WebResourceRequest,
+                ): Boolean {
+                    // Load the `_blank`/`window.open` target IN THE CURRENT view
+                    // through the normal load path (verification preserved), then
+                    // tear down the throwaway transport WebView.
+                    webView.loadUrl(request.url.toString())
+                    v.stopLoading()
+                    v.destroy()
+                    return true
+                }
+            }
+            (resultMsg.obj as WebView.WebViewTransport).webView = transport
+            resultMsg.sendToTarget()
+            // Return true: we HANDLED the new-window request (routed it in place);
+            // no real second window/tab was created.
+            return true
+        }
     }
 
     override fun onDestroy() {

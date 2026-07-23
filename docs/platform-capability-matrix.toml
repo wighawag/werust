@@ -257,6 +257,36 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "blank-window-open-navigates-in-place"
+description = "A `target=\"_blank\"` link / `window.open(url)` (a new-window request) navigates IN THE CURRENT view instead of being silently dropped (werust has no tab/window model yet), routed through the NORMAL navigation/scheme path so an `ipfs://`/ENS target is still hash-verified and an unsupported one refused (no trust bypass), and no real second window/tab is spawned."
+# werust has no tab/window model yet, so each platform's NATIVE new-window hook
+# routes the request into the SAME view via the SAME shared in-place rule
+# (`renderer::new_window_action`, pinned display-free by the seam tests
+# `a_new_window_request_navigates_the_current_view_in_place` in crates/renderer
+# and `a_new_window_request_navigates_the_existing_view_in_place_no_second_view`
+# in crates/webview-renderer). The in-place load goes through each platform's
+# NORMAL load path, so an `ipfs://`/ENS `_blank` target still hits the
+# hash-verified scheme handler and an unsupported one is still refused — the hook
+# is a router, not a trust bypass. Desktop: `WebViewRenderer::install_new_window_in_place`
+# wires WebKitGTK's `create` signal (crates/webview-renderer/src/backend.rs),
+# reads the navigation action's target URI, loads it into the existing
+# `self.view` via `load_uri`, and returns the EXISTING view so no second WebView
+# is created. iOS: `WKWebViewShellController` conforms to `WKUIDelegate` and
+# implements `webView(_:createWebViewWith:for:windowFeatures:)` — on a nil target
+# frame it calls `webView.load(navigationAction.request)` on the main view and
+# returns nil (no new WKWebView). Android: `BrowserActivity` sets
+# `settings.setSupportMultipleWindows(true)` and a `WebChromeClient.onCreateWindow`
+# (CoreWebChromeClient) recovers the target URL via a throwaway transport WebView
+# and loads it into the SAME WebView, creating no real second window. The
+# runtime-only mobile hooks (Swift/Kotlin) carry recorded manual verification
+# steps at docs/spikes/blank-and-window-open-links-navigate-in-place/README.md;
+# the shared in-place decision is recorded at docs/adr/0010. Task
+# `blank-and-window-open-links-navigate-in-place`, field finding C.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "retryable-error-distinction"
 description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an obvious retry affordance — the Reload button, which re-resolves a failed ENS name) from a HARD failure (unsupported protocol / verification / malformed, which keeps its prominent protocol-named reason), on every platform."
 # The distinction is the core's `ChromeState::failure_kind` / `failure_is_retryable`

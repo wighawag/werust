@@ -1188,6 +1188,73 @@ mod tests {
     }
 
     #[test]
+    fn a_new_window_request_navigates_the_existing_view_in_place_no_second_view() {
+        // Acceptance (the in-place decision at the layer it lives, headless,
+        // `docs/adr/0010`): a new-window / `create` request (a `_blank` link or
+        // `window.open(url)`) is routed into the CURRENT view via the SAME
+        // `navigate` path a normal in-view navigation takes — NOT a second view,
+        // and NOT dropped (field finding C). This models the desktop
+        // `connect_create` handler's body without a GTK loop: the real handler
+        // (`WebViewRenderer::install_new_window_in_place`, backend.rs) reads the
+        // navigation action's target URI, applies the shared
+        // `renderer::new_window_action` rule, and on `NavigateInPlace` calls
+        // `self.view.load_uri` (the same load `navigate` drives) and returns the
+        // existing view so WebKitGTK spawns no new WebView.
+        use renderer::{new_window_action, NewWindowAction};
+
+        let mut r = SeamHarness::default();
+        // A page is showing; the user clicks a `target="_blank"` link to another
+        // page. WebKitGTK's `create` fires with that target URI.
+        r.navigate("https://example.com/").unwrap();
+        r.drive_to_finished();
+        while r.poll_event().is_some() {}
+
+        // The `create` handler's body: resolve the request, then load in place.
+        let target = "https://example.com/opened-in-blank";
+        match new_window_action(Some(target)) {
+            NewWindowAction::NavigateInPlace { url } => {
+                // Routed through the NORMAL navigate path (which validates the URL
+                // and, for `ipfs://`, would run the hash-verified scheme handler),
+                // so trust is preserved — no bypass via the new-window hook.
+                r.navigate(&url)
+                    .expect("the `_blank` target loads in place");
+            }
+            NewWindowAction::Ignore => panic!("a real target must navigate in place"),
+        }
+
+        // The EXISTING view now shows the `_blank` target — it was NOT dropped, and
+        // there is exactly ONE view (the seam owns a single lifecycle; no second
+        // view was created).
+        assert_eq!(
+            r.current_url().as_deref(),
+            Some(target),
+            "the `_blank` target loaded in the current view, not a new window"
+        );
+        assert_eq!(
+            r.poll_event(),
+            Some(LoadEvent::Started {
+                url: target.to_string()
+            }),
+            "the in-place load starts a normal navigation lifecycle"
+        );
+    }
+
+    /// End-to-end wiring of the REAL WebKitGTK `create` (new-window) hook on the
+    /// backend. Ignored by default (constructing a `WebViewRenderer` initializes
+    /// GTK, which needs a display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. The in-place routing logic
+    /// is pinned display-free by
+    /// `a_new_window_request_navigates_the_existing_view_in_place_no_second_view`
+    /// above; here we only pin that installing the new-window hook on the real
+    /// backend wires the `create` signal without panicking.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_installs_the_new_window_in_place_hook() {
+        let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        r.install_new_window_in_place();
+    }
+
+    #[test]
     fn a_render_only_backend_on_this_seam_is_rejected() {
         // A backend on the SAME seam that renders but declares no trust hook is
         // disqualified, naming both missing hooks — the enforced seam property

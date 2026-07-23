@@ -18,7 +18,9 @@
 import UIKit
 import WebKit
 
-final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKNavigationDelegate {
+final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKNavigationDelegate,
+    WKUIDelegate
+{
 
     // The Rust core: all browsing logic (URL bar, history, load lifecycle, chrome)
     // lives behind this. The controller holds no browsing state of its own.
@@ -153,6 +155,16 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         }
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
+        // Handle NEW-WINDOW requests (a `target="_blank"` link / `window.open`) by
+        // navigating IN THE CURRENT view instead of dropping them: werust has no
+        // tab/window model yet (task
+        // blank-and-window-open-links-navigate-in-place, field finding C,
+        // docs/adr/0010). Without a `WKUIDelegate.webView(_:createWebViewWith:...)`
+        // WKWebView returns nil for a `_blank` request and the navigation is
+        // silently DROPPED. Setting ourselves as the UI delegate lets the hook
+        // below load the request into THIS same webView. See
+        // webView(_:createWebViewWith:for:windowFeatures:).
+        webView.uiDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
         // WEB INSPECTOR (task enable-web-inspector-devtools-all-platforms): make
         // the page inspectable via Safari's Web Inspector (the SAME WebKit devtools
@@ -324,6 +336,37 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
             afterCoreAction()
         }
         return true
+    }
+
+    // --- WKUIDelegate: new-window (`_blank` / window.open) -> in-place ---------
+    // A page asking to open a new window (a `target="_blank"` link or a
+    // `window.open(url)` call) has nowhere to go — werust has NO tab/window model
+    // yet. The recorded decision (in-place until tabs exist, docs/adr/0010) is to
+    // load the requested URL in the CURRENT view instead of dropping it. On a
+    // `_blank` request `navigationAction.targetFrame` is nil (there is no existing
+    // frame to load into), so we load the request into THIS webView and return nil
+    // (create NO new WKWebView, so no second window). WKWebView loads it through
+    // its NORMAL path, so an `ipfs://` target still routes to the registered
+    // `IpfsSchemeHandler` (hash-verified) and an unsupported scheme is still
+    // refused — the hook is a router, not a trust bypass. This mirrors the desktop
+    // `connect_create` handler and the Android `onCreateWindow`; the shared
+    // in-place rule is `renderer::new_window_action` (pinned by the seam test
+    // `a_new_window_request_navigates_the_current_view_in_place`). Manual
+    // verification steps: docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.
+    func webView(
+        _ wv: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction,
+        windowFeatures: WKWindowFeatures
+    ) -> WKWebView? {
+        // A nil target frame is the `_blank`/new-window case: load it in place.
+        // (A non-nil target frame would be handled by the normal navigation path.)
+        if navigationAction.targetFrame == nil {
+            wv.load(navigationAction.request)
+        }
+        // Return nil: create NO new WKWebView, so there is no second window — the
+        // navigation happened in the current view above.
+        return nil
     }
 
     // --- WKNavigationDelegate -> Rust core ------------------------------------

@@ -424,6 +424,15 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // the load rather than rendering unverified bytes (task
     // `ipfs-scheme-resolution-through-renderer-seam`).
     backend.install_ipfs();
+    // Make a `target="_blank"` link / `window.open(url)` navigate IN THE CURRENT
+    // view instead of being silently dropped. werust has no tab/window model yet,
+    // so WebKitGTK's new-window (`create`) request is routed into the existing
+    // view through the SAME navigation/scheme path (an `ipfs://`/ENS `_blank`
+    // target is still hash-verified, an unsupported one still refused) and no
+    // second window is spawned (task
+    // `blank-and-window-open-links-navigate-in-place`, field finding C,
+    // `docs/adr/0010`).
+    backend.install_new_window_in_place();
     // Make the webview FOLLOW the OS light/dark color-scheme setting, so
     // `prefers-color-scheme` and UA-styled controls match the user's OS preference
     // instead of silently defaulting to light. On a dark-mode desktop this is what

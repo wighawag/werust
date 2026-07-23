@@ -2,6 +2,7 @@ package com.github.wighawag.werust
 
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.util.TypedValue
@@ -109,6 +110,21 @@ class BrowserActivity : Activity() {
             // override the OS-follow and the page's own declared `color-scheme`.
             // A live OS light<->dark toggle recreates this Activity (no
             // `configChanges` for uiMode), so the fresh WebView re-reads the theme.
+            // WEB INSPECTOR (task enable-web-inspector-devtools-all-platforms):
+            // make the page inspectable via `chrome://inspect` (Chrome DevTools —
+            // console REPL + network — the SAME devtools desktop shows in-window)
+            // over USB from a desktop Chrome. `setWebContentsDebuggingEnabled` is a
+            // process-wide static, GATED on a DEBUG build so a RELEASE build is NOT
+            // silently inspectable — the Android analogue of the desktop
+            // `enable-developer-extras` debug gate and iOS's `#if DEBUG`. The debug
+            // signal is `ApplicationInfo.FLAG_DEBUGGABLE` (true for the debug APK
+            // this module builds; false for a future release APK) rather than
+            // `BuildConfig.DEBUG`, so no extra `buildConfig` generation is needed.
+            // See
+            // work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md.
+            if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+                WebView.setWebContentsDebuggingEnabled(true)
+            }
             webViewClient = CoreWebViewClient()
             // Wire the EIP-1193 provider bridge: a JS interface the injected shim's
             // `postMessage` calls (page -> native), plus the document-start shim

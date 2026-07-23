@@ -14,7 +14,7 @@ use gtk4::glib;
 use gtk4::prelude::*;
 use webkit6::prelude::*;
 use webkit6::{
-    LoadEvent as WkLoadEvent, UserContentInjectedFrames, UserContentManager, UserScript,
+    LoadEvent as WkLoadEvent, Settings, UserContentInjectedFrames, UserContentManager, UserScript,
     UserScriptInjectionTime, WebContext, WebView,
 };
 
@@ -56,9 +56,23 @@ impl WebViewRenderer {
 
         let content_manager = UserContentManager::new();
         let context = WebContext::new();
+        // Enable the WebKit Web Inspector (a real console REPL + network + DOM,
+        // opened in-window by the shell's F12 shortcut) ONLY in a debug build
+        // (task `enable-web-inspector-devtools-all-platforms`,
+        // `work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md`).
+        // `WebInspector::show` is a no-op unless `enable-developer-extras` is set,
+        // and the builder set NO `WebKitSettings` before this, so the inspector
+        // could not be opened at all. Gating on `developer_extras_enabled()`
+        // (which is `cfg!(debug_assertions)`) keeps a RELEASE build
+        // (`cargo build --release`, the GoReleaser Rust builder path, ADR-0002)
+        // NOT silently inspectable, while a developer `cargo run` build is.
+        let settings = Settings::builder()
+            .enable_developer_extras(developer_extras_enabled())
+            .build();
         let view = WebView::builder()
             .user_content_manager(&content_manager)
             .web_context(&context)
+            .settings(&settings)
             .build();
 
         let life: SharedLifecycle =
@@ -399,6 +413,48 @@ impl WebViewRenderer {
             std::mem::forget(proxy);
         }
     }
+
+    /// Open the WebKitGTK Web Inspector over the current page: a REAL browser
+    /// devtools surface (a console with a JS REPL you can type into, a network
+    /// tab, DOM/sources), the SAME WebKit Web Inspector a desktop WebKit browser
+    /// shows (task `enable-web-inspector-devtools-all-platforms`). This is NOT the
+    /// GTK interactive debugger (widget tree / CSS): that is a separate GTK-level
+    /// surface on Ctrl+Shift+I / Ctrl+Shift+D; this opens the WEB inspector for
+    /// the page content, which is what the human asked for.
+    ///
+    /// Wired to the shell's F12 shortcut (`crates/werust/src/main.rs`), chosen
+    /// because F12 is the desktop-browser-idiomatic devtools key and does NOT
+    /// collide with the GTK debugger's Ctrl+Shift+I / Ctrl+Shift+D. It only does
+    /// anything when `enable-developer-extras` is set, which
+    /// [`WebViewRenderer::new`] does only in a debug build
+    /// (`developer_extras_enabled`); in a release build the view has no inspector
+    /// and this is a safe no-op, so the shortcut cannot open devtools on a shipped
+    /// build.
+    ///
+    /// `WebView::inspector()` returns `None` when developer-extras is off; in that
+    /// case there is nothing to show, so this returns without error.
+    pub fn show_inspector(&self) {
+        if let Some(inspector) = self.view.inspector() {
+            inspector.show();
+        }
+    }
+}
+
+/// Whether the WebKit Web Inspector's `enable-developer-extras` is turned on for
+/// this build: TRUE in a debug build, FALSE in a release build.
+///
+/// This is the desktop half of the task's gating decision
+/// (`work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md`):
+/// the inspector is a developer surface, so a RELEASE build
+/// (`cargo build --release` — the shipped GoReleaser path, ADR-0002) is NOT
+/// silently inspectable, while a developer `cargo run` / `cargo test` build is.
+/// It keys off `debug_assertions`, which the Rust toolchain sets exactly on
+/// non-optimized (debug) builds — the desktop analogue of Android's
+/// `BuildConfig.DEBUG` and iOS's `#if DEBUG`. Pure so the gate is pinned
+/// display-free by the backend tests.
+#[must_use]
+pub fn developer_extras_enabled() -> bool {
+    cfg!(debug_assertions)
 }
 
 /// The XDG desktop portal address for reading the OS `color-scheme` preference.

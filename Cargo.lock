@@ -2747,6 +2747,7 @@ dependencies = [
  "native-renderer",
  "renderer",
  "script-engine",
+ "webkit6",
  "webview-renderer",
  "werust-core",
 ]

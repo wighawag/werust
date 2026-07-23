@@ -310,7 +310,7 @@ mod backend;
 mod offthread;
 #[cfg(test)]
 pub(crate) use backend::os_color_scheme_from_portal;
-pub use backend::WebViewRenderer;
+pub use backend::{developer_extras_enabled, WebViewRenderer};
 
 #[cfg(test)]
 mod tests {
@@ -1109,6 +1109,49 @@ mod tests {
     fn real_webview_follows_the_os_color_scheme() {
         let r = WebViewRenderer::new().expect("gtk init on a desktop session");
         r.follow_os_color_scheme();
+    }
+
+    #[test]
+    fn the_web_inspector_developer_extras_are_gated_on_a_debug_build() {
+        // Acceptance (the desktop half of the gating decision, headless): the
+        // WebKit Web Inspector's `enable-developer-extras` — which the F12
+        // shortcut needs to open a real console REPL + network in-window — is
+        // turned ON only in a debug build, so a RELEASE build
+        // (`cargo build --release`, the shipped GoReleaser path) is NOT silently
+        // inspectable. The gate keys off `debug_assertions`, the desktop analogue
+        // of Android's `BuildConfig.DEBUG` / iOS's `#if DEBUG`. This test itself
+        // runs under `cargo test` (a debug build), so the gate is ON here; the
+        // invariant it pins is that the gate IS `debug_assertions`, not a hardcoded
+        // `true` that would leave a release build inspectable.
+        assert_eq!(
+            super::developer_extras_enabled(),
+            cfg!(debug_assertions),
+            "developer-extras must follow the debug/release build gate, never be unconditionally on"
+        );
+        #[cfg(debug_assertions)]
+        assert!(
+            super::developer_extras_enabled(),
+            "a debug build enables the web inspector's developer-extras"
+        );
+        #[cfg(not(debug_assertions))]
+        assert!(
+            !super::developer_extras_enabled(),
+            "a release build does not silently enable the web inspector"
+        );
+    }
+
+    /// End-to-end open of the REAL WebKitGTK Web Inspector on the backend. Ignored
+    /// by default (constructing a `WebViewRenderer` initializes GTK, needing a
+    /// display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. The gate is pinned
+    /// display-free by `the_web_inspector_developer_extras_are_gated_on_a_debug_build`
+    /// above; here we only pin that showing the inspector on the real backend does
+    /// not panic (a no-op in a release build where developer-extras is off).
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_shows_the_web_inspector() {
+        let r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        r.show_inspector();
     }
 
     #[test]

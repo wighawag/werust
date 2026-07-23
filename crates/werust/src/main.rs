@@ -25,6 +25,7 @@ use gtk4::{
     Orientation, Widget,
 };
 
+use webkit6::prelude::WebViewExt;
 use webview_renderer::WebViewRenderer;
 use werust_core::{BrowserShell, ChromeState};
 
@@ -33,6 +34,34 @@ const DEFAULT_URL: &str = "https://example.com/";
 
 /// The GTK application id for the shell window.
 const APP_ID: &str = "com.github.wighawag.werust";
+
+/// Whether a key press should open the WebKit Web Inspector (the in-window
+/// devtools: a console REPL + network + DOM for the page), given the pressed
+/// key and the active modifiers.
+///
+/// The chosen shortcut is F12 with NO modifiers (task
+/// `enable-web-inspector-devtools-all-platforms`,
+/// `work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md`):
+/// F12 is the desktop-browser-idiomatic devtools key and, crucially, does NOT
+/// collide with the GTK INTERACTIVE debugger (widget tree / CSS), which GTK4
+/// binds to Ctrl+Shift+I and Ctrl+Shift+D. So opening the WEB inspector on F12
+/// leaves the GTK debugger's own keys untouched, satisfying the
+/// "does not conflict with the GTK interactive debugger" acceptance criterion.
+///
+/// Pure (a function of the keyval + modifiers) so the shortcut decision — in
+/// particular that it is F12 and NOT Ctrl+Shift+I — is pinned display-free; the
+/// GTK key controller that calls it, and the `show_inspector` it triggers, need a
+/// display and are covered by the ignored end-to-end tests.
+fn should_open_web_inspector(keyval: gdk::Key, modifiers: gdk::ModifierType) -> bool {
+    // F12 alone, ignoring lock modifiers (Caps/Num Lock) but rejecting any
+    // Ctrl/Shift/Alt combination, so this never fires on the GTK debugger's
+    // Ctrl+Shift+I / Ctrl+Shift+D.
+    let chord = modifiers
+        & (gdk::ModifierType::CONTROL_MASK
+            | gdk::ModifierType::SHIFT_MASK
+            | gdk::ModifierType::ALT_MASK);
+    keyval == gdk::Key::F12 && chord.is_empty()
+}
 
 /// Builds the startup banner shown when the browser launches.
 fn banner() -> String {
@@ -309,6 +338,15 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // forcing dark or overriding a page's own declared `color-scheme` (task
     // `webview-follow-os-color-scheme`, `docs/adr/0009`).
     backend.follow_os_color_scheme();
+    // Capture the live WebKitGTK view BEFORE the backend is boxed behind the
+    // `Renderer` seam, so the shell can open the WEB inspector (F12) on it. The
+    // web inspector is a WebKitGTK-specific surface (not part of the cross-backend
+    // seam), so it is wired here on the concrete view rather than through the
+    // seam — the same reason `install_provider`/`install_ipfs` wire directly. A
+    // clone is a cheap refcounted GObject handle; it stays valid because the
+    // backend (which owns the view) outlives the window (task
+    // `enable-web-inspector-devtools-all-platforms`).
+    let inspector_view = backend.web_view().clone();
     let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
 
     // Make the two trust-indicator states VISUALLY DISTINCT: a green verified
@@ -446,6 +484,28 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     shell.borrow_mut().focus_page(true);
     refresh();
 
+    // Wire the WEB inspector shortcut: F12 opens the WebKitGTK Web Inspector
+    // (a real console REPL + network + DOM) over the current page IN-WINDOW
+    // (task `enable-web-inspector-devtools-all-platforms`). F12 is chosen to NOT
+    // collide with the GTK interactive debugger (Ctrl+Shift+I / Ctrl+Shift+D),
+    // which is a separate GTK-level widget/CSS surface, not web content. The key
+    // controller is added to the WINDOW so the shortcut works wherever focus is,
+    // and `show_inspector` is a safe no-op in a release build (developer-extras is
+    // off there — the inspector is gated on a debug build), so this shortcut
+    // cannot open devtools on a shipped build.
+    let key_controller = gtk4::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
+        if should_open_web_inspector(keyval, modifiers) {
+            if let Some(inspector) = inspector_view.inspector() {
+                inspector.show();
+            }
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(key_controller);
+
     // Pump the seam's load-lifecycle events on the GTK loop and keep the chrome in
     // step; this is what turns WebKitGTK's async load into a live, reflected UI.
     glib::timeout_add_local(Duration::from_millis(50), {
@@ -466,11 +526,52 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, error_banner_text, error_banner_visible, status_line, trust_indicator,
-        trust_indicator_css_class, trust_indicator_detail, DEFAULT_URL,
+        banner, error_banner_text, error_banner_visible, should_open_web_inspector, status_line,
+        trust_indicator, trust_indicator_css_class, trust_indicator_detail, DEFAULT_URL,
     };
+    use gtk4::gdk;
     use renderer::{LoadState, TrustPosture};
     use werust_core::ChromeState;
+
+    #[test]
+    fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
+        // Acceptance: the desktop web-inspector shortcut is F12 (a real console
+        // REPL + network in-window), and it does NOT conflict with the GTK
+        // interactive debugger, which GTK4 binds to Ctrl+Shift+I / Ctrl+Shift+D.
+        // So F12 (no modifiers) opens the WEB inspector, while the GTK debugger's
+        // own chords must NOT trigger it — the two surfaces stay distinct.
+        assert!(
+            should_open_web_inspector(gdk::Key::F12, gdk::ModifierType::empty()),
+            "F12 opens the web inspector"
+        );
+        // Caps/Num Lock (non-chord modifiers) must not stop F12 firing.
+        assert!(should_open_web_inspector(
+            gdk::Key::F12,
+            gdk::ModifierType::LOCK_MASK
+        ));
+
+        // The GTK interactive debugger's chords must NOT open the web inspector.
+        let gtk_debugger_chord = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
+        assert!(
+            !should_open_web_inspector(gdk::Key::i, gtk_debugger_chord),
+            "Ctrl+Shift+I is the GTK debugger, not the web inspector"
+        );
+        assert!(
+            !should_open_web_inspector(gdk::Key::d, gtk_debugger_chord),
+            "Ctrl+Shift+D is the GTK debugger, not the web inspector"
+        );
+        // A modified F12 (any Ctrl/Shift/Alt) is not the plain-F12 shortcut either,
+        // so the web-inspector key is unambiguous and cannot be a debugger chord.
+        assert!(!should_open_web_inspector(
+            gdk::Key::F12,
+            gdk::ModifierType::CONTROL_MASK
+        ));
+        // An unrelated key never opens it.
+        assert!(!should_open_web_inspector(
+            gdk::Key::a,
+            gdk::ModifierType::empty()
+        ));
+    }
 
     #[test]
     fn banner_names_werust() {

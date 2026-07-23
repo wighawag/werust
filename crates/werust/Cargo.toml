@@ -17,3 +17,9 @@ native-renderer = { path = "../native-renderer" }
 fetcher = { path = "../fetcher" }
 script-engine = { path = "../script-engine" }
 gtk4 = { version = "=0.10.0", features = ["v4_14"] }
+# For the WEB inspector (F12) shortcut: the shell opens the WebKitGTK Web
+# Inspector on the concrete view before it is boxed behind the seam (the
+# inspector is a WebKitGTK-specific surface, not part of the cross-backend
+# `Renderer` seam). Pinned to match webview-renderer's webkit6 (task
+# `enable-web-inspector-devtools-all-platforms`).
+webkit6 = { version = "=0.5.0", features = ["v2_50"] }

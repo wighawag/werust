@@ -174,6 +174,30 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "web-inspector"
+description = "The platform's OWN full web inspector (WebKit/Chrome devtools: a typeable console REPL + a network view + DOM/sources), reached per-platform, gated on a debug build so a release build is not silently inspectable."
+# Each platform enables its NATIVE inspector (not a custom werust window), at the
+# SAME devtools capability (console REPL + network), gated on a debug build. The
+# reach differs per platform ("per its reach"), but all three are really wired.
+# Desktop: `WebViewRenderer::new` sets `WebKitSettings.enable-developer-extras`
+# (gated `cfg!(debug_assertions)` via `developer_extras_enabled`) and the shell
+# (crates/werust/src/main.rs) binds F12 to `WebInspector::show` over the page
+# IN-WINDOW — F12 chosen to NOT collide with the GTK interactive debugger
+# (Ctrl+Shift+I / Ctrl+Shift+D). iOS: `WKWebViewShellController` sets
+# `webView.isInspectable = true` (iOS 16.4+, gated `#if DEBUG`), so the page is
+# inspectable via Safari's Web Inspector over USB. Android: `BrowserActivity`
+# calls `WebView.setWebContentsDebuggingEnabled(true)` (gated on
+# `ApplicationInfo.FLAG_DEBUGGABLE`), so the page is inspectable via
+# `chrome://inspect` over USB. Per-platform "how to open it" is documented in
+# docs/spikes/enable-web-inspector-devtools-all-platforms/README.md; the gating
+# decision is recorded at
+# work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md.
+# Task `enable-web-inspector-devtools-all-platforms`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "prominent-load-failure"
 description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast in-view error banner the user cannot miss, carrying the accurate protocol-named reason), not only a subtle footer status line, on every platform — so fail-closed is honest (the user understands why nothing rendered)."
 # The reason is the SAME `last_error` the core surfaces (the resolver/decoder

@@ -141,6 +141,21 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         webView.translatesAutoresizingMaskIntoConstraints = false
+        // WEB INSPECTOR (task enable-web-inspector-devtools-all-platforms): make
+        // the page inspectable via Safari's Web Inspector (the SAME WebKit devtools
+        // — console REPL + network — desktop shows in-window), reached over USB
+        // from Safari on a Mac (Develop menu -> the device -> this page). iOS 16.4+
+        // exposes `WKWebView.isInspectable`; below that (and on the Simulator,
+        // where pages are always inspectable) it is a no-op. GATED on a DEBUG build
+        // (#if DEBUG) so a RELEASE build is NOT silently inspectable — the iOS
+        // analogue of the desktop `enable-developer-extras` debug gate and
+        // Android's `BuildConfig.DEBUG`. See
+        // work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md.
+        #if DEBUG
+            if #available(iOS 16.4, *) {
+                webView.isInspectable = true
+            }
+        #endif
         // COLOR SCHEME follows the OS (task webview-follow-os-color-scheme,
         // docs/adr/0009). WKWebView reports the page's `prefers-color-scheme` from
         // its `UITraitCollection.userInterfaceStyle`, which follows the OS

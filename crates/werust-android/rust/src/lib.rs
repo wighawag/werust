@@ -1229,4 +1229,118 @@ mod tests {
             "a non-ipfs URL is not intercepted through the sync boundary"
         );
     }
+
+    #[test]
+    fn the_sync_session_is_safe_to_drive_from_a_background_thread() {
+        // The ANR fix's load-bearing property (task
+        // `android-anr-main-thread-diagnose-and-unblock`,
+        // `docs/spikes/android-anr-main-thread-diagnose-and-unblock/DIAGNOSIS.md`).
+        //
+        // ROOT CAUSE: `BrowserShell::navigate` resolves an ENS/IPNS name inline
+        // with BLOCKING network I/O (two sequential `eth_call`s, +IPNS record
+        // fetch), so calling `navigate` on the Android UI thread blocks it for
+        // seconds and trips the ANR watchdog REGULARLY. The fix moves the
+        // session-DRIVING actions (`navigate`/`goBack`/`goForward`/`reload`) off
+        // the UI thread on the Kotlin edge and posts the WebView/widget updates
+        // (`takePendingLoad` + `chrome`) back to the UI thread.
+        //
+        // This guard pins the boundary that dispatch relies on: the long action
+        // may run on a thread OTHER than the UI thread (here a dedicated
+        // BACKGROUND thread, the Rust twin of the Kotlin executor) WHILE the UI
+        // thread only reads the chrome / applies pending loads and the WebView
+        // WORKER thread resolves `ipfs://` — and the session stays coherent and
+        // never panics. If a later change reintroduced a UI-thread-only
+        // assumption into the session, this reds the gate.
+        //
+        // Network-isolated: the background thread navigates a plain `https://`
+        // URL (the in-core `navigate` for a non-`.eth`, explicit-scheme entry does
+        // NO network — it just records history + queues the pending load; the real
+        // load is the WebView's job), so no `.eth`/RPC round-trip is made; the
+        // worker thread's `ipfs://` uses a malformed CID that fails closed BEFORE
+        // any fetch. The point is the THREADING boundary, not a real load.
+        use std::thread;
+
+        // Own the session on the main thread and cross ONLY the raw pointer to
+        // each worker, exactly as the JNI edge does (a `jlong` handle): the
+        // runtime `Mutex` inside `SyncSession`, not the type system, is what makes
+        // the multi-thread access sound. Both workers are joined before the box is
+        // dropped, so the pointer stays valid.
+        let session: Box<SyncSession> = Box::default();
+        let raw: *mut SyncSession = Box::into_raw(session);
+        let iterations = 500;
+
+        // The BACKGROUND executor thread: the session-driving action the fix moves
+        // off the UI thread (`navigate`, which is where the blocking ENS/IPNS
+        // resolve lives on device). It drives the load to done via the WebView's
+        // real signals, the same sequence the edge runs after the action returns.
+        let executor = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for i in 0..iterations {
+                    let url = format!("https://example.com/{i}");
+                    s.navigate(&url);
+                    if let Some(pending) = s.take_pending_load() {
+                        s.on_page_committed(&pending);
+                        s.on_page_finished(&pending);
+                    }
+                }
+            })
+        };
+
+        // The UI thread: after posting the action to the executor, it only READS
+        // the chrome to repaint (the cheap, non-blocking half that stays on the
+        // UI thread in the fix). It must never see a mid-borrow session.
+        let ui = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for _ in 0..iterations {
+                    let _ = s.chrome_json();
+                }
+            })
+        };
+
+        // The WebView worker thread: `shouldInterceptRequest` resolving `ipfs://`
+        // (fail-closed on a malformed CID) concurrently with both of the above.
+        let worker = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for _ in 0..iterations {
+                    match s.resolve_ipfs("ipfs://not-a-valid-cid/index.html") {
+                        Some(SchemeResolution::Err { .. }) => {}
+                        other => panic!("expected a fail-closed resolution, got {other:?}"),
+                    }
+                }
+            })
+        };
+
+        executor
+            .join()
+            .expect("the background-executor drive must not panic under the lock");
+        ui.join()
+            .expect("the UI-thread chrome read must not panic under the lock");
+        worker
+            .join()
+            .expect("the WebView-worker resolve must not panic under the lock");
+
+        // Reclaim ownership on the main thread now every worker has joined; the
+        // session is still coherent after the concurrent off-UI-thread drive.
+        let session: Box<SyncSession> = unsafe { Box::from_raw(raw) };
+        session.navigate("https://after.example/");
+        if let Some(pending) = session.take_pending_load() {
+            session.on_page_committed(&pending);
+            session.on_page_finished(&pending);
+        }
+        assert!(
+            session
+                .chrome_json()
+                .contains("\"url\":\"https://after.example/\""),
+            "the session is still coherent after the off-UI-thread drive"
+        );
+    }
 }

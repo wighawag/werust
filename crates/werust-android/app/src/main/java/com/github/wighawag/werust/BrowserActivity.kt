@@ -23,6 +23,8 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 /**
  * The Android OS edge: a real `Activity` with a URL bar and
@@ -41,6 +43,30 @@ import android.widget.TextView
 class BrowserActivity : Activity() {
 
     private val core = WerustCore()
+
+    /**
+     * A single background thread the blocking session-DRIVING actions
+     * ([WerustCore.navigate] / [WerustCore.goBack] / [WerustCore.goForward] /
+     * [WerustCore.reload]) run on, so they NEVER block the Android UI thread.
+     *
+     * WHY (task `android-anr-main-thread-diagnose-and-unblock`, field finding B,
+     * `docs/spikes/android-anr-main-thread-diagnose-and-unblock/DIAGNOSIS.md`): a
+     * bare `.eth` navigation resolves the ENS/IPNS name INLINE inside the shared
+     * core's `navigate`, with BLOCKING network I/O (two sequential `eth_call`s,
+     * plus an IPNS record fetch), each up to the 30s RPC timeout. Run on the UI
+     * thread that blocked the main thread for seconds and tripped Android's ANR
+     * watchdog REGULARLY ("isn't responding", recurring, while the bar stayed
+     * typeable). Driving those actions off the UI thread here — then posting the
+     * cheap WebView/widget updates BACK to the UI thread ([afterCoreAction]) —
+     * keeps the main thread idle between frames. This is a THREADING/cadence fix
+     * only: the SAME core methods run in the SAME order and return the SAME
+     * chrome; the `SyncSession` mutex still serialises every native call, so no
+     * trust/lifecycle/verification behaviour changes. It is the resolution-side
+     * twin of `ipfs-retrieval-off-main-thread-no-ui-freeze` (which moved the
+     * `ipfs://` content retrieval off the handler thread). Single-threaded so a
+     * user's rapid actions serialise in order rather than racing each other.
+     */
+    private val coreExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     private lateinit var urlBar: EditText
     private lateinit var backButton: Button
@@ -82,9 +108,11 @@ class BrowserActivity : Activity() {
             minimumHeight = dp(TOUCH_TARGET_DP)
         }
 
-        backButton = compactNavButton("◀") { core.goBack(); afterCoreAction() }
-        forwardButton = compactNavButton("▶") { core.goForward(); afterCoreAction() }
-        reloadButton = compactNavButton("⟳") { core.reload(); afterCoreAction() }
+        backButton = compactNavButton("◀") { driveCore { core.goBack() } }
+        forwardButton = compactNavButton("▶") { driveCore { core.goForward() } }
+        reloadButton = compactNavButton("⟳") { driveCore { core.reload() } }
+        // Stop is a cheap non-blocking core call (no resolve/network), so it can
+        // run inline on the UI thread; still refresh the chrome afterwards.
         stopButton = compactNavButton("✕") { core.stop(); afterCoreAction() }
         urlBar = EditText(this).apply {
             hint = "Enter a URL and press Enter"
@@ -93,7 +121,9 @@ class BrowserActivity : Activity() {
             setSingleLine()
             setOnEditorActionListener { _, actionId, _ ->
                 if (actionId == EditorInfo.IME_ACTION_GO) {
-                    core.navigate(text.toString()); afterCoreAction(); true
+                    val entry = text.toString()
+                    driveCore { core.navigate(entry) }
+                    true
                 } else {
                     false
                 }
@@ -190,10 +220,33 @@ class BrowserActivity : Activity() {
         root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         setContentView(root)
 
-        // Launch a browsing surface: drive the core to the start URL, then let the
-        // core surface it onto the WebView.
-        core.navigate(START_URL)
-        afterCoreAction()
+        // Launch a browsing surface: drive the core to the start URL OFF the UI
+        // thread (a `.eth`/ENS start URL would otherwise block onCreate on the
+        // blocking resolve), then let the core surface it onto the WebView on the
+        // UI thread.
+        driveCore { core.navigate(START_URL) }
+    }
+
+    /**
+     * Run a blocking session-driving core `action` on the [coreExecutor]
+     * background thread, then post [afterCoreAction] back to the UI thread to
+     * apply any pending load to the `WebView` and repaint the chrome.
+     *
+     * This is the ANR fix's dispatch: the core action (which may resolve an
+     * ENS/IPNS name with blocking network I/O) never runs on the UI thread, while
+     * `WebView.loadUrl` + widget mutation — which MUST be on the UI thread — are
+     * posted back. A guard against a destroyed Activity: if the executor was shut
+     * down (in [onDestroy]) the submit is rejected and skipped, and the UI post is
+     * a no-op once the Activity is finishing.
+     */
+    private fun driveCore(action: () -> Unit) {
+        if (coreExecutor.isShutdown) return
+        coreExecutor.execute {
+            action()
+            runOnUiThread {
+                if (!isFinishing && !isDestroyed) afterCoreAction()
+            }
+        }
     }
 
     /**
@@ -330,6 +383,10 @@ class BrowserActivity : Activity() {
     }
 
     override fun onDestroy() {
+        // Stop accepting new background actions and let the native session close.
+        // `shutdown` (not `shutdownNow`) lets any in-flight action finish so the
+        // native session is not freed out from under a running core call.
+        coreExecutor.shutdown()
         core.close()
         super.onDestroy()
     }

@@ -545,6 +545,25 @@ pub struct BrowserShell {
     /// (the shell keeps no URL stack, so it re-derives the name from the entry's
     /// underlying CID).
     url_override: Option<String>,
+    /// The NORMALIZED CID key of the resolved-root `ipfs://<cid>` the current
+    /// `url_override` name was pinned FOR (via
+    /// [`crate::ipfs::normalize_ens_page_key`]), or [`None`] when nothing is
+    /// pinned or the pin is not for a resolved-root entry (a failed ENS load / an
+    /// invalid entry pins the typed text with no backend URL).
+    ///
+    /// This is what distinguishes PINNING the `.eth` name for the front-door ROOT
+    /// load from FOLLOWING the backend URL as the user navigates WITHIN the page.
+    /// The pin holds while the load stays on the resolved root (its lifecycle
+    /// events carry the root CID), but an IN-PAGE navigation (a link click) is a
+    /// FRESH backend load whose event URL normalizes to a DIFFERENT key, so
+    /// [`pump`](BrowserShell::pump) drops the pin and the bar follows the backend
+    /// URL. The ROOT entry stays recoverable: it is in
+    /// [`ens_pages`](BrowserShell::ens_pages), so a back/forward return to it
+    /// re-derives its `.eth` name + posture off the normalized key
+    /// ([`ens-history-name-rederive-async-and-normalized`]). The pin-vs-follow
+    /// decision is recorded in
+    /// `docs/spikes/urlbar-tracks-in-page-navigation-not-just-pinned-name/pin-vs-follow-decision.md`.
+    pinned_root_key: Option<String>,
     /// The association from a backend underlying URL (a resolved `ipfs://<cid>`)
     /// to the ENS identity that produced it, so reload / back / forward onto an
     /// ENS-originated entry can RE-DERIVE the `.eth` name + its trust posture
@@ -657,6 +676,7 @@ impl BrowserShell {
             provider,
             ipns_source,
             url_override: None,
+            pinned_root_key: None,
             ens_pages: HashMap::new(),
             resolving_step: None,
         };
@@ -737,6 +757,7 @@ impl BrowserShell {
         // `refresh_chrome` derives the content step from the backend's load state.
         // A proceeding navigation also clears any prior invalid-entry state.
         self.url_override = None;
+        self.pinned_root_key = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
         self.chrome.invalid_entry = None;
@@ -887,6 +908,15 @@ impl BrowserShell {
         // entry after a back/forward. Keying on the raw display string was the
         // v0.2.3 regression: the stored and post-back strings differed and the
         // re-derive missed, leaking the CID into the bar.
+        // Record the NORMALIZED key of the resolved root this name is pinned FOR,
+        // so `pump` can tell the front-door root load (whose lifecycle events carry
+        // this same CID) from an IN-PAGE navigation off it (a link click, a fresh
+        // load whose event URL normalizes to a DIFFERENT key) and drop the pin only
+        // for the latter. `None` when the backend did not start a load.
+        self.pinned_root_key = self
+            .renderer
+            .current_url()
+            .map(|current| crate::ipfs::normalize_ens_page_key(&current));
         if let Some(current) = self.renderer.current_url() {
             self.ens_pages.insert(
                 crate::ipfs::normalize_ens_page_key(&current),
@@ -898,7 +928,9 @@ impl BrowserShell {
         }
         // Keep the front-door NAME the user typed in the bar (no `https://`
         // rewrite, no gateway redirect). The override PERSISTS across pumps so the
-        // name stays put for the whole load.
+        // name stays put for the whole load — until the user navigates OFF the
+        // resolved root (an in-page link click), which `pump` detects by the
+        // event URL's normalized key differing from `pinned_root_key`.
         self.url_override = Some(name.to_string());
         self.chrome.last_error = None;
         self.refresh_chrome();
@@ -920,6 +952,9 @@ impl BrowserShell {
         // step, and so it never lingers onto the next load.
         self.resolving_step = None;
         self.url_override = Some(name.to_string());
+        // A failed ENS load never navigated the backend, so there is no resolved
+        // root to follow off; the pin holds the name until the next navigation.
+        self.pinned_root_key = None;
         self.refresh_chrome();
         self.chrome.last_error = Some(reason.to_string());
     }
@@ -943,6 +978,8 @@ impl BrowserShell {
         // bar keeps it (there is no backend URL, and no reset to the prior page).
         self.resolving_step = None;
         self.url_override = Some(entry.to_string());
+        // No backend load, so no resolved root to follow off.
+        self.pinned_root_key = None;
         self.refresh_chrome();
         // Set the invalid-entry axis AFTER refresh (like `fail_ens_load` sets
         // `last_error`), so `refresh_chrome`'s URL logic runs with the pinned text
@@ -959,6 +996,7 @@ impl BrowserShell {
         self.renderer.go_back();
         // History navigation follows the backend's URL, not the pinned ENS name.
         self.url_override = None;
+        self.pinned_root_key = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
         // A history move proceeds, so any prior invalid-entry badge is cleared.
@@ -970,6 +1008,7 @@ impl BrowserShell {
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
         self.url_override = None;
+        self.pinned_root_key = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
         self.chrome.invalid_entry = None;
@@ -1021,6 +1060,7 @@ impl BrowserShell {
         }
         self.renderer.reload()?;
         self.url_override = None;
+        self.pinned_root_key = None;
         self.resolving_step = None;
         self.chrome.last_error = None;
         // A reload proceeds, so any prior invalid-entry badge is cleared.
@@ -1046,6 +1086,31 @@ impl BrowserShell {
         self.renderer.set_focus(focused);
     }
 
+    /// Drop the pinned `.eth` name if a lifecycle event's `event_url` is an
+    /// IN-PAGE navigation OFF the resolved root the name was pinned for.
+    ///
+    /// The ENS front door pins the `.eth` name for the resolved-ROOT load only
+    /// (recorded in
+    /// `docs/spikes/urlbar-tracks-in-page-navigation-not-just-pinned-name/pin-vs-follow-decision.md`).
+    /// The pinned root's own lifecycle events carry that root's CID, so they keep
+    /// the pin; but an IN-PAGE navigation (a link click within the page) is a
+    /// FRESH backend load whose `event_url` normalizes to a DIFFERENT key. When it
+    /// does, the user has navigated WITHIN/away, so drop the pin and let the bar
+    /// FOLLOW the backend URL. The root entry is still recoverable via `ens_pages`
+    /// on a history return, so nothing is lost. A no-op when nothing is pinned or
+    /// the pin has no resolved root (a failed ENS load / an invalid entry pins the
+    /// typed text with no backend URL to follow off).
+    fn drop_pin_on_in_page_nav(&mut self, event_url: &str) {
+        let Some(root_key) = &self.pinned_root_key else {
+            return;
+        };
+        if crate::ipfs::normalize_ens_page_key(event_url) != *root_key {
+            // Navigated off the resolved root: follow the backend URL from here.
+            self.url_override = None;
+            self.pinned_root_key = None;
+        }
+    }
+
     /// Drain every pending [`LoadEvent`] off the seam and fold it into the chrome.
     ///
     /// The window calls this on its main loop (a periodic pump). Each event moves
@@ -1057,6 +1122,15 @@ impl BrowserShell {
         let mut changed = false;
         while let Some(event) = self.renderer.poll_event() {
             changed = true;
+            // An IN-PAGE navigation off the pinned ENS root (a link click) is a
+            // FRESH backend load whose event URL normalizes to a DIFFERENT key than
+            // the resolved root the name was pinned FOR. When that happens, the
+            // user has navigated WITHIN/away, so drop the pin here and let the bar
+            // FOLLOW the backend URL (the pin-vs-follow decision). The ROOT entry
+            // stays recoverable via `ens_pages` on a history return. A load whose
+            // URL is the pinned root (the front-door root still loading) keeps the
+            // pin, so the name holds for the whole root load.
+            self.drop_pin_on_in_page_nav(event.url());
             // While an ENS name is pinned in the bar (`url_override`), the
             // lifecycle events carry the underlying `ipfs://<cid>` URL, which must
             // NOT overwrite the displayed name — the user keeps seeing `ronan.eth`
@@ -1330,6 +1404,37 @@ mod tests {
             b.events.push_back(LoadEvent::Failed {
                 url,
                 reason: reason.to_string(),
+            });
+        }
+
+        /// Simulate an IN-PAGE navigation the way a real webview delivers it: the
+        /// user clicks a link inside the current page, so WebKitGTK begins a FRESH
+        /// load and fires its `load-changed` signals for `url` WITHOUT the shell
+        /// ever calling [`Renderer::navigate`]. It pushes a new history entry (in
+        /// the WebKit-normalized display form), settles `current_url` onto it, and
+        /// resets the per-load posture/flags exactly as a fresh `navigate` does, so
+        /// an in-page move to a non-ENS resource starts UNVERIFIED and carries no
+        /// stale ENS flag. This is the path the old fake could not model (it only
+        /// exposed `navigate`, which the shell drives), and it is exactly where the
+        /// pinned `.eth` name used to freeze the bar.
+        fn navigate_in_page(&self, url: &str) {
+            let mut b = self.inner.borrow_mut();
+            // A fresh in-page load from mid-history drops the forward entries, just
+            // like `navigate`.
+            let next = b.cursor.map_or(0, |c| c + 1);
+            b.history.truncate(next);
+            b.history.push(webkit_normalize(url));
+            b.cursor = Some(b.history.len() - 1);
+            // The webview reports the new URL as it loads (no history-move async
+            // lag: this is a forward load, not a back/forward).
+            b.reported_url = Some(url.to_string());
+            b.pending_history = None;
+            b.state = LoadState::Started;
+            b.posture = TrustPosture::UnverifiedOrigin;
+            b.ens_origin = false;
+            b.mutable_name = false;
+            b.events.push_back(LoadEvent::Started {
+                url: url.to_string(),
             });
         }
 
@@ -2880,6 +2985,106 @@ mod tests {
         shell.reload().expect("reload a plain page");
         settle(&mut shell, &handle);
         assert_eq!(shell.chrome().url_text, "https://b.example/");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn in_page_navigation_on_an_ens_page_updates_the_bar_and_back_re_derives_the_name() {
+        // Acceptance (field finding v0.2.3, finding C): after loading an ENS page
+        // and navigating WITHIN it (a link click that changes the backend URL),
+        // the URL bar must UPDATE to reflect where the user now is, instead of
+        // staying FROZEN on the pinned `.eth` name. The pin is for the front-door
+        // ROOT load only; an in-page move FOLLOWS the backend URL (the recorded
+        // pin-vs-follow decision, see
+        // `docs/spikes/urlbar-tracks-in-page-navigation-not-just-pinned-name/`).
+        let page = b"<!doctype html><title>ronan</title><h1>ronan.eth root</h1>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // Load the ENS root: the name is pinned in the bar while its CID loads.
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+
+        // The user clicks a link WITHIN the ENS page: the webview begins a fresh
+        // in-page load to a DIFFERENT ipfs resource, WITHOUT the shell calling
+        // `navigate`. This is the exact path that used to be suppressed by the
+        // pinned name.
+        let in_page = "ipfs://bafyinpagesubresource/some/page.html";
+        handle.navigate_in_page(in_page);
+        shell.pump();
+        // The bar now FOLLOWS the backend URL: it no longer freezes on `ronan.eth`.
+        assert_ne!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "in-page navigation must not stay frozen on the pinned .eth name"
+        );
+        assert_eq!(
+            shell.chrome().url_text,
+            in_page,
+            "the bar follows the in-page backend URL"
+        );
+        // The posture tracks the ACTUAL load path: this in-page resource is NOT a
+        // known ENS entry and was not served via the verified path, so the ENS /
+        // verified posture must not persist.
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::ContentVerified,
+            "an in-page move to a non-ENS resource does not keep the ENS posture"
+        );
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+
+        // Back onto the ENS ROOT entry: its name is re-derived from the normalized
+        // `ens_pages` key (the pin was dropped, but the root is recoverable), and
+        // its ENS posture is re-marked — the root never loses its identity.
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "back onto the ENS root re-derives the name via ens_pages"
+        );
+        assert!(!shell.chrome().url_text.starts_with("ipfs://"));
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(webkit_normalize(&ipfs_uri).as_str())
+        );
+        handle.serve_via_verified_content_path();
+        shell.pump();
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS root keeps its posture on history return"
+        );
+    }
+
+    #[test]
+    fn in_page_navigation_on_a_plain_page_tracks_its_url_unregressed() {
+        // Acceptance: a plain (non-ENS) page tracks its URL on in-page navigation
+        // exactly as a browser does. This was already fine for non-pinned pages;
+        // the pin-vs-follow fix must not regress it.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://example.com/");
+
+        // A link click within the plain page: the bar follows the new URL.
+        handle.navigate_in_page("https://example.com/deep/link");
+        shell.pump();
+        assert_eq!(shell.chrome().url_text, "https://example.com/deep/link");
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://example.com/deep/link");
         assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
     }
 

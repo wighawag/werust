@@ -265,6 +265,22 @@ pub enum LoadEvent {
     Failed { url: String, reason: String },
 }
 
+impl LoadEvent {
+    /// The `url` this lifecycle event is about, regardless of the event kind.
+    ///
+    /// Lets a consumer inspect the event's target without matching every variant
+    /// (e.g. to tell an in-page navigation off a pinned entry by the URL changing).
+    #[must_use]
+    pub fn url(&self) -> &str {
+        match self {
+            LoadEvent::Started { url }
+            | LoadEvent::Committed { url }
+            | LoadEvent::Finished { url }
+            | LoadEvent::Failed { url, .. } => url,
+        }
+    }
+}
+
 /// A message sent from an injected page script up to the browser over the
 /// script-message bridge.
 ///

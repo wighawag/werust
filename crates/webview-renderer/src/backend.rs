@@ -208,13 +208,17 @@ impl WebViewRenderer {
     ///
     /// [`resolve_ipfs_request`]: werust_core::ipfs::resolve_ipfs_request
     pub fn install_ipfs(&mut self) {
+        use std::sync::Arc;
+
         use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
-        use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+        use werust_core::ipfs::IPFS_SCHEME;
+
+        use crate::offthread::{complete_ipfs_request, retrieve_off_thread};
 
         // The production content retriever: the DAG blocks fetched as a CAR from
         // a trustless gateway over the bound HTTP+TLS stack, each block verified
         // against its own CID and the UnixFS DAG reassembled/traversed locally
-        // before any byte is handed back. Owned by the scheme handler closure.
+        // before any byte is handed back.
         //
         // The gateway endpoint is the USER'S CHOSEN retrieval backend, read from
         // the persisted setting (task `retrieval-backend-user-setting`): a custom
@@ -223,10 +227,15 @@ impl WebViewRenderer {
         // switches the ACTUAL load path on the next launch. The per-block verify
         // above the gateway is unchanged: whatever endpoint the user picks, no
         // unverified byte is ever served.
-        let retriever = TrustlessGatewayCarRetriever::with_gateway(
+        //
+        // Wrapped in an `Arc` because the blocking retrieval now runs OFF the GTK
+        // main thread (see below): each intercepted request spawns a worker that
+        // holds a cheap clone of this `Send + Sync` retriever, so concurrent
+        // sub-resource fetches share one connection-pooling agent without racing.
+        let retriever = Arc::new(TrustlessGatewayCarRetriever::with_gateway(
             HttpFetcher::new(),
             &werust_core::retrieval::active_gateway_endpoint(),
-        );
+        ));
         // Share the load lifecycle into the scheme handler so a SUCCESSFUL verified
         // resolution can mark the current load content-verified — this is what
         // drives the chrome's trust indicator from the ACTUAL load path (every
@@ -251,30 +260,45 @@ impl WebViewRenderer {
         };
         let life = self.life.clone();
         context.register_uri_scheme(IPFS_SCHEME, move |request| {
+            // OFF THE UI THREAD (`docs/adr/0008`). The scheme-handler closure fires
+            // on the single GTK main thread, once per request (the main document
+            // AND every sub-resource). Running the blocking CAR fetch + per-block
+            // verify + DAG reassembly here synchronously froze the window (GNOME's
+            // "not responding" dialog on a real load). So instead:
+            //
+            // 1. `gio::spawn_blocking` runs the blocking `retrieve_off_thread` on
+            //    gio's I/O thread pool. It captures only a `Send` retriever clone
+            //    and the request URI (a plain `String`) and returns a `Send`
+            //    `RetrievalOutcome` value — NOTHING GTK and NOTHING `!Send` (not the
+            //    `WebKitURISchemeRequest`, not the `Rc`-shared lifecycle) crosses
+            //    the thread boundary. Verification is unchanged: the same verifying
+            //    path runs, just off the UI thread.
+            // 2. `MainContext::spawn_local` awaits that outcome and runs the
+            //    completion BACK on the GTK loop (a `!Send` future is allowed to
+            //    capture the `!Send` request + lifecycle). `complete_ipfs_request`
+            //    then marks the shared posture and finishes the request ON THE MAIN
+            //    THREAD — so the worker never races the UI thread's posture updates
+            //    (the desktop analogue of the Android Mutex fix), and the event loop
+            //    keeps turning so concurrent sub-resource fetches do not serialize.
             let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
-            match resolve_ipfs_request(&retriever, &renderer::SchemeRequest { uri }) {
-                Ok(response) => {
-                    // The bytes verified against their CID: mark the current load
-                    // content-verified so the chrome's trust indicator reflects the
-                    // real (hash-verified) load path.
-                    life.borrow_mut().mark_content_verified();
-                    let bytes = glib::Bytes::from(&response.body);
-                    let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
-                    request.finish(
-                        &stream,
-                        response.body.len() as i64,
-                        Some(&response.mime_type),
-                    );
-                }
-                Err(e) => {
-                    // Verification failed (a hash mismatch, an unverifiable CID, a
-                    // source error): fail the load WITHOUT marking it verified, so
-                    // unverified bytes never render AND the posture stays untrusted.
-                    let mut error =
-                        glib::Error::new(gtk4::gio::IOErrorEnum::Failed, &e.to_string());
-                    request.finish_error(&mut error);
-                }
-            }
+            let retriever = retriever.clone();
+            let life = life.clone();
+            // A `WebKitURISchemeRequest` is a refcounted GObject; clone bumps the
+            // refcount so the request lives until the completion future finishes it.
+            let request = request.clone();
+            let blocking =
+                gtk4::gio::spawn_blocking(move || retrieve_off_thread(retriever.as_ref(), uri));
+            glib::MainContext::default().spawn_local(async move {
+                // If the worker panicked, `join` is an `Err`; surface that as a
+                // fail-closed load rather than rendering anything.
+                let outcome = blocking.await.unwrap_or_else(|_| {
+                    Err(renderer::RendererError::Backend(
+                        "ipfs:// content-addressed load failed: retrieval worker panicked".into(),
+                    ))
+                });
+                let mut sink = WebKitRequestSink { request };
+                complete_ipfs_request(outcome, &mut sink, &life);
+            });
         });
 
         // The internal `werust://settings` page (task
@@ -302,6 +326,37 @@ impl WebViewRenderer {
                 }
             }
         });
+    }
+}
+
+/// A [`RequestSink`](crate::offthread::RequestSink) over the live WebKitGTK
+/// [`WebKitURISchemeRequest`](webkit6::URISchemeRequest): the marshalling-thread
+/// completion of an off-thread `ipfs://` resolution.
+///
+/// It is created and used ONLY inside the `MainContext::spawn_local` future
+/// `install_ipfs` schedules, so it runs on the GTK main thread — which is exactly
+/// where a `WebKitURISchemeRequest` may be finished. `finish` streams the verified
+/// bytes to the renderer; `fail` fails the load with the legible reason. The
+/// posture mark is done by `complete_ipfs_request` on the shared lifecycle before
+/// `finish`, so the two-thread split does not weaken the fail-closed trust path.
+struct WebKitRequestSink {
+    request: webkit6::URISchemeRequest,
+}
+
+impl crate::offthread::RequestSink for WebKitRequestSink {
+    fn finish(&mut self, response: renderer::SchemeResponse) {
+        let bytes = glib::Bytes::from(&response.body);
+        let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
+        self.request.finish(
+            &stream,
+            response.body.len() as i64,
+            Some(&response.mime_type),
+        );
+    }
+
+    fn fail(&mut self, error: RendererError) {
+        let mut err = glib::Error::new(gtk4::gio::IOErrorEnum::Failed, &error.to_string());
+        self.request.finish_error(&mut err);
     }
 }
 

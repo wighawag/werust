@@ -307,6 +307,7 @@ impl LoadLifecycle {
 pub(crate) type SharedLifecycle = Rc<RefCell<LoadLifecycle>>;
 
 mod backend;
+mod offthread;
 pub use backend::WebViewRenderer;
 
 #[cfg(test)]

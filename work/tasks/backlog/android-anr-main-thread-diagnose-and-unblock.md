@@ -32,3 +32,13 @@ Fix direction (apply only what the diagnosis proves): move the offending work of
 ## Blocked by
 
 - None. (Highest-priority mobile issue from the v0.2.3 field test.)
+
+## Prompt
+
+> Goal: fix the v0.2.3 field finding that Android throws the "isn't responding" (ANR) modal REGULARLY - pressing "wait" doesn't help, it keeps popping - while the UI stays typeable. That signature = the Android MAIN (UI) thread is repeatedly blocked/starved by looping or long main-thread work. This is a DIAGNOSE-THEN-FIX; do the diagnosis first (`~/.agents/skills/diagnosing-bugs/SKILL.md`), record the root cause, then apply the minimal fix. Do NOT guess-patch.
+>
+> Where to look (confirm with evidence - a main-thread stack / systrace / strategic logging, not assumption): `crates/werust-android/app/src/main/java/com/github/wighawag/werust/BrowserActivity.kt` and `WerustCore.kt` (a too-tight pump/chrome-refresh loop driven from the UI thread - a Handler/Choreographer/timer calling the Rust FFI `pump` + reading the chrome JSON every frame or faster, possibly tightened by the new v0.2.3 LoadStep/chrome-JSON polling); `crates/werust-android/rust/src/lib.rs` + `ffi_json.rs` (main-thread FFI cadence); the Android ipfs scheme interception (a synchronous main-thread FFI hop per request). Note `ipfs-retrieval-off-main-thread-no-ui-freeze` already moved the heavy RETRIEVAL off-thread, so the culprit is something else on the Android main thread.
+>
+> Fix direction (apply only what the diagnosis proves): move the offending work off the main thread (background executor/coroutine + post back), and/or throttle the pump/refresh with a change-guard (repaint only when the chrome actually changed - the core `pump()` already returns true-on-change; make the Android side honour it), and/or make the scheme-interception main-thread hop non-blocking. Keep trust/verification/lifecycle behaviour UNCHANGED (threading/cadence fix only).
+>
+> Done = root cause DIAGNOSED + recorded (`docs/spikes/<slug>/DIAGNOSIS.md` with evidence); the recurring ANR is gone (main thread idles between frames on a normal/slow load); no busy main-thread loop remains; trust/lifecycle/verification unchanged. Add the strongest automatable guard (e.g. the change-guarded pump cadence is unit-testable) and record any device-only manual verification steps. ANR is a device/emulator property - lean on the diagnosis + the automatable guard.

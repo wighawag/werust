@@ -32,3 +32,11 @@ Must stay coherent with:
 ## Blocked by
 
 - `ens-history-name-rederive-async-and-normalized` (the normalized `ens_pages` re-derive this task builds on; landing it first keeps the root-entry name recovery correct when the pin is dropped for in-page nav).
+
+## Prompt
+
+> Goal: fix the v0.2.3 field finding that the URL bar stays frozen on the pinned `.eth` name and never shows the new path when the user navigates WITHIN an ENS page (a link click). Today the ENS front door sets `url_override = Some(name)` which PERSISTS, and `pump()` writes `chrome.url_text` only when `!pinned`, so any in-page navigation is suppressed from the bar.
+>
+> Where to look: `crates/werust-core/src/lib.rs` (`load_resolved_content` sets the persistent `url_override`; `pump()`'s `!pinned` guard on the LoadEvent url writes; `refresh_chrome`'s `url_override` vs `ens_pages` re-derive precedence). Distinguish PINNING the `.eth` name for the front-door ROOT load from FOLLOWING the backend URL as the user navigates within/away. Recommended: drop the name pin once the user navigates OFF the resolved-root entry (a link click is a fresh load), so the bar follows the backend URL for in-page nav, while the ROOT entry re-shows its name via the normalized `ens_pages` re-derive from the blockedBy task (or show `name/<path>` if the path derives cleanly). Keep the trust posture tracking the ACTUAL load path (an in-page move to a non-verified resource must not keep a stale ENS/verified posture).
+>
+> Done = in-page navigation on an ENS page updates the bar (name/path or backend URL per the recorded decision); the resolved-root ENS entry still shows the name+posture (first load + on history return via the normalized ens_pages re-derive); posture tracks the load path; plain pages unregressed; the pin-vs-follow decision recorded durably. Network-isolated tests cover in-page nav updates the bar, root still shows name, back re-derives name, posture tracks path. Builds on `ens-history-name-rederive-async-and-normalized` (its blockedBy) - use the normalized re-derive, don't fight it. FIRST re-check the pin/`!pinned` mechanism still matches.

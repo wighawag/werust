@@ -32,3 +32,11 @@ Keep everything else the recorded reload/back decision established: reload still
 ## Blocked by
 
 - None. (The core is in the shared `BrowserShell`; verify the normalization key is coherent with the reload re-resolve path.)
+
+## Prompt
+
+> Goal: fix the v0.2.3 field regression where the back button shows `ipfs:///<cid>` instead of the `.eth` name when the previous page was an ENS name. The `preserve-ens-name-in-bar-on-reload-and-history` back/forward re-derive was verified only against the synchronous `FakeBackend`; it misses on the real WebKitGTK backend for two reasons, both to fix.
+>
+> Where to look: `crates/werust-core/src/lib.rs` (`BrowserShell::go_back`/`go_forward` set `url_override = None`; `refresh_chrome` re-derives the `.eth` name from `ens_pages` keyed on `renderer.current_url()`; `load_resolved_content` INSERTS into `ens_pages` keyed on `current_url()`; `reload`'s ENS-name lookup). `crates/webview-renderer/src/backend.rs` (`current_url()` reads the shared `LoadLifecycle`, updated ASYNCHRONOUSLY by WebKitGTK `load-changed` signals). (1) ASYNC history: after `go_back()` the current_url has not settled onto the ENS CID yet, so re-derive must re-apply on the settled pump, not only synchronously. (2) NORMALIZATION: the `ipfs:///` triple-slash means the stored key (from forward load) differs from the post-back string; key `ens_pages` on a NORMALIZED CID form applied IDENTICALLY at insert AND every lookup (refresh_chrome + reload) so they match.
+>
+> Done = back/forward on the REAL backend show the `.eth` name + posture (never `ipfs://`/`ipfs:///`), robust to async settle, matching on the normalized key; a non-ENS entry still shows its real URL; the name never leaks onto a non-ENS page. CRUCIAL: upgrade the test harness/FakeBackend to MODEL async history settle + URL-normalization variance so this regression class can no longer pass on a synchronous identical-string fake. Network-isolated tests assert bar text + posture after back and forward. FIRST re-check the keying mechanism still matches the description.

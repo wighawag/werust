@@ -36,3 +36,11 @@ Design notes:
 ## Blocked by
 
 - None. (Independent of the ENS-history and in-page-nav tasks, though it touches the same `navigate` front door; land order is flexible.)
+
+## Prompt
+
+> Goal: implement the v0.2.3 field request for scheme-less entry routing. Today `github.com` (no scheme) is rejected by `validate_url` (needs `scheme://`) and the URL bar silently resets to the previous page with no error. Human's desired behaviour: on `.eth` -> ENS (as today); else check valid url: if VALID, try it (prepend `https://` if no scheme) and on a LOAD failure show a normal browser-style in-page error while KEEPING the attempted URL in the bar; if INVALID, do NOT navigate but show a small "invalid URL" BADGE with the URL-bar text underlined red, keeping the typed text so the user can fix it, NEVER resetting the bar.
+>
+> Where to look: `crates/werust-core/src/lib.rs` (`BrowserShell::navigate`, `eth_name_from_entry` - add a sibling valid-host/URL classifier IN THE CORE so all edges share one unit-tested rule); the three `validate_url` twins (`crates/webview-renderer/src/lib.rs`, `crates/werust-ios/rust/src/backend.rs`, `crates/werust-android/rust/src/backend.rs`). Add the INVALID-entry state as a NEW orthogonal `ChromeState` axis (do NOT re-mean `last_error`, which is a load failure, nor the trust posture); paint the badge + red-underline per edge from that one chrome fact. Do not double-prepend a scheme or hijack an explicit `ipfs://`/`http://`/`https://`.
+>
+> Done = `.eth`->ENS unchanged; scheme-less valid host -> `https://` navigate; explicit scheme -> literal; valid-but-failing load -> in-page browser error + bar keeps the URL; invalid entry -> invalid-url badge + red-underline + typed text kept + no navigation + no bar reset. Classifier in werust-core, conservative/honest, unit-tested. Applied desktop + mobile (shared core fact) or tracked per the parity guard. Network-isolated tests cover all five routes. FIRST re-check the rejection mechanism still matches the description.

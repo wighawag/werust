@@ -4,6 +4,7 @@ slug: track-webview-url-on-spa-clientside-navigation
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 blockedBy: []
 covers: [2]
+needsAnswers: true
 ---
 
 ## What to build

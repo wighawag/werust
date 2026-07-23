@@ -40,6 +40,8 @@ mod ffi_json;
 
 pub use backend::{AndroidBackend, AndroidHandle};
 
+use std::sync::Mutex;
+
 use renderer::Renderer;
 use werust_core::{BrowserShell, ChromeState};
 
@@ -51,6 +53,7 @@ use werust_core::{BrowserShell, ChromeState};
 /// (`WebResourceResponse` with an error status / null stream), so the fail-closed
 /// posture desktop has (a hash mismatch fails the load, never renders) holds on
 /// Android too.
+#[derive(Debug)]
 pub enum SchemeResolution {
     /// A verified resolution: the MIME type and the verified body bytes.
     Ok { mime_type: String, body: Vec<u8> },
@@ -191,6 +194,143 @@ impl CoreSession {
     }
 }
 
+/// The thread-safety boundary between the Kotlin edge's TWO threads and the
+/// single-threaded [`CoreSession`].
+///
+/// # Why this exists (the Android-only data race)
+///
+/// The [`CoreSession`] is single-threaded by construction: its
+/// [`AndroidBackend`] shares its state through an [`Rc<RefCell>`](std::rc::Rc)
+/// (`!Sync`, the same interior-mutability shape `webview-renderer` uses), so
+/// every method assumes it is the ONLY thing touching the session. Desktop and
+/// iOS honour that: their scheme handlers dispatch on the single main/GTK thread,
+/// so the whole session is only ever driven from one thread.
+///
+/// Android is the exception. The platform `WebView` runs
+/// `WebViewClient.shouldInterceptRequest` on a WebView WORKER thread, while the
+/// UI thread independently drives the SAME session during an in-flight load
+/// (`navigate`/`onPageStarted`/`onPageFinished` + sub-resource interception).
+/// Without a boundary, the worker thread's [`resolve_ipfs`](CoreSession::resolve_ipfs)
+/// (`RefCell::borrow_mut` on the shared inner) races the UI thread's navigate /
+/// load-signal calls (also `borrow_mut`): two `&mut CoreSession` live across
+/// threads plus a non-atomic `RefCell` borrow = a data race / UB / a `RefCell`
+/// already-borrowed panic.
+///
+/// `SyncSession` closes that gap: it wraps the session in a [`Mutex`] and every
+/// edge call goes through it, so no two threads ever borrow the `RefCell`
+/// concurrently — the worker-thread resolve and the UI-thread drive are
+/// serialized. The lock is the SAME single-thread invariant desktop/iOS get for
+/// free from their single-threaded dispatch, made explicit on the one edge that
+/// needs it.
+///
+/// # Soundness of a `Mutex` over a `!Send` session
+///
+/// [`CoreSession`] is `!Send` (it owns `Rc`s), so `SyncSession` is itself
+/// `!Send`/`!Sync` at the type level and the JNI layer crosses only a raw
+/// pointer (never a typed `Send` reference). The `Mutex` provides the actual
+/// mutual exclusion + happens-before: the `Rc` refcounts are only ever touched
+/// while the lock is held (the `Rc`s never escape the guarded `CoreSession`), so
+/// there is no concurrent refcount mutation. One thread accesses the session at
+/// a time, with a release/acquire edge between them — the same guarantee a
+/// single dispatch thread would give.
+pub struct SyncSession {
+    inner: Mutex<CoreSession>,
+}
+
+impl Default for SyncSession {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SyncSession {
+    /// Build a fresh synchronized session over a new [`CoreSession`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(CoreSession::new()),
+        }
+    }
+
+    /// Run `f` against the guarded [`CoreSession`] while holding the lock, so no
+    /// other thread can borrow the session's `RefCell` for the duration.
+    ///
+    /// A poisoned lock (a prior panic while holding it) is recovered into the
+    /// guard rather than propagated: the edge must stay responsive, and the
+    /// session's own methods are internally consistent (a panic mid-borrow is a
+    /// bug we would rather surface as a degraded-but-live session than a crash on
+    /// every subsequent call).
+    fn with<R>(&self, f: impl FnOnce(&mut CoreSession) -> R) -> R {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        f(&mut guard)
+    }
+
+    /// Navigate to `url`, under the lock. See [`CoreSession::navigate`].
+    pub fn navigate(&self, url: &str) -> bool {
+        self.with(|s| s.navigate(url))
+    }
+
+    /// Go one step back, under the lock. See [`CoreSession::go_back`].
+    pub fn go_back(&self) {
+        self.with(CoreSession::go_back);
+    }
+
+    /// Go one step forward, under the lock. See [`CoreSession::go_forward`].
+    pub fn go_forward(&self) {
+        self.with(CoreSession::go_forward);
+    }
+
+    /// Reload, under the lock. See [`CoreSession::reload`].
+    pub fn reload(&self) -> bool {
+        self.with(CoreSession::reload)
+    }
+
+    /// Stop the in-flight load, under the lock. See [`CoreSession::stop`].
+    pub fn stop(&self) {
+        self.with(CoreSession::stop);
+    }
+
+    /// Drain the pending load, under the lock. See
+    /// [`CoreSession::take_pending_load`].
+    pub fn take_pending_load(&self) -> Option<String> {
+        self.with(CoreSession::take_pending_load)
+    }
+
+    /// Resolve an intercepted `ipfs://` request, under the lock. This is the
+    /// method the WebView WORKER thread calls from `shouldInterceptRequest`; the
+    /// lock serializes it against the UI thread's navigate / load-signal calls so
+    /// the shared `RefCell` is never borrowed by two threads at once. See
+    /// [`CoreSession::resolve_ipfs`].
+    pub fn resolve_ipfs(&self, uri: &str) -> Option<SchemeResolution> {
+        self.with(|s| s.resolve_ipfs(uri))
+    }
+
+    /// Report the commit signal, under the lock. See
+    /// [`CoreSession::on_page_committed`].
+    pub fn on_page_committed(&self, url: &str) {
+        self.with(|s| s.on_page_committed(url));
+    }
+
+    /// Report the finished signal, under the lock. See
+    /// [`CoreSession::on_page_finished`].
+    pub fn on_page_finished(&self, url: &str) {
+        self.with(|s| s.on_page_finished(url));
+    }
+
+    /// Report the error signal, under the lock. See
+    /// [`CoreSession::on_page_failed`].
+    pub fn on_page_failed(&self, url: &str, reason: &str) {
+        self.with(|s| s.on_page_failed(url, reason));
+    }
+
+    /// The current chrome as a JSON object, under the lock. See
+    /// [`CoreSession::chrome_json`].
+    #[must_use]
+    pub fn chrome_json(&self) -> String {
+        self.with(|s| s.chrome_json())
+    }
+}
+
 /// Install the native `ipfs://` scheme handler on `backend`, the twin of the
 /// desktop backend's `install_ipfs`.
 ///
@@ -231,19 +371,27 @@ fn install_ipfs(backend: &mut AndroidBackend) {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "android")]
 mod jni_exports {
-    use super::CoreSession;
+    use super::SyncSession;
     use jni::objects::{JClass, JString};
     use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
 
-    /// Reconstruct a `&mut CoreSession` from the opaque handle Kotlin threads back.
+    /// Reconstruct a `&SyncSession` from the opaque handle Kotlin threads back.
+    ///
+    /// The handle points at a [`SyncSession`], not a bare `CoreSession`, so a
+    /// shared `&` is enough: every session method locks the inner `Mutex` before
+    /// touching the `CoreSession`. This is what makes the two Kotlin threads
+    /// safe — the UI thread's navigate / load-signal calls and the WebView
+    /// worker thread's `shouldInterceptRequest` -> `nativeResolveIpfs` can hold
+    /// this `&` at the same time, but the `Mutex` serializes the actual session
+    /// access so the shared `RefCell` is never borrowed by two threads at once.
     ///
     /// # Safety
     /// `handle` must be a pointer returned by `nativeNew` and not yet freed by
     /// `nativeFree`; Kotlin guarantees this by construction (one handle per
-    /// `Activity`, threaded through every call on the UI thread).
-    unsafe fn session<'a>(handle: jlong) -> &'a mut CoreSession {
-        &mut *(handle as *mut CoreSession)
+    /// `Activity`, threaded through every call, freed once in `onDestroy`).
+    unsafe fn session<'a>(handle: jlong) -> &'a SyncSession {
+        &*(handle as *const SyncSession)
     }
 
     fn read(env: &mut JNIEnv, s: &JString) -> String {
@@ -255,7 +403,7 @@ mod jni_exports {
         _env: JNIEnv,
         _class: JClass,
     ) -> jlong {
-        Box::into_raw(Box::new(CoreSession::new())) as jlong
+        Box::into_raw(Box::new(SyncSession::new())) as jlong
     }
 
     /// # Safety
@@ -267,7 +415,7 @@ mod jni_exports {
         handle: jlong,
     ) {
         if handle != 0 {
-            drop(Box::from_raw(handle as *mut CoreSession));
+            drop(Box::from_raw(handle as *mut SyncSession));
         }
     }
 
@@ -656,5 +804,132 @@ mod tests {
         assert!(json.contains("\"canGoForward\":false"), "{json}");
         assert!(json.contains("\"loading\":false"), "{json}");
         assert!(json.contains("\"loadState\":\"finished\""), "{json}");
+    }
+
+    // --- The Android-only thread-safety boundary (the requeue's Gate-2 fix). ---
+
+    /// A `Send` shim carrying the raw `*mut SyncSession` across the thread
+    /// boundary, exactly as the JNI layer does: the pointer crosses threads but
+    /// the `Mutex` inside `SyncSession` is what serializes the actual access, so
+    /// this is sound for the same reason the JNI `jlong` handle is.
+    struct SessionPtr(*mut SyncSession);
+    // SAFETY: the pointer is only ever dereferenced through `SyncSession`'s
+    // locking methods (`&self` + inner `Mutex`), so the `!Send` `CoreSession` is
+    // only ever touched by one thread at a time under the lock — the same
+    // invariant the Kotlin UI-thread + WebView-worker-thread edge relies on.
+    unsafe impl Send for SessionPtr {}
+
+    #[test]
+    fn the_sync_session_serializes_the_ui_thread_and_the_webview_worker_thread() {
+        // The requeue's Gate-2 data race, reproduced and closed: on Android the
+        // WebView WORKER thread runs `shouldInterceptRequest` -> `resolve_ipfs`
+        // (a `RefCell::borrow_mut` on the shared inner) WHILE the UI thread drives
+        // the SAME session (navigate / onPageStarted / onPageFinished, also
+        // `borrow_mut`). Against a bare `CoreSession` that is two `&mut` across
+        // threads + a non-atomic `RefCell` borrow = UB / a `RefCell`
+        // already-borrowed panic. `SyncSession` wraps the session in a `Mutex`, so
+        // the two threads are serialized and neither the resolve nor the drive can
+        // observe a mid-borrow session.
+        //
+        // This drives BOTH edges concurrently many times over: if the boundary
+        // were missing (a bare `Rc<RefCell>` shared unsynchronized), the
+        // `borrow_mut` collisions would panic the worker or the UI thread. It
+        // stays network-isolated: the `ipfs://` CID is malformed, so `resolve_ipfs`
+        // fails closed in `Cid::try_from` BEFORE any fetch.
+        use std::thread;
+
+        // Own the session in a `Box` on the main thread and cross ONLY the raw
+        // `*mut SyncSession` to each worker — exactly as the JNI edge does (a
+        // `jlong` handle, never an `Arc`): `SyncSession` is `!Send` (it guards a
+        // `!Send` `CoreSession`), so the runtime `Mutex`, not the type system, is
+        // what makes the two-thread access sound. The main thread joins both
+        // threads before the box is dropped, so the pointer stays valid.
+        let session: Box<SyncSession> = Box::default();
+        let raw: *mut SyncSession = Box::into_raw(session);
+        let iterations = 500;
+
+        // The UI thread: the in-flight-load drive the Activity does on the main
+        // thread (navigate + the WebView's real load signals + chrome reads).
+        let ui = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for i in 0..iterations {
+                    let url = format!("https://example.com/{i}");
+                    s.navigate(&url);
+                    if let Some(pending) = s.take_pending_load() {
+                        s.on_page_committed(&pending);
+                        s.on_page_finished(&pending);
+                    }
+                    let _ = s.chrome_json();
+                }
+            })
+        };
+
+        // The WebView worker thread: `shouldInterceptRequest` resolving `ipfs://`
+        // through the shared core path concurrently with the UI-thread drive.
+        let worker = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for _ in 0..iterations {
+                    // Intercepted + routed to the core; a malformed CID fails
+                    // closed (network-isolated) but STILL exercises the same
+                    // `borrow_mut` on the shared inner that races the UI thread.
+                    match s.resolve_ipfs("ipfs://not-a-valid-cid/index.html") {
+                        Some(SchemeResolution::Err { .. }) => {}
+                        other => panic!("expected a fail-closed resolution, got {other:?}"),
+                    }
+                }
+            })
+        };
+
+        // If the boundary were missing this join would surface a panic (a
+        // `RefCell` already-borrowed) from either thread; with it, both complete.
+        ui.join()
+            .expect("the UI-thread drive must not panic under the lock");
+        worker
+            .join()
+            .expect("the WebView-worker resolve must not panic under the lock");
+
+        // Reclaim ownership on the main thread now both workers have joined.
+        let session: Box<SyncSession> = unsafe { Box::from_raw(raw) };
+
+        // The session survived the concurrent drive and is still coherent: a
+        // final navigate + settle through the same boundary still works.
+        session.navigate("https://after.example/");
+        if let Some(pending) = session.take_pending_load() {
+            session.on_page_committed(&pending);
+            session.on_page_finished(&pending);
+        }
+        let json = session.chrome_json();
+        assert!(
+            json.contains("\"url\":\"https://after.example/\""),
+            "the session is still coherent after the concurrent drive: {json}"
+        );
+    }
+
+    #[test]
+    fn the_sync_session_routes_ipfs_to_the_shared_core_fail_closed() {
+        // The sync boundary must not change the resolve SEMANTICS: an `ipfs://`
+        // URL is still intercepted and routed to the shared core path (fail-closed
+        // on a malformed CID), and a non-`ipfs` URL is still not intercepted —
+        // exactly as the bare `CoreSession`, now behind the lock.
+        let s = SyncSession::new();
+        match s.resolve_ipfs("ipfs://not-a-valid-cid/index.html") {
+            Some(SchemeResolution::Err { reason }) => {
+                assert!(
+                    reason.contains("ipfs://"),
+                    "legible fail-closed reason: {reason}"
+                );
+            }
+            other => panic!("a malformed CID must fail closed, got {other:?}"),
+        }
+        assert!(
+            s.resolve_ipfs("https://example.com/").is_none(),
+            "a non-ipfs URL is not intercepted through the sync boundary"
+        );
     }
 }

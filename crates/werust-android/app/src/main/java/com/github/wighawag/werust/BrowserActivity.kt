@@ -186,6 +186,15 @@ class BrowserActivity : Activity() {
          * work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md
          * for the internal-`https://appassets` fallback if a device build shows a
          * top-level `ipfs://` navigation does not reach this hook.
+         *
+         * THREADING: this hook runs on a WebView WORKER thread, NOT the UI thread
+         * that drives `navigate` / `onPageStarted` / `onPageFinished`. Both touch
+         * the SAME native session, so the Rust edge wraps it in a `SyncSession`
+         * (a `Mutex` around the single-threaded `CoreSession`): every native call
+         * — including this [WerustCore.resolveIpfs] — locks first, so the two
+         * threads are serialized and the core's shared `RefCell` is never borrowed
+         * concurrently. That is what makes calling into the core from this
+         * off-UI-thread hook sound.
          */
         override fun shouldInterceptRequest(
             view: WebView,
@@ -204,8 +213,10 @@ class BrowserActivity : Activity() {
                     // Fail closed: an HTTP error status with no body, so unverified
                     // bytes never render and the failure is honest. The reason is
                     // carried in the reason phrase; the `WebView` surfaces the
-                    // failed load via `onReceivedHttpError` on the UI thread (this
-                    // hook runs off the UI thread, so it must not mutate the core).
+                    // failed load via `onReceivedHttpError` on the UI thread. The
+                    // native session is serialized by its `SyncSession` mutex (see
+                    // the KDoc above), so calling into the core from this off-UI
+                    // worker thread is safe.
                     WebResourceResponse(
                         "text/plain",
                         "utf-8",

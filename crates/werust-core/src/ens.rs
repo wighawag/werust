@@ -365,10 +365,15 @@ pub fn resolve(
     let contenthash_bytes = decode_bytes_return(&contenthash_return)?;
 
     // 3. Decode via the ENSIP-7 decoder (do NOT re-decode); map its typed output
-    //    onto the resolution taxonomy. A well-formed unsupported protocol is a
-    //    NAMED refusal, never a success.
+    //    onto the resolution taxonomy. The two HANDLED cases — an immutable
+    //    `ipfs-ns` and a mutable `ipns-ns` — are returned as successes for the
+    //    front door to dispatch on (the `ipns-ns` name is RESOLVED via a
+    //    client-verified record before it loads); a well-formed UNSUPPORTED
+    //    protocol stays a NAMED refusal, never a success.
     match decode_contenthash(&contenthash_bytes) {
-        Ok(decoded @ DecodedContenthash::Ipfs { .. }) => Ok(decoded),
+        Ok(decoded @ (DecodedContenthash::Ipfs { .. } | DecodedContenthash::Ipns { .. })) => {
+            Ok(decoded)
+        }
         Ok(DecodedContenthash::Unsupported(proto)) => {
             Err(ResolutionError::UnsupportedContenthash(proto))
         }

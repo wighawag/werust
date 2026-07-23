@@ -391,6 +391,18 @@ impl Renderer for WebViewRenderer {
         self.life.borrow_mut().mark_ens_origin();
     }
 
+    fn mark_mutable_name(&mut self) {
+        // Flag the current load as pointing at a MUTABLE name on the SHARED
+        // lifecycle (the same one the `install_ipfs` scheme handler marks). The
+        // front door calls this right after starting an IPNS-resolved
+        // `ipfs://<cid>` load, so when the scheme handler later verifies the bytes
+        // and calls `mark_content_verified`, the lifecycle surfaces the honest
+        // `MutableName` posture instead of the immutable `ContentVerified` — or,
+        // if the load is ALSO ENS-originated, the louder `NameViaTrustedRpc` wins
+        // (the two-axis display rule). A fresh `begin` clears the flag.
+        self.life.borrow_mut().mark_mutable_name();
+    }
+
     fn current_url(&self) -> Option<String> {
         // The lifecycle lives behind interior mutability (the load signals mutate
         // it from the GTK main loop), so the URL is returned owned rather than

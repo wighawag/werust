@@ -24,13 +24,17 @@
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
+use fetcher::HttpFetcher;
+
 use crate::contenthash::DecodedContenthash;
 use crate::ethereum::{EthereumProvider, RpcProvider};
+use crate::ipns::{GatewayIpnsRecordSource, IpnsRecordSource};
 
 pub mod contenthash;
 pub mod ens;
 pub mod ethereum;
 pub mod ipfs;
+pub mod ipns;
 pub mod provider;
 pub mod retrieval;
 
@@ -141,6 +145,18 @@ impl ChromeState {
     pub fn is_name_via_trusted_rpc(&self) -> bool {
         self.trust_posture.is_name_via_trusted_rpc()
     }
+
+    /// Whether the current page's bytes were content-verified but its name is
+    /// MUTABLE (controller-repointable): a client-verified IPNS load (or, once
+    /// Phase 2 clears the RPC-trust warning, an ENS load). A distinct state the
+    /// window paints as its own trust indicator: never "verified" (only a direct
+    /// `ipfs://<cid>` is immutable), never merely "served" (the bytes verified),
+    /// and quieter than [`is_name_via_trusted_rpc`](ChromeState::is_name_via_trusted_rpc)
+    /// (a misdirecting RPC is the louder warning).
+    #[must_use]
+    pub fn is_mutable_name(&self) -> bool {
+        self.trust_posture.is_mutable_name()
+    }
 }
 
 /// The browser shell: the seam-driven logic behind the window.
@@ -159,6 +175,13 @@ pub struct BrowserShell {
     /// [`RpcProvider`](crate::ethereum::RpcProvider) today and a Phase-2 trustless
     /// light-client backend later, unchanged.
     provider: Box<dyn EthereumProvider>,
+    /// The [`IpnsRecordSource`](crate::ipns::IpnsRecordSource) the front door
+    /// resolves a MUTABLE `ipns-ns` name through: fetch the signed record from an
+    /// untrusted trustless gateway, then VERIFY it client-side against the key
+    /// (`crate::ipns::resolve_ipns_name`). `Box<dyn>` so the SAME shell drives the
+    /// default trustless-gateway source today and a delegated-routing /
+    /// embedded-p2p source later, unchanged — mirroring `provider`.
+    ipns_source: Box<dyn IpnsRecordSource>,
     /// The address-bar text to DISPLAY in place of the backend's underlying load
     /// URL, when they differ.
     ///
@@ -198,10 +221,41 @@ impl BrowserShell {
     /// subsystem to chase.
     #[must_use]
     pub fn with_provider(renderer: Box<dyn Renderer>, provider: Box<dyn EthereumProvider>) -> Self {
+        // The default IPNS record source: a trustless-gateway fetch over the bound
+        // HTTP `Fetcher`, pointed at the user's chosen retrieval backend (the SAME
+        // `active_gateway_endpoint` the content path uses, so the IPNS record and
+        // the content it points at come from one chosen gateway — no second
+        // config). Verification of the fetched record happens client-side in
+        // `ipns::resolve_ipns_name`, so this untrusted source cannot misdirect a
+        // name.
+        let ipns_source = Box::new(GatewayIpnsRecordSource::with_gateway(
+            HttpFetcher::new(),
+            &crate::retrieval::active_gateway_endpoint(),
+        ));
+        Self::with_provider_and_ipns_source(renderer, provider, ipns_source)
+    }
+
+    /// Build a shell over the given rendering backend,
+    /// [`EthereumProvider`](crate::ethereum::EthereumProvider), AND
+    /// [`IpnsRecordSource`](crate::ipns::IpnsRecordSource).
+    ///
+    /// This is how a caller (or a test) points BOTH the ENS front door and the
+    /// IPNS front door at specific backends — an in-process fixture provider + a
+    /// pinned record source — rather than the labelled defaults, so the whole
+    /// bare-`.eth` → (ipfs-ns | ipns-ns) → verified-load path is exercised off the
+    /// live network. Mirrors [`with_provider`](BrowserShell::with_provider), with
+    /// no config subsystem to chase.
+    #[must_use]
+    pub fn with_provider_and_ipns_source(
+        renderer: Box<dyn Renderer>,
+        provider: Box<dyn EthereumProvider>,
+        ipns_source: Box<dyn IpnsRecordSource>,
+    ) -> Self {
         let mut shell = Self {
             renderer,
             chrome: ChromeState::default(),
             provider,
+            ipns_source,
             url_override: None,
         };
         shell.refresh_chrome();
@@ -266,7 +320,14 @@ impl BrowserShell {
     ///   ([`Renderer::mark_ens_origin`]) so the resulting posture is
     ///   "content-verified, name via trusted RPC" rather than plain
     ///   `ContentVerified`;
-    /// * every OTHER type (ipns/swarm/arweave/unknown) is the decoder's graceful,
+    /// * an `ipns-ns` name is first RESOLVED to its current CID via a
+    ///   client-VERIFIED IPNS record ([`crate::ipns::resolve_ipns_name`] over the
+    ///   shell's untrusted [`IpnsRecordSource`](crate::ipns::IpnsRecordSource)),
+    ///   then that CID feeds the SAME verified `ipfs://` path. It is flagged BOTH
+    ///   ENS-originated AND mutable-named, so the loudest applicable posture wins
+    ///   (`NameViaTrustedRpc` via ENS today; `MutableName` once Phase 2 clears the
+    ///   RPC warning) — NEVER immutable `ContentVerified`;
+    /// * every OTHER type (swarm/arweave/unknown) is the decoder's graceful,
     ///   protocol-named failure — NEVER defaulted to `ipfs://`.
     ///
     /// The address bar keeps `name` (the identity the user typed), not the
@@ -282,36 +343,40 @@ impl BrowserShell {
     fn navigate_ens_name(&mut self, name: &str) -> Result<(), RendererError> {
         match crate::ens::resolve(self.provider.as_ref(), name) {
             Ok(DecodedContenthash::Ipfs { uri, .. }) => {
-                // Feed the resolved CID into the EXISTING verified `ipfs://` path.
-                // If the backend cannot even start the load (an unusable URI), that
-                // is a hard error surfaced as a failed front-door load, never a
-                // silent success.
-                if let Err(e) = self.renderer.navigate(&uri) {
-                    self.fail_ens_load(name, &e.to_string());
-                    return Ok(());
-                }
-                // Flag the load ENS-originated so that when the `ipfs://` scheme
-                // handler verifies the bytes and marks the lifecycle, the posture
-                // surfaces `NameViaTrustedRpc` instead of plain `ContentVerified`
-                // (the ENS-origin posture winning over the handler's unconditional
-                // mark). This must come AFTER `navigate` — which resets the flag
-                // on a fresh `begin` — and only fires on a real ENS resolution.
-                self.renderer.mark_ens_origin();
-                // Keep the `.eth` name the user typed in the address bar, not the
-                // resolved CID: no `https://` rewrite, no gateway redirect. The
-                // override PERSISTS across pumps (the load-lifecycle events carry
-                // the `ipfs://<cid>` URL, which would otherwise overwrite the bar),
-                // so the name stays put for the whole ENS load.
-                self.url_override = Some(name.to_string());
-                self.chrome.last_error = None;
-                self.refresh_chrome();
+                // The immutable `ipfs-ns` case: load the resolved CID directly. It
+                // is ENS-originated (trusted RPC) but NOT mutable-flagged, so the
+                // posture is `NameViaTrustedRpc`.
+                self.load_resolved_content(name, &uri, false);
                 Ok(())
             }
-            // A well-formed but unsupported contenthash (ipns/swarm/arweave/
-            // unknown) is the decoder's named refusal. `resolve` already maps it to
+            Ok(DecodedContenthash::Ipns { name: ipns_name }) => {
+                // The MUTABLE `ipns-ns` case: RESOLVE the IPNS name to its current
+                // CID via a client-VERIFIED record (fetched from the untrusted
+                // record source, its signature + name-binding + validity checked
+                // client-side against the key) BEFORE loading anything. A bad
+                // record / bad target fails closed with its distinct reason —
+                // nothing unverified is rendered.
+                match crate::ipns::resolve_ipns_name(self.ipns_source.as_ref(), &ipns_name) {
+                    Ok(resolved) => {
+                        // The name is MUTABLE, so flag the load mutable-named too:
+                        // its honest posture is at most `MutableName`, NEVER
+                        // immutable `ContentVerified`. Via ENS the LOUDER
+                        // `NameViaTrustedRpc` still wins today (the two-axis display
+                        // rule); it falls back to `MutableName` once Phase 2 clears
+                        // the RPC warning — no rule change here.
+                        self.load_resolved_content(name, &resolved.uri, true);
+                    }
+                    // A record/target failure is fail-closed with its distinct,
+                    // legible reason — the load renders nothing.
+                    Err(e) => self.fail_ens_load(name, &e.to_string()),
+                }
+                Ok(())
+            }
+            // A well-formed but unsupported contenthash (swarm/arweave/unknown) is
+            // the decoder's named refusal. `resolve` already maps it to
             // `Err(UnsupportedContenthash)`, so it does not surface here as an
             // `Ok`; but should the contract ever change, dispatch is by the
-            // DECODED type's OWN kind — only `ipfs-ns` is loadable, so an
+            // DECODED type's OWN kind — only `ipfs-ns`/`ipns-ns` are loadable, so an
             // `Unsupported` is fail-closed with its named reason, NEVER mis-
             // dispatched to `ipfs://`.
             Ok(other @ DecodedContenthash::Unsupported(_)) => {
@@ -329,6 +394,38 @@ impl BrowserShell {
                 Ok(())
             }
         }
+    }
+
+    /// Feed an already-resolved `ipfs://<cid>` `uri` into the EXISTING verified
+    /// `ipfs://` render path, keeping the front-door `name` in the address bar,
+    /// and flag the load's trust axes.
+    ///
+    /// Shared by the `ipfs-ns` (immutable name via trusted RPC) and the resolved
+    /// `ipns-ns` (mutable name) branches: both feed a CID into the SAME verified
+    /// path, differing only in whether the name is MUTABLE. The load is always
+    /// flagged ENS-originated ([`Renderer::mark_ens_origin`]) — the name was
+    /// learned over the trusted RPC — and, when `mutable`, ALSO mutable-named
+    /// ([`Renderer::mark_mutable_name`]); the backend then surfaces the LOUDEST
+    /// applicable posture when the scheme handler verifies the bytes
+    /// (`NameViaTrustedRpc` today, `MutableName` once Phase 2 clears the RPC
+    /// warning). The flags must come AFTER `navigate` (which resets them on a
+    /// fresh `begin`). If the backend cannot even start the load, that is a
+    /// fail-closed front-door failure, never a silent success.
+    fn load_resolved_content(&mut self, name: &str, uri: &str, mutable: bool) {
+        if let Err(e) = self.renderer.navigate(uri) {
+            self.fail_ens_load(name, &e.to_string());
+            return;
+        }
+        self.renderer.mark_ens_origin();
+        if mutable {
+            self.renderer.mark_mutable_name();
+        }
+        // Keep the front-door NAME the user typed in the bar (no `https://`
+        // rewrite, no gateway redirect). The override PERSISTS across pumps so the
+        // name stays put for the whole load.
+        self.url_override = Some(name.to_string());
+        self.chrome.last_error = None;
+        self.refresh_chrome();
     }
 
     /// Fail an ENS front-door load closed: surface `reason` in the chrome and keep
@@ -525,6 +622,13 @@ mod tests {
         /// instead of plain `ContentVerified` — exactly the real backend's
         /// `mark_content_verified` redirect.
         ens_origin: bool,
+        /// Whether the current load was flagged as pointing at a MUTABLE name (the
+        /// shell called `mark_mutable_name`), mirroring the real
+        /// `LoadLifecycle::mutable_name`: reset on every fresh
+        /// `navigate`/`reload`/history move, and consulted by the simulated
+        /// verified content path so it surfaces `MutableName` (when not also
+        /// ENS-originated) — the two-axis display rule the real backend applies.
+        mutable_name: bool,
     }
 
     impl BackendInner {
@@ -606,8 +710,13 @@ mod tests {
         /// mark without the handler knowing about ENS.
         fn mark_content_verified(&self) {
             let mut b = self.inner.borrow_mut();
+            // The two-axis display rule: the trusted-RPC warning is the loudest,
+            // then the mutable-name warning, else plain content-verified — exactly
+            // the real `LoadLifecycle::mark_content_verified`.
             b.posture = if b.ens_origin {
                 TrustPosture::NameViaTrustedRpc
+            } else if b.mutable_name {
+                TrustPosture::MutableName
             } else {
                 TrustPosture::ContentVerified
             };
@@ -621,6 +730,18 @@ mod tests {
         /// ENS-originated reaches this posture.
         fn serve_via_ens_trusted_rpc(&self) {
             self.inner.borrow_mut().ens_origin = true;
+            self.mark_content_verified();
+        }
+
+        /// Simulate a client-verified IPNS load: flag the current load as pointing
+        /// at a MUTABLE name (as the front door's `mark_mutable_name` does) THEN
+        /// serve it through the verified content path, so the posture surfaces
+        /// `MutableName` — driving the REAL two-axis mechanism, not setting the
+        /// posture directly. Only a load actually flagged mutable (and NOT
+        /// ENS-originated) reaches this posture.
+        #[allow(dead_code)]
+        fn serve_via_ipns_mutable_name(&self) {
+            self.inner.borrow_mut().mutable_name = true;
             self.mark_content_verified();
         }
     }
@@ -648,6 +769,7 @@ mod tests {
             // flag resets too, so it never leaks onto a later load.
             b.posture = TrustPosture::UnverifiedOrigin;
             b.ens_origin = false;
+            b.mutable_name = false;
             b.events.push_back(LoadEvent::Started {
                 url: url.to_string(),
             });
@@ -663,6 +785,7 @@ mod tests {
             b.state = LoadState::Started;
             b.posture = TrustPosture::UnverifiedOrigin;
             b.ens_origin = false;
+            b.mutable_name = false;
             b.events.push_back(LoadEvent::Started { url });
             Ok(())
         }
@@ -683,6 +806,7 @@ mod tests {
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
                     b.ens_origin = false;
+                    b.mutable_name = false;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -697,6 +821,7 @@ mod tests {
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
                     b.ens_origin = false;
+                    b.mutable_name = false;
                     b.events.push_back(LoadEvent::Started { url });
                 }
             }
@@ -723,6 +848,13 @@ mod tests {
             // Flag the current load ENS-originated, exactly as the real
             // `WebViewRenderer::mark_ens_origin` forwards to the shared lifecycle.
             self.inner.borrow_mut().ens_origin = true;
+        }
+
+        fn mark_mutable_name(&mut self) {
+            // Flag the current load as pointing at a MUTABLE name, exactly as the
+            // real `WebViewRenderer::mark_mutable_name` forwards to the shared
+            // lifecycle's second axis.
+            self.inner.borrow_mut().mutable_name = true;
         }
 
         fn current_url(&self) -> Option<String> {
@@ -870,6 +1002,117 @@ mod tests {
         let provider = ScriptedProvider::new(answers);
         (
             BrowserShell::with_provider(Box::new(backend), Box::new(provider)),
+            handle,
+        )
+    }
+
+    // ---- The IPNS front door: bare `.eth` -> ipns-ns -> resolve record --------
+
+    use crate::ipns::{IpnsError, IpnsRecordSource};
+    use libp2p_identity::Keypair;
+
+    /// A minted ed25519 keypair + the canonical base36 IPNS name (the libp2p-key
+    /// CID) it corresponds to, PLUS the raw `ipns-ns` contenthash bytes an ENS
+    /// resolver would return for it. A REAL key, so the record it signs verifies
+    /// against the name the ENS front door decodes — all off the live network.
+    struct IpnsKeyFixture {
+        keypair: Keypair,
+        name: String,
+        contenthash: Vec<u8>,
+    }
+
+    impl IpnsKeyFixture {
+        fn new() -> Self {
+            let keypair = Keypair::generate_ed25519();
+            let peer_id = keypair.public().to_peer_id();
+            const LIBP2P_KEY_CODEC: u64 = 0x72;
+            let mh = cid::multihash::Multihash::from_bytes(&peer_id.to_bytes())
+                .expect("peer id is a multihash");
+            let name_cid = Cid::new_v1(LIBP2P_KEY_CODEC, mh);
+            let name = name_cid
+                .to_string_of_base(cid::multibase::Base::Base36Lower)
+                .expect("base36 name");
+            // The ENSIP-7 `ipns-ns` contenthash is the 0xe5 protoCode varint plus
+            // the libp2p-key CID bytes — exactly what the decoder consumes.
+            let mut contenthash = varint(0xe5);
+            contenthash.extend_from_slice(&name_cid.to_bytes());
+            Self {
+                keypair,
+                name,
+                contenthash,
+            }
+        }
+
+        /// Sign a record pointing the name at `/ipfs/<cid>`, valid 24h, seq 1, and
+        /// return its encoded bytes (the wire form a gateway serves).
+        fn signed_record_for(&self, ipfs_cid: &str) -> Vec<u8> {
+            use chrono::{Duration as ChronoDuration, Utc};
+            let record = rust_ipns::Record::new(
+                &self.keypair,
+                format!("/ipfs/{ipfs_cid}").as_bytes(),
+                Utc::now() + ChronoDuration::hours(24),
+                1,
+                std::time::Duration::from_secs(3600),
+            )
+            .expect("sign an ipns record");
+            record.encode().expect("encode the signed record")
+        }
+    }
+
+    /// A pinned in-memory [`IpnsRecordSource`] for the front-door tests: returns a
+    /// canned record for a name, or a chosen source failure, off the network.
+    #[derive(Default)]
+    struct PinnedIpnsSource {
+        records: std::collections::HashMap<String, Vec<u8>>,
+        fail: Option<IpnsError>,
+    }
+
+    impl PinnedIpnsSource {
+        fn with_record(name: &str, record: Vec<u8>) -> Self {
+            let mut records = std::collections::HashMap::new();
+            records.insert(name.to_string(), record);
+            Self {
+                records,
+                fail: None,
+            }
+        }
+
+        fn failing(err: IpnsError) -> Self {
+            Self {
+                records: std::collections::HashMap::new(),
+                fail: Some(err),
+            }
+        }
+    }
+
+    impl IpnsRecordSource for PinnedIpnsSource {
+        fn fetch_record(&self, name: &str) -> Result<Vec<u8>, IpnsError> {
+            if let Some(err) = &self.fail {
+                return Err(err.clone());
+            }
+            self.records
+                .get(name)
+                .cloned()
+                .ok_or_else(|| IpnsError::Source(format!("no record pinned for {name}")))
+        }
+    }
+
+    /// Build a shell over a fresh fake backend, a scripted RPC provider, AND a
+    /// pinned IPNS record source — so BOTH the ENS resolution and the IPNS record
+    /// resolution run off the live network.
+    fn shell_with_provider_and_ipns(
+        answers: Vec<Result<Vec<u8>, ProviderError>>,
+        ipns_source: PinnedIpnsSource,
+    ) -> (BrowserShell, BackendHandle) {
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let provider = ScriptedProvider::new(answers);
+        (
+            BrowserShell::with_provider_and_ipns_source(
+                Box::new(backend),
+                Box::new(provider),
+                Box::new(ipns_source),
+            ),
             handle,
         )
     }
@@ -1054,6 +1297,148 @@ mod tests {
         );
         assert!(!shell.chrome().is_content_verified());
         assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn a_bare_eth_name_with_an_ipns_ns_contenthash_resolves_via_a_verified_record_and_renders() {
+        // Acceptance (the DONE bar, end to end, offline): a bare `.eth` whose ENS
+        // contenthash is `ipns-ns` (0xe5) is no longer refused — the front door
+        // RESOLVES the IPNS name to its current CID via a client-VERIFIED record
+        // (fetched from the untrusted pinned source, signature + validity checked
+        // against the key), feeds that CID into the EXISTING verified `ipfs://`
+        // path, keeps the `.eth` name in the bar, and — because the name is MUTABLE
+        // and learned via a trusted RPC — shows the loudest applicable warning
+        // (`NameViaTrustedRpc` via ENS), NEVER immutable `ContentVerified`.
+        let key = IpnsKeyFixture::new();
+        let page = b"<!doctype html><title>ipns</title><h1>the ipns site's current content</h1>";
+        let target_cid = cid_v1_raw_sha256(page).expect("derive the target cid");
+        let record = key.signed_record_for(&target_cid);
+        let (mut shell, handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),        // registry.resolver(node)
+                Ok(abi_bytes_return(&key.contenthash)), // resolver.contenthash(node) -> ipns-ns
+            ],
+            PinnedIpnsSource::with_record(&key.name, record),
+        );
+
+        shell
+            .navigate("mutable.eth")
+            .expect("the front door handles a .eth entry with an ipns-ns contenthash");
+        // The bar shows the NAME, not the resolved CID.
+        assert_eq!(shell.chrome().url_text, "mutable.eth");
+        assert!(
+            shell.chrome().is_loading(),
+            "the resolved ipfs load is in flight"
+        );
+        // The underlying load went to the resolved `ipfs://<cid>` (the record's
+        // current target), proving the IPNS resolution actually happened.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(format!("ipfs://{target_cid}").as_str())
+        );
+
+        // The `ipfs://` scheme handler verifies the bytes and marks the load; it
+        // settles with the name still pinned.
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(shell.chrome().url_text, "mutable.eth");
+        // Via ENS the loudest warning wins: `NameViaTrustedRpc`. It is NEVER the
+        // immutable `ContentVerified`.
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert!(!shell.chrome().is_content_verified());
+        assert_eq!(shell.chrome().last_error, None);
+    }
+
+    #[test]
+    fn a_client_verified_ipns_load_shows_the_mutable_name_posture_once_rpc_trust_clears() {
+        // Acceptance: the NEW `MutableName` posture is the honest floor for a
+        // client-verified IPNS load whose name was NOT learned over a trusted RPC
+        // (the Phase-2 shape, and a direct `ipns://` follow-on). Driven through the
+        // REAL two-axis mechanism: a load flagged mutable-named but NOT
+        // ENS-originated surfaces `MutableName` — content-verified, never
+        // "verified", and distinct from the trusted-RPC posture. This proves the
+        // display precedence is explicit, so ENS falls back to `MutableName` with
+        // no rule change once Phase 2 clears the RPC warning.
+        let (mut shell, handle) = shell_with_backend();
+        shell
+            .navigate("ipns://k51fixturekey/index.html")
+            .expect("a direct ipns-resolved ipfs load navigates");
+        // The mechanism: flag the load mutable-named (as the front door does for a
+        // resolved IPNS name) then serve it through the verified content path.
+        handle.serve_via_ipns_mutable_name();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::MutableName);
+        assert!(shell.chrome().is_mutable_name());
+        assert!(!shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn an_ipns_name_with_an_unverifiable_record_fails_closed() {
+        // Fail-closed: an `ipns-ns` name whose record does NOT verify (here signed
+        // by a DIFFERENT key than the name — a misdirecting source) FAILS the load
+        // with a legible reason, renders NOTHING, and never becomes verified.
+        let key = IpnsKeyFixture::new();
+        let attacker = IpnsKeyFixture::new();
+        let target_cid = cid_v1_raw_sha256(b"content the attacker wants").expect("cid");
+        // The attacker signs a record, but it is served for `key`'s name.
+        let forged = attacker.signed_record_for(&target_cid);
+        let (mut shell, _handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ],
+            PinnedIpnsSource::with_record(&key.name, forged),
+        );
+
+        shell
+            .navigate("forged.eth")
+            .expect("handled, failed closed");
+        // Nothing was navigated to / rendered.
+        assert_eq!(
+            shell.current_url_for_test(),
+            None,
+            "nothing unverified loaded"
+        );
+        assert_eq!(shell.chrome().url_text, "forged.eth");
+        let reason = shell.chrome().last_error.clone().expect("a legible reason");
+        assert!(
+            reason.contains("did not verify"),
+            "the chrome surfaces the record-verification failure: {reason}"
+        );
+        assert!(!shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_name_via_trusted_rpc());
+        assert!(!shell.chrome().is_mutable_name());
+    }
+
+    #[test]
+    fn an_ipns_name_whose_record_cannot_be_fetched_fails_closed() {
+        // Fail-closed: an `ipns-ns` name whose record cannot be fetched (an
+        // unresolvable name / dead endpoint) fails the load with a distinct
+        // legible reason, never a guessed render.
+        let key = IpnsKeyFixture::new();
+        let (mut shell, _handle) = shell_with_provider_and_ipns(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ],
+            PinnedIpnsSource::failing(IpnsError::Source("connection refused".into())),
+        );
+
+        shell
+            .navigate("unreachable-ipns.eth")
+            .expect("handled, failed closed");
+        assert_eq!(shell.current_url_for_test(), None);
+        let reason = shell.chrome().last_error.clone().expect("a legible reason");
+        assert!(
+            reason.contains("connection refused"),
+            "the chrome surfaces the record-fetch failure: {reason}"
+        );
+        assert!(!shell.chrome().is_content_verified());
     }
 
     #[test]

@@ -8,6 +8,13 @@ repository.workspace = true
 [dependencies]
 renderer = { path = "../renderer" }
 fetcher = { path = "../fetcher" }
+# The CID + multibase crate, for canonicalising an `ipns-ns` libp2p-key name to
+# its base36 `k…` form (the string a trustless gateway accepts at
+# `GET /ipns/{name}`) and deriving the `PeerId` a record verifies against. The
+# SAME `cid 0.11` the `fetcher` seam verifies against (re-exported as
+# `fetcher::Cid`); pinned here too so the `Base`/`multihash` helpers are in
+# scope without leaking a second lineage.
+cid = "0.11.3"
 serde_json = "1"
 # keccak256 for the ENS `namehash` (ENSIP-1) and the function selectors ENS
 # resolution ABI-encodes. `sha3::Keccak256` is the LEGACY Keccak variant
@@ -29,6 +36,20 @@ ens-normalize = "0.1.1"
 # `Fetcher` seam. Same vetted rustls-backed client the `fetcher` crate binds;
 # TLS is NEVER hand-written. Pinned to match the repo's exact-version style.
 ureq = "=3.3.0"
+# IPNS record decode + client-side signature/validity verification, so werust
+# resolves a MUTABLE `ipns-ns` name to its current CID without an IPFS node and
+# without HAND-ROLLING signature crypto (`docs/adr/0001`, `docs/adr/0007`). It
+# sits on the SAME `ipld-core` / `cid 0.11` / `multihash` / `quick-protobuf`
+# lineage the `fetcher` CAR path already binds, and its signature crypto is the
+# vetted `libp2p-identity` (ed25519/secp256k1/ecdsa/rsa) — never in-house. NO
+# async runtime (mirrors the sync `Fetcher` seam and `docs/adr/0004`).
+rust-ipns = "0.9.0"
+# The `PeerId` an IPNS name (a libp2p-key CID) hashes to, which
+# `rust-ipns`'s `Record::verify` checks the record's signature + name binding
+# against. Same crate + version `rust-ipns` binds, so the `PeerId` type matches
+# with no skew. Default features off (no `rand`: werust only VERIFIES records,
+# never generates keys in production) plus `peerid`.
+libp2p-identity = { version = "0.2.14", default-features = false, features = ["peerid"] }
 
 [dev-dependencies]
 # Parses the release-plumbing config files (`.goreleaser.yaml` +
@@ -41,3 +62,12 @@ serde_yaml = "0.9"
 # `tests/platform_capability_parity.rs`. Dev-only, like `serde_yaml` above: it
 # never enters the shipped binary, only `cargo test` (the verify gate).
 toml = "1"
+# Test-only: SIGN pinned IPNS record fixtures (a real ed25519 keypair + a real
+# V2 signature) so the IPNS module's tests verify against a genuine record
+# offline, NO live network. `rand`/`ed25519` let a test mint a keypair and sign;
+# production `libp2p-identity` above stays verify-only. Same crate/version as
+# `rust-ipns`, so the `Keypair`/`PeerId` types match.
+libp2p-identity = { version = "0.2.14", features = ["peerid", "ed25519", "rand"] }
+# Build the EOL validity timestamp for the signed record fixtures. Same `chrono`
+# lineage `rust-ipns` binds.
+chrono = "0.4"

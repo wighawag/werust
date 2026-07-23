@@ -143,6 +143,8 @@ fn trust_indicator(state: &ChromeState) -> &'static str {
         "✓ verified"
     } else if state.is_name_via_trusted_rpc() {
         "◈ name via trusted RPC"
+    } else if state.is_mutable_name() {
+        "◇ content verified, mutable name"
     } else {
         "⚠ unverified origin"
     }
@@ -155,6 +157,8 @@ fn trust_indicator_detail(state: &ChromeState) -> &'static str {
         "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
     } else if state.is_name_via_trusted_rpc() {
         "This page's content was hash-verified, but its name was resolved over a TRUSTED RPC (not a light client), which could misdirect the name to different content. werust makes no name-verification claim here."
+    } else if state.is_mutable_name() {
+        "This page's content was hash-verified, but its name is MUTABLE: the controller (an IPNS key holder, or an ENS name owner) can repoint it to different content at any time. werust makes no immutability claim here."
     } else {
         "This page was served by an origin werust does not trust by default; its content was not hash-verified."
     }
@@ -168,6 +172,8 @@ fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
         "trust-verified"
     } else if state.is_name_via_trusted_rpc() {
         "trust-name-trusted-rpc"
+    } else if state.is_mutable_name() {
+        "trust-mutable-name"
     } else {
         "trust-unverified"
     }
@@ -181,6 +187,7 @@ fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
 const TRUST_INDICATOR_CSS: &str = "\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
+.trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
 .trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
@@ -475,5 +482,58 @@ mod tests {
         );
         assert_eq!(trust_indicator_css_class(&verified), "trust-verified");
         assert_eq!(trust_indicator_css_class(&served), "trust-unverified");
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_distinct_mutable_name_badge_never_labelled_verified() {
+        // Acceptance: a client-verified IPNS page (bytes verified, name mutable)
+        // renders as its OWN legible, visually-distinct badge — distinct from the
+        // verified, name-via-trusted-RPC, and unverified badges — and it is NEVER
+        // surfaced as "verified".
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        let name_via_rpc = ChromeState {
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            ..ChromeState::default()
+        };
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let mutable = ChromeState {
+            trust_posture: TrustPosture::MutableName,
+            ..ChromeState::default()
+        };
+
+        let label = trust_indicator(&mutable);
+        assert_eq!(label, "◇ content verified, mutable name");
+        // Distinct from the other three badges.
+        assert_ne!(label, trust_indicator(&verified));
+        assert_ne!(label, trust_indicator(&name_via_rpc));
+        assert_ne!(label, trust_indicator(&served));
+        // Its "verified" only ever appears as part of "content verified", never as
+        // a bare immutability claim; the badge is honest that the NAME is mutable.
+        assert!(
+            label.contains("mutable name"),
+            "the mutable-name badge must say the name is mutable: {label}"
+        );
+        // The tooltip is honest that the name is mutable / controller-repointable,
+        // and makes NO immutability claim (it may say it makes "no immutability
+        // claim", but must not assert the name IS immutable).
+        let detail = trust_indicator_detail(&mutable);
+        assert!(detail.contains("MUTABLE"));
+        assert!(
+            detail.contains("can repoint"),
+            "the tooltip is honest the controller can repoint the name: {detail}"
+        );
+
+        // Its own CSS class, distinct from the other three.
+        assert_eq!(trust_indicator_css_class(&mutable), "trust-mutable-name");
+        assert_ne!(
+            trust_indicator_css_class(&mutable),
+            trust_indicator_css_class(&name_via_rpc)
+        );
     }
 }

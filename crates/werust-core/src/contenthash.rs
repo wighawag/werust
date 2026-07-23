@@ -63,7 +63,10 @@ pub enum ProtoCode {
     Ipfs,
     /// `swarm-ns` (`0xe4`): a Swarm address.
     Swarm,
-    /// `ipns-ns` (`0xe5`): a mutable IPNS pointer (deferred to Phase 2/3).
+    /// `ipns-ns` (`0xe5`): a MUTABLE IPNS pointer. Now HANDLED (via resolution),
+    /// so it decodes to [`DecodedContenthash::Ipns`] rather than an
+    /// [`Unsupported`](DecodedContenthash::Unsupported) refusal; this variant
+    /// remains only for the multicodec name table.
     Ipns,
     /// `zeronet` (`0xe6`): a ZeroNet site address.
     ZeroNet,
@@ -145,9 +148,24 @@ pub enum DecodedContenthash {
         /// want the identifier without the scheme.
         cid: String,
     },
-    /// A well-formed contenthash whose protoCode is NOT `ipfs-ns`: detected and
-    /// named, but not supported (nor mis-dispatched to `ipfs://`). The
-    /// [`ProtoCode`] carries which protocol it is (named or [`Unknown`](ProtoCode::Unknown)).
+    /// `ipns-ns` (`0xe5`): a MUTABLE IPNS pointer. NOT directly loadable like
+    /// `ipfs-ns` — it must first be RESOLVED (a client-verified IPNS record maps
+    /// the name to its current `/ipfs/<cid>`) before its CID feeds the verified
+    /// `ipfs://` path. Carries the canonical libp2p-key IPNS `name` (a base36
+    /// `k…` CIDv1, the string a trustless gateway accepts at `GET /ipns/{name}`),
+    /// which the front door hands to [`crate::ipns::resolve_ipns_name`]. This is
+    /// the ONCE-refused, now-handled case (`docs/adr/0007`): distinct from the
+    /// immutable [`Ipfs`](DecodedContenthash::Ipfs) case so the resolved page can
+    /// carry the honest MUTABLE-name trust posture.
+    Ipns {
+        /// The canonical libp2p-key IPNS name (a base36 `k…` CIDv1), ready to
+        /// resolve via a verifiable IPNS record.
+        name: String,
+    },
+    /// A well-formed contenthash whose protoCode is NOT `ipfs-ns`/`ipns-ns`:
+    /// detected and named, but not supported (nor mis-dispatched to `ipfs://`).
+    /// The [`ProtoCode`] carries which protocol it is (named or
+    /// [`Unknown`](ProtoCode::Unknown)).
     Unsupported(ProtoCode),
 }
 
@@ -157,6 +175,17 @@ impl DecodedContenthash {
     #[must_use]
     pub fn is_supported(&self) -> bool {
         matches!(self, DecodedContenthash::Ipfs { .. })
+    }
+
+    /// Whether this is the `ipns-ns` case: a MUTABLE IPNS name that must be
+    /// RESOLVED (via a client-verified IPNS record) before its CID feeds the
+    /// verified `ipfs://` path. Distinct from [`is_supported`](DecodedContenthash::is_supported)
+    /// (the directly-loadable immutable `ipfs-ns` case): the front door dispatches
+    /// an `Ipns` into [`crate::ipns::resolve_ipns_name`], not straight into the
+    /// `ipfs://` load.
+    #[must_use]
+    pub fn is_ipns(&self) -> bool {
+        matches!(self, DecodedContenthash::Ipns { .. })
     }
 
     /// A legible, protocol-named reason for an [`Unsupported`](DecodedContenthash::Unsupported)
@@ -170,10 +199,9 @@ impl DecodedContenthash {
     #[must_use]
     pub fn reason(&self) -> Option<String> {
         match self {
-            DecodedContenthash::Ipfs { .. } => None,
-            DecodedContenthash::Unsupported(ProtoCode::Ipns) => {
-                Some("this name uses a mutable IPNS pointer, not yet supported".to_string())
-            }
+            // The two HANDLED cases have no refusal: `ipfs-ns` loads directly,
+            // `ipns-ns` is resolved (via a client-verified record) then loaded.
+            DecodedContenthash::Ipfs { .. } | DecodedContenthash::Ipns { .. } => None,
             DecodedContenthash::Unsupported(ProtoCode::Unknown { code }) => Some(format!(
                 "unsupported/unknown contenthash protocol ({code:#x})"
             )),
@@ -208,6 +236,13 @@ pub enum ContenthashError {
     /// yield an `ipfs://<cid>`. Distinct from [`Malformed`](ContenthashError::Malformed)
     /// so an IPFS contenthash with a broken CID is legible as such.
     InvalidCid(String),
+    /// The protoCode was `ipns-ns` but the bytes that follow are not a valid
+    /// libp2p-key IPNS name: either they do not parse as a CID at all, or they
+    /// parse as a CID whose codec is NOT `libp2p-key` (`0x72`) — so it cannot name
+    /// a key to resolve a record against. Refused rather than guessed, and kept
+    /// distinct from [`InvalidCid`](ContenthashError::InvalidCid) (the immutable
+    /// `ipfs-ns` case) so a broken IPNS pointer is legible as such.
+    InvalidIpnsName(String),
 }
 
 impl std::fmt::Display for ContenthashError {
@@ -222,6 +257,12 @@ impl std::fmt::Display for ContenthashError {
             ContenthashError::InvalidCid(detail) => {
                 write!(f, "ipfs contenthash carries an invalid CID: {detail}")
             }
+            ContenthashError::InvalidIpnsName(detail) => {
+                write!(
+                    f,
+                    "ipns contenthash carries an invalid libp2p-key name: {detail}"
+                )
+            }
         }
     }
 }
@@ -231,6 +272,35 @@ impl std::error::Error for ContenthashError {}
 /// The `ipfs` scheme the SUPPORTED `ipfs-ns` case decodes to (kept in sync with
 /// [`crate::ipfs::IPFS_SCHEME`], which the produced URI feeds).
 const IPFS_SCHEME: &str = "ipfs";
+
+/// The `libp2p-key` IPLD multicodec (`0x72`): an IPNS name is a CIDv1 with this
+/// codec, wrapping the key's multihash (the `PeerId`). A CID under any OTHER
+/// codec is NOT an IPNS name and is refused (never resolved as if it were a key).
+const LIBP2P_KEY_CODEC: u64 = 0x72;
+
+/// Canonicalise an `ipns-ns` payload (the bytes after the `0xe5` protoCode) into
+/// the base36 `k…` libp2p-key IPNS name a trustless gateway accepts at
+/// `GET /ipns/{name}`.
+///
+/// The payload is a libp2p-key CID (parsed with the vetted `cid` crate, the SAME
+/// lineage the verified path and the IPNS resolver use — no hand-rolled byte
+/// layout). Its codec MUST be `libp2p-key` (`0x72`): a CID under any other codec
+/// (e.g. a raw/ipfs CID) is refused as a distinct
+/// [`ContenthashError::InvalidIpnsName`], never treated as a key. The name is
+/// rendered case-insensitive base36 (the IPNS spec's suggested default), which
+/// [`crate::ipns::resolve_ipns_name`] re-parses to the same key.
+fn canonical_ipns_name(payload: &[u8]) -> Result<String, ContenthashError> {
+    let cid =
+        Cid::try_from(payload).map_err(|e| ContenthashError::InvalidIpnsName(e.to_string()))?;
+    if cid.codec() != LIBP2P_KEY_CODEC {
+        return Err(ContenthashError::InvalidIpnsName(format!(
+            "cid codec {codec:#x} is not libp2p-key (0x72)",
+            codec = cid.codec()
+        )));
+    }
+    cid.to_string_of_base(cid::multibase::Base::Base36Lower)
+        .map_err(|e| ContenthashError::InvalidIpnsName(e.to_string()))
+}
 
 /// Read one unsigned LEB128 varint (the multicodec protoCode) from the front of
 /// `bytes`, returning the value and the number of bytes consumed.
@@ -278,6 +348,11 @@ fn read_protocode_varint(bytes: &[u8]) -> Result<(u64, usize), ContenthashError>
 ///   [`DecodedContenthash::Ipfs`] carrying `ipfs://<canonical-cid>` — the SUPPORTED
 ///   case. A protoCode of `ipfs-ns` with unparseable CID bytes is
 ///   [`ContenthashError::InvalidCid`], NOT a silent guess.
+/// * `ipns-ns` (`0xe5`) -> canonicalises the following libp2p-key CID into a
+///   base36 IPNS `name` and returns a [`DecodedContenthash::Ipns`], the MUTABLE
+///   case the front door RESOLVES (via a client-verified IPNS record) before
+///   loading. A payload that is not a valid libp2p-key CID is
+///   [`ContenthashError::InvalidIpnsName`], NOT a silent guess.
 /// * any OTHER protoCode -> [`DecodedContenthash::Unsupported`] naming the
 ///   protocol (the caller turns it into a "points to <protocol>, not supported"
 ///   load failure). It NEVER defaults to `ipfs://`.
@@ -304,6 +379,16 @@ pub fn decode_contenthash(bytes: &[u8]) -> Result<DecodedContenthash, Contenthas
                 .to_string();
             let uri = format!("{IPFS_SCHEME}://{cid}");
             Ok(DecodedContenthash::Ipfs { uri, cid })
+        }
+        ProtoCode::Ipns => {
+            // The bytes after the protoCode are a libp2p-key CID naming the IPNS
+            // key. Canonicalise it to the base36 name a gateway accepts; the
+            // front door hands it to `ipns::resolve_ipns_name` (which fetches +
+            // client-verifies the record) rather than loading it directly. A
+            // payload that is not a valid libp2p-key CID is a distinct
+            // `InvalidIpnsName`, NOT a silent guess.
+            let name = canonical_ipns_name(payload)?;
+            Ok(DecodedContenthash::Ipns { name })
         }
         // Every other protoCode is detected and NAMED, never resolved and never
         // mis-dispatched to ipfs://. The payload is not inspected: Phase 1 only
@@ -379,17 +464,85 @@ mod tests {
         assert!(Cid::try_from(parsed.cid.as_str()).is_ok());
     }
 
+    /// A real libp2p-key IPNS name (a CIDv1, `libp2p-key` codec 0x72, over a
+    /// sha2-256 multihash of some "public key" bytes) as both its canonical
+    /// base36 string AND the raw CID bytes an `ipns-ns` contenthash carries —
+    /// derived with the SAME `cid`/`multihash` crates the resolver uses, so the
+    /// round-trip is honest. (The bytes are not a real key, but the decoder only
+    /// canonicalises the CID; signature verification against the key is the
+    /// resolver's job, exercised in the `ipns` module.)
+    fn ipns_name_fixture() -> (String, Vec<u8>) {
+        const LIBP2P_KEY_CODEC: u64 = 0x72;
+        // Reuse the sha2-256 multihash the fetcher helper derives (a real
+        // multihash, via the SAME `cid`/`multihash` crates), rewrapped under the
+        // libp2p-key codec to make a real IPNS name CID.
+        let sha256_cid = Cid::try_from(
+            cid_v1_raw_sha256(b"an ipns public key")
+                .expect("derive a sha2-256 cid")
+                .as_str(),
+        )
+        .expect("the derived cid parses");
+        let name_cid = Cid::new_v1(LIBP2P_KEY_CODEC, *sha256_cid.hash());
+        let name_str = name_cid
+            .to_string_of_base(cid::multibase::Base::Base36Lower)
+            .expect("base36 name string");
+        (name_str, name_cid.to_bytes())
+    }
+
     #[test]
-    fn ipns_ns_is_a_distinct_mutable_pointer_refusal() {
-        // Acceptance: `ipns-ns` (0xe5) is its OWN distinct variant/message — the
-        // mutable-pointer refusal, deferred to Phase 2/3. It is NOT ipfs.
-        let bytes = contenthash(0xe5, b"some ipns key bytes");
+    fn ipns_ns_decodes_to_a_libp2p_key_name_that_routes_into_resolution() {
+        // Acceptance: `ipns-ns` (0xe5) is no longer a hard refusal — it decodes to
+        // a distinct `Ipns` variant carrying the canonical libp2p-key IPNS name
+        // (a base36 `k…` CIDv1), which the front door routes into IPNS resolution.
+        // It is NOT ipfs (not directly loadable) and NOT a named refusal.
+        let (name_str, name_bytes) = ipns_name_fixture();
+        let bytes = contenthash(0xe5, &name_bytes);
         let decoded = decode_contenthash(&bytes).expect("well-formed ipns-ns contenthash");
-        assert_eq!(decoded, DecodedContenthash::Unsupported(ProtoCode::Ipns));
-        assert!(!decoded.is_supported());
         assert_eq!(
-            decoded.reason().as_deref(),
-            Some("this name uses a mutable IPNS pointer, not yet supported")
+            decoded,
+            DecodedContenthash::Ipns {
+                name: name_str.clone(),
+            }
+        );
+        // It is not the directly-loadable ipfs case, and it has no refusal reason
+        // (it is now handled, via resolution, not refused).
+        assert!(!decoded.is_supported());
+        assert!(decoded.is_ipns());
+        assert_eq!(decoded.reason(), None);
+        // The name is the canonical base36 libp2p-key form gateways accept at
+        // `GET /ipns/{name}`.
+        assert!(
+            name_str.starts_with('k'),
+            "a base36 libp2p-key name: {name_str}"
+        );
+    }
+
+    #[test]
+    fn an_ipns_ns_protocode_with_invalid_name_bytes_is_a_distinct_invalid_name_error() {
+        // Fail-closed: an `ipns-ns` whose payload is not a valid libp2p-key CID is
+        // its OWN distinct error (not Malformed, not a guess, not a panic).
+        let bytes = contenthash(0xe5, &[0xff, 0xff, 0xff]);
+        let err = decode_contenthash(&bytes).expect_err("bad ipns name bytes");
+        assert!(
+            matches!(err, ContenthashError::InvalidIpnsName(_)),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_ipns_ns_carrying_a_non_libp2p_key_cid_is_refused() {
+        // Fail-closed: an `ipns-ns` payload that parses as a CID but is NOT a
+        // libp2p-key CID (e.g. a raw/ipfs CID) is refused as an invalid IPNS name,
+        // never resolved as if it named a key.
+        let raw_cid = cid_v1_raw_sha256(b"not a key").expect("derive a raw cid");
+        let raw_bytes = Cid::try_from(raw_cid.as_str())
+            .expect("cid parses")
+            .to_bytes();
+        let bytes = contenthash(0xe5, &raw_bytes);
+        let err = decode_contenthash(&bytes).expect_err("a non-libp2p-key ipns name is refused");
+        assert!(
+            matches!(err, ContenthashError::InvalidIpnsName(_)),
+            "got: {err:?}"
         );
     }
 
@@ -494,10 +647,13 @@ mod tests {
 
     #[test]
     fn the_decoder_never_defaults_a_non_ipfs_protocode_to_ipfs() {
-        // The hard requirement stated four ways: swarm, ipns, arweave, and an
-        // unknown code must all be Unsupported (never Ipfs), so nothing but a real
-        // `ipfs-ns` ever yields an `ipfs://` reference.
-        for code in [0xe4u64, 0xe5, 0xb29910, 0x99] {
+        // The hard requirement stated three ways: swarm, arweave, and an unknown
+        // code must all be Unsupported (never Ipfs), so nothing but a real
+        // `ipfs-ns` ever yields a directly-loadable `ipfs://` reference. (ipns-ns
+        // is now handled via RESOLUTION, its own `Ipns` variant — covered by
+        // `ipns_ns_decodes_to_a_libp2p_key_name_that_routes_into_resolution` — and
+        // is likewise never the ipfs case.)
+        for code in [0xe4u64, 0xb29910, 0x99] {
             let decoded = decode_contenthash(&contenthash(code, b"payload"))
                 .expect("well-formed non-ipfs contenthash");
             assert!(
@@ -505,6 +661,19 @@ mod tests {
                 "protoCode {code:#x} must not be dispatched as ipfs, got: {decoded:?}"
             );
         }
+        // ipns-ns decodes to the `Ipns` variant (routed into resolution), NEVER
+        // the ipfs case.
+        let (_name, name_bytes) = ipns_name_fixture();
+        let ipns = decode_contenthash(&contenthash(0xe5, &name_bytes))
+            .expect("a well-formed ipns-ns name");
+        assert!(
+            matches!(ipns, DecodedContenthash::Ipns { .. }),
+            "ipns-ns must decode to Ipns, never ipfs, got: {ipns:?}"
+        );
+        assert!(
+            !ipns.is_supported(),
+            "ipns is not the directly-loadable ipfs case"
+        );
     }
 
     #[test]

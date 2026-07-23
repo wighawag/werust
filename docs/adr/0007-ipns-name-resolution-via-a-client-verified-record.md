@@ -1,0 +1,23 @@
+# IPNS name resolution via a client-verified record (no node), bound to `rust-ipns`
+
+Context: an ENS `ipns-ns` (`0xe5`) contenthash names a MUTABLE IPNS pointer, which the ENSIP-7 decoder used to refuse ("mutable IPNS pointer, not yet supported"). `ipns-name-resolution-and-render` closes that gap: resolve the IPNS name to the `/ipfs/<cid>` it CURRENTLY points at, then render that CID through the existing verified `ipfs://` path. Resolving a name to content is a trust decision (a bad record could misdirect the name), so the approach is recorded here.
+
+## The decision
+
+1. **The record is UNTRUSTED; the client verifies it.** werust fetches the signed IPNS record over plain HTTP from a trustless/delegated endpoint (`GET /ipns/{name}?format=ipns-record`, `application/vnd.ipfs.ipns-record`) and verifies it CLIENT-SIDE against the key before using it: the name binding (the record's key matches the requested name), the V2 signature, AND that the EOL validity window has not elapsed. This is the SAME untrusted-source-plus-client-verify discipline the CAR blocks use (`docs/adr/0004`): a hostile or buggy endpoint cannot misdirect the name because the signature is checked against the key the name IS. NO IPFS node, NO async runtime (a single GET over the sync `Fetcher` seam).
+
+2. **Bind a vetted crate for decode + signature crypto; never hand-roll it (`docs/adr/0001`).** The record decode + full verification (`Record::decode` then `Record::verify(peer_id)`) is `rust-ipns 0.9`, whose signature crypto is `libp2p-identity` (ed25519/secp256k1/ecdsa/rsa). It sits on the SAME `ipld-core 0.4` / `cid 0.11` / `multihash` / `quick-protobuf` / `chrono` lineage the `fetcher` CAR path already binds, so there is no second CID/crypto lineage at the trust boundary. The IPNS name (a libp2p-key CIDv1, codec `0x72`) yields the `PeerId` the record verifies against: the name's multihash IS the PeerId, handed to `PeerId::from_bytes` as bytes (so the two crates' multihash lineages need not match at the boundary). Production `libp2p-identity` is verify-only (`default-features = false`, `peerid`); the `ed25519`/`rand` features are DEV-only, to mint keypairs and sign record fixtures offline.
+
+3. **Modelled as a seam, like the content path.** An `IpnsRecordSource` trait ("given an IPNS name, produce the candidate record bytes") is the abstraction; the transport is a swappable BACKEND. One default ships now: `GatewayIpnsRecordSource` (a trustless-gateway fetch over the bound `Fetcher`), pointed at the SAME `retrieval::active_gateway_endpoint` the content path uses (the user's chosen backend, no second config). A delegated-routing / embedded-p2p source is a later backend swap. The `resolve_ipns_name(&dyn IpnsRecordSource, name)` core is `&dyn` so the SAME resolution drives every backend.
+
+4. **Entry surface = `ipns-ns` via ENS only (Phase 1).** The ENSIP-7 decoder's `0xe5` refusal becomes a distinct `DecodedContenthash::Ipns { name }` (the canonical base36 libp2p-key name), which the ENS front door routes into `resolve_ipns_name`, then feeds the resolved CID into the verified `ipfs://` path. A bare `ipns://` in the URL bar, and DNSLink (a `_dnslink` DNS-TXT lookup, a DIFFERENT trust story from a signed libp2p-key record), are named follow-ons, NOT built here.
+
+5. **Honest mutable-name posture.** A signature-verified record + content-verified bytes is STILL a mutable name (the key holder can publish a new record), so the resolved page is marked `TrustPosture::MutableName`, never immutable `ContentVerified` (`docs/adr/0006`). Reached via ENS the louder `NameViaTrustedRpc` wins today; it falls back to `MutableName` once Phase 2 clears the RPC-trust warning.
+
+## Fail-closed taxonomy
+
+Every step is a DISTINCT `IpnsError`, and the front door renders NOTHING on any of them: `InvalidName` (not a libp2p-key CID / usable key), `Source` (fetch/transport/non-2xx/empty), `MalformedRecord` (undecodable), `Unverifiable` (bad signature / name mismatch / expired), `UnsupportedTarget` (a `/ipns/` chain, refused not blindly followed), `InvalidTarget` (not an `/ipfs/<cid>`, or a CID that does not parse). Nothing unverified is ever resolved or rendered.
+
+## Considered options (crate binding)
+
+`rust-ipns` was chosen over rolling the IPNS protobuf/dag-cbor + signature checks by hand (forbidden by `docs/adr/0001`) and over pulling a heavier libp2p/ipfs stack (which would drag an async runtime, against the sync-seam tier `docs/adr/0004` sets). Its `Record::verify` already does name-binding + V2 signature + EOL in one call against a `PeerId`, matching werust's fail-closed "verify against the key, reject on any mismatch" shape exactly.

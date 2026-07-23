@@ -105,6 +105,32 @@ pub enum TrustPosture {
     /// load path: it is set ONLY when a load genuinely went through ENS
     /// trusted-RPC resolution, never inferred from a `.eth`-looking URL.
     NameViaTrustedRpc,
+    /// The page's BYTES were content-verified (hash-checked on the
+    /// content-addressed path, exactly like [`ContentVerified`](TrustPosture::ContentVerified)),
+    /// but the NAME->CID mapping is CONTROLLER-REPOINTABLE: the name is MUTABLE,
+    /// so the controller can publish a different (still valid, still
+    /// hash-consistent) CID at any time. The honest floor for ANY mutable name
+    /// whose bytes verified — an IPNS name (the key holder can publish a new
+    /// signed record) or (in a later phase) an ENS name (the owner can call
+    /// `setContenthash`).
+    ///
+    /// This is the two-axis trust model's mutability warning
+    /// (`work/notes/observations/trust-posture-two-axes-model-2026-07-22.md`,
+    /// recorded as an ADR): it is DISTINCT from [`ContentVerified`](TrustPosture::ContentVerified)
+    /// (honestly weaker: only a direct `ipfs://<cid>` is immutable) and from
+    /// [`UnverifiedOrigin`](TrustPosture::UnverifiedOrigin) (the bytes DID
+    /// hash-verify). It MUST never be labelled "verified".
+    ///
+    /// It is the QUIETER warning of the two axes: when a load ALSO learned the
+    /// name over a trusted RPC (an ENS Phase-1 load), the LOUDER
+    /// [`NameViaTrustedRpc`](TrustPosture::NameViaTrustedRpc) wins (a misdirecting
+    /// RPC is worse than an honest controller repointing). So an ENS ipns-ns /
+    /// ipfs-ns load shows `NameViaTrustedRpc`; a name learned WITHOUT RPC trust
+    /// (a client-verified IPNS record, or an ENS name once Phase 2 clears the RPC
+    /// warning) shows `MutableName`. Like the others it tracks the ACTUAL load
+    /// path, set only when a load genuinely verified through the
+    /// content-addressed path AND was flagged mutable.
+    MutableName,
 }
 
 impl TrustPosture {
@@ -123,6 +149,16 @@ impl TrustPosture {
     #[must_use]
     pub fn is_name_via_trusted_rpc(self) -> bool {
         matches!(self, TrustPosture::NameViaTrustedRpc)
+    }
+
+    /// Whether the current page's bytes were content-verified but its name is
+    /// MUTABLE (controller-repointable): the [`MutableName`](TrustPosture::MutableName)
+    /// posture. A distinct state: it is NOT [`is_content_verified`](TrustPosture::is_content_verified)
+    /// (only a direct `ipfs://<cid>` is immutable) and NOT the plain unverified
+    /// origin (the bytes did hash-verify). Never surfaced as "verified".
+    #[must_use]
+    pub fn is_mutable_name(self) -> bool {
+        matches!(self, TrustPosture::MutableName)
     }
 }
 
@@ -642,6 +678,34 @@ pub trait Renderer {
     /// cannot surface the ENS posture, so flagging is simply ignored and the load
     /// stays untrusted.
     fn mark_ens_origin(&mut self) {}
+
+    /// Flag the CURRENT load as pointing at a MUTABLE name: an IPNS name (the key
+    /// holder can publish a new signed record) or, in a later phase, an ENS name
+    /// (the owner can `setContenthash`).
+    ///
+    /// This is the SECOND axis of the two-axis trust model
+    /// (`docs/adr/0006`), orthogonal to [`mark_ens_origin`](Renderer::mark_ens_origin)
+    /// (how the name was learned). The front door
+    /// (`ipns-name-resolution-and-render`) calls this the moment it has resolved a
+    /// mutable name to a CID and is about to feed it into the verified `ipfs://`
+    /// path, so the backend surfaces the honest [`TrustPosture::MutableName`]
+    /// ("content-verified, mutable name") for THIS load instead of the immutable
+    /// [`TrustPosture::ContentVerified`]. If the load is ALSO flagged
+    /// ENS-originated, the LOUDER [`TrustPosture::NameViaTrustedRpc`] wins (a
+    /// misdirecting RPC beats an honest controller repointing), so an ENS ipns-ns
+    /// load shows `NameViaTrustedRpc` today and falls back to `MutableName` once
+    /// Phase 2 clears the RPC-trust flag — with no display-rule change.
+    ///
+    /// Like [`mark_ens_origin`](Renderer::mark_ens_origin) it MUST track the
+    /// ACTUAL load path: only a load that genuinely verifies through the
+    /// content-addressed path AND was flagged here surfaces the mutable-name
+    /// posture, and a fresh navigation resets the flag so it never leaks onto a
+    /// later immutable `ipfs://<cid>` or served load.
+    ///
+    /// The provided default is a no-op, for the same reason as
+    /// [`mark_ens_origin`](Renderer::mark_ens_origin): a backend with no verified
+    /// content-addressed path cannot surface the posture.
+    fn mark_mutable_name(&mut self) {}
 }
 
 #[cfg(test)]
@@ -1149,5 +1213,33 @@ mod tests {
         // And the other two are not this one.
         assert!(!TrustPosture::ContentVerified.is_name_via_trusted_rpc());
         assert!(!TrustPosture::UnverifiedOrigin.is_name_via_trusted_rpc());
+    }
+
+    #[test]
+    fn the_mutable_name_posture_is_a_distinct_content_verified_but_mutable_state() {
+        // Acceptance: `MutableName` is a FOURTH state (the two-axis model's
+        // mutability warning). Its bytes verified but the name is
+        // controller-repointable, so it is honestly NOT "verified", NOT merely
+        // "served", and NOT the trusted-RPC posture.
+        let mutable = FakeBackend {
+            posture: TrustPosture::MutableName,
+            ..FakeBackend::default()
+        };
+        assert_eq!(mutable.trust_posture(), TrustPosture::MutableName);
+        assert!(mutable.trust_posture().is_mutable_name());
+        // It is NEVER surfaced as verified (only a direct `ipfs://<cid>` is
+        // immutable), and it is not the trusted-RPC posture.
+        assert!(!mutable.trust_posture().is_content_verified());
+        assert!(!mutable.trust_posture().is_name_via_trusted_rpc());
+
+        // It is distinct from every other posture.
+        for other in [
+            TrustPosture::ContentVerified,
+            TrustPosture::UnverifiedOrigin,
+            TrustPosture::NameViaTrustedRpc,
+        ] {
+            assert_ne!(TrustPosture::MutableName, other);
+            assert!(!other.is_mutable_name());
+        }
     }
 }

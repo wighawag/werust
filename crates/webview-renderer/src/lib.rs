@@ -83,6 +83,27 @@ pub struct LoadLifecycle {
     /// `.eth`-looking URL on its own — so it never leaks onto a later plain
     /// `ipfs://` or served load.
     ens_origin: bool,
+    /// Whether the CURRENT load's name is MUTABLE (controller-repointable): an
+    /// IPNS name (the key holder can publish a new signed record) or (in a later
+    /// phase) an ENS name (the owner can `setContenthash`).
+    ///
+    /// This is the SECOND axis of the two-axis trust model
+    /// (`work/notes/observations/trust-posture-two-axes-model-2026-07-22.md`,
+    /// `docs/adr/0006`): mutability, orthogonal to how the name was learned
+    /// ([`ens_origin`](Self::ens_origin)). When a verified load is flagged mutable
+    /// (via [`mark_mutable_name`](LoadLifecycle::mark_mutable_name)) but NOT
+    /// ENS-originated, [`mark_content_verified`](LoadLifecycle::mark_content_verified)
+    /// surfaces [`TrustPosture::MutableName`] instead of the plain
+    /// [`TrustPosture::ContentVerified`]. If the load is ALSO ENS-originated the
+    /// LOUDER [`TrustPosture::NameViaTrustedRpc`] still wins (a misdirecting RPC
+    /// beats an honest controller repointing), which is exactly what an ENS
+    /// ipns-ns load wants; when Phase 2 clears the RPC-trust flag such an ENS load
+    /// naturally falls back to `MutableName` with NO rule change here.
+    ///
+    /// Like the other axis flags it tracks the ACTUAL load path: every fresh
+    /// [`begin`](LoadLifecycle::begin) resets it, so it never leaks onto a later
+    /// immutable `ipfs://<cid>` or served load.
+    mutable_name: bool,
 }
 
 impl LoadLifecycle {
@@ -105,6 +126,10 @@ impl LoadLifecycle {
         // `mark_ens_origin`). Resetting here is what keeps the ENS posture from
         // leaking onto a later plain `ipfs://` or served load.
         self.ens_origin = false;
+        // A fresh load is likewise not mutable-named until the front door flags it
+        // (an IPNS resolution), so an immutable `ipfs://<cid>` never inherits a
+        // stale mutability warning.
+        self.mutable_name = false;
         self.events.push_back(LoadEvent::Started {
             url: url.to_string(),
         });
@@ -130,8 +155,17 @@ impl LoadLifecycle {
         // RPC's word. Redirecting the mark here — rather than teaching the scheme
         // handler about ENS — is how the ENS-origin posture WINS over the
         // handler's unconditional content-verified mark.
+        //
+        // The two-axis display rule (`docs/adr/0006`): show the LOUDEST
+        // applicable warning. `ens_origin` (the name learned over a trusted RPC)
+        // is the loudest — a misdirecting RPC is worse than an honest controller
+        // repointing — so it wins over `mutable_name`; a mutable name with no RPC
+        // trust (a client-verified IPNS record) shows `MutableName`; an immutable,
+        // RPC-free load is plain `ContentVerified`.
         self.posture = if self.ens_origin {
             TrustPosture::NameViaTrustedRpc
+        } else if self.mutable_name {
+            TrustPosture::MutableName
         } else {
             TrustPosture::ContentVerified
         };
@@ -159,6 +193,33 @@ impl LoadLifecycle {
     #[must_use]
     pub fn is_ens_origin(&self) -> bool {
         self.ens_origin
+    }
+
+    /// Flag the CURRENT load as pointing at a MUTABLE name (the two-axis model's
+    /// mutability axis): an IPNS name (the key holder can publish a new signed
+    /// record) or, later, an ENS name (the owner can `setContenthash`).
+    ///
+    /// The front door calls this right after resolving a mutable name to a CID and
+    /// feeding it into the verified `ipfs://` path. Like
+    /// [`mark_ens_origin`](LoadLifecycle::mark_ens_origin) it makes NO trust
+    /// claim on its own: it only records that IF this load verifies through the
+    /// content-addressed path, the honest posture is at most
+    /// [`TrustPosture::MutableName`] — never immutable `ContentVerified` — and, if
+    /// the name was ALSO learned over a trusted RPC, the louder
+    /// [`TrustPosture::NameViaTrustedRpc`] wins (see
+    /// [`mark_content_verified`](LoadLifecycle::mark_content_verified)). A load
+    /// that fails verification is never marked, and a fresh
+    /// [`begin`](LoadLifecycle::begin) clears the flag so it never leaks onto a
+    /// later immutable `ipfs://<cid>` load.
+    pub fn mark_mutable_name(&mut self) {
+        self.mutable_name = true;
+    }
+
+    /// Whether the CURRENT load was flagged as pointing at a mutable name (see
+    /// [`mark_mutable_name`](LoadLifecycle::mark_mutable_name)).
+    #[must_use]
+    pub fn is_mutable_name(&self) -> bool {
+        self.mutable_name
     }
 
     /// Mark the CURRENT load as content-verified-but-name-via-a-trusted-RPC: its

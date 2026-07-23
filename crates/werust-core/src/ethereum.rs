@@ -716,18 +716,16 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nonblocking(false);
-                            // Read the request head + body far enough to capture
-                            // the JSON payload. The fixture keeps bodies small, so
-                            // one read of a generous buffer drains request line +
-                            // headers + body.
-                            let mut buf = [0u8; 4096];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            // Capture everything after the header terminator as the
-                            // request body, so the test can assert the eth_call JSON
-                            // actually went over the wire.
-                            let raw = &buf[..n];
-                            if let Some(pos) = find_header_end(raw) {
-                                captured.lock().unwrap().push(raw[pos..].to_vec());
+                            // Drain the COMPLETE request (head + full
+                            // `Content-Length` body) before responding, so the
+                            // captured body carries the whole `eth_call` JSON even
+                            // when the body arrives in a later TCP segment under
+                            // parallel load. Shared, race-hardened reader:
+                            // `crate::loopback_test_server`.
+                            if let Some(body) =
+                                crate::loopback_test_server::read_request_body(&mut stream)
+                            {
+                                captured.lock().unwrap().push(body);
                             }
                             let head = format!(
                                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
@@ -768,12 +766,6 @@ mod tests {
                 let _ = handle.join();
             }
         }
-    }
-
-    /// The byte offset just past the `\r\n\r\n` header terminator in an HTTP
-    /// request, i.e. the start of the body.
-    fn find_header_end(raw: &[u8]) -> Option<usize> {
-        raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
     }
 
     #[test]

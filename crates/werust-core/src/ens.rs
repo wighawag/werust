@@ -785,7 +785,7 @@ mod tests {
     // per accepted request, in order) and captures each request body — the ENS
     // two-call analogue of the `ethereum` module's single-answer LocalRpcServer,
     // off the live network. Torn down on Drop.
-    use std::io::{Read, Write};
+    use std::io::Write;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -814,13 +814,17 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             let _ = stream.set_nonblocking(false);
-                            let mut buf = [0u8; 8192];
-                            let n = stream.read(&mut buf).unwrap_or(0);
-                            let raw = &buf[..n];
-                            if let Some(pos) =
-                                raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+                            // Drain the COMPLETE request (head + full
+                            // `Content-Length` body) before responding, via the
+                            // shared race-hardened reader
+                            // (`crate::loopback_test_server`), so each captured
+                            // request body carries the whole `eth_call` JSON even
+                            // when the body arrives in a later TCP segment under
+                            // parallel load.
+                            if let Some(body) =
+                                crate::loopback_test_server::read_request_body(&mut stream)
                             {
-                                captured.lock().unwrap().push(raw[pos..].to_vec());
+                                captured.lock().unwrap().push(body);
                             }
                             let idx = next.fetch_add(1, Ordering::Relaxed);
                             let empty = Vec::new();

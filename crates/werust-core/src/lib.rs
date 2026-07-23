@@ -1722,3 +1722,152 @@ mod tests {
         );
     }
 }
+
+/// A race-hardened reader for the throwaway loopback HTTP fixtures the crate's
+/// end-to-end tests bind on `127.0.0.1:0` (`ethereum::LocalRpcServer`,
+/// `ens::SequencedRpcServer`).
+///
+/// The fixtures capture and assert on the request body that went over the wire
+/// (e.g. the `eth_call` JSON). Reading that request with a SINGLE
+/// `stream.read(&mut buf)` assumes the whole HTTP request (request line +
+/// headers + body) lands in one TCP segment. Under parallel test load the body
+/// can arrive in a LATER segment, leaving the captured body empty and the
+/// downstream `serde_json::from_slice` assert panicking with
+/// "EOF while parsing a value" — an intermittent harness race that reds the
+/// `verify` gate (see `work/notes/observations/flaky-loopback-rpc-server-partial-read.md`
+/// and `flaky-ethereum-end-to-end-loopback-test-2026-07-22.md`). This module is
+/// the single shared fix the fixtures reuse, so the whole family is hardened in
+/// one place rather than three drifting copies.
+#[cfg(test)]
+pub(crate) mod loopback_test_server {
+    use std::io::Read;
+
+    /// Read one complete HTTP request from `stream` and return its body (the
+    /// bytes AFTER the `\r\n\r\n` header terminator), draining the full declared
+    /// `Content-Length` before returning.
+    ///
+    /// It loops `read()` until (a) the header terminator has been seen AND (b)
+    /// the number of body bytes already buffered reaches the request's
+    /// `Content-Length` (0 for a body-less request), so a body split across
+    /// several TCP segments is fully drained rather than truncated. A `read()`
+    /// returning `0` (peer closed) or erroring ends the loop with whatever was
+    /// received, so a malformed/short request degrades to the old best-effort
+    /// capture instead of hanging. Any bytes read past the declared body length
+    /// (a pipelined next request, which these one-shot fixtures never send) are
+    /// left out of the returned body.
+    ///
+    /// Returns `None` when no header terminator was ever received (the request
+    /// head never completed), matching the fixtures' prior "only capture once we
+    /// found the header end" behaviour.
+    pub(crate) fn read_request_body(stream: &mut impl Read) -> Option<Vec<u8>> {
+        let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut chunk = [0u8; 4096];
+        loop {
+            // Stop as soon as we have the full head AND the full declared body.
+            if let Some(header_end) = find_header_end(&buf) {
+                let content_length = parse_content_length(&buf[..header_end]);
+                let body_len = buf.len() - header_end;
+                if body_len >= content_length {
+                    return Some(buf[header_end..header_end + content_length].to_vec());
+                }
+            }
+            match stream.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                Err(_) => break,
+            }
+        }
+        // The stream closed (or errored) before the full request arrived: return
+        // whatever body bytes we did receive if the head at least completed, so a
+        // short/malformed request degrades gracefully rather than the read looping
+        // forever.
+        find_header_end(&buf).map(|header_end| buf[header_end..].to_vec())
+    }
+
+    /// The byte offset just past the `\r\n\r\n` header terminator (the start of
+    /// the body), or `None` if the head is not yet complete.
+    fn find_header_end(raw: &[u8]) -> Option<usize> {
+        raw.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+    }
+
+    /// The declared `Content-Length` of a request head (case-insensitive header
+    /// name), or `0` when the header is absent or unparseable — the fixtures only
+    /// ever send a well-formed `Content-Length`, and a body-less request drains
+    /// zero body bytes.
+    fn parse_content_length(head: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(head);
+        for line in text.split("\r\n") {
+            if let Some((name, value)) = line.split_once(':') {
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    return value.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::read_request_body;
+        use std::io::Write;
+        use std::net::{TcpListener, TcpStream};
+        use std::thread;
+        use std::time::Duration;
+
+        /// The bug this whole task fixes: when the request body lands in a LATER
+        /// TCP segment than the headers, a single `read()` would capture an empty
+        /// body. The shared reader must loop until the full `Content-Length` body
+        /// is drained, so the returned body is the COMPLETE JSON payload.
+        #[test]
+        fn drains_a_body_that_arrives_in_a_later_tcp_segment() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+
+            let body = br#"{"jsonrpc":"2.0","id":1,"method":"eth_call"}"#;
+            let writer = thread::spawn(move || {
+                let mut client = TcpStream::connect(addr).expect("connect loopback");
+                // Send the request line + headers FIRST, flush, pause, THEN the
+                // body — forcing the body into a separate segment the way the
+                // real flake does under parallel load. A single-read fixture would
+                // capture an empty body here.
+                let head = format!(
+                    "POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                    body.len()
+                );
+                client.write_all(head.as_bytes()).expect("write head");
+                client.flush().expect("flush head");
+                thread::sleep(Duration::from_millis(50));
+                client.write_all(body).expect("write body");
+                client.flush().expect("flush body");
+            });
+
+            let (mut stream, _) = listener.accept().expect("accept");
+            let captured = read_request_body(&mut stream).expect("the head completed");
+            writer.join().expect("writer thread");
+
+            assert_eq!(
+                captured, body,
+                "the full body must be drained even when it arrives in a later segment"
+            );
+        }
+
+        /// A body-less request (no `Content-Length`) returns an empty body once
+        /// the head completes, without looping forever waiting for a body.
+        #[test]
+        fn returns_empty_body_for_a_bodyless_request() {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("local addr");
+            let writer = thread::spawn(move || {
+                let mut client = TcpStream::connect(addr).expect("connect loopback");
+                client
+                    .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                    .expect("write head");
+                client.flush().expect("flush");
+            });
+            let (mut stream, _) = listener.accept().expect("accept");
+            let captured = read_request_body(&mut stream).expect("the head completed");
+            writer.join().expect("writer thread");
+            assert!(captured.is_empty(), "a body-less request drains no body");
+        }
+    }
+}

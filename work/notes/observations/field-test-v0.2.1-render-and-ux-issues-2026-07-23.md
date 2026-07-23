@@ -1,0 +1,28 @@
+---
+title: "Field test v0.2.1: 4 real render/UX issues (main-thread freeze, broken styling/layout, invisible IPNS error, black mobile page)"
+date: 2026-07-23
+status: open
+spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
+kind: field-observation
+source: human manual test of the v0.2.1 build on desktop + Android
+---
+
+## What the human observed (v0.2.1, real builds)
+
+Four distinct issues, each a different layer. Captured verbatim before triage.
+
+### 1. Desktop: ~10s FREEZE (GNOME "application not responding, wait?") before the page loads
+The window froze for ~10s on an ENS/ipfs load; GNOME offered the force-quit-or-wait dialog; waiting let it eventually load. LIKELY ROOT CAUSE (from code): the `ipfs://` scheme handler (`crates/webview-renderer/src/backend.rs`, `register_uri_scheme`) calls `resolve_ipfs_request` SYNCHRONOUSLY inside the GTK scheme-handler closure, which runs the FULL trustless-gateway CAR fetch + per-block verify + DAG reassembly ON THE GTK MAIN THREAD. And it runs PER REQUEST (the main HTML plus every sub-resource), each a blocking network CAR retrieval. Blocking the UI thread on network I/O is the freeze. FIX DIRECTION: move retrieval off the main thread (async/worker + finish the scheme request when bytes are ready), or at minimum stream. NOTE this compounds with the desktop being a single GTK thread (the same thread the Android task had to Mutex-guard for a different reason).
+
+### 2. Desktop: page renders WRONG — text colour off, some layout off
+The site loaded but looked wrong: wrong text colour, layout partly off. STRONGLY SUGGESTS sub-resources (CSS, maybe JS/fonts) are not being applied — an unstyled/partially-styled render. Candidates to investigate: (a) sub-resource `ipfs://<dir-cid>/style.css` requests failing or timing out (see #1's per-request blocking), (b) a relative-URL/authority mismatch so the CSS request never reaches the handler, (c) MIME wrong for some asset (the handler derives MIME from the path extension via `mime_type_for_path`; a CSS served as the wrong type would not apply). Needs a real trace of which sub-resource requests fire and what each returns.
+
+### 3. Desktop: `ronan.eth` resolves to IPNS and FAILS, but the error is not easily seen
+`ronan.eth`'s contenthash is ipns-ns; the IPNS resolution failed, but the failure was not clearly surfaced. Two sub-issues: (a) WHY did the IPNS resolve fail (a real resolution bug? an endpoint issue? worth capturing the actual error), and (b) the failure is stored in `ChromeState.last_error` but is "not easily seen" — the error surfacing in the desktop chrome is too weak/hidden. A fail-closed load must show its reason PROMINENTLY (the whole honesty point). FIX DIRECTION: make the load-failure reason a visible in-page/chrome error state, not a subtle status line.
+
+### 4. Mobile (Android): the page loaded but is FULLY BLACK
+On Android the ENS/ipfs page loaded but rendered fully black. Could be: the same missing-sub-resource/CSS issue as #2 but worse (a dark default with no styling), a MIME/charset issue, a WebView background/theme default, or the mobile scheme interception returning the wrong bytes/type for the root. Needs a mobile trace (what the WebView requested and what `resolve_scheme` returned per request).
+
+## Triage note
+
+#1 (main-thread blocking retrieval) is the highest-value: it is almost certainly the freeze AND a contributor to #2/#4 (blocking per-sub-resource fetch -> timeouts -> partial/failed styling). #2 and #4 may share a root cause (sub-resource resolution) and should be investigated together with a real request trace. #3 splits into a resolution-correctness question and an error-visibility UX fix. NONE of these are hand-fixed here; each becomes a scoped task. The verified-render + parity work is sound at the unit level (all offline tests pass); these are integration/real-browser behaviours the offline fixtures did not exercise — the same class of gap that hid the original mandalas.eth bug, now at the rendering layer.

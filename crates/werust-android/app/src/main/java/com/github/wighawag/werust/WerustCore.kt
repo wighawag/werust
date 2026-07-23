@@ -99,6 +99,15 @@ class WerustCore : AutoCloseable {
     /** Report the platform `WebView`'s error signal into the core. */
     fun onPageFailed(url: String, reason: String) = nativeOnPageFailed(handle, url, reason)
 
+    /**
+     * Report a SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`
+     * client-side navigation) into the core, so the URL bar follows the new
+     * location instead of freezing. Reported from
+     * [android.webkit.WebViewClient.doUpdateVisitedHistory], which fires on
+     * same-document history changes (no `onPageStarted`/`onPageFinished`).
+     */
+    fun onUrlChanged(url: String) = nativeOnUrlChanged(handle, url)
+
     /** The current chrome the Activity paints (URL bar, nav enablement, status). */
     fun chrome(): Chrome = Chrome.fromJson(nativeChromeJson(handle))
 
@@ -283,6 +292,7 @@ class WerustCore : AutoCloseable {
     private external fun nativeOnPageCommitted(handle: Long, url: String)
     private external fun nativeOnPageFinished(handle: Long, url: String)
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)
+    private external fun nativeOnUrlChanged(handle: Long, url: String)
     private external fun nativeChromeJson(handle: Long): String
 
     companion object {

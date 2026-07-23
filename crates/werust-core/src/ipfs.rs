@@ -138,6 +138,37 @@ pub fn normalize_ens_page_key(url: &str) -> String {
     }
 }
 
+/// Split an `ipfs://`-family URL into its ROOT CID and the in-site path (with a
+/// leading `/`, or `""` at the root), for the shell's root-CID-PREFIX ENS
+/// association: recognise ANY `<rootcid>/<path>` as being UNDER a known ENS
+/// site's root CID.
+///
+/// Returns [`None`] for a non-`ipfs://` URL (a plain served page has no CID
+/// identity, so it never matches a known ENS site — plain pages are wholly
+/// unaffected). Built on [`normalize_ens_page_key`] so it accepts BOTH the
+/// authority form (`ipfs://<cid>[/path]`) and the WebKit authority-less form
+/// (`ipfs:///<cid>[/path]`) and shares the same CID/path canonicalization the
+/// `ens_pages` keys use, so the stored root CID and a post-back sub-path URL
+/// split to the SAME root CID.
+///
+/// The v0.2.4 leak this closes: `ens_pages` was keyed on the exact normalized
+/// entry (the bare `<rootcid>` root, or `<rootcid>/blog` for a `.eth/blog`
+/// entry), so a history return / SPA nav onto a DIFFERENT sub-path
+/// (`<rootcid>/blog/post-1`) missed the exact-key lookup and leaked the raw CID.
+/// Splitting the current URL to its root CID lets the shell match it against a
+/// known site's root CID and re-derive `name/<in-site-path>` for ANY sub-path.
+#[must_use]
+pub fn ipfs_root_cid_and_path(url: &str) -> Option<(String, String)> {
+    url.strip_prefix("ipfs://")?;
+    // `normalize_ens_page_key` reduces both forms to `<cid>` or `<cid>/path`
+    // (dropping the scheme, any empty authority, and a bare trailing slash).
+    let key = normalize_ens_page_key(url);
+    match key.split_once('/') {
+        Some((cid, path)) => Some((cid.to_string(), format!("/{path}"))),
+        None => Some((key, String::new())),
+    }
+}
+
 /// Infer the response MIME type from an `ipfs://` reference's path, for
 /// served-page parity.
 ///
@@ -351,6 +382,35 @@ mod tests {
             "https://example.com/"
         );
         assert_eq!(normalize_ens_page_key("about:blank"), "about:blank");
+    }
+
+    #[test]
+    fn ipfs_root_cid_and_path_splits_the_root_cid_from_the_in_site_path() {
+        // The root-CID-PREFIX association fuel: split ANY `<rootcid>/<path>` (in
+        // either URL form) into its root CID + in-site path, so a sub-path return
+        // matches the SAME site's stored root CID and re-derives the name.
+        assert_eq!(
+            ipfs_root_cid_and_path("ipfs://bafyroot"),
+            Some(("bafyroot".to_string(), String::new())),
+            "the bare root splits to the cid + an empty in-site path"
+        );
+        assert_eq!(
+            ipfs_root_cid_and_path("ipfs://bafyroot/"),
+            Some(("bafyroot".to_string(), String::new())),
+            "a bare trailing slash is still the root"
+        );
+        assert_eq!(
+            ipfs_root_cid_and_path("ipfs://bafyroot/blog/post-1"),
+            Some(("bafyroot".to_string(), "/blog/post-1".to_string()))
+        );
+        // BOTH URL forms (authority + WebKit authority-less) split to the SAME
+        // root CID, so a stored root CID matches a post-back sub-path URL.
+        assert_eq!(
+            ipfs_root_cid_and_path("ipfs:///bafyroot/blog"),
+            Some(("bafyroot".to_string(), "/blog".to_string()))
+        );
+        // A plain served page has no CID identity, so it never matches a site.
+        assert_eq!(ipfs_root_cid_and_path("https://example.com/blog"), None);
     }
 
     #[test]

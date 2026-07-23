@@ -186,6 +186,15 @@ final class WerustCore {
         url.withCString { werust_ios_on_page_finished(handle, $0) }
     }
 
+    /// Report a SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`
+    /// client-side navigation) into the core, so the URL bar follows the new
+    /// location instead of freezing. Reported from a KVO observer on
+    /// `webView.url`, which fires on same-document history changes (no
+    /// `didCommit`/`didFinish`).
+    func onUrlChanged(_ url: String) {
+        url.withCString { werust_ios_on_url_changed(handle, $0) }
+    }
+
     /// Report the platform `WKWebView`'s error signal into the core.
     func onPageFailed(_ url: String, _ reason: String) {
         url.withCString { u in

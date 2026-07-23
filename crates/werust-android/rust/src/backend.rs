@@ -356,6 +356,37 @@ impl AndroidHandle {
         self.inner.borrow().pending_eval.clone()
     }
 
+    /// Report a SAME-DOCUMENT URL change: an SPA `pushState`/`replaceState`
+    /// client-side navigation rewrote the address WITHOUT a fresh page load, so no
+    /// `onPageStarted`/`onPageFinished` fires. Called from Kotlin's
+    /// `WebViewClient.doUpdateVisitedHistory` (which DOES fire on same-document
+    /// history changes).
+    ///
+    /// It emits ONLY a [`LoadEvent::UrlChanged`] and updates the session-history
+    /// entry, but leaves the load state, trust posture, and per-load flags
+    /// UNTOUCHED — the document (and its already-established verified/ENS posture)
+    /// is unchanged; the SPA only rewrote the history URL. This is the mobile twin
+    /// of the desktop `LoadLifecycle::url_changed` (WebKitGTK `notify::uri`). A
+    /// NO-OP when `url` already matches the current entry, so a
+    /// `doUpdateVisitedHistory` that merely echoes the current load's URL (a real
+    /// load, not an SPA nav) emits nothing.
+    pub fn on_url_changed(&self, url: &str) {
+        let mut b = self.inner.borrow_mut();
+        if b.current().map(String::as_str) == Some(url) {
+            return;
+        }
+        // A same-document history push adds a forward entry from mid-history,
+        // dropping any forward entries — just like a navigation, but with NO load
+        // lifecycle reset (state/posture/flags keep the current document's values).
+        let next = b.cursor.map_or(0, |c| c + 1);
+        b.history.truncate(next);
+        b.history.push(url.to_string());
+        b.cursor = Some(b.history.len() - 1);
+        b.events.push_back(LoadEvent::UrlChanged {
+            url: url.to_string(),
+        });
+    }
+
     /// Report that the platform `WebView` committed the load on `url` (the
     /// effective URL after any redirects): advance to [`LoadState::Committed`] and
     /// emit [`LoadEvent::Committed`]. Called from Kotlin's `onPageCommitVisible`.
@@ -752,6 +783,51 @@ mod tests {
             err,
             RendererError::Backend("ipfs:// load failed: hash mismatch".to_string())
         );
+    }
+
+    #[test]
+    fn a_same_document_url_change_emits_url_changed_without_a_load_transition() {
+        // Acceptance (Android SPA tracking): a same-document URL change (the
+        // `doUpdateVisitedHistory` the OS edge reports for an SPA `pushState`)
+        // emits a DISTINCT `LoadEvent::UrlChanged`, updates the current entry, and
+        // leaves the load state + trust posture UNTOUCHED — the document (and its
+        // established verified posture) is unchanged. Not a fresh load.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.navigate("ipfs://bafyroot/").unwrap();
+        h.mark_content_verified();
+        settle(&mut b, &h);
+        assert_eq!(b.load_state(), LoadState::Finished);
+        assert_eq!(b.trust_posture(), TrustPosture::ContentVerified);
+
+        h.on_url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(
+            b.poll_event(),
+            Some(LoadEvent::UrlChanged {
+                url: "ipfs://bafyroot/portfolio".into()
+            })
+        );
+        assert_eq!(
+            b.current_url().as_deref(),
+            Some("ipfs://bafyroot/portfolio"),
+            "the same-document URL change updates the current entry"
+        );
+        assert_eq!(
+            b.load_state(),
+            LoadState::Finished,
+            "a same-document URL change is not a load transition"
+        );
+        assert_eq!(
+            b.trust_posture(),
+            TrustPosture::ContentVerified,
+            "a same-document nav keeps the document's established posture"
+        );
+        // Back returns to the root entry (the same-document nav pushed history).
+        assert!(b.can_go_back());
+
+        // A change that merely echoes the current URL emits nothing.
+        h.on_url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(b.poll_event(), None, "an unchanged URL emits no event");
     }
 
     #[test]

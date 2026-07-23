@@ -553,6 +553,19 @@ class BrowserActivity : Activity() {
             refreshChrome()
         }
 
+        override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
+            // A SvelteKit SPA link click is a CLIENT-SIDE `pushState`/`replaceState`
+            // navigation: the document does NOT reload, so `onPageStarted`/
+            // `onPageFinished` never fire and the URL bar used to freeze on the
+            // pinned `.eth` name. `doUpdateVisitedHistory` DOES fire on such
+            // same-document history changes, so report the new URL as a
+            // same-document change (NOT a load): the core follows it (dropping the
+            // pin / re-deriving the ENS name) without faking a load lifecycle.
+            // Task `track-webview-url-on-spa-clientside-navigation`.
+            core.onUrlChanged(url)
+            refreshChrome()
+        }
+
         override fun onReceivedError(
             view: WebView,
             request: WebResourceRequest,

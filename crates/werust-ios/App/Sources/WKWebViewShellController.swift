@@ -47,6 +47,10 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// surfacing desktop/Android show.
     private let errorBanner = UILabel()
     private var webView: WKWebView!
+    /// KVO token for observing `webView.url` so a SAME-DOCUMENT URL change (an SPA
+    /// `pushState`/`replaceState`) is reported into the core. Held for the
+    /// controller's lifetime; released on deinit.
+    private var urlObservation: NSKeyValueObservation?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -155,6 +159,20 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         }
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
+        // SAME-DOCUMENT URL tracking (task
+        // track-webview-url-on-spa-clientside-navigation): a SvelteKit SPA link
+        // click is a CLIENT-SIDE `pushState`/`replaceState` navigation — the
+        // document does NOT reload, so `didCommit`/`didFinish` never fire and the
+        // URL bar used to freeze on the pinned `.eth` name. `WKWebView.url` IS
+        // KVO-observable and DOES update on such same-document history changes, so
+        // observe it and report the new URL as a same-document change (NOT a load):
+        // the core follows it (dropping the pin / re-deriving the ENS name) without
+        // faking a load lifecycle.
+        urlObservation = webView.observe(\.url, options: [.new]) { [weak self] wv, _ in
+            guard let self = self else { return }
+            self.core.onUrlChanged(wv.url?.absoluteString ?? "")
+            self.refreshChrome()
+        }
         // Handle NEW-WINDOW requests (a `target="_blank"` link / `window.open`) by
         // navigating IN THE CURRENT view instead of dropping them: werust has no
         // tab/window model yet (task

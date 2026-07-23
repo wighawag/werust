@@ -124,6 +124,28 @@ impl WebViewRenderer {
             // Let WebKitGTK show its default error page.
             false
         });
+
+        // SAME-DOCUMENT URL tracking (task
+        // `track-webview-url-on-spa-clientside-navigation`): a SvelteKit SPA link
+        // click is a CLIENT-SIDE `pushState`/`replaceState` navigation — the
+        // document does NOT reload, so `load-changed` NEVER fires and the pump had
+        // no event to drain (the bar froze on the pinned `.eth` name). But
+        // WebKitGTK's `WebView::uri` property DOES update on such same-document
+        // history changes, firing `notify::uri`. Observe it and surface a
+        // same-document [`LoadEvent::UrlChanged`] through the shared lifecycle, so
+        // the shell FOLLOWS the new URL (drops the pin / re-derives the ENS name)
+        // exactly as it does for an in-page load event — WITHOUT faking a load.
+        //
+        // `url_changed` is a NO-OP when the new URI already matches the lifecycle's
+        // current URL, so a `notify::uri` that merely echoes a real load's URL
+        // (`navigate` already `begin`s it optimistically) emits nothing; only a
+        // genuine URL change with no accompanying load transition surfaces an event.
+        let life_uri = life.clone();
+        view.connect_uri_notify(move |view| {
+            if let Some(uri) = view.uri() {
+                life_uri.borrow_mut().url_changed(&uri);
+            }
+        });
     }
 
     /// The live [`webkit6::WebView`] widget, for the shell to embed in a window.

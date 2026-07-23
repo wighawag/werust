@@ -52,6 +52,7 @@ fn main() {
             LoadEvent::Committed { url } => println!("SEAM committed: {url}"),
             LoadEvent::Finished { .. } => println!("SEAM finished."),
             LoadEvent::Failed { url, reason } => println!("SEAM failed: {url}: {reason}"),
+            LoadEvent::UrlChanged { url } => println!("SEAM url changed: {url}"),
         }
     }
 

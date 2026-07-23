@@ -259,6 +259,16 @@ impl CoreSession {
         self.shell.pump();
     }
 
+    /// Report a SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`
+    /// client-side navigation) into the core, then fold the resulting
+    /// `UrlChanged` event into the chrome so the URL bar FOLLOWS the new location
+    /// (dropping a pinned `.eth` name / re-deriving an ENS identity) instead of
+    /// freezing. Called from Swift's KVO observer on `webView.url`.
+    pub fn on_url_changed(&mut self, url: &str) {
+        self.backend.on_url_changed(url);
+        self.shell.pump();
+    }
+
     /// Report the platform `WKWebView`'s error signal into the core.
     pub fn on_page_failed(&mut self, url: &str, reason: &str) {
         self.backend.on_page_failed(url, reason);
@@ -736,6 +746,23 @@ mod ffi {
         let url = read(url);
         if let Some(s) = session_mut(session) {
             s.on_page_finished(&url);
+        }
+    }
+
+    /// Report a same-document URL change (an SPA `pushState`/`replaceState`) into
+    /// the core, then fold it into the chrome. Called from Swift's KVO observer on
+    /// `webView.url`.
+    ///
+    /// # Safety
+    /// `session` is a live handle; `url` is a valid NUL-terminated C string.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_on_url_changed(
+        session: *mut CoreSession,
+        url: *const c_char,
+    ) {
+        let url = read(url);
+        if let Some(s) = session_mut(session) {
+            s.on_url_changed(&url);
         }
     }
 

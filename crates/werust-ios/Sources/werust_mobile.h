@@ -133,6 +133,12 @@ void werust_ios_on_page_finished(WerustCoreSession *session, const char *url);
 void werust_ios_on_page_failed(WerustCoreSession *session, const char *url,
                                const char *reason);
 
+/* Report a same-document URL change (an SPA pushState/replaceState client-side
+ * navigation) into the core, so the URL bar follows the new location instead of
+ * freezing. Reported from a KVO observer on `webView.url`. `url` is a borrowed
+ * C string. */
+void werust_ios_on_url_changed(WerustCoreSession *session, const char *url);
+
 /* The current chrome as a heap C string (JSON: url / loadState / loading /
  * canGoBack / canGoForward / trustPosture / error), for Swift to paint the URL
  * bar, nav-control enablement, status line, and the trust indicator. Free with

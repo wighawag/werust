@@ -275,6 +275,32 @@ impl LoadLifecycle {
         });
     }
 
+    /// Record a SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`
+    /// client-side navigation): update the current URL and emit
+    /// [`LoadEvent::UrlChanged`], WITHOUT touching the load state or the trust
+    /// posture.
+    ///
+    /// This is DELIBERATELY not a lifecycle transition: a same-document nav is not
+    /// a fresh load — the document (and its already-established
+    /// content-verified/ENS posture) is unchanged, the SPA only rewrote the
+    /// history URL. So unlike [`begin`](LoadLifecycle::begin) this does NOT reset
+    /// `posture`/`ens_origin`/`mutable_name`, and unlike
+    /// [`commit`](LoadLifecycle::commit)/[`finish`](LoadLifecycle::finish) it does
+    /// NOT move the [`LoadState`]. It is a NO-OP when `url` already matches the
+    /// current URL, so the webview's `notify::uri` firing for the load-lifecycle
+    /// URL (a real load, not an SPA nav) does not emit a spurious `UrlChanged`.
+    /// The browser follows the new URL (dropping a pinned name / re-deriving an
+    /// ENS identity) from the emitted event.
+    pub fn url_changed(&mut self, url: &str) {
+        if self.url.as_deref() == Some(url) {
+            return;
+        }
+        self.url = Some(url.to_string());
+        self.events.push_back(LoadEvent::UrlChanged {
+            url: url.to_string(),
+        });
+    }
+
     /// Stop an in-flight load, returning the lifecycle to a settled
     /// [`LoadState::Idle`]. A settled (finished/failed) load is left as-is.
     pub fn stop(&mut self) {
@@ -494,6 +520,56 @@ mod tests {
             self.life.commit(&url);
             self.life.finish(&url);
         }
+    }
+
+    #[test]
+    fn a_same_document_url_change_emits_url_changed_without_a_load_transition() {
+        // Acceptance (desktop SPA tracking, headless): a same-document URL change
+        // (the WebKitGTK `notify::uri` the backend observes for an SPA `pushState`)
+        // updates the current URL and emits a DISTINCT `LoadEvent::UrlChanged`,
+        // WITHOUT moving the load state or resetting the trust posture — the
+        // document (and its established verified/ENS posture) is unchanged. This
+        // pins the pure lifecycle behaviour the `connect_uri_notify` wiring drives,
+        // display-free (the GTK signal itself needs a display).
+        let mut life = LoadLifecycle::default();
+        // A verified ENS load has settled on the root.
+        life.begin("ipfs://bafyroot/");
+        life.mark_ens_origin();
+        life.mark_content_verified();
+        life.commit("ipfs://bafyroot/");
+        life.finish("ipfs://bafyroot/");
+        let _ = life.poll(); // Started
+        let _ = life.poll(); // Committed
+        let _ = life.poll(); // Finished
+        assert_eq!(life.state(), LoadState::Finished);
+        assert_eq!(life.posture(), TrustPosture::NameViaTrustedRpc);
+
+        // A SPA client-side nav to a sub-path of the SAME document: only a URL
+        // change, no load. It emits `UrlChanged` and updates the current URL.
+        life.url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(
+            life.poll(),
+            Some(LoadEvent::UrlChanged {
+                url: "ipfs://bafyroot/portfolio".into()
+            })
+        );
+        assert_eq!(
+            life.current_url(),
+            Some("ipfs://bafyroot/portfolio"),
+            "the same-document URL change updates the reported URL"
+        );
+        // The load state and the posture are UNCHANGED: not a fresh load.
+        assert_eq!(life.state(), LoadState::Finished);
+        assert_eq!(
+            life.posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "a same-document nav within a verified site keeps its posture"
+        );
+
+        // A `notify::uri` that merely echoes the CURRENT URL emits nothing (a real
+        // load's optimistic `begin` already set it), so no spurious event.
+        life.url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(life.poll(), None, "an unchanged URI emits no event");
     }
 
     #[test]

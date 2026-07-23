@@ -234,6 +234,16 @@ impl CoreSession {
         self.shell.pump();
     }
 
+    /// Report a SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`
+    /// client-side navigation) into the core, then fold the resulting
+    /// `UrlChanged` event into the chrome so the URL bar FOLLOWS the new location
+    /// (dropping a pinned `.eth` name / re-deriving an ENS identity) instead of
+    /// freezing. Called from Kotlin's `WebViewClient.doUpdateVisitedHistory`.
+    pub fn on_url_changed(&mut self, url: &str) {
+        self.backend.on_url_changed(url);
+        self.shell.pump();
+    }
+
     /// The current [`ChromeState`] the Kotlin edge paints its URL bar, nav-control
     /// enablement, and status line from.
     #[must_use]
@@ -392,6 +402,12 @@ impl SyncSession {
     /// [`CoreSession::on_page_failed`].
     pub fn on_page_failed(&self, url: &str, reason: &str) {
         self.with(|s| s.on_page_failed(url, reason));
+    }
+
+    /// Report a same-document URL change, under the lock. See
+    /// [`CoreSession::on_url_changed`].
+    pub fn on_url_changed(&self, url: &str) {
+        self.with(|s| s.on_url_changed(url));
     }
 
     /// The current chrome as a JSON object, under the lock. See
@@ -801,6 +817,17 @@ mod jni_exports {
         let url = read(&mut env, &url);
         let reason = read(&mut env, &reason);
         unsafe { session(handle) }.on_page_failed(&url, &reason);
+    }
+
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeOnUrlChanged(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        url: JString,
+    ) {
+        let url = read(&mut env, &url);
+        unsafe { session(handle) }.on_url_changed(&url);
     }
 
     #[no_mangle]

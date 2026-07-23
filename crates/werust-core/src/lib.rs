@@ -663,6 +663,16 @@ struct EnsIdentity {
     /// Whether the resolved name is MUTABLE (`ipns-ns`), so a history/reload load
     /// re-marks the mutable axis too ([`Renderer::mark_mutable_name`]).
     mutable: bool,
+    /// The ROOT CID this ENS site resolved to (the bare `<cid>`, no path), so a
+    /// history/reload/SPA nav onto ANY `<rootcid>/<path>` of the SAME site is
+    /// recognised by a ROOT-CID-PREFIX match, not only the exact normalized entry
+    /// key. This is what closes the v0.2.4 `ipfs://`-reappears leak (`ens_pages`
+    /// was root-entry-only, so a sub-path return missed and leaked the raw CID).
+    root_cid: String,
+    /// The ROOT `.eth` name of this site (`ronan.eth`, never a sub-path display),
+    /// so a root-CID-prefix match on a sub-path re-derives `ronan.eth/<in-site-path>`
+    /// (the whole-site identity), not the exact stored entry's display.
+    root_name: String,
 }
 
 impl BrowserShell {
@@ -999,12 +1009,22 @@ impl BrowserShell {
             .renderer
             .current_url()
             .map(|current| crate::ipfs::normalize_ens_page_key(&current));
+        // The ROOT CID this site resolved to (the bare `<cid>` from `uri`, before
+        // the sub-path append), so a later history/reload/SPA nav onto ANY
+        // `<rootcid>/<path>` of this SAME site is recognised by a root-CID-PREFIX
+        // match (`ens_identity_for_url`), not only the exact normalized entry key.
+        // `name` is the bare `.eth` name (no path), the whole-site display root.
+        let root_cid = crate::ipfs::ipfs_root_cid_and_path(uri)
+            .map(|(cid, _)| cid)
+            .unwrap_or_default();
         if let Some(current) = self.renderer.current_url() {
             self.ens_pages.insert(
                 crate::ipfs::normalize_ens_page_key(&current),
                 EnsIdentity {
                     name: display.clone(),
                     mutable,
+                    root_cid,
+                    root_name: name.to_string(),
                 },
             );
         }
@@ -1131,11 +1151,9 @@ impl BrowserShell {
         let ens_identity = self
             .renderer
             .current_url()
-            .and_then(|url| {
-                self.ens_pages
-                    .get(&crate::ipfs::normalize_ens_page_key(&url))
-                    .map(|e| e.name.clone())
-            })
+            // Matched on the ROOT CID PREFIX so a reload from ANY sub-path of a
+            // known ENS site re-resolves the site (never the raw CID).
+            .and_then(|url| self.ens_identity_for_url(&url).map(|(name, _)| name))
             // A FAILED ENS load never navigated the backend (no `current_url`), but
             // still pinned the name (+ path) in the bar; reloading it re-runs the
             // resolution from that pinned identity, so a transient failure is
@@ -1204,6 +1222,47 @@ impl BrowserShell {
         }
     }
 
+    /// Recognise a backend `url` as belonging to a known ENS site, returning the
+    /// `.eth` name to display (`ronan.eth` or `ronan.eth/<in-site-path>`) + the
+    /// site's `mutable` axis, so reload / back / forward / SPA nav onto it
+    /// re-derive the name + re-mark the posture instead of leaking the raw CID.
+    ///
+    /// The match is on the ROOT CID PREFIX of the entry, not only its exact
+    /// normalized key — the fix for the v0.2.4 `ipfs://`-reappears leak
+    /// (`ens_pages` was populated root-entry-only, so a history return onto a
+    /// DIFFERENT sub-path of the same site missed the exact-key lookup and leaked
+    /// `ipfs://<rootcid>/<path>`):
+    ///
+    /// 1. An EXACT normalized-key hit wins (unchanged behaviour): it keeps the
+    ///    stored display (e.g. a `.eth/blog/` entry's own `ronan.eth/blog/`) and
+    ///    its `mutable` flag.
+    /// 2. Otherwise the entry's ROOT CID (the first `ipfs://` segment) is matched
+    ///    against every known site's `root_cid`; on a hit the display is the
+    ///    site's ROOT `.eth` name plus the entry's IN-SITE path
+    ///    (`ronan.eth/<path>`, or bare `ronan.eth` at the root), and the site's
+    ///    `mutable` axis is carried so the posture re-marks correctly.
+    ///
+    /// A non-`ipfs://` (plain served) URL has no root CID, so it never matches —
+    /// plain pages are wholly unaffected.
+    fn ens_identity_for_url(&self, url: &str) -> Option<(String, bool)> {
+        // 1. Exact normalized-key hit: the entry the user actually resolved.
+        let key = crate::ipfs::normalize_ens_page_key(url);
+        if let Some(entry) = self.ens_pages.get(&key) {
+            return Some((entry.name.clone(), entry.mutable));
+        }
+        // 2. Root-CID-PREFIX match: ANY `<rootcid>/<path>` of a known ENS site.
+        let (root_cid, in_site_path) = crate::ipfs::ipfs_root_cid_and_path(url)?;
+        let entry = self
+            .ens_pages
+            .values()
+            .find(|e| e.root_cid == root_cid && !e.root_cid.is_empty())?;
+        // Display the whole-site ROOT name plus the in-site path
+        // (`ronan.eth/<path>`), never the raw CID. `in_site_path` carries its
+        // leading `/` (or is empty at the root).
+        let display = format!("{}{in_site_path}", entry.root_name);
+        Some((display, entry.mutable))
+    }
+
     /// Drain every pending [`LoadEvent`] off the seam and fold it into the chrome.
     ///
     /// The window calls this on its main loop (a periodic pump). Each event moves
@@ -1237,6 +1296,18 @@ impl BrowserShell {
                     self.chrome.last_error = None;
                 }
                 LoadEvent::Committed { url } | LoadEvent::Finished { url } => {
+                    if !pinned {
+                        self.chrome.url_text = url;
+                    }
+                }
+                // A SAME-DOCUMENT URL change (an SPA `pushState`/`replaceState`):
+                // FOLLOW the new URL exactly as an in-page load event does
+                // (`drop_pin_on_in_page_nav` above already dropped a pin off the
+                // resolved root), but do NOT fake a load lifecycle — it does not
+                // touch the load state or the error. `refresh_chrome` below then
+                // re-derives the ENS identity for the new address (a nav back onto
+                // a known ENS root/sub-path re-shows `ronan.eth[/path]`).
+                LoadEvent::UrlChanged { url } => {
                     if !pinned {
                         self.chrome.url_text = url;
                     }
@@ -1297,14 +1368,16 @@ impl BrowserShell {
         // instead of the entry's real `NameViaTrustedRpc` / `MutableName`. Marking
         // is idempotent (a plain bool set on the lifecycle), so re-marking on every
         // pump keeps the axes set for the whole (async) reloaded/history load.
-        let ens_entry = self.renderer.current_url().and_then(|url| {
-            self.ens_pages
-                .get(&crate::ipfs::normalize_ens_page_key(&url))
-                .cloned()
-        });
-        if let Some(entry) = &ens_entry {
+        // Matched on the ROOT CID PREFIX (`ens_identity_for_url`), so ANY
+        // `<rootcid>/<path>` of a known ENS site re-derives the name + re-marks the
+        // posture — not only the exact resolved entry (the v0.2.4 leak fix).
+        let ens_entry = self
+            .renderer
+            .current_url()
+            .and_then(|url| self.ens_identity_for_url(&url));
+        if let Some((_, mutable)) = &ens_entry {
             self.renderer.mark_ens_origin();
-            if entry.mutable {
+            if *mutable {
                 self.renderer.mark_mutable_name();
             }
         }
@@ -1325,8 +1398,8 @@ impl BrowserShell {
         // moves onto a plain, non-ENS entry).
         if let Some(name) = &self.url_override {
             self.chrome.url_text = name.clone();
-        } else if let Some(entry) = &ens_entry {
-            self.chrome.url_text = entry.name.clone();
+        } else if let Some((name, _)) = &ens_entry {
+            self.chrome.url_text = name.clone();
         } else if let Some(url) = self.renderer.current_url() {
             self.chrome.url_text = url;
         }
@@ -1527,6 +1600,39 @@ mod tests {
             b.ens_origin = false;
             b.mutable_name = false;
             b.events.push_back(LoadEvent::Started {
+                url: url.to_string(),
+            });
+        }
+
+        /// Simulate a SAME-DOCUMENT URL change the way a real webview delivers a
+        /// client-side history navigation (an SPA `pushState`/`replaceState`): the
+        /// address the webview reports changes to `url` WITHOUT a fresh page load,
+        /// so NO `load-changed`/lifecycle signal fires. It emits ONLY a
+        /// [`LoadEvent::UrlChanged`] and leaves the load state, posture, and
+        /// per-load flags UNTOUCHED (the document, and its already-established
+        /// trust, are unchanged) — exactly what the real backends do on
+        /// `notify::uri` / KVO / `doUpdateVisitedHistory`. This is the SPA path
+        /// `navigate_in_page` (a real fresh in-page load) does NOT model: a SPA nav
+        /// fires no load event, which is precisely why the bar used to freeze.
+        ///
+        /// It updates the reported URL and the session-history entry (a
+        /// same-document nav pushes a history entry the back button returns to),
+        /// but does not reset the lifecycle: `state`/`posture`/`ens_origin`/
+        /// `mutable_name` keep the current document's values.
+        fn change_url_in_page(&self, url: &str) {
+            let mut b = self.inner.borrow_mut();
+            // A same-document history push adds a forward entry from mid-history,
+            // dropping any forward entries, just like a real navigation — but with
+            // NO load lifecycle reset.
+            let next = b.cursor.map_or(0, |c| c + 1);
+            b.history.truncate(next);
+            b.history.push(webkit_normalize(url));
+            b.cursor = Some(b.history.len() - 1);
+            // The webview now reports the new same-document URL. Crucially the load
+            // state and trust posture are NOT touched: this is not a fresh load.
+            b.reported_url = Some(url.to_string());
+            b.pending_history = None;
+            b.events.push_back(LoadEvent::UrlChanged {
                 url: url.to_string(),
             });
         }
@@ -3233,6 +3339,158 @@ mod tests {
         settle(&mut shell, &handle);
         assert_eq!(shell.chrome().url_text, "https://example.com/deep/link");
         assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    // ---- SPA client-side (same-document) URL tracking + root-CID-prefix ENS ----
+    // (task `track-webview-url-on-spa-clientside-navigation`)
+
+    #[test]
+    fn a_spa_same_document_url_change_updates_the_bar_and_drops_the_pin() {
+        // Acceptance (Part 1, the frozen-bar-on-internal-nav): a SvelteKit SPA link
+        // click is a CLIENT-SIDE `pushState` — the webview's reported URL changes
+        // but NO load-changed / LoadEvent lifecycle fires. The seam surfaces this
+        // as a distinct `LoadEvent::UrlChanged`; the shell must FOLLOW it (drop the
+        // pinned `.eth` name and show the new location) exactly as it does for an
+        // in-page load event — instead of freezing on `ronan.eth`.
+        let page = b"<!doctype html><title>ronan</title><h1>ronan.eth root</h1>";
+        let (contenthash, _ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // Load the ENS root: the name is pinned in the bar while its CID loads.
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+
+        // The user clicks an INTERNAL SvelteKit link: a client-side `pushState` to
+        // a sub-path of the SAME ipfs document, with NO load lifecycle event — only
+        // a same-document URL change. This is the exact path that used to freeze
+        // the bar (the desktop pump had no events to drain).
+        let sub_path = format!("{}/portfolio", ipfs_root_of(&handle));
+        handle.change_url_in_page(&sub_path);
+        shell.pump();
+        // The bar no longer freezes on `ronan.eth`; it FOLLOWS the new location.
+        // Because the new URL is UNDER the known ENS site's root CID (Part 2), it
+        // re-derives `ronan.eth/portfolio`, never the raw `ipfs://<cid>/portfolio`.
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/portfolio",
+            "a SPA same-document nav updates the bar to the in-site path"
+        );
+        assert!(!shell.chrome().url_text.starts_with("ipfs://"));
+        // A same-document nav within a verified ipfs site keeps the document's
+        // established trust: the SPA nav must NOT reset or fake the load posture.
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "a same-document nav within the verified ENS site stays verified"
+        );
+        // The load state is unchanged: a same-document URL change is NOT a load.
+        assert_eq!(
+            shell.chrome().load_state,
+            LoadState::Finished,
+            "a same-document URL change does not restart the load lifecycle"
+        );
+    }
+
+    #[test]
+    fn history_return_onto_any_subpath_of_a_known_ens_site_re_derives_the_name_never_the_cid() {
+        // Acceptance (Part 2, the `ipfs://`-reappears leak): after loading an ENS
+        // site and navigating to a SUB-PATH within it, a back/forward/reload that
+        // lands on ANY `<rootcid>/<path>` of that site shows the `.eth` name
+        // (`ronan.eth/<path>`) + its ENS posture — NEVER the raw
+        // `ipfs://<rootcid>/<path>`. The association is matched on the ROOT CID
+        // PREFIX of the current entry, not only its exact normalized key (which is
+        // why the v0.2.4 root-only `ens_pages` leaked on a sub-path return).
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, _ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // Load the ENS root, then SPA-navigate deep into the site (a sub-path whose
+        // normalized key DIFFERS from the stored root `<cid>` key).
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        let deep = format!("{}/blog/post-1", ipfs_root_of(&handle));
+        handle.change_url_in_page(&deep);
+        shell.pump();
+        assert_eq!(shell.chrome().url_text, "ronan.eth/blog/post-1");
+
+        // Navigate AWAY to a plain page, then BACK: the back lands on the deep
+        // sub-path entry, whose exact normalized key is NOT in `ens_pages` (only
+        // the root `<cid>` is). The root-CID-prefix lookup must still recognise it
+        // as under `ronan.eth` and show `ronan.eth/blog/post-1`, never the CID.
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/blog/post-1",
+            "a history return onto a sub-path of a known ENS site re-derives the name+path"
+        );
+        assert!(
+            !shell.chrome().url_text.starts_with("ipfs://"),
+            "the raw ipfs://<rootcid>/<path> must never leak into the bar"
+        );
+        // The ENS posture is re-marked for the sub-path entry too (the verified
+        // content path surfaces NameViaTrustedRpc, not a bare-CID ContentVerified).
+        handle.serve_via_verified_content_path();
+        shell.pump();
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "a sub-path of a known ENS site keeps its ENS posture"
+        );
+    }
+
+    #[test]
+    fn a_spa_url_change_on_a_plain_page_follows_the_url_unregressed() {
+        // Acceptance: a plain (non-ENS) page tracks a same-document URL change too,
+        // exactly as a browser does, and never re-derives an ENS name (a plain URL
+        // has no root CID to match). This guards the full-page-load / plain path
+        // against regression by the new UrlChanged handling.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://example.com/");
+
+        // A client-side history push within the plain page (no load event).
+        handle.change_url_in_page("https://example.com/spa/route");
+        shell.pump();
+        assert_eq!(
+            shell.chrome().url_text,
+            "https://example.com/spa/route",
+            "a same-document URL change on a plain page follows the URL"
+        );
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+        assert_eq!(
+            shell.chrome().load_state,
+            LoadState::Finished,
+            "a same-document URL change is not a load"
+        );
+    }
+
+    /// The `ipfs://<rootcid>` root URL the backend currently reports (the RAW,
+    /// pre-WebKit-normalize form the shell resolved the ENS name to), so a test can
+    /// build a same-document sub-path URL `<rootcid>/<path>` of the SAME site.
+    fn ipfs_root_of(handle: &BackendHandle) -> String {
+        handle
+            .inner
+            .borrow()
+            .current()
+            .cloned()
+            .expect("a current ipfs root url")
     }
 
     // ---- A `.eth` name WITH a path -> ENS front door + `ipfs://<cid>/<path>` ---

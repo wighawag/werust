@@ -67,6 +67,7 @@ fn main() -> glib::ExitCode {
                     LoadEvent::Failed { url, reason } => {
                         println!("SEAM failed: {url}: {reason}");
                     }
+                    LoadEvent::UrlChanged { url } => println!("SEAM url changed: {url}"),
                 }
             }
             match r.load_state() {

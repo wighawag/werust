@@ -51,6 +51,26 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "spa-url-tracking"
+description = "Track a SAME-DOCUMENT (SPA client-side) URL change — a SvelteKit `pushState`/`replaceState` navigation that fires NO page load — so the URL bar FOLLOWS the new location (dropping a pinned `.eth` name / re-deriving an ENS identity) instead of freezing, modelled as a distinct `LoadEvent::UrlChanged` (never a faked load lifecycle, no trust re-mean)."
+# The shell logic (drop-pin/follow + root-CID-prefix ENS re-derive) is the SHARED
+# toolkit-free core (`werust-core`'s `pump` handling of `LoadEvent::UrlChanged` +
+# `ens_identity_for_url`), so it is available on every context. Each platform
+# wires its OWN native SAME-DOCUMENT URL observation (distinct from a load
+# lifecycle signal) that feeds the seam `UrlChanged`: desktop
+# `WebViewRenderer::connect_load_signals` observes WebKitGTK's `notify::uri`
+# (which fires on same-document history changes) and drives the shared
+# `LoadLifecycle::url_changed`; Android's `CoreWebViewClient.doUpdateVisitedHistory`
+# calls `WerustCore.onUrlChanged` -> `AndroidHandle::on_url_changed`; iOS observes
+# `webView.url` via KVO (`urlObservation`) and calls `WerustCore.onUrlChanged` ->
+# `IosHandle::on_url_changed`. All three emit ONLY `UrlChanged` (no load-state /
+# posture change), so a same-document nav within a verified site keeps its posture.
+# Task `track-webview-url-on-spa-clientside-navigation`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "back-forward"
 description = "Session history: go_back / go_forward and their availability."
 # Each backend owns its session-history truth (webview-renderer, IosBackend,

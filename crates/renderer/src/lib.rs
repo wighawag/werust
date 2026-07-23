@@ -263,6 +263,21 @@ pub enum LoadEvent {
     Finished { url: String },
     /// The load of `url` failed, with a human-readable reason.
     Failed { url: String, reason: String },
+    /// The current document's URL changed WITHOUT a fresh load: a same-document
+    /// history change (an SPA `pushState`/`replaceState` client-side navigation)
+    /// rewrote the address the webview reports, but no `load-changed` / page load
+    /// fired (the document — and its already-established trust posture — is
+    /// unchanged).
+    ///
+    /// This is DELIBERATELY distinct from the `Started`/`Committed`/`Finished`
+    /// lifecycle events: a consumer must NOT treat it as a fresh load (it does not
+    /// move the load state and carries no trust claim). It flows through the same
+    /// `poll_event` drain so the browser can FOLLOW the new URL (drop a pinned name
+    /// / re-derive an ENS identity for the new address) exactly as it does for an
+    /// in-page load event, without faking a load lifecycle. A backend emits it when
+    /// its webview reports a same-document URL change (WebKitGTK `notify::uri`, iOS
+    /// KVO on `webView.url`, Android `doUpdateVisitedHistory`).
+    UrlChanged { url: String },
 }
 
 impl LoadEvent {
@@ -276,7 +291,8 @@ impl LoadEvent {
             LoadEvent::Started { url }
             | LoadEvent::Committed { url }
             | LoadEvent::Finished { url }
-            | LoadEvent::Failed { url, .. } => url,
+            | LoadEvent::Failed { url, .. }
+            | LoadEvent::UrlChanged { url } => url,
         }
     }
 }
@@ -991,6 +1007,26 @@ mod tests {
             self.state = LoadState::Finished;
             self.events.push_back(LoadEvent::Finished { url });
         }
+    }
+
+    #[test]
+    fn url_changed_is_a_distinct_same_document_event_carrying_the_new_url() {
+        // A same-document URL change (an SPA `pushState`) is modelled as a DISTINCT
+        // `LoadEvent::UrlChanged`, not a faked load lifecycle event. Its `url()`
+        // accessor returns the new URL like every other variant, so the browser can
+        // follow it through the same drain without a special case.
+        let event = LoadEvent::UrlChanged {
+            url: "ipfs://bafyroot/blog/post-1".into(),
+        };
+        assert_eq!(event.url(), "ipfs://bafyroot/blog/post-1");
+        // It is not any of the lifecycle variants.
+        assert!(!matches!(
+            event,
+            LoadEvent::Started { .. }
+                | LoadEvent::Committed { .. }
+                | LoadEvent::Finished { .. }
+                | LoadEvent::Failed { .. }
+        ));
     }
 
     #[test]

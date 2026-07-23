@@ -91,6 +91,62 @@ fn eth_name_from_entry(entry: &str) -> Option<&str> {
     Some(name)
 }
 
+/// Recognise a `.eth` URL-bar entry that MAY carry a sub-path, splitting it into
+/// the ENS NAME (`<label>.eth`) and the PATH (the remainder from the first `/`,
+/// with its leading `/`, or `""` for a bare name), or [`None`] if the entry is
+/// not a `.eth` name.
+///
+/// This is the name+path sibling of [`eth_name_from_entry`] (which stays the
+/// strict bare-name recogniser and STILL rejects any `/`). It is what lets a
+/// `.eth` name WITH a path route to the ENS front door: `ronan.eth/blog/` splits
+/// into the name `ronan.eth` and the path `/blog/`, so the front door resolves
+/// the NAME and threads the PATH into the resolved `ipfs://<cid>/<path>` load
+/// (the ipfs sub-path + directory-index resolution already exists,
+/// `docs/adr/0004` / `resolve_ipfs_request`). Field finding B,
+/// `work/notes/observations/field-test-v0.2.4-spa-clientrouting-eth-path-blank-links-2026-07-23.md`.
+///
+/// The guards mirror [`eth_name_from_entry`], applied to the NAME part only:
+///
+/// * an explicit scheme (`https://…`, `ipfs://…`, any `scheme://…`) is taken
+///   literally and never treated as a name (so `https://ronan.eth/blog/` is NOT
+///   hijacked);
+/// * the label before the first `/` must end in `.eth` (case-insensitively) with
+///   a non-empty label before it — so a non-`.eth` host with a path
+///   (`github.com/foo`) is NOT an ENS name (it classifies as an https candidate),
+///   and ONLY a `.eth` TLD label routes to ENS;
+/// * a bare `.eth` (no `/`, or a lone trailing `/`) yields an EMPTY path, so it is
+///   identical to the [`eth_name_from_entry`] bare-name case.
+///
+/// A lone trailing slash on the bare name (`ronan.eth/`) is treated as the bare
+/// name with no path (empty path), matching [`eth_name_from_entry`] — the
+/// directory + trailing-slash handling for a REAL sub-path lives in the ipfs path
+/// resolution + [`normalize_ens_page_key`](crate::ipfs::normalize_ens_page_key),
+/// so `ronan.eth/blog/` and `ronan.eth/blog` resolve the same entity there.
+/// Label normalisation/validation is still the resolver's job.
+fn eth_name_and_path_from_entry(entry: &str) -> Option<(&str, &str)> {
+    // An explicit scheme is taken literally: only the scheme-less front door is a
+    // name (identical to `eth_name_from_entry`).
+    if entry.contains("://") {
+        return None;
+    }
+    // Split off the sub-path at the FIRST `/`: the name is before it, the path is
+    // from the `/` onward (leading `/` kept). A bare `.eth` (no `/`, or only a
+    // lone trailing `/`) has an empty path.
+    let (name, path) = match entry.find('/') {
+        Some(idx) => (&entry[..idx], &entry[idx..]),
+        None => (entry, ""),
+    };
+    // A lone trailing slash (`ronan.eth/`) is the bare name with no path, matching
+    // `eth_name_from_entry`'s "or a trailing `/`" rule.
+    let path = if path == "/" { "" } else { path };
+    // The NAME part must be a valid bare `.eth` name — delegate to the SAME
+    // recogniser the no-path front door uses, so the `.eth` TLD + non-empty-label
+    // guard lives in ONE place (and `eth_name_from_entry` stays load-bearing and
+    // keeps its "a bare name has no `/`" rule intact for the no-path caller).
+    let name = eth_name_from_entry(name)?;
+    Some((name, path))
+}
+
 /// How the scheme-less URL-bar front door should route a NON-`.eth` entry: a
 /// plausible host/URL werust should TRY, or garbage it should REFUSE without
 /// navigating.
@@ -601,7 +657,8 @@ pub struct BrowserShell {
 /// name), so the right posture axes can be re-marked on a reload / history move.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EnsIdentity {
-    /// The `.eth` name the user typed, kept in the URL bar in place of the CID.
+    /// The `.eth` identity the user typed — the name, PLUS any sub-path
+    /// (`ronan.eth/blog/`) — kept in the URL bar in place of the CID(+path).
     name: String,
     /// Whether the resolved name is MUTABLE (`ipns-ns`), so a history/reload load
     /// re-marks the mutable axis too ([`Renderer::mark_mutable_name`]).
@@ -730,8 +787,13 @@ impl BrowserShell {
     ///    door handled the entry and surfaced the state in the chrome), not an
     ///    `Err`.
     pub fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
-        if let Some(name) = eth_name_from_entry(url) {
-            return self.navigate_ens_name(name);
+        // A `.eth` entry, WITH or WITHOUT a sub-path, is the ENS front door: split
+        // it into the NAME and the optional PATH so `ronan.eth/blog/` resolves
+        // `ronan.eth` and loads the sub-path `ipfs://<cid>/blog/`, instead of
+        // falling through to `https://ronan.eth/blog/` (field finding B). A bare
+        // `.eth` yields an empty path (unchanged).
+        if let Some((name, path)) = eth_name_and_path_from_entry(url) {
+            return self.navigate_ens_name(name, path);
         }
         // A NON-`.eth` entry: classify it into try-it (explicit scheme or a
         // scheme-less plausible host) vs refuse-it (garbage).
@@ -790,17 +852,23 @@ impl BrowserShell {
     /// * every OTHER type (swarm/arweave/unknown) is the decoder's graceful,
     ///   protocol-named failure — NEVER defaulted to `ipfs://`.
     ///
-    /// The address bar keeps `name` (the identity the user typed), not the
-    /// resolved CID: there is no `https://` rewrite and no gateway redirect.
+    /// The `path` (from [`eth_name_and_path_from_entry`], with its leading `/`, or
+    /// `""` for a bare name) is threaded into the resolved load: the backend loads
+    /// `ipfs://<cid><path>` (e.g. `ipfs://<cid>/blog/`, resolved by the existing
+    /// ipfs sub-path + directory-index path), and the bar keeps `<name><path>`
+    /// (e.g. `ronan.eth/blog/`) — the identity+path the user typed.
+    ///
+    /// The address bar keeps `name` (+ any `path`), not the resolved CID: there is
+    /// no `https://` rewrite and no gateway redirect.
     ///
     /// Fail-closed: a resolution failure or an unsupported/absent contenthash
     /// FAILS the load with a legible reason surfaced in
     /// [`ChromeState::last_error`], and nothing unverified is ever rendered. A
     /// failed resolution returns `Ok(())` (the front door handled the entry and
     /// surfaced the failure in the chrome), not an `Err`, so the URL bar keeps the
-    /// name for the user to see the reason — mirroring how a failed load surfaces
-    /// its reason rather than throwing.
-    fn navigate_ens_name(&mut self, name: &str) -> Result<(), RendererError> {
+    /// name (+ path) for the user to see the reason — mirroring how a failed load
+    /// surfaces its reason rather than throwing.
+    fn navigate_ens_name(&mut self, name: &str, path: &str) -> Result<(), RendererError> {
         // The ENS front door proceeds, so any prior invalid-entry state is cleared
         // (a valid route never leaves the badge showing).
         self.chrome.invalid_entry = None;
@@ -811,10 +879,10 @@ impl BrowserShell {
         self.resolving_step = Some(LoadStep::ResolvingName);
         match crate::ens::resolve(self.provider.as_ref(), name) {
             Ok(DecodedContenthash::Ipfs { uri, .. }) => {
-                // The immutable `ipfs-ns` case: load the resolved CID directly. It
-                // is ENS-originated (trusted RPC) but NOT mutable-flagged, so the
-                // posture is `NameViaTrustedRpc`.
-                self.load_resolved_content(name, &uri, false);
+                // The immutable `ipfs-ns` case: load the resolved CID + the typed
+                // sub-path directly. It is ENS-originated (trusted RPC) but NOT
+                // mutable-flagged, so the posture is `NameViaTrustedRpc`.
+                self.load_resolved_content(name, path, &uri, false);
                 Ok(())
             }
             Ok(DecodedContenthash::Ipns { name: ipns_name }) => {
@@ -836,11 +904,11 @@ impl BrowserShell {
                         // `NameViaTrustedRpc` still wins today (the two-axis display
                         // rule); it falls back to `MutableName` once Phase 2 clears
                         // the RPC warning — no rule change here.
-                        self.load_resolved_content(name, &resolved.uri, true);
+                        self.load_resolved_content(name, path, &resolved.uri, true);
                     }
                     // A record/target failure is fail-closed with its distinct,
                     // legible reason — the load renders nothing.
-                    Err(e) => self.fail_ens_load(name, &e.to_string()),
+                    Err(e) => self.fail_ens_load(name, path, &e.to_string()),
                 }
                 Ok(())
             }
@@ -855,22 +923,31 @@ impl BrowserShell {
                 let reason = other
                     .reason()
                     .unwrap_or_else(|| "unsupported contenthash protocol".to_string());
-                self.fail_ens_load(name, &reason);
+                self.fail_ens_load(name, path, &reason);
                 Ok(())
             }
             // Any typed resolution failure (unnormalizable name, no resolver, no/
             // malformed/unsupported contenthash, an RPC/seam error) is fail-closed
             // with its distinct, legible reason — nothing unverified is rendered.
             Err(e) => {
-                self.fail_ens_load(name, &e.to_string());
+                self.fail_ens_load(name, path, &e.to_string());
                 Ok(())
             }
         }
     }
 
-    /// Feed an already-resolved `ipfs://<cid>` `uri` into the EXISTING verified
-    /// `ipfs://` render path, keeping the front-door `name` in the address bar,
-    /// and flag the load's trust axes.
+    /// Feed an already-resolved `ipfs://<cid>` `uri` (plus the typed sub-`path`)
+    /// into the EXISTING verified `ipfs://` render path, keeping the front-door
+    /// `name` (+ `path`) in the address bar, and flag the load's trust axes.
+    ///
+    /// The `path` (with its leading `/`, or `""`) is appended to BOTH the backend
+    /// load target (`ipfs://<cid><path>`, resolved by the ipfs sub-path +
+    /// directory-index path) and the displayed identity (`<name><path>`, e.g.
+    /// `ronan.eth/blog/`), so a `.eth/<path>` entry loads its sub-path while the
+    /// bar keeps what the user typed. The `ens_pages` / `pinned_root_key`
+    /// association is keyed on the normalized CID+path form the resolved
+    /// `ipfs://<cid><path>` produces, so reload / back / forward onto THIS entry
+    /// re-derive the name+path (not the bare-CID root, nor the raw CID+path).
     ///
     /// Shared by the `ipfs-ns` (immutable name via trusted RPC) and the resolved
     /// `ipns-ns` (mutable name) branches: both feed a CID into the SAME verified
@@ -883,15 +960,20 @@ impl BrowserShell {
     /// warning). The flags must come AFTER `navigate` (which resets them on a
     /// fresh `begin`). If the backend cannot even start the load, that is a
     /// fail-closed front-door failure, never a silent success.
-    fn load_resolved_content(&mut self, name: &str, uri: &str, mutable: bool) {
+    fn load_resolved_content(&mut self, name: &str, path: &str, uri: &str, mutable: bool) {
+        // The backend target is the resolved CID PLUS the typed sub-path
+        // (`ipfs://<cid>/blog/`); the displayed identity is the name PLUS the path
+        // (`ronan.eth/blog/`) — the identity the user typed, never the CID+path.
+        let target = format!("{uri}{path}");
+        let display = format!("{name}{path}");
         // Resolution is done; the backend now drives the CONTENT step. Hand the
         // step off to the backend's load state (via `refresh_chrome`).
         self.resolving_step = None;
-        if let Err(e) = self.renderer.navigate(uri) {
+        if let Err(e) = self.renderer.navigate(&target) {
             // A backend that cannot even start the content load failed at the
             // content step, not resolution.
             self.resolving_step = None;
-            self.fail_ens_load(name, &e.to_string());
+            self.fail_ens_load(name, path, &e.to_string());
             return;
         }
         self.renderer.mark_ens_origin();
@@ -921,37 +1003,40 @@ impl BrowserShell {
             self.ens_pages.insert(
                 crate::ipfs::normalize_ens_page_key(&current),
                 EnsIdentity {
-                    name: name.to_string(),
+                    name: display.clone(),
                     mutable,
                 },
             );
         }
-        // Keep the front-door NAME the user typed in the bar (no `https://`
-        // rewrite, no gateway redirect). The override PERSISTS across pumps so the
-        // name stays put for the whole load — until the user navigates OFF the
-        // resolved root (an in-page link click), which `pump` detects by the
-        // event URL's normalized key differing from `pinned_root_key`.
-        self.url_override = Some(name.to_string());
+        // Keep the front-door NAME (+ path) the user typed in the bar (no
+        // `https://` rewrite, no gateway redirect). The override PERSISTS across
+        // pumps so the name stays put for the whole load — until the user navigates
+        // OFF the resolved entry (an in-page link click), which `pump` detects by
+        // the event URL's normalized key differing from `pinned_root_key`.
+        self.url_override = Some(display);
         self.chrome.last_error = None;
         self.refresh_chrome();
     }
 
     /// Fail an ENS front-door load closed: surface `reason` in the chrome and keep
-    /// the `.eth` `name` in the bar, without navigating the backend to anything.
+    /// the `.eth` `name` (+ any `path`) in the bar, without navigating the backend
+    /// to anything.
     ///
     /// This is the fail-closed path (spec story 3): a resolution failure or an
     /// unsupported/absent contenthash renders NOTHING — it only reports the
     /// legible reason the shell surfaces via [`ChromeState::last_error`], with the
     /// load state left settled so the chrome shows the failure rather than a
-    /// spinner. The trust posture stays untrusted (no verified load happened).
-    fn fail_ens_load(&mut self, name: &str, reason: &str) {
-        // Pin the `.eth` name in the bar (the front door did not navigate the
-        // backend anywhere, so there is no underlying URL to fall back to). The
+    /// spinner. The trust posture stays untrusted (no verified load happened). The
+    /// typed `<name><path>` (e.g. `ronan.eth/blog/`) stays in the bar so a failed
+    /// `.eth/<path>` shows what the user typed, never an https fallthrough.
+    fn fail_ens_load(&mut self, name: &str, path: &str, reason: &str) {
+        // Pin the `.eth` name (+ path) in the bar (the front door did not navigate
+        // the backend anywhere, so there is no underlying URL to fall back to). The
         // load has SETTLED (failed), so no step is in flight: clear the pinned
         // resolution step BEFORE refreshing so the failed chrome shows the `Idle`
         // step, and so it never lingers onto the next load.
         self.resolving_step = None;
-        self.url_override = Some(name.to_string());
+        self.url_override = Some(format!("{name}{path}"));
         // A failed ENS load never navigated the backend, so there is no resolved
         // root to follow off; the pin holds the name until the next navigation.
         self.pinned_root_key = None;
@@ -1023,7 +1108,9 @@ impl BrowserShell {
     /// re-loading the cached CID: reload means "get the current version", so for a
     /// MUTABLE name (`ipns-ns`, or a repointable ENS name) it catches a changed
     /// pointer, and for an immutable `ipfs-ns` name it re-derives the same CID.
-    /// Either way the `.eth` name stays pinned in the bar and its ENS posture
+    /// For a `.eth/<path>` page the SAME sub-path is re-loaded (the stored identity
+    /// is re-split into name + path). Either way the `.eth` name (+ path) stays
+    /// pinned in the bar and its ENS posture
     /// (`NameViaTrustedRpc` / `MutableName`) is preserved — never the raw
     /// `ipfs://<cid>` or the plain `ContentVerified` a bare CID would show. (The
     /// re-resolve + history re-derive decision, and its history side-effect, are
@@ -1037,8 +1124,11 @@ impl BrowserShell {
         // If the current entry is an ENS-originated page, re-resolve its `.eth`
         // name (the recorded reload decision) so a mutable name refreshes and the
         // name + posture stay in the bar. The shell keeps no URL stack, so the
-        // current entry is recognised by its underlying CID via `ens_pages`.
-        let ens_name = self
+        // current entry is recognised by its underlying CID via `ens_pages`. The
+        // stored identity is the DISPLAY form (`ronan.eth/blog/`), so it is re-split
+        // into name + sub-path via `eth_name_and_path_from_entry` to re-resolve the
+        // name and re-load the SAME sub-path.
+        let ens_identity = self
             .renderer
             .current_url()
             .and_then(|url| {
@@ -1047,16 +1137,19 @@ impl BrowserShell {
                     .map(|e| e.name.clone())
             })
             // A FAILED ENS load never navigated the backend (no `current_url`), but
-            // still pinned the name in the bar; reloading it re-runs the resolution
-            // from that pinned name, so a transient failure is retryable.
-            .or_else(|| {
-                self.url_override
-                    .as_deref()
-                    .and_then(eth_name_from_entry)
-                    .map(str::to_string)
-            });
-        if let Some(name) = ens_name {
-            return self.navigate_ens_name(&name);
+            // still pinned the name (+ path) in the bar; reloading it re-runs the
+            // resolution from that pinned identity, so a transient failure is
+            // retryable.
+            .or_else(|| self.url_override.clone());
+        // Re-split the display identity into name + path; a non-`.eth` pinned
+        // string (a plain page's URL) yields `None`, so it falls through to a plain
+        // reload.
+        if let Some((name, path)) = ens_identity
+            .as_deref()
+            .and_then(eth_name_and_path_from_entry)
+        {
+            let (name, path) = (name.to_string(), path.to_string());
+            return self.navigate_ens_name(&name, &path);
         }
         self.renderer.reload()?;
         self.url_override = None;
@@ -1909,6 +2002,60 @@ mod tests {
         assert_eq!(eth_name_from_entry("example.com"), None);
         assert_eq!(eth_name_from_entry(".eth"), None);
         assert_eq!(eth_name_from_entry("ronan.eth/page"), None);
+    }
+
+    #[test]
+    fn eth_name_and_path_splits_a_dot_eth_entry_into_name_and_optional_path() {
+        // Acceptance: a `.eth` entry WITH a path (`ronan.eth/blog/`) is recognised
+        // as the ENS front door for `ronan.eth` + the sub-path `/blog/`, so the
+        // path can be threaded into the resolved `ipfs://<cid>/<path>` load — while
+        // `eth_name_from_entry` (the bare-name recogniser) STILL rejects a `/`.
+        //
+        // A bare `.eth` (no path) is unchanged: no path component.
+        assert_eq!(
+            eth_name_and_path_from_entry("ronan.eth"),
+            Some(("ronan.eth", ""))
+        );
+        // A bare `.eth` with a lone trailing `/` is still the bare name (the path
+        // is empty), so it stays identical to the no-slash entry.
+        assert_eq!(
+            eth_name_and_path_from_entry("ronan.eth/"),
+            Some(("ronan.eth", ""))
+        );
+        // A `.eth` WITH a real path: split into the name and the `/<path>` (with
+        // its leading `/`, and the trailing `/` preserved verbatim).
+        assert_eq!(
+            eth_name_and_path_from_entry("ronan.eth/blog/"),
+            Some(("ronan.eth", "/blog/"))
+        );
+        assert_eq!(
+            eth_name_and_path_from_entry("ronan.eth/blog"),
+            Some(("ronan.eth", "/blog"))
+        );
+        assert_eq!(
+            eth_name_and_path_from_entry("a.b.eth/x/y/z.html"),
+            Some(("a.b.eth", "/x/y/z.html"))
+        );
+        // Case-insensitive on the `.eth` label, same as the bare recogniser.
+        assert_eq!(
+            eth_name_and_path_from_entry("Ronan.ETH/Blog/"),
+            Some(("Ronan.ETH", "/Blog/"))
+        );
+        // An explicit scheme is STILL literal, never hijacked into an ENS name.
+        assert_eq!(
+            eth_name_and_path_from_entry("https://ronan.eth/blog/"),
+            None
+        );
+        assert_eq!(eth_name_and_path_from_entry("ipfs://bafycid/blog/"), None);
+        assert_eq!(eth_name_and_path_from_entry("ens://ronan.eth/blog"), None);
+        // A non-`.eth` host with a path is NOT an ENS name (it stays an https
+        // candidate): only a `.eth` TLD label routes to ENS.
+        assert_eq!(eth_name_and_path_from_entry("github.com/foo"), None);
+        assert_eq!(eth_name_and_path_from_entry("example.com"), None);
+        // A bare `.eth` label (empty name before the TLD) is not a name, path or
+        // no path.
+        assert_eq!(eth_name_and_path_from_entry(".eth"), None);
+        assert_eq!(eth_name_and_path_from_entry(".eth/blog"), None);
     }
 
     #[test]
@@ -3086,6 +3233,196 @@ mod tests {
         settle(&mut shell, &handle);
         assert_eq!(shell.chrome().url_text, "https://example.com/deep/link");
         assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    // ---- A `.eth` name WITH a path -> ENS front door + `ipfs://<cid>/<path>` ---
+    // (task `eth-name-with-path-routes-to-ens-and-subpath`)
+
+    #[test]
+    fn a_dot_eth_with_a_path_routes_to_ens_and_loads_the_subpath_keeping_the_name_path_in_the_bar()
+    {
+        // Acceptance (the DONE bar, offline): `ronan.eth/blog/` is detected as the
+        // ENS front door for `ronan.eth` (NOT `https://ronan.eth/blog/`), resolves
+        // the name to its `ipfs-ns` contenthash, and loads the SUB-PATH
+        // `ipfs://<cid>/blog/` (its index.html via the existing ipfs path
+        // resolution). The bar keeps the identity+path the user typed
+        // (`ronan.eth/blog/`) with the ENS posture — never the raw CID+path.
+        let page = b"<!doctype html><title>ronan blog</title>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),    // registry.resolver(node)
+            Ok(abi_bytes_return(&contenthash)), // resolver.contenthash(node)
+        ]);
+
+        shell
+            .navigate("ronan.eth/blog/")
+            .expect("the front door handles a .eth entry with a path");
+        // The bar shows the NAME+PATH, not the CID, even while it loads.
+        assert_eq!(shell.chrome().url_text, "ronan.eth/blog/");
+        assert!(
+            shell.chrome().is_loading(),
+            "the ipfs subpath load is in flight"
+        );
+        // The underlying load went to the resolved `ipfs://<cid>/blog/` — the CID
+        // from the name PLUS the typed sub-path, NOT `https://ronan.eth/blog/`.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(format!("{ipfs_uri}/blog/").as_str())
+        );
+
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().load_state, LoadState::Finished);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/blog/",
+            "the .eth name + path stays in the bar through the whole verified load"
+        );
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+        assert!(shell.chrome().is_name_via_trusted_rpc());
+        assert_eq!(shell.chrome().last_error, None);
+    }
+
+    #[test]
+    fn a_github_com_path_still_routes_to_https_not_ens() {
+        // Acceptance: a NON-`.eth` host with a path (`github.com/foo`) still routes
+        // to `https://github.com/foo` — the name+path split only fires for a `.eth`
+        // TLD label, so a plausible dotted host is untouched (no ENS hijack).
+        let (mut shell, handle) = shell_with_backend();
+        shell
+            .navigate("github.com/foo")
+            .expect("navigates as https");
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some("https://github.com/foo"),
+            "a non-.eth host+path is an https candidate, never ENS"
+        );
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://github.com/foo");
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn a_dot_eth_path_that_resolves_to_no_dag_entity_fails_closed_keeping_the_bar() {
+        // Acceptance: a `.eth/<path>` whose PATH resolves to no entity in the DAG
+        // fails closed with the existing legible reason (the ipfs path-not-found
+        // class, surfaced as a failed load), keeps the typed `.eth/<path>` in the
+        // bar, and NEVER falls through to https or silently resets — mirroring a
+        // failed bare-name load. The name RESOLVES fine (a valid contenthash); it
+        // is the sub-path load that fails at the backend/scheme handler.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        shell
+            .navigate("ronan.eth/no-such-path/")
+            .expect("the front door handles the entry");
+        // The resolved sub-path load is in flight against the CID+path.
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(format!("{ipfs_uri}/no-such-path/").as_str())
+        );
+        // The `ipfs://` scheme handler fails the sub-path load (the DAG has no such
+        // entity): a hard, legible reason surfaces and the typed name+path stays.
+        handle.drive_to_failed(
+            "ipfs:// content-addressed load failed: sub-resource path not found: /no-such-path/",
+        );
+        shell.pump();
+        assert_eq!(shell.chrome().load_state, LoadState::Failed);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/no-such-path/",
+            "a failed sub-path load keeps the typed .eth/<path> in the bar"
+        );
+        assert!(
+            !shell.chrome().url_text.starts_with("https://"),
+            "no https fallthrough on a failed sub-path load"
+        );
+        assert!(
+            shell.chrome().last_error.is_some(),
+            "a legible reason is shown"
+        );
+        assert!(!shell.chrome().is_content_verified());
+    }
+
+    #[test]
+    fn reload_and_back_re_derive_the_name_and_path_of_a_dot_eth_path_page() {
+        // Acceptance: reload / back / forward of a `.eth/<path>` page keep the
+        // name+path+posture. Reload RE-RESOLVES the name and re-loads the same
+        // sub-path; back onto the sub-path entry re-derives `ronan.eth/blog/` from
+        // the CID+path `ens_pages` key (never leaking the raw CID+path).
+        let page = b"<!doctype html><title>ronan blog</title>";
+        let (contenthash, ipfs_uri) = ipfs_contenthash_fixture(page);
+        // Three resolutions worth of answers: the initial load, the reload
+        // re-resolve, and the back re-resolve are each a fresh namehash ->
+        // resolver -> contenthash pair.
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+
+        // Load the `.eth/<path>` page.
+        shell.navigate("ronan.eth/blog/").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth/blog/");
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(format!("{ipfs_uri}/blog/").as_str())
+        );
+
+        // Reload RE-RESOLVES the name+path (the recorded reload decision): the
+        // sub-path is reloaded and the name+path+posture stay in the bar.
+        shell
+            .reload()
+            .expect("reload re-resolves the .eth/<path> page");
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/blog/",
+            "reload keeps the name+path in the bar"
+        );
+        assert_eq!(
+            shell.current_url_for_test().as_deref(),
+            Some(format!("{ipfs_uri}/blog/").as_str()),
+            "reload re-loads the same resolved sub-path"
+        );
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth/blog/");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc
+        );
+
+        // Navigate away to a plain page, then back onto the ENS sub-path entry: its
+        // name+path is re-derived from the CID+path `ens_pages` key (the pin was
+        // dropped, but the entry is recoverable), never the raw CID.
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/blog/",
+            "back onto the ENS sub-path re-derives the name+path via ens_pages"
+        );
+        assert!(!shell.chrome().url_text.starts_with("ipfs://"));
+        handle.serve_via_verified_content_path();
+        shell.pump();
+        assert_eq!(shell.chrome().url_text, "ronan.eth/blog/");
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS sub-path entry keeps its posture on history return"
+        );
     }
 
     // ---- Loading progress + transient-vs-hard error (task

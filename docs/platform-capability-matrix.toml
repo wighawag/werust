@@ -150,7 +150,7 @@ android = { state = "implemented" }
 
 [[capability]]
 name = "trust-indicator"
-description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / mutable-name / unverified) in the chrome."
+description = "Surface the load's trust posture (content-verified / name-via-trusted-rpc / mutable-name / unverified) in the chrome, showing a NEUTRAL loading state (no trust claim) while a load is in flight so a stale/previous posture never lingers into a new load."
 # Desktop reads the shared LoadLifecycle posture (marked by the `ipfs://` scheme
 # handler / ENS front door). Both mobile backends now surface it too (task
 # mobile-provider-injection-and-trust-indicator): their `Inner` tracks the same
@@ -161,6 +161,14 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # `UnverifiedOrigin` is no longer inherited. The chrome JSON carries `trustPosture`
 # and the mobile chrome paints the indicator (content-verified / name-via-trusted-rpc
 # / mutable-name / unverified) from it, matching desktop for the same load.
+# While a load is in flight the indicator is a NEUTRAL loading state on every
+# platform (task chrome-loading-state-resets-trust-indicator): each chrome applies
+# the SAME loading-wins rule over the posture from the SAME `loading` fact —
+# desktop `trust_indicator`/`_detail`/`_css_class` in crates/werust/src/main.rs,
+# and the mobile `Chrome.trustIndicator()` (Kotlin WerustCore.kt, Swift
+# WerustCore.swift) reading the `loading` field of the chrome JSON — so the prior
+# page's trust posture never lingers while a new, possibly differently-trusted
+# page loads.
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }

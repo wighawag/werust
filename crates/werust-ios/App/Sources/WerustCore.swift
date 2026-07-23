@@ -224,10 +224,20 @@ final class WerustCore {
         }
 
         /// The short trust-indicator badge the controller paints from the core's
-        /// posture (the ACTUAL load path, not the URL) — the SAME four states the
+        /// posture (the ACTUAL load path, not the URL) — the SAME states the
         /// desktop chrome shows. Never labels a name-resolved or mutable page
         /// "verified" (only a direct `ipfs://<cid>` earns that).
+        ///
+        /// While a load is IN FLIGHT (`loading`) the indicator is a NEUTRAL loading
+        /// state that WINS over the posture, making NO trust claim — the
+        /// trust-honesty fix (task `chrome-loading-state-resets-trust-indicator`):
+        /// on navigation to a possibly differently-trusted page, the indicator must
+        /// not keep asserting the previous page's (or a not-yet-proven) trust while
+        /// the new page loads; the real posture appears only once the load settles.
+        /// The SAME loading-wins rule the desktop chrome applies, from the SAME
+        /// `loading` fact.
         func trustIndicator() -> String {
+            if loading { return "⋯ loading…" }
             switch trustPosture {
             case "content-verified": return "✓ verified"
             case "name-via-trusted-rpc": return "◈ name via trusted RPC"

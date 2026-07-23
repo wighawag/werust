@@ -93,17 +93,22 @@ impl Chrome {
         self.stop.set_sensitive(state.is_loading());
         self.reload.set_sensitive(!state.is_loading());
         self.status.set_text(&status_line(state));
-        // The trust indicator: a distinct, legible label for each of the three
-        // trust postures (content-verified / name-via-trusted-RPC / unverified
+        // The trust indicator: a distinct, legible label for each state (a
+        // neutral loading badge while a load is in flight, else the trust posture:
+        // content-verified / name-via-trusted-RPC / mutable-name / unverified
         // origin), plus a CSS class so the states are visually distinct. Exactly
-        // one class is active at a time.
+        // one class is active at a time, so the toggle set must list EVERY class
+        // `trust_indicator_css_class` can return — including `trust-loading` and
+        // `trust-mutable-name` — or a stale class would linger on a transition.
         self.trust.set_text(trust_indicator(state));
         self.trust
             .set_tooltip_text(Some(trust_indicator_detail(state)));
         let active = trust_indicator_css_class(state);
         for class in [
+            "trust-loading",
             "trust-verified",
             "trust-name-trusted-rpc",
+            "trust-mutable-name",
             "trust-unverified",
         ] {
             if class == active {
@@ -138,8 +143,20 @@ fn status_line(state: &ChromeState) -> String {
 /// but the name->CID mapping came from a trusted RPC) is a DISTINCT middle badge
 /// that is deliberately NOT labelled "verified" — Phase 1 makes no
 /// name-verification claim.
+///
+/// While a load is IN FLIGHT (`is_loading()`) the indicator is a NEUTRAL loading
+/// state that WINS over the posture, making NO trust claim at all — the
+/// trust-honesty fix (`chrome-loading-state-resets-trust-indicator`): on
+/// navigation to a possibly differently-trusted page, the indicator must not keep
+/// asserting the previous page's (or a not-yet-proven) trust while the new page
+/// loads. The real posture is revealed only once the load SETTLES
+/// (finished/failed/idle). This loading-wins precedence lives at the same display
+/// layer as the two-axis posture precedence, and is applied identically on the
+/// mobile shells (they consult the same `loading` fact from the chrome JSON).
 fn trust_indicator(state: &ChromeState) -> &'static str {
-    if state.is_content_verified() {
+    if state.is_loading() {
+        "⋯ loading…"
+    } else if state.is_content_verified() {
         "✓ verified"
     } else if state.is_name_via_trusted_rpc() {
         "◈ name via trusted RPC"
@@ -153,7 +170,9 @@ fn trust_indicator(state: &ChromeState) -> &'static str {
 /// The longer explanation shown as the trust indicator's tooltip, so the badge is
 /// self-explaining on hover. Pure, for the same reason as [`trust_indicator`].
 fn trust_indicator_detail(state: &ChromeState) -> &'static str {
-    if state.is_content_verified() {
+    if state.is_loading() {
+        "werust is loading this page and is not yet asserting a trust level for it: the trust indicator shows the real posture only once the load settles."
+    } else if state.is_content_verified() {
         "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
     } else if state.is_name_via_trusted_rpc() {
         "This page's content was hash-verified, but its name was resolved over a TRUSTED RPC (not a light client), which could misdirect the name to different content. werust makes no name-verification claim here."
@@ -168,7 +187,9 @@ fn trust_indicator_detail(state: &ChromeState) -> &'static str {
 /// trust classes. A pure function of [`ChromeState`] so the badge styling is
 /// testable without a display.
 fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
-    if state.is_content_verified() {
+    if state.is_loading() {
+        "trust-loading"
+    } else if state.is_content_verified() {
         "trust-verified"
     } else if state.is_name_via_trusted_rpc() {
         "trust-name-trusted-rpc"
@@ -179,12 +200,15 @@ fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
     }
 }
 
-/// The stylesheet that makes the three trust-indicator states visually distinct:
-/// a green content-verified badge, a blue name-via-trusted-RPC badge (an
-/// honest middle state), and an amber unverified-origin one. Kept as one constant
-/// next to the classes the chrome toggles (`trust-verified` /
-/// `trust-name-trusted-rpc` / `trust-unverified`).
+/// The stylesheet that makes the trust-indicator states visually distinct: a
+/// NEUTRAL grey loading badge (no trust claim, shown while a load is in flight),
+/// a green content-verified badge, a blue name-via-trusted-RPC badge (an honest
+/// middle state), a purple mutable-name badge, and an amber unverified-origin
+/// one. Kept as one constant next to the classes the chrome toggles
+/// (`trust-loading` / `trust-verified` / `trust-name-trusted-rpc` /
+/// `trust-mutable-name` / `trust-unverified`).
 const TRUST_INDICATOR_CSS: &str = "\
+.trust-loading { color: #5c5c5c; font-weight: bold; padding: 0 6px; }\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
 .trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
@@ -413,6 +437,73 @@ mod tests {
             ..ChromeState::default()
         };
         assert_eq!(status_line(&failed), "failed: name not resolved");
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_neutral_loading_state_that_hides_the_posture_while_loading() {
+        // Acceptance (the trust-honesty fix): while a load is in flight the trust
+        // indicator is a NEUTRAL loading state (no trust claim), NOT the
+        // carried-over posture of the previous page. The display rule is
+        // loading-wins: even a load whose backend posture still reads
+        // content-verified (mid-transition) must show the loading badge, so the
+        // indicator never asserts a trust level for a page that is not yet shown.
+        for posture in [
+            TrustPosture::UnverifiedOrigin,
+            TrustPosture::ContentVerified,
+            TrustPosture::NameViaTrustedRpc,
+            TrustPosture::MutableName,
+        ] {
+            let loading = ChromeState {
+                load_state: LoadState::Started,
+                trust_posture: posture,
+                ..ChromeState::default()
+            };
+            assert_eq!(
+                trust_indicator(&loading),
+                "⋯ loading…",
+                "while loading, the indicator is a neutral loading state, not the {posture:?} posture"
+            );
+            // The loading badge makes NO trust claim: it never reads "verified"
+            // and never asserts the origin is (un)verified.
+            assert!(!trust_indicator(&loading)
+                .to_lowercase()
+                .contains("verified"));
+            assert_eq!(trust_indicator_css_class(&loading), "trust-loading");
+            // The tooltip is honest that werust is not yet asserting a trust level.
+            assert!(trust_indicator_detail(&loading)
+                .to_lowercase()
+                .contains("loading"));
+            assert!(!trust_indicator_detail(&loading)
+                .to_lowercase()
+                .contains("verified"));
+        }
+
+        // A Committed load is still in flight, so it is still the neutral state.
+        let committed = ChromeState {
+            load_state: LoadState::Committed,
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&committed), "⋯ loading…");
+
+        // Once the load SETTLES (Finished), the real posture appears — the loading
+        // state does not swallow the settled badge.
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&settled), "✓ verified");
+
+        // A FAILED load is not "loading": it shows its (unverified) posture, not the
+        // spinner — a failed load must never read as a stale success.
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            last_error: Some("name not resolved".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&failed), "⚠ unverified origin");
     }
 
     #[test]

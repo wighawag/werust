@@ -1707,6 +1707,93 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_navigation_shows_a_neutral_loading_state_hiding_the_prior_posture_until_settle() {
+        // Acceptance (the DONE bar, the trust-honesty fix): navigating from a
+        // content-verified page to a DIFFERENTLY-trusted page must NOT keep
+        // asserting the previous page's trust while the new one loads. A
+        // fake-backend drives load-start -> load-settle across two pages with
+        // different postures: while the SECOND load is in flight the chrome is a
+        // neutral loading state (`is_loading()` true, the posture is NOT the prior
+        // page's), and the NEW page's real posture appears only once it settles.
+        let (mut shell, handle) = shell_with_backend();
+
+        // Page one settles content-verified (a plain `ipfs://<cid>`).
+        shell.navigate("ipfs://bafypageone/index.html").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert!(shell.chrome().is_content_verified());
+        assert!(!shell.chrome().is_loading());
+
+        // Navigate to page two (a plain served origin, a DIFFERENT posture). While
+        // its load is in flight the chrome must be a neutral loading state, NOT the
+        // prior page's content-verified posture — the indicator never asserts a
+        // trust level for a page that is not the one being displayed.
+        shell.navigate("https://example.com/").unwrap();
+        assert!(shell.chrome().is_loading(), "the second load is in flight");
+        assert!(
+            !shell.chrome().is_content_verified(),
+            "the prior page's content-verified posture must NOT linger during the new load"
+        );
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "a fresh navigation clears the stale posture before the new page settles"
+        );
+
+        // Only on settle does the NEW page's real posture appear (here: unverified
+        // served origin, honestly weaker than the page we came from).
+        settle(&mut shell, &handle);
+        assert!(!shell.chrome().is_loading());
+        assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn a_fresh_navigation_clears_the_stale_name_and_error_into_the_new_load() {
+        // Acceptance: a fresh navigation clears any stale name/posture/error so
+        // nothing from the previous page lingers into the new load. Here the
+        // previous page is a FAILED ENS load (it pinned the `.eth` name in the bar
+        // and surfaced a failure reason); the next navigation must drop BOTH the
+        // pinned name and the surfaced error immediately, before the new page
+        // settles — so the chrome never shows a stale failure over a fresh load.
+        let mut swarm_ch = varint(0xe4); // swarm-ns: an unsupported protocol
+        swarm_ch.extend_from_slice(b"some swarm address bytes");
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x44u8; 20])),
+            Ok(abi_bytes_return(&swarm_ch)),
+        ]);
+
+        // A failed ENS load: the `.eth` name stays in the bar and the failure is
+        // surfaced.
+        shell.navigate("swarm-site.eth").unwrap();
+        assert_eq!(shell.chrome().url_text, "swarm-site.eth");
+        assert!(
+            shell.chrome().last_error.is_some(),
+            "the failure is surfaced"
+        );
+
+        // A fresh navigation clears the stale pinned name AND the stale error at
+        // once — nothing from the previous page lingers into the new load.
+        shell.navigate("https://fresh.example/").unwrap();
+        assert_eq!(
+            shell.chrome().url_text,
+            "https://fresh.example/",
+            "the stale `.eth` name does not linger into the new load"
+        );
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "the stale failure does not linger into the new load"
+        );
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::UnverifiedOrigin,
+            "the new load begins with no carried-over posture"
+        );
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "https://fresh.example/");
+    }
+
+    #[test]
     fn the_shell_forwards_focus_through_the_seam() {
         // Acceptance: the shell makes the page interactive THROUGH the seam. It
         // focuses the live view via the seam (how the embedded webview widget

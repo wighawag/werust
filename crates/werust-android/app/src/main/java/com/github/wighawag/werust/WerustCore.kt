@@ -143,14 +143,24 @@ class WerustCore : AutoCloseable {
 
         /**
          * The short trust-indicator badge the Activity paints from the core's
-         * posture (the ACTUAL load path, not the URL) — the SAME four states the
+         * posture (the ACTUAL load path, not the URL) — the SAME states the
          * desktop chrome shows. Never labels a name-resolved or mutable page
          * "verified" (only a direct `ipfs://<cid>` earns that).
+         *
+         * While a load is IN FLIGHT (`loading`) the indicator is a NEUTRAL loading
+         * state that WINS over the posture, making NO trust claim — the
+         * trust-honesty fix (task `chrome-loading-state-resets-trust-indicator`):
+         * on navigation to a possibly differently-trusted page, the indicator must
+         * not keep asserting the previous page's (or a not-yet-proven) trust while
+         * the new page loads; the real posture appears only once the load settles.
+         * The SAME loading-wins rule the desktop chrome applies, from the SAME
+         * `loading` fact.
          */
-        fun trustIndicator(): String = when (trustPosture) {
-            "content-verified" -> "✓ verified"
-            "name-via-trusted-rpc" -> "◈ name via trusted RPC"
-            "mutable-name" -> "◇ content verified, mutable name"
+        fun trustIndicator(): String = when {
+            loading -> "⋯ loading…"
+            trustPosture == "content-verified" -> "✓ verified"
+            trustPosture == "name-via-trusted-rpc" -> "◈ name via trusted RPC"
+            trustPosture == "mutable-name" -> "◇ content verified, mutable name"
             else -> "⚠ unverified origin"
         }
 

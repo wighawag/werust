@@ -702,11 +702,16 @@ impl BrowserShell {
         // Remember the CID <-> name association so a later reload / back / forward
         // that lands the backend on this same underlying `ipfs://<cid>` can
         // re-derive the `.eth` name + re-mark the posture axes, instead of leaking
-        // the raw CID (`refresh_chrome`). Keyed on the exact underlying URL the
-        // backend now reports as `current_url`.
+        // the raw CID (`refresh_chrome`). Keyed on the NORMALIZED CID form
+        // (`crate::ipfs::normalize_ens_page_key`), applied IDENTICALLY here and at
+        // every lookup, so the authority form we store now (`ipfs://<cid>`) still
+        // matches the authority-less `ipfs:///<cid>` WebKitGTK reports for the SAME
+        // entry after a back/forward. Keying on the raw display string was the
+        // v0.2.3 regression: the stored and post-back strings differed and the
+        // re-derive missed, leaking the CID into the bar.
         if let Some(current) = self.renderer.current_url() {
             self.ens_pages.insert(
-                current,
+                crate::ipfs::normalize_ens_page_key(&current),
                 EnsIdentity {
                     name: name.to_string(),
                     mutable,
@@ -790,7 +795,11 @@ impl BrowserShell {
         let ens_name = self
             .renderer
             .current_url()
-            .and_then(|url| self.ens_pages.get(&url).map(|e| e.name.clone()))
+            .and_then(|url| {
+                self.ens_pages
+                    .get(&crate::ipfs::normalize_ens_page_key(&url))
+                    .map(|e| e.name.clone())
+            })
             // A FAILED ENS load never navigated the backend (no `current_url`), but
             // still pinned the name in the bar; reloading it re-runs the resolution
             // from that pinned name, so a transient failure is retryable.
@@ -912,10 +921,11 @@ impl BrowserShell {
         // instead of the entry's real `NameViaTrustedRpc` / `MutableName`. Marking
         // is idempotent (a plain bool set on the lifecycle), so re-marking on every
         // pump keeps the axes set for the whole (async) reloaded/history load.
-        let ens_entry = self
-            .renderer
-            .current_url()
-            .and_then(|url| self.ens_pages.get(&url).cloned());
+        let ens_entry = self.renderer.current_url().and_then(|url| {
+            self.ens_pages
+                .get(&crate::ipfs::normalize_ens_page_key(&url))
+                .cloned()
+        });
         if let Some(entry) = &ens_entry {
             self.renderer.mark_ens_origin();
             if entry.mutable {
@@ -967,8 +977,27 @@ mod tests {
     #[derive(Default)]
     struct BackendInner {
         /// The back/forward list; `cursor` is the index of the current entry.
+        /// Each entry stores the WebKit-NORMALIZED display URL (see
+        /// [`webkit_normalize`]), so a history move reports the same
+        /// authority-less `ipfs:///<cid>` form the real WebKitGTK does, DIFFERENT
+        /// from the authority `ipfs://<cid>` string stored at forward-load time.
         history: Vec<String>,
         cursor: Option<usize>,
+        /// The URL the backend currently REPORTS as `current_url`, modelling
+        /// WebKitGTK's shared `LoadLifecycle` that the `load-changed` signals
+        /// update ASYNCHRONOUSLY on the GTK loop. A fresh `navigate` reflects its
+        /// target here optimistically (the real backend's `begin(url)`), but a
+        /// `go_back`/`go_forward` does NOT: it stays on the PREVIOUS entry until a
+        /// simulated load signal (`settle_pending_history`) lands it on the target
+        /// entry - exactly the async lag that hid the v0.2.3 regression from the
+        /// old synchronous fake. `None` before any navigation.
+        reported_url: Option<String>,
+        /// A history move (`go_back`/`go_forward`) whose async settle has not
+        /// landed yet: the `history` index the backend WILL report once a load
+        /// signal turns. `reported_url` lags on the old entry until then, so the
+        /// shell's synchronous post-`go_back` `refresh_chrome` sees the OLD url and
+        /// must re-derive later on the settled pump.
+        pending_history: Option<usize>,
         state: LoadState,
         events: VecDeque<LoadEvent>,
         /// Records that the shell forwarded focus/input through the seam, so the
@@ -1001,8 +1030,43 @@ mod tests {
     }
 
     impl BackendInner {
+        /// The URL the backend REPORTS as its current entry - the async-lagging
+        /// `reported_url`, NOT the raw `history[cursor]`. Right after a
+        /// `go_back`/`go_forward` this still names the PREVIOUS entry (the history
+        /// move has not settled), which is exactly the real WebKitGTK behaviour the
+        /// old synchronous fake failed to model.
         fn current(&self) -> Option<&String> {
-            self.cursor.and_then(|c| self.history.get(c))
+            self.reported_url.as_ref()
+        }
+
+        /// Land a pending async history move onto its target entry: the backend now
+        /// REPORTS that entry's (WebKit-normalized) URL as `current_url`. Called by
+        /// a simulated load signal (`settle`/`drive_to_*`), modelling the
+        /// `load-changed` signal that finally settles `current_url` on the GTK
+        /// loop. A no-op when there is no pending history move (a fresh navigate
+        /// already reflected its URL optimistically).
+        fn settle_pending_history(&mut self) {
+            if let Some(idx) = self.pending_history.take() {
+                if let Some(url) = self.history.get(idx).cloned() {
+                    self.reported_url = Some(url);
+                }
+            }
+        }
+    }
+
+    /// Mimic WebKitGTK's normalization of an authority-less `ipfs://<cid>` URL:
+    /// WebKit treats the CID as a PATH under an empty authority and re-reports the
+    /// entry as `ipfs:///<cid>` (triple slash). This is the exact display-string
+    /// variance that made the shell's raw-string `ens_pages` lookup miss after a
+    /// back/forward in v0.2.3; the fake now reproduces it so the regression can no
+    /// longer pass on an identical-string fake. A non-`ipfs://` URL is unchanged.
+    fn webkit_normalize(url: &str) -> String {
+        match url.strip_prefix("ipfs://") {
+            // Already authority-less (`ipfs:///...`): leave it.
+            Some(rest) if rest.starts_with('/') => url.to_string(),
+            // Authority form `ipfs://<cid>...` -> authority-less `ipfs:///<cid>...`.
+            Some(rest) => format!("ipfs:///{rest}"),
+            None => url.to_string(),
         }
     }
 
@@ -1036,6 +1100,10 @@ mod tests {
         /// webview's load signals would.
         fn drive_to_finished(&self) {
             let mut b = self.inner.borrow_mut();
+            // A load signal turning on the GTK loop is where an async history move
+            // finally settles `current_url` onto the target entry (its normalized
+            // form), so drive that first, then report the settled URL.
+            b.settle_pending_history();
             let url = b.current().expect("a load in flight").clone();
             b.state = LoadState::Committed;
             b.events
@@ -1047,6 +1115,7 @@ mod tests {
         /// Report a failed load.
         fn drive_to_failed(&self, reason: &str) {
             let mut b = self.inner.borrow_mut();
+            b.settle_pending_history();
             let url = b.current().expect("a load in flight").clone();
             b.state = LoadState::Failed;
             b.events.push_back(LoadEvent::Failed {
@@ -1128,8 +1197,18 @@ mod tests {
             // A fresh navigation from mid-history drops the forward entries.
             let next = b.cursor.map_or(0, |c| c + 1);
             b.history.truncate(next);
-            b.history.push(url.to_string());
+            // History stores the WebKit-NORMALIZED display URL (the form the
+            // backend later reports for this entry after a back/forward), while the
+            // OPTIMISTIC `reported_url` below is the RAW target the caller passed -
+            // exactly the real backend's `begin(url)` vs. its later settled
+            // `current_url`. For an authority-less `ipfs://<cid>` these two forms
+            // DIFFER, which is the normalization variance the fix must survive.
+            b.history.push(webkit_normalize(url));
             b.cursor = Some(b.history.len() - 1);
+            // A fresh navigate reflects its target immediately (no history-move
+            // async lag) and clears any pending history move.
+            b.reported_url = Some(url.to_string());
+            b.pending_history = None;
             b.state = LoadState::Started;
             // A fresh load starts UNVERIFIED and is only marked verified if this
             // load's bytes actually go through the verified content path — exactly
@@ -1152,6 +1231,7 @@ mod tests {
                 .ok_or_else(|| RendererError::Backend("nothing to reload".into()))?
                 .clone();
             b.state = LoadState::Started;
+            b.pending_history = None;
             b.posture = TrustPosture::UnverifiedOrigin;
             b.ens_origin = false;
             b.mutable_name = false;
@@ -1170,7 +1250,14 @@ mod tests {
             let mut b = self.inner.borrow_mut();
             if let Some(c) = b.cursor {
                 if c > 0 {
+                    // Move the session cursor, but DO NOT settle `current_url` onto
+                    // the target yet: WebKitGTK reports the previous entry until its
+                    // `load-changed` signal turns on the GTK loop. `reported_url`
+                    // stays put; `settle_pending_history` (driven by a simulated
+                    // load signal) lands it. This is the async lag the old fake
+                    // skipped by updating `current_url` synchronously.
                     b.cursor = Some(c - 1);
+                    b.pending_history = Some(c - 1);
                     let url = b.history[c - 1].clone();
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
@@ -1185,7 +1272,11 @@ mod tests {
             let mut b = self.inner.borrow_mut();
             if let Some(c) = b.cursor {
                 if c + 1 < b.history.len() {
+                    // Same async lag as `go_back`: cursor moves now, `current_url`
+                    // settles only when a simulated load signal lands the pending
+                    // history move.
                     b.cursor = Some(c + 1);
+                    b.pending_history = Some(c + 1);
                     let url = b.history[c + 1].clone();
                     b.state = LoadState::Started;
                     b.posture = TrustPosture::UnverifiedOrigin;
@@ -2282,22 +2373,43 @@ mod tests {
         assert_eq!(shell.chrome().url_text, "https://example.com/");
         assert_eq!(shell.chrome().trust_posture, TrustPosture::UnverifiedOrigin);
 
-        // Back onto the ENS entry: the bar shows the NAME, not the CID, and the
-        // ENS posture is re-applied (re-marked on the seam so the verified path
-        // surfaces it), not the plain content-verified the bare CID would show.
+        // Back onto the ENS entry. On the REAL (async) backend `current_url` does
+        // NOT settle onto the ENS CID synchronously inside `go_back`, so the name
+        // cannot appear yet: the bar still follows the OLD entry until the
+        // backend's `load-changed` signal settles. This is exactly the async lag
+        // the upgraded fake now models (the old synchronous fake hid it).
         shell.go_back();
         assert_eq!(
             shell.chrome().url_text,
-            "ronan.eth",
-            "back onto an ENS entry shows the `.eth` name, not the ipfs://<cid>"
+            "https://example.com/",
+            "async history: the name is NOT re-derived before current_url settles"
         );
-        // The underlying entry is still the resolved CID.
+        // Once the history move settles via the pump, the backend reports the ENS
+        // CID in WebKit's authority-less `ipfs:///<cid>` form; the shell re-derives
+        // the `.eth` name off the NORMALIZED key and re-marks the ENS posture axis.
+        // The re-derivation is robust to BOTH v0.2.3 regression causes: the async
+        // settle AND the URL-normalization variance.
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth",
+            "back onto an ENS entry re-derives the `.eth` name on the settled pump, never the ipfs:///<cid>"
+        );
+        assert!(
+            !shell.chrome().url_text.starts_with("ipfs://"),
+            "the ipfs:// / ipfs:/// CID never leaks into the bar"
+        );
+        // The underlying entry is the resolved CID in WebKit's normalized form; the
+        // NORMALIZED key still matches the authority form stored at forward load.
         assert_eq!(
             shell.current_url_for_test().as_deref(),
-            Some(ipfs_uri.as_str())
+            Some(webkit_normalize(&ipfs_uri).as_str())
         );
+        // The verified content path serves the settled entry's bytes; the re-marked
+        // ENS-origin axis makes the posture `NameViaTrustedRpc`, not a bare-CID
+        // `ContentVerified`.
         handle.serve_via_verified_content_path();
-        settle(&mut shell, &handle);
+        shell.pump();
         assert_eq!(shell.chrome().url_text, "ronan.eth");
         assert_eq!(
             shell.chrome().trust_posture,
@@ -2348,11 +2460,19 @@ mod tests {
         shell.navigate("https://example.com/").unwrap();
         settle(&mut shell, &handle);
 
-        // Back onto the mutable ENS entry: name + posture re-derived.
+        // Back onto the mutable ENS entry. As with the immutable case, the name is
+        // re-derived only once the async history move SETTLES via the pump (not
+        // synchronously in `go_back`), off the NORMALIZED key.
         shell.go_back();
-        assert_eq!(shell.chrome().url_text, "mutable.eth");
-        handle.serve_via_verified_content_path();
         settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "mutable.eth",
+            "back onto a mutable ENS entry re-derives the name on the settled pump"
+        );
+        assert!(!shell.chrome().url_text.starts_with("ipfs://"));
+        handle.serve_via_verified_content_path();
+        shell.pump();
         assert_eq!(shell.chrome().url_text, "mutable.eth");
         assert_eq!(
             shell.chrome().trust_posture,

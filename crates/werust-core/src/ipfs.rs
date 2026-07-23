@@ -95,6 +95,49 @@ pub fn parse_ipfs_uri(uri: &str) -> Result<IpfsRef, RendererError> {
     })
 }
 
+/// Canonicalize an `ipfs://`-family URL to a STABLE key on the CID identity, for
+/// keying the shell's `ens_pages` CID<->name map identically at insert and at
+/// every lookup.
+///
+/// The problem this solves: werust stores an authority-form `ipfs://<cid>` at
+/// forward-load time (what `current_url` reports right after `navigate`), but
+/// WebKitGTK reports the SAME history entry back as an authority-LESS
+/// `ipfs:///<cid>` (triple slash: the CID moved into the path, empty authority),
+/// and may add or drop a trailing slash. Keyed on the raw display string, the
+/// stored key and the post-back key differ, so the back/forward re-derive misses
+/// and the raw CID leaks into the bar. Reducing BOTH forms to the same
+/// `<cid>[/path]` key (dropping the scheme, any empty authority, and a bare
+/// trailing slash) makes the forward-store key and the post-back key identical,
+/// so a WebKit-normalized variant of the same entry still matches.
+///
+/// A non-`ipfs://` URL (a plain served page) has no CID identity to canonicalize
+/// and is returned UNCHANGED, so a plain history entry keeps keying on its exact
+/// URL and is wholly unaffected by the ENS association.
+#[must_use]
+pub fn normalize_ens_page_key(url: &str) -> String {
+    // Accept both the authority form (`ipfs://<cid>[/path]`) and the WebKit
+    // authority-less form (`ipfs:///<cid>[/path]`); the CID is the first non-empty
+    // segment, the rest (with its leading `/`) is the path.
+    let Some(rest) = url.strip_prefix("ipfs://") else {
+        return url.to_string();
+    };
+    // `ipfs:///<cid>` leaves a leading `/` (the empty authority); drop it so the
+    // CID is the first segment in both forms.
+    let rest = rest.strip_prefix('/').unwrap_or(rest);
+    let (cid, path) = match rest.split_once('/') {
+        Some((cid, tail)) => (cid, tail),
+        None => (rest, ""),
+    };
+    // A bare trailing slash (`ipfs://<cid>/`) is the same entry as `ipfs://<cid>`;
+    // normalize it away so the two forms share one key.
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        cid.to_string()
+    } else {
+        format!("{cid}/{path}")
+    }
+}
+
 /// Infer the response MIME type from an `ipfs://` reference's path, for
 /// served-page parity.
 ///
@@ -257,6 +300,57 @@ mod tests {
         let r = parse_ipfs_uri("ipfs://bafydir/assets/app.css").expect("a deep path");
         assert_eq!(r.cid, "bafydir");
         assert_eq!(r.path, "/assets/app.css");
+    }
+
+    #[test]
+    fn normalize_ens_page_key_collapses_the_webkit_authority_variance() {
+        // The regression's core: the authority form we store and the
+        // authority-less (triple-slash) form WebKit reports for the SAME entry
+        // must reduce to ONE key, so the forward-store key and the post-back key
+        // match.
+        let stored = normalize_ens_page_key("ipfs://bafycid");
+        let webkit = normalize_ens_page_key("ipfs:///bafycid");
+        assert_eq!(stored, webkit, "ipfs:// and ipfs:/// collapse to one key");
+        assert_eq!(stored, "bafycid");
+    }
+
+    #[test]
+    fn normalize_ens_page_key_ignores_a_bare_trailing_slash() {
+        // A bare root `/` is the same entry as no path.
+        assert_eq!(
+            normalize_ens_page_key("ipfs://bafycid"),
+            normalize_ens_page_key("ipfs://bafycid/")
+        );
+        assert_eq!(
+            normalize_ens_page_key("ipfs:///bafycid/"),
+            "bafycid",
+            "authority-less + trailing slash still reduces to the bare cid"
+        );
+    }
+
+    #[test]
+    fn normalize_ens_page_key_keeps_a_real_sub_resource_path() {
+        // A genuine deep path is part of the entry's identity and is preserved
+        // (only a BARE trailing slash is trimmed), and both URL forms still agree.
+        assert_eq!(
+            normalize_ens_page_key("ipfs://bafydir/assets/app.css"),
+            "bafydir/assets/app.css"
+        );
+        assert_eq!(
+            normalize_ens_page_key("ipfs://bafydir/sub/"),
+            normalize_ens_page_key("ipfs:///bafydir/sub")
+        );
+    }
+
+    #[test]
+    fn normalize_ens_page_key_leaves_a_non_ipfs_url_unchanged() {
+        // A plain served page has no CID identity to canonicalize: it keys on its
+        // exact URL, so the ENS association never touches it.
+        assert_eq!(
+            normalize_ens_page_key("https://example.com/"),
+            "https://example.com/"
+        );
+        assert_eq!(normalize_ens_page_key("about:blank"), "about:blank");
     }
 
     #[test]

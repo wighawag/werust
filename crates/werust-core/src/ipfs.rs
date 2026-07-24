@@ -76,10 +76,29 @@ pub struct IpfsRef {
 /// than guessing. (The CID string is NOT validated here; that is the
 /// [`ContentRetriever`]'s job, which rejects a malformed CID as its own verify
 /// failure so the trust boundary stays in one place.)
+///
+/// A trailing query string (`?…`) and fragment (`#…`) are STRIPPED before the
+/// path is taken: they are request/anchor modifiers, NOT part of the
+/// content-addressed DAG path. This is load-bearing for SvelteKit
+/// `adapter-static` sites, whose client router fetches a route's data as
+/// `<page>/__data.json?x-sveltekit-invalidated=…` on every client-side
+/// navigation — the invalidation query is always present. Without stripping it,
+/// the last path segment becomes a literal `__data.json?x-sveltekit-invalidated=01`
+/// that matches no directory entry, the retrieval fails `PathNotFound`, and
+/// SvelteKit renders its client error boundary (the ronan.eth blog "500").
+/// (`docs/spikes/diagnose-sveltekit-static-over-ipfs-with-ronan-eth-fixture/DIAGNOSIS.md`.)
 pub fn parse_ipfs_uri(uri: &str) -> Result<IpfsRef, RendererError> {
-    let rest = uri
+    let after_scheme = uri
         .strip_prefix("ipfs://")
         .ok_or_else(|| RendererError::InvalidUrl(uri.to_string()))?;
+    // Drop a fragment first (it may itself contain a `?`), then a query string;
+    // the remainder is the content-addressed `<cid>[/path]` the DAG resolves.
+    // A `?`/`#` cannot appear in a CID or a static file path, so cutting at the
+    // first of either is unambiguous.
+    let rest = after_scheme
+        .split_once('#')
+        .map_or(after_scheme, |(head, _)| head);
+    let rest = rest.split_once('?').map_or(rest, |(head, _)| head);
     // The CID authority is up to the first '/'; the rest (with its leading '/')
     // is the path. `ipfs://<cid>` has no '/', so the whole remainder is the CID.
     let (cid, path) = match rest.split_once('/') {
@@ -325,6 +344,39 @@ mod tests {
     }
 
     #[test]
+    fn strips_a_query_string_from_the_resolved_dag_path() {
+        // SvelteKit's client router fetches a route's data as
+        // `<page>/__data.json?x-sveltekit-invalidated=…` on every client-side
+        // navigation (the invalidation param is ALWAYS appended). A query string
+        // is a REQUEST modifier, not part of the content-addressed DAG path: the
+        // resource named in the DAG is `/blog/__data.json`, not
+        // `/blog/__data.json?x-sveltekit-invalidated=01`. The query (and any
+        // fragment) must be stripped before the path is resolved, or the last
+        // segment is a literal `__data.json?x-sveltekit-invalidated=01` that
+        // matches no directory entry and the load fails.
+        let r = parse_ipfs_uri("ipfs://bafydir/blog/__data.json?x-sveltekit-invalidated=01")
+            .expect("a query-carrying data uri");
+        assert_eq!(r.cid, "bafydir");
+        assert_eq!(
+            r.path, "/blog/__data.json",
+            "the query string must not leak into the resolved dag path"
+        );
+    }
+
+    #[test]
+    fn strips_a_fragment_from_the_resolved_dag_path() {
+        // A URL fragment (`#…`) is a client-side anchor, never part of the
+        // content-addressed path; it must be stripped like the query.
+        let r = parse_ipfs_uri("ipfs://bafydir/blog/#posts").expect("a fragment-carrying uri");
+        assert_eq!(r.cid, "bafydir");
+        assert_eq!(r.path, "/blog/");
+        // A bare query on the root authority leaves an empty path, not `?…`.
+        let root = parse_ipfs_uri("ipfs://bafydir?foo=bar").expect("a query on a bare cid");
+        assert_eq!(root.cid, "bafydir");
+        assert_eq!(root.path, "");
+    }
+
+    #[test]
     fn parses_a_deep_sub_resource_path() {
         // A real site's relative asset: the whole tail after the cid is the path
         // the retriever resolves into the DAG.
@@ -452,6 +504,35 @@ mod tests {
         .expect("directory root resolves index.html");
         assert_eq!(response.body, index);
         assert_eq!(response.mime_type, "text/html");
+    }
+
+    #[test]
+    fn a_sveltekit_data_fetch_with_the_invalidated_query_resolves_the_nested_data() {
+        // The end-to-end SvelteKit-over-ipfs regression at the seam: the client
+        // router's `/blog/__data.json?x-sveltekit-invalidated=01` fetch must
+        // resolve the SAME verified `/blog/__data.json` bytes the build ships,
+        // with an application/json MIME. Before the fix the query leaked into the
+        // path segment, so the retriever was asked for a resource named
+        // `__data.json?x-sveltekit-invalidated=01` and the load failed (SvelteKit
+        // then rendered its client error boundary: the reported "500").
+        let cid = "bafysvelteroot";
+        let data_json = br#"{"type":"data","nodes":[null,{"type":"data"}]}"#;
+        let mut retriever = PinnedRetriever::default();
+        // The retriever is keyed on the CLEAN dag path; a leaked query would miss.
+        retriever.put(cid, "/blog/__data.json", data_json);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/blog/__data.json?x-sveltekit-invalidated=01"),
+            },
+        )
+        .expect("the nested __data.json resolves despite the client-nav query");
+        assert_eq!(response.body, data_json);
+        assert_eq!(
+            response.mime_type, "application/json",
+            "__data.json is served as json for parity"
+        );
     }
 
     #[test]

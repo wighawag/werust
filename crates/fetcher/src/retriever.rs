@@ -1645,6 +1645,93 @@ mod tests {
     }
 
     #[test]
+    fn a_sveltekit_adapter_static_build_serves_the_nested_page_and_its_data_json() {
+        // Regression fixture for the SvelteKit-over-ipfs:// class (the ronan.eth
+        // blog "500"). A minimal `@sveltejs/adapter-static` build shape served
+        // content-addressed, network-isolated: a root `index.html`, an `_app/`
+        // asset dir, and a NESTED list route `blog/` carrying BOTH its
+        // prerendered `index.html` AND the `__data.json` the client router
+        // fetches on a client-side nav. werust must resolve + serve the nested
+        // page AND its `__data.json`, every block hash-verified.
+        //
+        // (The client router appends `?x-sveltekit-invalidated=…` to the
+        // `__data.json` fetch; that query is stripped at the `ipfs://` seam
+        // [`werust_core::ipfs::parse_ipfs_uri`] before the path reaches this
+        // retriever, so here the retriever sees the clean `/blog/__data.json`
+        // path this walk resolves. This fixture guards the DAG-walk half; the
+        // seam's own tests guard the query-strip half.)
+        let root_index = b"<!doctype html><title>ronan</title><h1>home</h1>";
+        let (root_index_cid, root_index_block) = file_leaf(root_index);
+
+        // `_app/immutable/entry/app.js` collapsed to one `_app/app.js` leaf: the
+        // point is a real `_app/` asset dir sibling, not the full immutable tree.
+        let app_js = b"export const start=()=>{};";
+        let (app_js_cid, app_js_block) = file_leaf(app_js);
+        let (app_dir_cid, app_dir_block) = directory(&[("app.js".into(), app_js_cid)]);
+
+        // The nested `blog/` list route: its prerendered page AND its client-nav
+        // data. dag-pb requires links in sorted name order
+        // (`__data.json` < `index.html`).
+        let blog_data = br#"{"type":"data","nodes":[null,{"type":"data","data":{"posts":[]}}]}"#;
+        let (blog_data_cid, blog_data_block) = file_leaf(blog_data);
+        let blog_index = b"<!doctype html><title>blog</title><h1>posts</h1>";
+        let (blog_index_cid, blog_index_block) = file_leaf(blog_index);
+        let (blog_dir_cid, blog_dir_block) = directory(&[
+            ("__data.json".into(), blog_data_cid),
+            ("index.html".into(), blog_index_cid),
+        ]);
+
+        // The site root (`_app` < `blog` < `index.html`).
+        let (root_cid, root_block) = directory(&[
+            ("_app".into(), app_dir_cid),
+            ("blog".into(), blog_dir_cid),
+            ("index.html".into(), root_index_cid),
+        ]);
+
+        let blocks = vec![
+            (root_cid, root_block),
+            (root_index_cid, root_index_block),
+            (app_dir_cid, app_dir_block),
+            (app_js_cid, app_js_block),
+            (blog_dir_cid, blog_dir_block),
+            (blog_index_cid, blog_index_block),
+            (blog_data_cid, blog_data_block),
+        ];
+        let car = build_car(&root_cid, &blocks);
+        let r = retriever(car);
+
+        // The root page renders (portfolio-equivalent: a page that works today).
+        let home = r
+            .retrieve(&root_cid.to_string(), "/")
+            .expect("the site root resolves index.html");
+        assert_eq!(home.bytes, root_index);
+
+        // The nested list-route PAGE resolves its index.html (`/blog/`).
+        let blog_page = r
+            .retrieve(&root_cid.to_string(), "/blog/")
+            .expect("the nested blog route resolves its index.html");
+        assert_eq!(blog_page.bytes, blog_index);
+
+        // The nested route's client-nav DATA resolves (`/blog/__data.json`): the
+        // exact resource whose failure produced the SvelteKit "500". Every block
+        // hash-verified through the same walk.
+        let blog_json = r
+            .retrieve(&root_cid.to_string(), "/blog/__data.json")
+            .expect("the nested __data.json resolves");
+        assert_eq!(blog_json.bytes, blog_data);
+
+        // A genuinely-missing nested resource still fails closed (the fix is
+        // correct resolution, not a bypass of verification/fail-closed).
+        let missing = r
+            .retrieve(&root_cid.to_string(), "/blog/does-not-exist.json")
+            .expect_err("a missing nested resource still fails closed");
+        assert!(
+            matches!(missing, RetrieveError::PathNotFound { .. }),
+            "a missing nested resource fails closed, got: {missing:?}"
+        );
+    }
+
+    #[test]
     fn a_chunked_file_reassembles_in_link_order() {
         // A multi-block file directly (not under a directory) reassembles its
         // leaf chunks in link order, every block verified.

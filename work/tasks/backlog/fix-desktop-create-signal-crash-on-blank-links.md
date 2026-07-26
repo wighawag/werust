@@ -4,6 +4,7 @@ slug: fix-desktop-create-signal-crash-on-blank-links
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 blockedBy: []
 covers: [2]
+needsAnswers: true
 ---
 
 ## What to build

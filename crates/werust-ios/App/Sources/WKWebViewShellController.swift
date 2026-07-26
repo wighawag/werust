@@ -367,7 +367,7 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     // its NORMAL path, so an `ipfs://` target still routes to the registered
     // `IpfsSchemeHandler` (hash-verified) and an unsupported scheme is still
     // refused — the hook is a router, not a trust bypass. This mirrors the desktop
-    // `connect_create` handler and the Android `onCreateWindow`; the shared
+    // `create`-signal handler and the Android `onCreateWindow`; the shared
     // in-place rule is `renderer::new_window_action` (pinned by the seam test
     // `a_new_window_request_navigates_the_current_view_in_place`). Manual
     // verification steps: docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.

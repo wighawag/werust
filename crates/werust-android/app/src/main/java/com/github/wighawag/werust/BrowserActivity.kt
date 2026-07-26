@@ -243,7 +243,7 @@ class BrowserActivity : ComponentActivity() {
             // the WebView's NORMAL path keeps trust intact: an `ipfs://` target
             // still reaches `shouldInterceptRequest` (hash-verified) and an
             // unsupported scheme is still refused — the hook is a router, not a
-            // trust bypass. Mirrors the desktop `connect_create` and iOS
+            // trust bypass. Mirrors the desktop `create`-signal and iOS
             // `createWebViewWith` hooks; the shared in-place rule is
             // `renderer::new_window_action`.
             settings.setSupportMultipleWindows(true)

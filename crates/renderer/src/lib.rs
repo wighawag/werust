@@ -630,7 +630,7 @@ pub enum NewWindowAction {
 /// [`NavigateInPlace`](NewWindowAction::NavigateInPlace) url into its NORMAL load
 /// path so verification is preserved, and returns no new view. Pure and
 /// toolkit-free so the routing is pinned display-free at the seam, then reused by
-/// the desktop `connect_create` handler and mirrored by the mobile hooks.
+/// the desktop `create`-signal handler and mirrored by the mobile hooks.
 #[must_use]
 pub fn new_window_action(target_uri: Option<&str>) -> NewWindowAction {
     match target_uri {

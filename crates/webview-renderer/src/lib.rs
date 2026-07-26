@@ -1269,13 +1269,17 @@ mod tests {
         // `docs/adr/0010`): a new-window / `create` request (a `_blank` link or
         // `window.open(url)`) is routed into the CURRENT view via the SAME
         // `navigate` path a normal in-view navigation takes — NOT a second view,
-        // and NOT dropped (field finding C). This models the desktop
-        // `connect_create` handler's body without a GTK loop: the real handler
+        // and NOT dropped (field finding C). This models the desktop `create`
+        // handler's body without a GTK loop: the real handler
         // (`WebViewRenderer::install_new_window_in_place`, backend.rs) reads the
         // navigation action's target URI, applies the shared
         // `renderer::new_window_action` rule, and on `NavigateInPlace` calls
-        // `self.view.load_uri` (the same load `navigate` drives) and returns the
-        // existing view so WebKitGTK spawns no new WebView.
+        // `self.view.load_uri` (the same load `navigate` drives) and returns NULL
+        // so WebKitGTK spawns no new WebView. (Returning the EXISTING view instead
+        // is what ABORTED the process in v0.2.5 — task
+        // `fix-desktop-create-signal-crash-on-blank-links`; the live guard is the
+        // ignored `real_webview_new_window_requests_load_in_place_without_aborting`
+        // below.)
         use renderer::{new_window_action, NewWindowAction};
 
         let mut r = SeamHarness::default();
@@ -1328,6 +1332,118 @@ mod tests {
     fn real_webview_installs_the_new_window_in_place_hook() {
         let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
         r.install_new_window_in_place();
+    }
+
+    /// Turn the GTK main loop until `settled` holds or `timeout_ms` elapses,
+    /// returning whether it settled. The live WebKitGTK tests below need a running
+    /// loop (loads, signals, and JS all complete on it) but must never hang the
+    /// test binary, so every wait is bounded.
+    #[cfg(test)]
+    fn pump_until(settled: impl Fn() -> bool, timeout_ms: u64) -> bool {
+        let ctx = gtk4::glib::MainContext::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            while ctx.iteration(false) {}
+            if settled() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return settled();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// LIVE reproduction of the v0.2.5 desktop CRASH and its fix (task
+    /// `fix-desktop-create-signal-crash-on-blank-links`): a real `target="_blank"`
+    /// link click AND a real `window.open(url)` call, driven through a REAL
+    /// WebKitGTK view on a running GTK loop, must load IN THE CURRENT view and
+    /// must NOT abort the process.
+    ///
+    /// This is the only automatable guard for the crash: the bug was a WebKitGTK
+    /// SIGABRT (`std::optional<WebCore::WindowFeatures>` `_M_is_engaged()` failed)
+    /// raised inside the `create` signal emission when the handler returned the
+    /// EXISTING view instead of a NEW view or NULL, so it is invisible to any
+    /// display-free test — and it kills the test binary rather than failing an
+    /// assertion, which is exactly what makes it a usable red/green signal here.
+    ///
+    /// Ignored by default (needs a display; a `WebViewRenderer` initializes GTK).
+    /// Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored --test-threads=1`. Both
+    /// triggers share ONE renderer because GTK/WebKit want a single view driven on
+    /// one loop. The fixture pages are served off an in-memory custom scheme, so
+    /// the test never touches the network.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_new_window_requests_load_in_place_without_aborting() {
+        use webkit6::prelude::WebViewExt;
+
+        const SOURCE: &str = "blanktest://source/";
+        const VIA_BLANK: &str = "blanktest://opened-in-blank/";
+        const VIA_WINDOW_OPEN: &str = "blanktest://opened-via-window-open/";
+
+        let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        // Serve the fixture pages from memory: the source page carries BOTH
+        // triggers (a `target="_blank"` link and a `window.open(url)` button), and
+        // each target is a distinct page so the assertion below can tell which
+        // trigger navigated the view.
+        r.register_scheme_handler(
+            "blanktest",
+            Box::new(|req: renderer::SchemeRequest| {
+                let body = if req.uri.starts_with(SOURCE) {
+                    format!(
+                        "<!doctype html><html><body>\
+                         <a id=\"blank\" href=\"{VIA_BLANK}\" target=\"_blank\">blank</a>\
+                         <button id=\"popup\" onclick=\"window.open('{VIA_WINDOW_OPEN}')\">popup</button>\
+                         </body></html>"
+                    )
+                } else {
+                    format!("<!doctype html><html><body><p>{}</p></body></html>", req.uri)
+                };
+                Ok(renderer::SchemeResponse {
+                    body: body.into_bytes(),
+                    mime_type: "text/html".to_string(),
+                })
+            }),
+        );
+        r.install_new_window_in_place();
+
+        let view = r.web_view().clone();
+
+        // Drive each trigger from the source page and assert the SAME view ended up
+        // on the target: the new-window request navigated in place (no second
+        // window, no dropped link) and, crucially, the process is still alive —
+        // before the fix the `create` emission aborted here.
+        for (trigger, expected) in [
+            ("document.getElementById('blank').click()", VIA_BLANK),
+            ("document.getElementById('popup').click()", VIA_WINDOW_OPEN),
+        ] {
+            r.navigate(SOURCE).expect("the fixture source page loads");
+            let on_source = pump_until(
+                || view.uri().as_deref() == Some(SOURCE) && !view.is_loading(),
+                10_000,
+            );
+            assert!(
+                on_source,
+                "the fixture source page settled before {trigger}"
+            );
+
+            r.evaluate_javascript(trigger);
+            let navigated = pump_until(|| view.uri().as_deref() == Some(expected), 10_000);
+            assert!(
+                navigated,
+                "`{trigger}` navigated the EXISTING view to {expected} \
+                 (in place, not dropped and not a second window); saw {:?}",
+                view.uri()
+            );
+            // The shell's URL bar follows the new URL because the hook began the
+            // lifecycle on the same URL it loaded.
+            assert_eq!(
+                r.current_url().as_deref(),
+                Some(expected),
+                "the seam's current URL follows the in-place `{trigger}` load"
+            );
+        }
     }
 
     #[test]

@@ -331,8 +331,18 @@ description = "A `target=\"_blank\"` link / `window.open(url)` (a new-window req
 # is a router, not a trust bypass. Desktop: `WebViewRenderer::install_new_window_in_place`
 # wires WebKitGTK's `create` signal (crates/webview-renderer/src/backend.rs),
 # reads the navigation action's target URI, loads it into the existing
-# `self.view` via `load_uri`, and returns the EXISTING view so no second WebView
-# is created. iOS: `WKWebViewShellController` conforms to `WKUIDelegate` and
+# `self.view` via `load_uri`, and returns NULL so no second WebView is created.
+# It wires `create` through the RAW glib signal (`connect_local("create", …)`,
+# answering `None::<gtk4::Widget>`) because the typed `connect_create` binding's
+# generated return type is a NON-nullable `gtk::Widget` and cannot express the
+# "no new view" answer the signal contract requires; returning the EXISTING view
+# instead (the shipped v0.2.5 shape) made WebKitGTK deref an empty
+# `std::optional<WebCore::WindowFeatures>` and ABORT on every `_blank` click
+# (task `fix-desktop-create-signal-crash-on-blank-links`, before/after repro +
+# why `decide-policy` alone is not enough — it never fires for `window.open` —
+# at docs/spikes/fix-desktop-create-signal-crash-on-blank-links/README.md; the
+# live guard is the ignored `real_webview_new_window_requests_load_in_place_without_aborting`).
+# iOS: `WKWebViewShellController` conforms to `WKUIDelegate` and
 # implements `webView(_:createWebViewWith:for:windowFeatures:)` — on a nil target
 # frame it calls `webView.load(navigationAction.request)` on the main view and
 # returns nil (no new WKWebView). Android: `BrowserActivity` sets

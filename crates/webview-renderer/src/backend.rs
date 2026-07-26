@@ -386,10 +386,32 @@ impl WebViewRenderer {
     /// [`navigate`](Renderer::navigate) drives — so an `ipfs://`/ENS `_blank`
     /// target still flows through the hash-verified `ipfs://` scheme handler
     /// (`install_ipfs`) and an unsupported scheme is still refused: the hook is a
-    /// ROUTER, not a trust bypass. It then returns the EXISTING view widget so
-    /// WebKitGTK creates NO second WebView (no real new window/tab), and
-    /// optimistically begins the lifecycle so the shell's URL bar follows the new
-    /// URL exactly as a normal navigation does.
+    /// ROUTER, not a trust bypass. It optimistically begins the lifecycle so the
+    /// shell's URL bar follows the new URL exactly as a normal navigation does,
+    /// and then returns **NULL** so WebKitGTK creates NO second WebView (no real
+    /// new window/tab) — the navigation already happened in place.
+    ///
+    /// WHY THE RAW `connect_local("create", …)` AND NOT THE TYPED
+    /// [`connect_create`](webkit6::prelude::WebViewExt::connect_create) (task
+    /// `fix-desktop-create-signal-crash-on-blank-links`,
+    /// `docs/spikes/fix-desktop-create-signal-crash-on-blank-links/README.md`):
+    /// WebKitGTK's `create` contract is "return a NEWLY ALLOCATED
+    /// `WebKitWebView`, or NULL". The typed `connect_create` binding is generated
+    /// as `Fn(&Self, &NavigationAction) -> gtk::Widget` — a NON-nullable return —
+    /// so there is no way to answer NULL through it, which is what pushed the
+    /// first version of this hook into returning the EXISTING view. That answer is
+    /// neither a new view nor NULL: WebKitGTK then applied the new window's
+    /// `WindowFeatures` to the returned view and dereferenced an EMPTY
+    /// `std::optional<WebCore::WindowFeatures>`, ABORTING the process
+    /// (`_M_is_engaged()` failed) on every `_blank` click — the v0.2.5 desktop
+    /// crash. The RAW glib signal API has no such nullability restriction, so the
+    /// handler below answers a real NULL `GtkWidget`, the documented
+    /// "no new view" answer. This keeps ONE hook covering BOTH triggers: a
+    /// `target="_blank"` link AND `window.open(url)` both reach `create`, whereas
+    /// `decide-policy`/`NewWindowAction` fires only for the `_blank` link
+    /// (`window.open` goes `LocalDOMWindow::open` -> `WebCore::createWindow` ->
+    /// `Chrome::createWindow` -> `create`, never through `PolicyChecker::checkNewWindowPolicy`),
+    /// so routing via decide-policy alone would silently drop `window.open`.
     ///
     /// It is registered directly on `self.view` (not through the seam) for the
     /// same reason `install_provider`/`install_ipfs` are: the handler captures a
@@ -403,12 +425,15 @@ impl WebViewRenderer {
         // on the GTK loop the `create` signal fires on.
         let view_for_create = self.view.clone();
         let life = self.life.clone();
-        self.view.connect_create(move |_view, navigation_action| {
-            // The target URI comes from the navigation action's request (the
-            // `_blank`/`window.open` destination). `NavigationAction::request`
-            // takes `&mut`, so clone the action to read it.
-            let mut action = navigation_action.clone();
-            let target = action.request().and_then(|req| req.uri());
+        self.view.connect_local("create", false, move |args| {
+            // `create` is `GtkWidget* (WebKitWebView*, WebKitNavigationAction*)`:
+            // args[0] is the emitting view, args[1] the navigation action carrying
+            // the `_blank`/`window.open` destination. `NavigationAction::request`
+            // takes `&mut`, so take an owned action to read it.
+            let target = args
+                .get(1)
+                .and_then(|arg| arg.get::<webkit6::NavigationAction>().ok())
+                .and_then(|mut action| action.request().and_then(|req| req.uri()));
             if let NewWindowAction::NavigateInPlace { url } = new_window_action(target.as_deref()) {
                 // Load in the EXISTING view via the SAME path `navigate` drives, so
                 // the normal navigation/scheme handling (ipfs:// verification,
@@ -417,9 +442,10 @@ impl WebViewRenderer {
                 life.borrow_mut().begin(&url);
                 view_for_create.load_uri(&url);
             }
-            // Return the EXISTING view: WebKitGTK creates NO new WebView, so there
-            // is no second window/tab — the navigation happened in place above.
-            view_for_create.clone().upcast::<gtk4::Widget>()
+            // Answer NULL: WebKitGTK creates NO new WebView (and applies no
+            // `WindowFeatures` to anything), so there is no second window/tab and
+            // no abort — the navigation happened in place above.
+            Some(None::<gtk4::Widget>.to_value())
         });
     }
 

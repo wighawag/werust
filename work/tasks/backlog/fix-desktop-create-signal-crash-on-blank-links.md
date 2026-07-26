@@ -60,3 +60,7 @@ MECHANISM CORRECTION (the agent's STOP was right): do NOT use decide-policy as t
 ## Requeue 2026-07-26
 
 The corrected raw-connect_local('create')-returns-NULL fix IS implemented on this branch (commit 4eeda6b: connect_local('create', ...) -> Some(None::<gtk4::Widget>.to_value()), plus ADR-0010/matrix/README updated). The run only failed at FINAL INTEGRATION due to a transient Anthropic API overloaded_error, not a code problem. On re-claim: continue from this branch tip, re-run the gate, and integrate — the implementation should need no further changes unless the gate/review finds a real issue.
+
+## Requeue 2026-07-26
+
+PAUSED: Anthropic API is currently OVERLOADED (overloaded_error), causing transient-infra failures at integration. The corrected fix is already implemented + pushed on this branch (4eeda6b: raw connect_local('create')->NULL, both _blank+window.open in place, ADR-0010/matrix/README updated). Re-drive (dorfl do task:fix-desktop-create-signal-crash-on-blank-links --isolated --review --merge --allow-backlog) once the API recovers; it continues from this branch tip, re-gates, and integrates.

@@ -49,9 +49,26 @@ The FACT the edge reads is the core's, and is pinned headlessly:
 
 The EDGE WIRING (a live Android `Activity` + the dispatcher) is runtime-only — it cannot run inside this repo's pure-Rust `verify` gate (`cargo fmt && clippy && build && test`, no Android SDK). Its strongest automatable guard is the SOURCE-SHAPE half of the same test file, which parses `BrowserActivity.kt` and asserts: the AndroidX callback is registered on `onBackPressedDispatcher` and starts disabled; `systemBackCallback.isEnabled = chrome.canGoBack` sits in `refreshChrome` alongside `backButton.isEnabled = chrome.canGoBack`; `handleOnBackPressed` drives `driveCore { core.goBack() }` (never an inline UI-thread core call); and neither `onBackPressed()` nor `KEYCODE_BACK` is used. Same spirit as the config-shape guard `crates/werust-core/tests/release_plumbing_shape.rs`.
 
-## Manual verification (on a device or emulator)
+The runtime BEHAVIOUR that no gate can assert was verified by hand on an emulator; the executed run is recorded below.
+
+## Device verification (on a device or emulator)
 
 Build/install the debug APK: `cd crates/werust-android && ANDROID_HOME=<sdk> ./gradlew :app:assembleDebug`, then `adb install -r app/build/outputs/apk/debug/app-debug.apk`.
+
+### Run of record: EXECUTED and PASSED, 2026-07-26
+
+Steps 1-4 and 6 were actually run on an emulator (AVD `Medium_Phone_API_36.1`, Android API 36.1 x86_64, headless `-no-window`, gesture navigation active — `settings get secure navigation_mode` = `2`) against the debug APK built from this branch. The oracle for "exited vs stayed" was `adb shell dumpsys activity activities | grep ResumedActivity`, and the page/URL-bar/button state was read from `adb shell screencap`. Results:
+
+- Step 1 (one entry, on-screen `◀` greyed): `KEYCODE_BACK` -> resumed activity became `com.google.android.apps.nexuslauncher/.NexusLauncherActivity`, i.e. the app EXITED via the platform default. PASS.
+- Step 2 (two entries after following the `example.com` -> `iana.org` link, on-screen `◀` enabled): `KEYCODE_BACK` -> resumed activity was STILL `com.github.wighawag.werust/.BrowserActivity` and the URL bar went back to `https://example.com/` with the previous page rendered. The app did NOT exit; it navigated. PASS.
+- Step 3 (lockstep): after that Back, `◀` was greyed and `▶` had become enabled — the on-screen affordance and the system Back agreed at every observed point. PASS.
+- Step 4 (walk back to the start, then exit): one further `KEYCODE_BACK` from the first entry -> launcher resumed, i.e. exit. PASS.
+- Step 6 (gesture navigation): the same two-entry setup driven with the left-edge swipe (`input swipe 5 1200 700 1200`) instead of the key event -> the app stayed resumed and the URL bar returned to `https://example.com/`. The dispatcher handles the gesture identically. PASS.
+- No ANR/crash: `adb logcat -d -b crash,main` showed no `ANR`, no `FATAL`, and no "Not responding" for the app across the run.
+
+Step 5 (no ANR on a slow `.eth` history navigation) was NOT run in this pass: it needs live ENS/IPNS egress from the emulator, so it stays a manual step for a networked device. The ANR-safety of this path is otherwise covered structurally — `handleOnBackPressed` uses the very same `driveCore { core.goBack() }` expression as the on-screen button, asserted by `the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button`.
+
+### The steps
 
 1. **Back exits at the start of history.** Launch the app (it opens the start URL, one entry). Press the system Back button (or perform the OS back gesture). EXPECT: the app EXITS (the platform default) — the on-screen `◀` is greyed out at this point, and system Back agrees with it.
 2. **Back navigates history.** Navigate somewhere (type a URL and press Go), then follow a link so there are at least two entries. Press system Back. EXPECT: the WebView goes BACK ONE PAGE — exactly what tapping the on-screen `◀` does — and the URL bar + trust indicator update to the previous page. The app does NOT exit.

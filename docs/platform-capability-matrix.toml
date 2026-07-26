@@ -99,7 +99,9 @@ description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back t
 # Activity), so it carries the strongest automatable guard — the source-shape test
 # `crates/werust-android/rust/tests/system_back_wiring_shape.rs` (in the pure-Rust
 # `verify` gate) plus the headless `can_go_back` assertion of the fact it reads —
-# and recorded manual device steps at
+# and device steps that were EXECUTED and PASSED on an API-36 emulator (navigates
+# with history, exits without, lockstep with the on-screen control, same for the
+# gesture-nav edge swipe), recorded at
 # docs/spikes/android-hardware-back-button-navigates-history/README.md. Task
 # `android-hardware-back-button-navigates-history`, field finding v0.2.5.
 # Desktop/iOS are `n-a` because neither platform HAS this affordance: a GTK window

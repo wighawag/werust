@@ -6,8 +6,10 @@
   false and the System WebView reports `prefers-color-scheme: dark` to match the
   OS setting.
 
-  Parented on the DARK framework Material theme (no androidx, matching the app's
-  deliberate no-androidx stance) so the app chrome + UA-styled WebView controls
+  Parented on the DARK framework Material theme (a FRAMEWORK theme, not an
+  androidx/AppCompat one: the module's single androidx dependency,
+  `androidx.activity`, is taken only for the system-Back dispatcher and brings no
+  theming requirement) so the app chrome + UA-styled WebView controls
   theme dark alongside the page. isLightTheme=false is the load-bearing bit: the
   WebView reads it to report `prefers-color-scheme: dark`.
 

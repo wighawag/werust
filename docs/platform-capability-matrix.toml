@@ -80,6 +80,40 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "system-back-navigates-history"
+description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back the OS itself routes to the app) navigates BACK ONE PAGE in session history when there IS back history \u2014 the SAME action the on-screen Back control drives \u2014 and only falls through to the platform default (leave/exit the app) when there is none."
+# The affordance itself is ANDROID-ONLY: only Android gives the OS a Back button/
+# gesture that is delivered to the app and, unhandled, finishes the Activity.
+# Where it exists, it must read the SAME core fact the on-screen control does
+# (`ChromeState::can_go_back`) and drive the SAME core action (`go_back`), so the
+# two Back affordances can never disagree — that lockstep is what this row pins.
+# Android: `BrowserActivity` registers an AndroidX `OnBackPressedCallback` on the
+# Activity's `onBackPressedDispatcher` (the non-deprecated API; the deprecated
+# `onBackPressed()` override and raw KEYCODE_BACK interception are NOT used); its
+# `isEnabled` is set from `chrome.canGoBack` in `refreshChrome`, right where
+# `backButton.isEnabled` is, and `handleOnBackPressed` runs the SAME
+# `driveCore { core.goBack() }` the on-screen `◀` does — off the UI thread, so the
+# ANR fix (task `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
+# Disabled means the platform default runs, so Back at the start of history exits
+# the app as a normal browser does. The edge wiring is runtime-only (a live
+# Activity), so it carries the strongest automatable guard — the source-shape test
+# `crates/werust-android/rust/tests/system_back_wiring_shape.rs` (in the pure-Rust
+# `verify` gate) plus the headless `can_go_back` assertion of the fact it reads —
+# and recorded manual device steps at
+# docs/spikes/android-hardware-back-button-navigates-history/README.md. Task
+# `android-hardware-back-button-navigates-history`, field finding v0.2.5.
+# Desktop/iOS are `n-a` because neither platform HAS this affordance: a GTK window
+# has no OS Back button (its Back is the on-screen control, covered by
+# `back-forward`), and iOS has no hardware Back button either — its platform
+# analogue is the WKWebView edge-swipe back GESTURE, a different affordance with
+# its own enablement (`allowsBackForwardNavigationGestures`), noted as a separate
+# signal in work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md
+# rather than folded into this row.
+desktop = { state = "n-a", reason = "a GTK desktop window has no OS-level system Back button/gesture the app must handle; desktop Back is the on-screen control (capability `back-forward`)" }
+ios = { state = "n-a", reason = "iOS has no hardware/system Back button delivered to the app; its platform analogue is the WKWebView edge-swipe back gesture, a distinct affordance tracked separately (see work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md)" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "ens-eth-resolution"
 description = "Bare `.eth` URL-bar entry resolved namehash -> resolver -> contenthash (ENS)."
 # Toolkit-free core logic in `werust-core` (ens/contenthash/ethereum modules),

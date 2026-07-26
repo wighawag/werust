@@ -1,7 +1,6 @@
 package com.github.wighawag.werust
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Paint
@@ -25,6 +24,8 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -41,8 +42,15 @@ import java.util.concurrent.Executors
  * chrome exactly as the desktop GTK pump folds WebKitGTK's signals. The URL bar
  * text, the Back/Forward enablement, and the load status are all read from the
  * core — the edge keeps no history or load state of its own.
+ *
+ * The SYSTEM Back button is a second view onto the SAME core action the
+ * on-screen `◀` drives (see [systemBackCallback]); it is an
+ * [androidx.activity.ComponentActivity] (rather than a bare `android.app.Activity`)
+ * ONLY so the non-deprecated [androidx.activity.OnBackPressedDispatcher] is
+ * available — see
+ * `docs/spikes/android-hardware-back-button-navigates-history/README.md`.
  */
-class BrowserActivity : Activity() {
+class BrowserActivity : ComponentActivity() {
 
     private val core = WerustCore()
 
@@ -96,6 +104,45 @@ class BrowserActivity : Activity() {
      * provider shim to inject.
      */
     private var providerScript: String = ""
+
+    /**
+     * The SYSTEM/hardware Back handler: makes the Android Back button/gesture go
+     * BACK ONE PAGE in history instead of exiting the app.
+     *
+     * WHY (task `android-hardware-back-button-navigates-history`, field finding
+     * v0.2.5 "the android back button do not navigate back in history like it
+     * should"): before this, only the on-screen `◀` [backButton] drove
+     * [WerustCore.goBack]; nothing handled system Back, so it fell through to the
+     * platform default and FINISHED the Activity even mid-history — the app just
+     * quit.
+     *
+     * HOW IT STAYS COHERENT WITH THE ON-SCREEN BUTTON:
+     * * [OnBackPressedCallback.isEnabled] is the core's `chrome.canGoBack`, set
+     *   in [refreshChrome] right where [backButton]'s enablement is, from the
+     *   SAME fact — the two Back affordances can never disagree. It starts
+     *   DISABLED (no history at launch).
+     * * When it is DISABLED (nothing to go back to) the dispatcher falls through
+     *   to the platform default, so Back at the start of history EXITS the app,
+     *   as a normal browser does.
+     * * [handleOnBackPressed] drives the core through [driveCore] — the SAME
+     *   off-UI-thread path the on-screen button uses — so this second Back entry
+     *   point does NOT reintroduce a UI-thread-blocking core call and the ANR fix
+     *   (task `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
+     *
+     * WHY THIS API: [androidx.activity.OnBackPressedDispatcher] is the
+     * non-deprecated route and the ONE implementation that works across versions
+     * — it bridges to the Android 13+ `OnBackInvokedDispatcher` when the app opts
+     * into predictive back (`android:enableOnBackInvokedCallback`, deliberately
+     * NOT opted into yet: see the recorded decision at
+     * `docs/spikes/android-hardware-back-button-navigates-history/README.md`), and
+     * uses the legacy dispatch below that. The deprecated `onBackPressed()`
+     * override is NOT used.
+     */
+    private val systemBackCallback = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            driveCore { core.goBack() }
+        }
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -239,6 +286,13 @@ class BrowserActivity : Activity() {
         root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         setContentView(root)
 
+        // Handle the SYSTEM/hardware Back button: while the core has back history
+        // it navigates history (the SAME `driveCore { core.goBack() }` the
+        // on-screen `◀` runs); with no history left the callback is disabled and
+        // the platform default exits the Activity. Registered with this Activity
+        // as the lifecycle owner so it is removed on destroy.
+        onBackPressedDispatcher.addCallback(this, systemBackCallback)
+
         // Launch a browsing surface: drive the core to the start URL OFF the UI
         // thread (a `.eth`/ENS start URL would otherwise block onCreate on the
         // blocking resolve), then let the core surface it onto the WebView on the
@@ -330,6 +384,10 @@ class BrowserActivity : Activity() {
             urlBar.paintFlags = urlBar.paintFlags and Paint.UNDERLINE_TEXT_FLAG.inv()
         }
         backButton.isEnabled = chrome.canGoBack
+        // The SYSTEM Back button in LOCKSTEP with the on-screen one: both read the
+        // SAME `canGoBack` fact here, so they never disagree. Disabled = the
+        // platform default runs and Back EXITS (no history left to walk).
+        systemBackCallback.isEnabled = chrome.canGoBack
         forwardButton.isEnabled = chrome.canGoForward
         stopButton.isEnabled = chrome.loading
         reloadButton.isEnabled = !chrome.loading

@@ -41,9 +41,22 @@ android {
 }
 
 dependencies {
-    // No androidx dependency: the OS edge uses a plain framework `Activity`,
-    // `WebView`, and widgets, so the Rust core is the only linked "library" that
-    // matters and the app builds with just the platform SDK.
+    // The ONLY androidx dependency, and a deliberate one (task
+    // `android-hardware-back-button-navigates-history`): `ComponentActivity`
+    // brings the non-deprecated `OnBackPressedDispatcher`, which is how the
+    // SYSTEM/hardware Back button is handled so it navigates page history instead
+    // of exiting the app. The framework `android.app.Activity` offers only the
+    // DEPRECATED `onBackPressed()` override, and the platform
+    // `OnBackInvokedDispatcher` exists only on Android 13+ (this app's minSdk is
+    // 21), so the dispatcher is the one implementation that works across
+    // versions. It also bridges to the platform Android 13+ API if/when
+    // predictive back is opted into. See
+    // docs/spikes/android-hardware-back-button-navigates-history/README.md.
+    //
+    // Everything else stays framework-only: the OS edge still uses the plain
+    // platform `WebView` + widgets + framework themes, so the Rust core remains
+    // the only linked "library" that matters.
+    implementation("androidx.activity:activity:1.9.3")
 }
 
 // ---------------------------------------------------------------------------

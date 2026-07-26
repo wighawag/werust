@@ -18,9 +18,11 @@
 //! `src/lib.rs`, plus `the_system_back_affordance_is_enabled_exactly_when_the_core_can_go_back`
 //! below, which pins the fact the edge reads). What is NOT otherwise assertable
 //! is that the EDGE really reads that fact for the SYSTEM Back affordance, in
-//! lockstep with the on-screen button, on the SAME off-UI-thread path. So this
-//! test PARSES the Kotlin edge and asserts that shape — the strongest automatable
-//! guard for runtime-only wiring, in the same spirit as the config-shape test
+//! lockstep with the on-screen button, on the SAME off-UI-thread path; the
+//! Gradle/Kotlin build is not in `verify` either, so nothing else in the gate
+//! sees that wiring at all. So this test PARSES the Kotlin edge and asserts that
+//! shape: the strongest automatable guard for runtime-only wiring, and the ONLY
+//! gate-side cover it has, in the same spirit as the config-shape test
 //! `crates/werust-core/tests/release_plumbing_shape.rs`. The manual on-device
 //! steps that cover the rest are recorded at
 //! `docs/spikes/android-hardware-back-button-navigates-history/README.md`.
@@ -33,7 +35,15 @@
 //!    (`the_system_back_callback_is_registered_on_the_dispatcher_and_starts_disabled`,
 //!    `the_system_back_enabled_state_is_in_lockstep_with_can_go_back`).
 //! 3. The SAME off-UI-thread path as the on-screen button (the ANR fix is not
-//!    regressed) (`the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button`).
+//!    regressed) (`the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button`):
+//!    `handleOnBackPressed`'s OWN body (brace-matched by [`kotlin_block_body`],
+//!    so it stops at the handler's closing brace) must contain
+//!    `driveCore { core.goBack() }` and, once that dispatch is stripped, must
+//!    contain no remaining `core.` call at all. Emptying the handler, replacing
+//!    the dispatch with an inline UI-thread `core.goBack()`, or ADDING an inline
+//!    core call beside the dispatch each turn that assertion RED (verified by
+//!    mutation), and [`the_block_extractor_stops_at_the_matching_brace`] pins
+//!    the extractor itself so the guard cannot silently go vacuous again.
 //! 4. Lockstep enablement, set where the on-screen button's is
 //!    (`the_system_back_enabled_state_is_in_lockstep_with_can_go_back`).
 //! 5. The non-deprecated API only — no `onBackPressed()` override
@@ -54,22 +64,84 @@ fn browser_activity_source() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The body of a `private fun <name>(...)` in the Kotlin source: everything from
-/// its signature up to the next member declaration at class-member indentation.
-/// Deliberately coarse — enough to assert "these two assignments are in the SAME
-/// method" without pinning the method's exact contents.
-fn kotlin_fun_body<'a>(source: &'a str, signature: &str) -> &'a str {
+/// The first occurrence of `pat` in `bytes` at or after `from`, as an absolute
+/// index. Byte-wise (never slices the `str`) so the scan below can walk a source
+/// that contains multi-byte characters (`◀`, `⛔`, and the like) without landing
+/// mid-char.
+fn find_from(bytes: &[u8], from: usize, pat: &[u8]) -> Option<usize> {
+    if from >= bytes.len() {
+        return None;
+    }
+    bytes[from..]
+        .windows(pat.len())
+        .position(|w| w == pat)
+        .map(|i| from + i)
+}
+
+/// The BODY of a Kotlin declaration: the text between the braces of the block
+/// that opens after `signature`, bounded at its MATCHING closing brace.
+///
+/// POSITION-bounded, deliberately. The first version of this guard ended a body
+/// at the next member declaration picked by KIND, not position (`\n    private
+/// fun ` was tried BEFORE `\n    override fun `), so for `handleOnBackPressed` it
+/// matched the far-later `private fun driveCore` and swallowed the whole of
+/// `onCreate`. The criterion-3 assertion below was then satisfied by the
+/// ON-SCREEN button's `compactNavButton("◀") { driveCore { core.goBack() } }`
+/// line and stayed GREEN even with an EMPTY handler, i.e. a vacuous guard. Brace
+/// matching cannot drift that way: the body ends where the block ends. The
+/// extractor's own regression guard is
+/// [`the_block_extractor_stops_at_the_matching_brace`].
+///
+/// `//` line comments, `/* */` block comments and `"`/`"""` string literals are
+/// skipped, so a brace inside one cannot unbalance the count.
+fn kotlin_block_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let bytes = source.as_bytes();
     let start = source
         .find(signature)
-        .unwrap_or_else(|| panic!("BrowserActivity.kt must declare `{signature}`"));
-    let rest = &source[start + signature.len()..];
-    let end = rest
-        .find("\n    private fun ")
-        .or_else(|| rest.find("\n    fun "))
-        .or_else(|| rest.find("\n    override fun "))
-        .or_else(|| rest.find("\n    private inner class "))
-        .unwrap_or(rest.len());
-    &rest[..end]
+        .unwrap_or_else(|| panic!("the Kotlin source must declare `{signature}`"));
+    let after = start + signature.len();
+    let open =
+        find_from(bytes, after, b"{").unwrap_or_else(|| panic!("`{signature}` must open a block"));
+
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        let tail = &bytes[i..];
+        if tail.starts_with(b"//") {
+            i = find_from(bytes, i, b"\n").unwrap_or(bytes.len());
+            continue;
+        }
+        if tail.starts_with(b"/*") {
+            i = find_from(bytes, i + 2, b"*/").map_or(bytes.len(), |e| e + 2);
+            continue;
+        }
+        if tail.starts_with(b"\"\"\"") {
+            i = find_from(bytes, i + 3, b"\"\"\"").map_or(bytes.len(), |e| e + 3);
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `open` and `i` are both ASCII brace positions, so these are
+                    // char boundaries.
+                    return &source[open + 1..i];
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("`{signature}` opens a block that is never closed")
 }
 
 #[test]
@@ -156,7 +228,7 @@ fn the_system_back_enabled_state_is_in_lockstep_with_can_go_back() {
     // affordances can never disagree — and when `canGoBack` is false the callback
     // is disabled, which is what lets the default Back exit the app.
     let src = browser_activity_source();
-    let refresh = kotlin_fun_body(&src, "private fun refreshChrome()");
+    let refresh = kotlin_block_body(&src, "private fun refreshChrome()");
     assert!(
         refresh.contains("backButton.isEnabled = chrome.canGoBack"),
         "the on-screen back button's enablement must be the core's `canGoBack`, in `refreshChrome`"
@@ -176,16 +248,25 @@ fn the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button()
     // actions off the UI thread, and a second Back entry point calling the core
     // inline would regress it.
     let src = browser_activity_source();
-    let handler = kotlin_fun_body(&src, "override fun handleOnBackPressed()");
+    // POSITION-bounded (brace-matched) so this is the handler's OWN body and
+    // nothing else. See `kotlin_block_body` and
+    // `the_block_extractor_stops_at_the_matching_brace`. Emptying the handler, or
+    // making it call the core inline, FAILS these asserts.
+    let handler = kotlin_block_body(&src, "override fun handleOnBackPressed()");
     assert!(
         handler.contains("driveCore { core.goBack() }"),
         "`handleOnBackPressed` must drive the core through `driveCore` (off the UI thread), the \
-         SAME path the on-screen `◀` button uses"
+         SAME path the on-screen `◀` button uses; its body is instead: {handler:?}"
     );
+    // Every core call in the handler must be the dispatched one: strip the
+    // `driveCore` dispatch and NOTHING that touches the core may remain, so an
+    // added inline `core.<anything>()` on the UI thread (the ANR regression this
+    // guards) fails here.
+    let without_dispatch = handler.replace("driveCore { core.goBack() }", "");
     assert!(
-        !handler.contains("core.goBack()\n") && !handler.contains("core.goBack();"),
+        !without_dispatch.contains("core."),
         "the system Back must not call the core inline on the UI thread (that would regress the \
-         ANR fix)"
+         ANR fix); the handler has a core call outside `driveCore`: {without_dispatch:?}"
     );
     // The on-screen button's dispatch is the reference path: both must be the
     // same expression, so a future change to one is visibly a change to both.
@@ -193,6 +274,74 @@ fn the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button()
         src.contains("compactNavButton(\"◀\") { driveCore { core.goBack() } }"),
         "the on-screen `◀` button must keep driving the core through `driveCore` (the reference \
          path the system Back mirrors)"
+    );
+}
+
+#[test]
+fn the_block_extractor_stops_at_the_matching_brace() {
+    // The guard ON the guard. `kotlin_block_body` is what makes the criterion-3
+    // assertion above mean anything, so its bounding is pinned here on a fixture
+    // shaped exactly like the trap that made the first version of this test
+    // VACUOUS: a short `override fun` whose next member declaration is an
+    // `override fun`, with a `private fun` (carrying a decoy `driveCore { ... }`
+    // call) FURTHER DOWN. A kind-ordered terminator search reaches for the
+    // `private fun` first and swallows everything between; a brace-matched one
+    // stops at the handler's own closing brace.
+    let fixture = "\
+class Fixture {
+    private val cb = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            driveCore { core.goBack() }
+        }
+    }
+
+    override fun onCreate() {
+        val b = compactNavButton(\"◀\") { driveCore { core.goBack() } }
+    }
+
+    private fun driveCore(action: () -> Unit) {
+    }
+}
+";
+    let handler = kotlin_block_body(fixture, "override fun handleOnBackPressed()");
+    assert!(
+        handler.contains("driveCore { core.goBack() }"),
+        "the extracted body must contain the handler's own dispatch"
+    );
+    assert!(
+        !handler.contains("compactNavButton"),
+        "the extracted body must STOP at the handler's matching brace; it must not run on into \
+         `onCreate` and pick up the ON-SCREEN button's dispatch (the vacuity that made the first \
+         version of this guard pass with an EMPTY handler); it extracted: {handler:?}"
+    );
+
+    // An EMPTY handler must extract as empty, which is what makes the
+    // criterion-3 assertion FAIL when the handler stops driving the core.
+    let emptied = fixture.replace("            driveCore { core.goBack() }\n", "");
+    assert!(
+        !kotlin_block_body(&emptied, "override fun handleOnBackPressed()").contains("core.goBack"),
+        "an EMPTY handler must extract as an empty body (otherwise the criterion-3 guard is \
+         vacuous)"
+    );
+
+    // Braces inside comments and string literals must not unbalance the count.
+    let tricky = "\
+    private fun sample() {
+        // a brace in a comment: }
+        /* and a block one: } */
+        val s = \"a literal brace }\"
+        val t = \"\"\"a raw one }\"\"\"
+        val marker = 1
+    }
+
+    private fun after() {
+        val outside = 2
+    }
+";
+    let body = kotlin_block_body(tricky, "private fun sample()");
+    assert!(
+        body.contains("val marker = 1") && !body.contains("val outside = 2"),
+        "braces inside comments/strings must not end the body early or late; extracted: {body:?}"
     );
 }
 

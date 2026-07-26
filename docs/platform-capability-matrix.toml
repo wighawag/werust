@@ -96,12 +96,17 @@ description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back t
 # ANR fix (task `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
 # Disabled means the platform default runs, so Back at the start of history exits
 # the app as a normal browser does. The edge wiring is runtime-only (a live
-# Activity), so it carries the strongest automatable guard — the source-shape test
+# Activity) and the Gradle/Kotlin build is not in the gate either, so its ONLY
+# gate-side cover is the source-shape test
 # `crates/werust-android/rust/tests/system_back_wiring_shape.rs` (in the pure-Rust
-# `verify` gate) plus the headless `can_go_back` assertion of the fact it reads —
-# and device steps that were EXECUTED and PASSED on an API-36 emulator (navigates
-# with history, exits without, lockstep with the on-screen control, same for the
-# gesture-nav edge swipe), recorded at
+# `verify` gate), whose handler assertion is brace-bounded to
+# `handleOnBackPressed`'s own body and was re-checked by mutation (emptying the
+# handler, an inline UI-thread core call, an extra core call beside the dispatch,
+# or a removed/relocated lockstep line each turn it red). Alongside it sit the
+# headless `can_go_back` assertion of the fact the edge reads, and device steps
+# that were EXECUTED and PASSED on an API-36 emulator (navigates with history,
+# exits without, lockstep with the on-screen control, same for the gesture-nav
+# edge swipe), recorded at
 # docs/spikes/android-hardware-back-button-navigates-history/README.md. Task
 # `android-hardware-back-button-navigates-history`, field finding v0.2.5.
 # Desktop/iOS are `n-a` because neither platform HAS this affordance: a GTK window

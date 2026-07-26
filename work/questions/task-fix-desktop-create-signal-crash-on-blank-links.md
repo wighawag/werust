@@ -214,3 +214,13 @@
 <!-- q13 fields: id=q13 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q14
+
+**'task:fix-desktop-create-signal-crash-on-blank-links' was bounced — how should we proceed?**
+
+> transient infra: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CdQWKxQednhops3jviXb6"      }
+
+<!-- q14 fields: id=q14 kind=stuck -->
+
+**Your answer** (write below this line):

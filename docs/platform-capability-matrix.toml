@@ -373,3 +373,28 @@ description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an 
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "ipfs-web-pathing-fallback"
+description = "Resolve a NOT-FOUND path under an `ipfs://` site per the SITE's own IPFS web-pathing rules (the root `_redirects` file, IPIP-0002, plus the default root `404.html`): serve the site's custom error page with its honest not-found status, or a `200` rewrite target at the requested URL, instead of werust's hard error."
+# The whole decision + the rule grammar is the SHARED toolkit-free core
+# (`werust-core`'s `redirects` module + the `PathNotFound` branch of
+# `werust_core::ipfs::resolve_ipfs_request`), so every context gets identical
+# behaviour through the SAME hash-verified retrieval it already uses — no
+# verification bypass, and a target may never leave the site's root CID. What each
+# edge adds is only carrying the resolved STATUS onto its platform response so a
+# site's own 404 page renders as the not-found it is (rather than werust claiming
+# 200 for a page the site declared missing): desktop maps a non-OK status onto a
+# `webkit6::URISchemeResponse` (`set_status`) in the `WebKitRequestSink`
+# (crates/webview-renderer/src/backend.rs); Android answers the status-taking
+# `WebResourceResponse` overload in `shouldInterceptRequest` (BrowserActivity.kt,
+# via `WerustCore.Resolution.Ok.status` over the `nativeResolutionStatus` JNI
+# accessor); iOS answers an `HTTPURLResponse` carrying the status on the
+# `WKURLSchemeTask` (WKWebViewShellController.swift, via
+# `werust_ios_resolution_status`). Task
+# `ipfs-web-redirects-and-404-fallback-support`; the subset that landed (served
+# 200/404/410/451 + placeholders/splat; 3xx navigation NOT followed) is recorded in
+# docs/spikes/ipfs-web-redirects-and-404-fallback-support/DECISIONS.md.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

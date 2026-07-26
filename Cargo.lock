@@ -2770,6 +2770,8 @@ dependencies = [
  "cid",
  "ens-normalize",
  "fetcher",
+ "ipld-core",
+ "ipld-dagpb",
  "libp2p-identity",
  "quick-protobuf",
  "renderer",
@@ -2779,8 +2781,10 @@ dependencies = [
  "serde_ipld_dagcbor",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "sha3",
  "toml",
+ "unsigned-varint",
  "ureq",
 ]
 

@@ -472,10 +472,31 @@ final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
             return
         }
         switch core.resolveIpfs(url.absoluteString) {
-        case .some(.success(let mimeType, let body)):
-            let response = URLResponse(
-                url: url, mimeType: mimeType,
-                expectedContentLength: body.count, textEncodingName: "utf-8")
+        case .some(.success(let mimeType, let body, let status)):
+            // A NON-OK status WITH a body is the site's own error page, named by
+            // its `_redirects` (IPIP-0002) for a path that is not in its DAG: it
+            // must RENDER, but as the not-found it honestly is (what a gateway
+            // does), so it is answered as an `HTTPURLResponse` carrying that
+            // status. A plain `URLResponse` cannot express a status, so the
+            // ordinary 200 case keeps using it. The bytes are the same
+            // hash-verified bytes either way.
+            let response: URLResponse
+            if status == 200 {
+                response = URLResponse(
+                    url: url, mimeType: mimeType,
+                    expectedContentLength: body.count, textEncodingName: "utf-8")
+            } else {
+                response =
+                    HTTPURLResponse(
+                        url: url, statusCode: status, httpVersion: "HTTP/1.1",
+                        headerFields: [
+                            "Content-Type": mimeType,
+                            "Content-Length": String(body.count),
+                        ])
+                    ?? URLResponse(
+                        url: url, mimeType: mimeType,
+                        expectedContentLength: body.count, textEncodingName: "utf-8")
+            }
             urlSchemeTask.didReceive(response)
             urlSchemeTask.didReceive(body)
             urlSchemeTask.didFinish()
@@ -525,7 +546,7 @@ final class WerustSchemeHandler: NSObject, WKURLSchemeHandler {
             return
         }
         switch core.applySettings(url.absoluteString) {
-        case .some(.success(let mimeType, let body)):
+        case .some(.success(let mimeType, let body, _)):
             let response = URLResponse(
                 url: url, mimeType: mimeType,
                 expectedContentLength: body.count, textEncodingName: "utf-8")

@@ -331,6 +331,41 @@ pub struct SchemeResponse {
     pub mime_type: String,
     /// The response body bytes.
     pub body: Vec<u8>,
+    /// The HTTP-equivalent status to answer the intercepted request with.
+    ///
+    /// Almost always [`STATUS_OK`]: a resolved resource IS the requested
+    /// resource. It is carried on the seam because a content-addressed site can
+    /// legitimately answer a request with a NON-OK status while still returning
+    /// a body to render: the IPFS `_redirects` convention (IPIP-0002) lets a
+    /// site name its OWN error page for a path that is not in its DAG (e.g.
+    /// `/* /404.html 404`), and a gateway serves that page with a not-found
+    /// status. Without this field werust could serve such a page only by lying
+    /// about the status (claiming OK for a page the site declared missing), so
+    /// the honest status travels with the body and each backend maps it onto its
+    /// platform response.
+    ///
+    /// This is NOT a redirect channel: a 3xx would be a NAVIGATION (a URL-bar
+    /// and identity change), which belongs to the navigation path, not to
+    /// answering an intercepted request in place.
+    pub status: u16,
+}
+
+/// The ordinary status of a resolved [`SchemeResponse`]: the resource was found
+/// and its bytes are the answer.
+pub const STATUS_OK: u16 = 200;
+
+impl SchemeResponse {
+    /// A plain OK response: `body` IS the requested resource, served as
+    /// `mime_type`. The overwhelmingly common case, so a caller never has to
+    /// spell [`STATUS_OK`] out.
+    #[must_use]
+    pub fn ok(mime_type: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            body,
+            status: STATUS_OK,
+        }
+    }
 }
 
 /// A pointer input event forwarded to the live view.
@@ -1117,10 +1152,10 @@ mod tests {
         r.register_scheme_handler(
             "ipfs",
             Box::new(|req| {
-                Ok(SchemeResponse {
-                    mime_type: "text/html".into(),
-                    body: format!("resolved {}", req.uri).into_bytes(),
-                })
+                Ok(SchemeResponse::ok(
+                    "text/html",
+                    format!("resolved {}", req.uri).into_bytes(),
+                ))
             }),
         );
         assert_eq!(r.script_handlers, ["werustProvider"]);

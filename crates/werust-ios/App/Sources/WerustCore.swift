@@ -83,7 +83,8 @@ final class WerustCore {
             } else {
                 body = Data()
             }
-            return .success(mimeType: mime, body: body)
+            let status = Int(werust_ios_resolution_status(res))
+            return .success(mimeType: mime, body: body, status: status)
         } else {
             let reason = werust_ios_resolution_error(res).map { c -> String in
                 defer { werust_ios_string_free(c) }
@@ -129,7 +130,7 @@ final class WerustCore {
             } else {
                 body = Data()
             }
-            return .success(mimeType: mime, body: body)
+            return .success(mimeType: mime, body: body, status: Int(werust_ios_resolution_status(res)))
         } else {
             let reason = werust_ios_resolution_error(res).map { c -> String in
                 defer { werust_ios_string_free(c) }
@@ -140,14 +141,19 @@ final class WerustCore {
     }
 
     /// The outcome of resolving an intercepted `ipfs://` request through the core:
-    /// verified bytes + MIME type, or a fail-closed reason. Mirrors the Rust
-    /// `SchemeResolution`; the `WKURLSchemeHandler` turns `.success` into a
+    /// verified bytes + MIME type + status, or a fail-closed reason. Mirrors the
+    /// Rust `SchemeResolution`; the `WKURLSchemeHandler` turns `.success` into a
     /// `URLResponse` + data on the task and `.failure` into `didFailWithError`,
     /// so the desktop fail-closed posture holds on iOS. Also serves the internal
     /// `werust://settings` page (via [applySettings]): the `.success` bytes are the
     /// page HTML, the `.failure` reason a fail-closed host error.
+    ///
+    /// `status` is 200 for an ordinary resource; it is carried so a site's own
+    /// error page (named by its `_redirects`, IPIP-0002, for a path that is not in
+    /// its DAG) is answered with the HONEST not-found status while still
+    /// rendering, exactly as an IPFS gateway serves it.
     enum Resolution {
-        case success(mimeType: String, body: Data)
+        case success(mimeType: String, body: Data, status: Int)
         case failure(reason: String)
     }
 

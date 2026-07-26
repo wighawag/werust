@@ -567,11 +567,29 @@ class BrowserActivity : ComponentActivity() {
             return when (val resolution = core.resolveIpfs(url)) {
                 null -> null // not an intercepted scheme: let the WebView handle it
                 is WerustCore.Resolution.Ok ->
-                    WebResourceResponse(
-                        resolution.mimeType,
-                        "utf-8",
-                        ByteArrayInputStream(resolution.body),
-                    )
+                    if (resolution.status == 200) {
+                        WebResourceResponse(
+                            resolution.mimeType,
+                            "utf-8",
+                            ByteArrayInputStream(resolution.body),
+                        )
+                    } else {
+                        // A NON-OK status WITH a body: the site's own error page,
+                        // named by its `_redirects` (IPIP-0002) for a path that is
+                        // not in its DAG. The bytes are the same hash-verified
+                        // bytes; only the reported status differs, so the page
+                        // renders as the not-found it honestly is (what a gateway
+                        // does) instead of werust claiming 200 for a page the site
+                        // declared missing.
+                        WebResourceResponse(
+                            resolution.mimeType,
+                            "utf-8",
+                            resolution.status,
+                            statusReasonPhrase(resolution.status),
+                            emptyMap<String, String>(),
+                            ByteArrayInputStream(resolution.body),
+                        )
+                    }
                 is WerustCore.Resolution.Error ->
                     // Fail closed: an HTTP error status with no body, so unverified
                     // bytes never render and the failure is honest. The reason is
@@ -594,6 +612,18 @@ class BrowserActivity : ComponentActivity() {
                         ByteArrayInputStream(ByteArray(0)),
                     )
             }
+        }
+
+        /**
+         * The HTTP reason phrase for a status a site's `_redirects` may ask for
+         * (IPIP-0002 §2.3). `WebResourceResponse` rejects a blank phrase, so every
+         * supported status has one and anything else falls back to a generic one.
+         */
+        private fun statusReasonPhrase(status: Int): String = when (status) {
+            404 -> "Not Found"
+            410 -> "Gone"
+            451 -> "Unavailable For Legal Reasons"
+            else -> "Status $status"
         }
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {

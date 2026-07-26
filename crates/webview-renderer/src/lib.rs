@@ -690,10 +690,10 @@ mod tests {
         r.register_scheme_handler(
             "ipfs",
             Box::new(|req| {
-                Ok(renderer::SchemeResponse {
-                    mime_type: "text/html".into(),
-                    body: format!("resolved {}", req.uri).into_bytes(),
-                })
+                Ok(renderer::SchemeResponse::ok(
+                    "text/html",
+                    format!("resolved {}", req.uri).into_bytes(),
+                ))
             }),
         );
         assert_eq!(r.script_handlers, ["werustProvider"]);
@@ -1400,10 +1400,7 @@ mod tests {
                 } else {
                     format!("<!doctype html><html><body><p>{}</p></body></html>", req.uri)
                 };
-                Ok(renderer::SchemeResponse {
-                    body: body.into_bytes(),
-                    mime_type: "text/html".to_string(),
-                })
+                Ok(renderer::SchemeResponse::ok("text/html", body.into_bytes()))
             }),
         );
         r.install_new_window_in_place();

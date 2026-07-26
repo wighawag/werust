@@ -55,8 +55,19 @@ use werust_core::{BrowserShell, ChromeState};
 /// Android too.
 #[derive(Debug)]
 pub enum SchemeResolution {
-    /// A verified resolution: the MIME type and the verified body bytes.
-    Ok { mime_type: String, body: Vec<u8> },
+    /// A verified resolution: the MIME type, the verified body bytes, and the
+    /// HTTP-equivalent status to answer with.
+    ///
+    /// `status` is 200 for an ordinary resource. It is carried because a site's
+    /// IPFS `_redirects` rules (IPIP-0002) can name its OWN error page for a
+    /// path that is not in its DAG (`/* /404.html 404`), which a gateway serves
+    /// WITH a not-found status; reporting 200 there would lie about a page the
+    /// site declared missing.
+    Ok {
+        mime_type: String,
+        body: Vec<u8>,
+        status: u16,
+    },
     /// A fail-closed resolution failure carrying its legible reason.
     Err { reason: String },
 }
@@ -187,6 +198,7 @@ impl CoreSession {
                 SchemeResolution::Ok {
                     mime_type: response.mime_type,
                     body: response.body,
+                    status: response.status,
                 }
             }
             Err(e) => SchemeResolution::Err {
@@ -708,6 +720,25 @@ mod jni_exports {
         env.byte_array_from_slice(body)
             .map(|a| a.into_raw())
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The HTTP-equivalent status of a successful resolution (0 on an error
+    /// result, which Kotlin answers with its own fail-closed status instead).
+    ///
+    /// Almost always 200. It is exposed so the Kotlin edge can answer a
+    /// `WebResourceResponse` with the HONEST status when a site's `_redirects`
+    /// (IPIP-0002) names its own error page for a path that is not in its DAG
+    /// (`/* /404.html 404`) — the page renders, but as the not-found it is.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeResolutionStatus(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jni::sys::jint {
+        match unsafe { resolution(handle) } {
+            super::SchemeResolution::Ok { status, .. } => jni::sys::jint::from(*status),
+            super::SchemeResolution::Err { .. } => 0,
+        }
     }
 
     /// The fail-closed reason of an error resolution (empty string on success).

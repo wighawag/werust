@@ -103,6 +103,12 @@ char *werust_ios_resolution_mime(const WerustSchemeResolution *resolution);
 const uint8_t *werust_ios_resolution_body(const WerustSchemeResolution *resolution);
 size_t werust_ios_resolution_body_len(const WerustSchemeResolution *resolution);
 
+/* The HTTP-equivalent status of a successful resolution (0 on an error result).
+ * Almost always 200; a site's _redirects rules (IPIP-0002) may name its own
+ * error page for a path not in its DAG (`/* /404.html 404`), which is answered
+ * with that honest status while still rendering, as a gateway does. */
+uint16_t werust_ios_resolution_status(const WerustSchemeResolution *resolution);
+
 /* The fail-closed reason of an error resolution, as a heap C string (empty on
  * success). Free with werust_ios_string_free. */
 char *werust_ios_resolution_error(const WerustSchemeResolution *resolution);

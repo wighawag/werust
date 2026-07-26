@@ -38,6 +38,7 @@ pub mod ethereum;
 pub mod ipfs;
 pub mod ipns;
 pub mod provider;
+pub mod redirects;
 pub mod retrieval;
 
 /// The URL-bar suffix that marks a bare entry as an ENS name to resolve: a

@@ -736,10 +736,7 @@ mod tests {
         b.register_scheme_handler(
             "ipfs",
             Box::new(|request: SchemeRequest| {
-                Ok(SchemeResponse {
-                    mime_type: "text/html".to_string(),
-                    body: request.uri.into_bytes(),
-                })
+                Ok(SchemeResponse::ok("text/html", request.uri.into_bytes()))
             }),
         );
 

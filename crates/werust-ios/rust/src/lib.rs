@@ -54,8 +54,19 @@ use werust_core::{BrowserShell, ChromeState};
 /// fail-closed posture desktop has (a hash mismatch fails the load, never
 /// renders) holds on iOS too.
 pub enum SchemeResolution {
-    /// A verified resolution: the MIME type and the verified body bytes.
-    Ok { mime_type: String, body: Vec<u8> },
+    /// A verified resolution: the MIME type, the verified body bytes, and the
+    /// HTTP-equivalent status to answer with.
+    ///
+    /// `status` is 200 for an ordinary resource. It is carried because a site's
+    /// IPFS `_redirects` rules (IPIP-0002) can name its OWN error page for a
+    /// path that is not in its DAG (`/* /404.html 404`), which a gateway serves
+    /// WITH a not-found status; reporting 200 there would lie about a page the
+    /// site declared missing.
+    Ok {
+        mime_type: String,
+        body: Vec<u8>,
+        status: u16,
+    },
     /// A fail-closed resolution failure carrying its legible reason.
     Err { reason: String },
 }
@@ -185,6 +196,7 @@ impl CoreSession {
                 SchemeResolution::Ok {
                     mime_type: response.mime_type,
                     body: response.body,
+                    status: response.status,
                 }
             }
             Err(e) => SchemeResolution::Err {
@@ -239,6 +251,7 @@ impl CoreSession {
             Ok(response) => SchemeResolution::Ok {
                 mime_type: response.mime_type,
                 body: response.body,
+                status: response.status,
             },
             Err(e) => SchemeResolution::Err {
                 reason: e.to_string(),
@@ -645,6 +658,26 @@ mod ffi {
     ) -> usize {
         match resolution.as_ref() {
             Some(super::SchemeResolution::Ok { body, .. }) => body.len(),
+            _ => 0,
+        }
+    }
+
+    /// The HTTP-equivalent status of a successful resolution (0 on an error
+    /// result, which Swift fails the task on instead).
+    ///
+    /// Almost always 200. It is exposed so the Swift `WKURLSchemeHandler` can
+    /// answer with the HONEST status when a site's `_redirects` (IPIP-0002) names
+    /// its own error page for a path that is not in its DAG (`/* /404.html 404`)
+    /// — the page renders, but as the not-found it is.
+    ///
+    /// # Safety
+    /// `resolution` is a live handle from `werust_ios_resolve_ipfs`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_resolution_status(
+        resolution: *const super::SchemeResolution,
+    ) -> u16 {
+        match resolution.as_ref() {
+            Some(super::SchemeResolution::Ok { status, .. }) => *status,
             _ => 0,
         }
     }
@@ -1073,7 +1106,9 @@ mod tests {
             .apply_settings("werust://settings")
             .expect("the werust scheme is intercepted and routed to the core");
         match resolution {
-            SchemeResolution::Ok { mime_type, body } => {
+            SchemeResolution::Ok {
+                mime_type, body, ..
+            } => {
                 assert_eq!(mime_type, "text/html");
                 let html = String::from_utf8(body).expect("the page is UTF-8 HTML");
                 assert!(

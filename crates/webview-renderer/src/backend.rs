@@ -673,11 +673,24 @@ impl crate::offthread::RequestSink for WebKitRequestSink {
     fn finish(&mut self, response: renderer::SchemeResponse) {
         let bytes = glib::Bytes::from(&response.body);
         let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
-        self.request.finish(
-            &stream,
-            response.body.len() as i64,
-            Some(&response.mime_type),
-        );
+        if response.status == renderer::STATUS_OK {
+            self.request.finish(
+                &stream,
+                response.body.len() as i64,
+                Some(&response.mime_type),
+            );
+            return;
+        }
+        // A NON-OK status with a body: the site's own error page, named by its
+        // `_redirects` (IPIP-0002) for a path that is not in its DAG. WebKitGTK's
+        // plain `finish` can only say 200, which would LIE about a page the site
+        // declared missing, so the status travels on a `URISchemeResponse` and the
+        // page still renders — exactly what a gateway does. The bytes are the same
+        // hash-verified bytes; only the reported status differs.
+        let scheme_response = webkit6::URISchemeResponse::new(&stream, response.body.len() as i64);
+        scheme_response.set_content_type(&response.mime_type);
+        scheme_response.set_status(u32::from(response.status), None);
+        self.request.finish_with_response(&scheme_response);
     }
 
     fn fail(&mut self, error: RendererError) {

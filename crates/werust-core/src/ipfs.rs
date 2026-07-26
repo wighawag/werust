@@ -33,6 +33,11 @@
 use fetcher::{ContentRetriever, RetrieveError};
 use renderer::{RendererError, SchemeRequest, SchemeResponse};
 
+use crate::redirects::{
+    match_fallback, parse_redirects, FallbackAction, RedirectsError, DEFAULT_404_PATH,
+    REDIRECTS_PATH,
+};
+
 /// The custom scheme this module resolves: `ipfs`.
 ///
 /// Kept as one constant so the backend that registers the scheme handler
@@ -234,6 +239,17 @@ fn retrieve_error_to_renderer_error(err: RetrieveError) -> RendererError {
     RendererError::Backend(format!("ipfs:// content-addressed load failed: {err}"))
 }
 
+/// Map a `_redirects` problem onto the seam's [`RendererError`], so a broken,
+/// off-root, or unsupported rule FAILS the load with its distinct reason.
+///
+/// IPIP-0002 §3.4 requires an unreadable/unparseable redirects file to be
+/// surfaced rather than ignored: ignoring it would serve a DIFFERENT page than
+/// the site's author wrote (or a hard not-found where they wrote a fallback), so
+/// every [`RedirectsError`] is a legible failed load.
+fn redirects_error_to_renderer_error(err: RedirectsError) -> RendererError {
+    RendererError::Backend(format!("ipfs:// _redirects fallback failed: {err}"))
+}
+
 /// Resolve an intercepted `ipfs://` [`SchemeRequest`] through the verifiable
 /// content-retrieval [`ContentRetriever`](fetcher::ContentRetriever) seam,
 /// returning the verified bytes as a [`SchemeResponse`] to render, or a
@@ -254,6 +270,17 @@ fn retrieve_error_to_renderer_error(err: RetrieveError) -> RendererError {
 /// a [`RendererError`] and NOTHING is rendered: verification gates the load. On
 /// success the verified bytes are handed back with a MIME type inferred from the
 /// path for served-page parity.
+///
+/// # The one exception: a NOT-FOUND path consults the site's own rules
+///
+/// A [`PathNotFound`](RetrieveError::PathNotFound) — and ONLY that — is handed to
+/// the site's IPFS web-pathing rules before it fails: a root `_redirects`
+/// (IPIP-0002, [`crate::redirects`]) or the default root `404.html`, exactly as
+/// an HTTP gateway resolves it, which is what makes `jolly-roger.eth/unknown`
+/// serve that site's own 404 page instead of a hard error. The fallback target is
+/// fetched through the SAME verifying retrieval, by path under the SAME root CID,
+/// so this adds NO verification bypass and NO cross-site reach; a site that ships
+/// neither file is completely unchanged (the feature is opt-in per site).
 pub fn resolve_ipfs_request(
     retriever: &dyn ContentRetriever,
     request: &SchemeRequest,
@@ -263,13 +290,142 @@ pub fn resolve_ipfs_request(
     // block in the resolved resource's DAG hashed to its own CID. Any failure is
     // a hard failure that fails the load, never a silent render of unverified
     // bytes.
-    let content = retriever
-        .retrieve(&reference.cid, &reference.path)
-        .map_err(retrieve_error_to_renderer_error)?;
-    Ok(SchemeResponse {
-        mime_type: mime_type_for_path(&reference.path).to_string(),
-        body: content.bytes,
-    })
+    match retriever.retrieve(&reference.cid, &reference.path) {
+        Ok(content) => Ok(SchemeResponse::ok(
+            mime_type_for_path(&reference.path),
+            content.bytes,
+        )),
+        // The ONLY branch the site's web-pathing rules are consulted on: a path
+        // that is not in the DAG (IPIP-0002 §3.3, "no forced redirects"). An
+        // existing resource is served above, untouched, so a catch-all rule can
+        // never shadow a real page and a site without the opt-in files pays no
+        // cost at all.
+        Err(not_found @ RetrieveError::PathNotFound { .. }) => {
+            resolve_not_found_fallback(retriever, &reference, not_found)
+        }
+        Err(other) => Err(retrieve_error_to_renderer_error(other)),
+    }
+}
+
+/// Resolve a NOT-FOUND path per the SITE's own web-pathing rules (IPIP-0002),
+/// or surface the original honest not-found.
+///
+/// The order mirrors an HTTP gateway: the site's root `_redirects` first (its
+/// first matching rule decides), then the DEFAULT root `404.html` convention,
+/// then — for a site that ships neither — the untouched fail-closed
+/// [`PathNotFound`](RetrieveError::PathNotFound) werust always gave. So the
+/// feature is strictly OPT-IN per site.
+///
+/// TRUST (the load-bearing part): the `_redirects` file AND the rule's target are
+/// fetched through the SAME [`ContentRetriever`] as any other resource, by PATH
+/// under the SAME root CID — every block hash-verified, the budget unchanged,
+/// nothing bypassed. A target that would leave the root CID is refused by
+/// [`match_fallback`] before it is ever fetched (the unique-origin rule recorded
+/// in [`crate::redirects`]), so a site's rules can only ever serve that site's
+/// own content. A target that does not exist is itself a not-found (fail-closed,
+/// no second round of rules).
+fn resolve_not_found_fallback(
+    retriever: &dyn ContentRetriever,
+    reference: &IpfsRef,
+    not_found: RetrieveError,
+) -> Result<SchemeResponse, RendererError> {
+    match probe_optional(retriever, &reference.cid, REDIRECTS_PATH)? {
+        Some(file) => {
+            let rules = parse_redirects(&file).map_err(redirects_error_to_renderer_error)?;
+            match match_fallback(&rules, &reference.path) {
+                Some(Ok(FallbackAction::Serve { path, status })) => {
+                    serve_fallback_target(retriever, reference, &path, status)
+                }
+                Some(Err(e)) => Err(redirects_error_to_renderer_error(e)),
+                // The file exists but says nothing about this path: fall through
+                // to the default `404.html` convention, then to the honest
+                // not-found.
+                None => serve_default_404(retriever, reference, not_found),
+            }
+        }
+        // No `_redirects` at all: the site simply did not opt in to rules.
+        None => serve_default_404(retriever, reference, not_found),
+    }
+}
+
+/// Probe for an OPTIONAL fallback file (`_redirects`, `404.html`) under the root
+/// CID, distinguishing "the site does not ship it" from "it is there but did not
+/// verify".
+///
+/// [`Ok(None)`] means ABSENT, which is not an error: the caller falls through to
+/// the next convention and ultimately to the original honest not-found (so a site
+/// that opted into nothing behaves exactly as it did before this feature).
+/// Absence arrives in two shapes and BOTH must count as absent: a local
+/// [`PathNotFound`](RetrieveError::PathNotFound) when the root's listing is
+/// already at hand, and a [`Source`](RetrieveError::Source) transport failure
+/// when the gateway answers the scoped request for a non-existent path with an
+/// HTTP error (how absence is signalled over that transport, and gateway-
+/// dependent). Treating a transport failure on an OPTIONAL probe as absence
+/// cannot yield content and cannot weaken verification: the worst case is the
+/// pre-existing honest not-found.
+///
+/// Every VERIFICATION-class failure (tamper, incomplete DAG, budget, malformed,
+/// unsupported codec/hash, invalid CID) still fails the load on its real reason:
+/// the fallback never degrades a tamper signal into a plain not-found.
+fn probe_optional(
+    retriever: &dyn ContentRetriever,
+    cid: &str,
+    path: &str,
+) -> Result<Option<Vec<u8>>, RendererError> {
+    match retriever.retrieve(cid, path) {
+        Ok(content) => Ok(Some(content.bytes)),
+        Err(RetrieveError::PathNotFound { .. } | RetrieveError::Source(_)) => Ok(None),
+        Err(other) => Err(retrieve_error_to_renderer_error(other)),
+    }
+}
+
+/// The DEFAULT custom-error-page convention: a site with a root `404.html` (and
+/// no rule naming something else) serves it, with a not-found status, for a path
+/// that is not in the DAG. A site without one keeps the original honest
+/// not-found.
+fn serve_default_404(
+    retriever: &dyn ContentRetriever,
+    reference: &IpfsRef,
+    not_found: RetrieveError,
+) -> Result<SchemeResponse, RendererError> {
+    match probe_optional(retriever, &reference.cid, DEFAULT_404_PATH)? {
+        Some(bytes) => Ok(SchemeResponse {
+            mime_type: mime_type_for_path(DEFAULT_404_PATH).to_string(),
+            body: bytes,
+            status: 404,
+        }),
+        // No default error page either: the site opted into nothing, so werust's
+        // honest fail-closed not-found stands, exactly as before this feature.
+        None => Err(retrieve_error_to_renderer_error(not_found)),
+    }
+}
+
+/// Fetch a matched rule's target through the SAME verified retrieval and answer
+/// the REQUESTED url with it, at the rule's status.
+///
+/// Nothing navigates: the bytes are the answer to the intercepted request, so a
+/// `200` rewrite (the SPA/PWA case) and a `404`/`410`/`451` error page both leave
+/// the URL bar — and therefore the page's identity and trust posture — exactly
+/// where they were. A target that does not resolve is itself a not-found, named
+/// so the site author can see WHICH target was missing; the rules are NOT
+/// re-evaluated for it (no fallback loops).
+fn serve_fallback_target(
+    retriever: &dyn ContentRetriever,
+    reference: &IpfsRef,
+    target: &str,
+    status: u16,
+) -> Result<SchemeResponse, RendererError> {
+    match retriever.retrieve(&reference.cid, target) {
+        Ok(content) => Ok(SchemeResponse {
+            mime_type: mime_type_for_path(target).to_string(),
+            body: content.bytes,
+            status,
+        }),
+        Err(RetrieveError::PathNotFound { .. }) => Err(RendererError::Backend(format!(
+            "ipfs:// _redirects fallback failed: target `{target}` is not in the site's dag"
+        ))),
+        Err(other) => Err(retrieve_error_to_renderer_error(other)),
+    }
 }
 
 #[cfg(test)]
@@ -291,6 +447,9 @@ mod tests {
     struct PinnedRetriever {
         ok: HashMap<(String, String), Vec<u8>>,
         err: HashMap<(String, String), RetrieveError>,
+        /// Every `(cid, path)` asked for, in call order, so a test can assert
+        /// WHICH extra retrievals the fallback did (and did not) make.
+        asked: std::cell::RefCell<Vec<String>>,
     }
 
     impl PinnedRetriever {
@@ -304,10 +463,16 @@ mod tests {
         fn fail(&mut self, cid: &str, path: &str, err: RetrieveError) {
             self.err.insert((cid.to_string(), path.to_string()), err);
         }
+
+        /// The paths retrieved so far, in call order.
+        fn asked_paths(&self) -> Vec<String> {
+            self.asked.borrow().clone()
+        }
     }
 
     impl ContentRetriever for PinnedRetriever {
         fn retrieve(&self, cid: &str, path: &str) -> Result<RetrievedContent, RetrieveError> {
+            self.asked.borrow_mut().push(path.to_string());
             let key = (cid.to_string(), path.to_string());
             if let Some(err) = self.err.get(&key) {
                 return Err(err.clone());
@@ -673,5 +838,303 @@ mod tests {
         )
         .expect_err("a missing sub-resource fails the load");
         assert!(matches!(err, RendererError::Backend(_)));
+    }
+
+    // -----------------------------------------------------------------------
+    // The `_redirects` / custom-404 fallback AT THE SEAM (IPIP-0002).
+    //
+    // The rule grammar/matching is unit-tested in `crate::redirects`, and the
+    // whole thing is proven over a REAL content-addressed DAG in
+    // `tests/ipfs_redirects_fixture.rs`. Here we pin the seam glue: WHICH paths
+    // are retrieved (and which are NOT), and how the action becomes a response.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_not_found_path_serves_the_sites_custom_404_page_with_a_not_found_status() {
+        // The field case (jolly-roger.eth/unknown): the site's root `_redirects`
+        // is `/* /404.html/index.html 404`, so a not-found path serves that
+        // page's VERIFIED bytes with a not-found status, instead of a hard error.
+        let cid = "bafyjollyroger";
+        let page = b"<!doctype html><title>404</title><h1>arr, nothing here</h1>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/* /404.html/index.html 404\n");
+        retriever.put(cid, "/404.html/index.html", page);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect("the site's rules resolve the not-found path");
+        assert_eq!(response.body, page, "the site's own 404 page is served");
+        assert_eq!(response.status, 404, "with the honest not-found status");
+        assert_eq!(
+            response.mime_type, "text/html",
+            "the mime comes from the TARGET path, so the page renders as a page"
+        );
+    }
+
+    #[test]
+    fn a_200_rule_serves_the_rewrite_target_as_the_requested_resource() {
+        // A 200 rule is a REWRITE: the target's bytes answer the REQUESTED url.
+        // Nothing navigates (the resolver returns a response, never a
+        // navigation), so the URL bar — and with it the page identity the trust
+        // indicator describes — is untouched.
+        let cid = "bafyspa";
+        let app = b"<!doctype html><title>app</title><div id=app></div>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/app/* /app/index.html 200\n");
+        retriever.put(cid, "/app/index.html", app);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/app/deep/client-route"),
+            },
+        )
+        .expect("the spa rewrite resolves");
+        assert_eq!(response.body, app);
+        assert_eq!(response.status, 200);
+    }
+
+    #[test]
+    fn a_resolvable_path_never_reads_the_redirects_file_at_all() {
+        // IPIP-0002 §3.3 ("no forced redirects") AND the opt-in cost promise: the
+        // rules are consulted ONLY for a path that is not in the DAG, so a normal
+        // page load does not pay a single extra retrieval — and a catch-all rule
+        // can never shadow a real page.
+        let cid = "bafysite";
+        let index = b"<!doctype html><title>home</title>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/", index);
+        retriever.put(cid, "/_redirects", b"/* /404.html 404\n");
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/"),
+            },
+        )
+        .expect("an existing page resolves normally");
+        assert_eq!(response.body, index);
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            retriever.asked_paths(),
+            vec!["/".to_string()],
+            "a found resource must not trigger any _redirects lookup"
+        );
+    }
+
+    #[test]
+    fn a_site_with_no_redirects_and_no_404_page_keeps_the_honest_not_found() {
+        // The feature is OPT-IN per site: a site shipping neither file behaves
+        // exactly as before — a fail-closed not-found naming the requested path.
+        let cid = "bafyplain";
+        let retriever = PinnedRetriever::default();
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect_err("an opt-out site keeps the hard not-found");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("path not found") && reason.contains("/unknown"),
+            "the ORIGINAL not-found reason is preserved, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_root_404_html_is_served_when_the_site_ships_no_redirects() {
+        // The DEFAULT convention: a root `404.html` with no `_redirects` at all
+        // is still honoured, exactly as a gateway honours it.
+        let cid = "bafydefault404";
+        let page = b"<!doctype html><title>404</title>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/404.html", page);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/nope"),
+            },
+        )
+        .expect("the default 404.html is honoured");
+        assert_eq!(response.body, page);
+        assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn a_redirects_file_that_matches_nothing_falls_through_to_the_default_404() {
+        // A `_redirects` that simply says nothing about this path is not a match:
+        // the default `404.html` convention still applies (and, without one, the
+        // honest not-found stands).
+        let cid = "bafypartial";
+        let page = b"<!doctype html><title>404</title>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/only/this /that.html 200\n");
+        retriever.put(cid, "/404.html", page);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/elsewhere"),
+            },
+        )
+        .expect("an unmatched path falls through to the default 404 page");
+        assert_eq!(response.body, page);
+        assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn a_fallback_target_that_is_missing_fails_closed_and_names_the_target() {
+        // No invented content, and no second round of rules: a `to` that is not
+        // in the DAG is itself a not-found, naming WHICH target was missing.
+        let cid = "bafybadtarget";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/* /missing-404.html 404\n");
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect_err("a missing target must fail closed");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("missing-404.html"),
+            "the failure names the unresolvable target, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_off_root_target_is_refused_and_never_fetched() {
+        // The unique-origin rule: a `to` that leaves the root CID is refused
+        // BEFORE any retrieval, so a site's rules can never reach at (or make it
+        // look like it is serving) another content root.
+        let cid = "bafyimpersonator";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(
+            cid,
+            "/_redirects",
+            b"/* https://evil.example/404.html 404\n",
+        );
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect_err("an off-root target must be refused");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("root cid"),
+            "the refusal names the unique-origin rule, got: {reason}"
+        );
+        assert_eq!(
+            retriever.asked_paths(),
+            vec!["/unknown".to_string(), "/_redirects".to_string()],
+            "the off-root target is never fetched"
+        );
+    }
+
+    #[test]
+    fn a_matching_redirect_rule_fails_with_its_reason_rather_than_silently_serving() {
+        // What did NOT land: 3xx NAVIGATION. A matching redirect rule fails the
+        // load with a legible reason instead of falling through to a later rule
+        // (which would serve a page the author never named for this path).
+        let cid = "bafyredirect";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/old/* /new/:splat 301\n");
+        retriever.put(cid, "/404.html", b"<h1>404</h1>");
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/old/thing"),
+            },
+        )
+        .expect_err("an unsupported redirect rule fails the load");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("301") && reason.contains("/new/thing"),
+            "the refusal names the status and the target, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_gateway_404_on_the_optional_probe_counts_as_absent_not_as_a_hard_failure() {
+        // A real trustless gateway signals "this path is not in the dag" for an
+        // OPTIONAL probe (`/_redirects`, `/404.html`) as an HTTP error on the
+        // scoped request, which surfaces as a `Source` transport failure rather
+        // than a local `PathNotFound`. Both shapes mean ABSENT, so a site with no
+        // `_redirects` must still reach its default `404.html` (and, with neither,
+        // its original honest not-found) instead of failing on the probe.
+        let cid = "bafyprobe";
+        let page = b"<!doctype html><title>404</title>";
+        let mut retriever = PinnedRetriever::default();
+        retriever.fail(
+            cid,
+            "/_redirects",
+            RetrieveError::Source(fetcher::FetchError::Transport(
+                "gateway returned status 404".into(),
+            )),
+        );
+        retriever.put(cid, "/404.html", page);
+
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect("an absent _redirects must not fail the fallback");
+        assert_eq!(response.body, page);
+        assert_eq!(response.status, 404);
+    }
+
+    #[test]
+    fn a_tampered_redirects_file_fails_the_load_and_never_falls_back_to_guessing() {
+        // The `_redirects` file is itself content: if IT fails to verify, the load
+        // fails on the REAL reason (tamper), rather than pretending the site has
+        // no rules and serving something else.
+        let cid = "bafytamperedrules";
+        let mut retriever = PinnedRetriever::default();
+        retriever.fail(
+            cid,
+            "/_redirects",
+            RetrieveError::BlockHashMismatch {
+                cid: cid.to_string(),
+            },
+        );
+        retriever.put(cid, "/404.html", b"<h1>404</h1>");
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+        )
+        .expect_err("a tampered _redirects must fail the load");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("mismatch"),
+            "the real verify failure is surfaced, got: {reason}"
+        );
     }
 }

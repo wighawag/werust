@@ -60,7 +60,11 @@ class WerustCore : AutoCloseable {
         if (res == 0L) return null
         try {
             return if (nativeResolutionIsOk(res)) {
-                Resolution.Ok(nativeResolutionMime(res), nativeResolutionBody(res))
+                Resolution.Ok(
+                    nativeResolutionMime(res),
+                    nativeResolutionBody(res),
+                    nativeResolutionStatus(res),
+                )
             } else {
                 Resolution.Error(nativeResolutionError(res))
             }
@@ -120,13 +124,18 @@ class WerustCore : AutoCloseable {
 
     /**
      * The outcome of resolving an intercepted `ipfs://` request through the core:
-     * verified bytes + MIME type, or a fail-closed reason. Mirrors the Rust
-     * `SchemeResolution`; the `WebViewClient` turns [Resolution.Ok] into a
+     * verified bytes + MIME type + status, or a fail-closed reason. Mirrors the
+     * Rust `SchemeResolution`; the `WebViewClient` turns [Resolution.Ok] into a
      * `WebResourceResponse` and [Resolution.Error] into a failed load, so the
      * desktop fail-closed posture holds on Android.
+     *
+     * [Resolution.Ok.status] is 200 for an ordinary resource; it is carried so a
+     * site's own error page (named by its `_redirects`, IPIP-0002, for a path not
+     * in its DAG) is answered with the HONEST not-found status while still
+     * rendering, exactly as an IPFS gateway serves it.
      */
     sealed class Resolution {
-        data class Ok(val mimeType: String, val body: ByteArray) : Resolution()
+        data class Ok(val mimeType: String, val body: ByteArray, val status: Int) : Resolution()
         data class Error(val reason: String) : Resolution()
     }
 
@@ -287,6 +296,7 @@ class WerustCore : AutoCloseable {
     private external fun nativeResolutionIsOk(resolution: Long): Boolean
     private external fun nativeResolutionMime(resolution: Long): String
     private external fun nativeResolutionBody(resolution: Long): ByteArray
+    private external fun nativeResolutionStatus(resolution: Long): Int
     private external fun nativeResolutionError(resolution: Long): String
     private external fun nativeResolutionFree(resolution: Long)
     private external fun nativeOnPageCommitted(handle: Long, url: String)

@@ -735,10 +735,10 @@ pub fn apply_settings_request_in(
         },
     };
 
-    Ok(SchemeResponse {
-        mime_type: "text/html".to_string(),
-        body: settings_page_html(&settings, status.as_deref()).into_bytes(),
-    })
+    Ok(SchemeResponse::ok(
+        "text/html",
+        settings_page_html(&settings, status.as_deref()).into_bytes(),
+    ))
 }
 
 #[cfg(test)]

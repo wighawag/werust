@@ -43,21 +43,41 @@ pub mod provider;
 pub mod redirects;
 pub mod retrieval;
 
+/// The version-RESOLUTION rules the build script runs, compiled in under test so
+/// the pure-Rust `verify` gate covers them.
+///
+/// `build.rs` `include!`s the SAME file to resolve `WERUST_VERSION` at build
+/// time; a build script cannot itself be `cargo test`ed, so the precedence and
+/// normalisation live in one shared file that is both `include!`d there and
+/// unit-tested here. It contributes nothing to a non-test build.
+#[cfg(test)]
+mod version_resolution;
+
 /// werust's version string: the SINGLE source every surface that shows a version
 /// reads.
 ///
-/// It is the Rust workspace version (`CARGO_PKG_VERSION` of this crate, which
-/// inherits `workspace.package.version`), so the desktop startup banner, the
-/// browser [`menu`]'s version line, and the mobile menus (which read it over the
-/// FFI — `werust_ios_version` / `nativeVersion`) all report the SAME version.
+/// It is `WERUST_VERSION`, RESOLVED ONCE at build time by this crate's
+/// [`build.rs`](../build.rs): the injected `WERUST_VERSION` env var (CI exports
+/// it from the release tag), else `git describe --tags --always` (an informative
+/// dev build such as `0.2.6-3-gabc1234`), else `CARGO_PKG_VERSION`. The rules
+/// live in `src/version_resolution.rs` and are unit-tested there.
+///
+/// The desktop startup banner, the browser [`menu`]'s version line, and the
+/// mobile menus (which read it over the FFI — `werust_ios_version` /
+/// `nativeVersion`) all report the SAME version because they all call THIS.
 /// Before this, the version existed only as an `env!` in the desktop binary and
 /// a hand-maintained Gradle `versionName`; the menu task made a second, third
 /// and fourth reader, so it is centralised here rather than re-`env!`'d per edge
 /// (an `env!` in a mobile crate would read THAT crate's version, which is the
 /// same today only by workspace inheritance).
+///
+/// It is deliberately NOT `CARGO_PKG_VERSION` directly: nothing in the release
+/// path ever injected the tag into the compiled Rust, so a tagged `v0.2.6` build
+/// shipped every menu reading `werust 0.0.0` — a confident lie in a user-facing
+/// surface. Do NOT add a second version source; extend the resolution instead.
 #[must_use]
 pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    env!("WERUST_VERSION")
 }
 
 /// The URL-bar suffix that marks a bare entry as an ENS name to resolve: a

@@ -26,6 +26,16 @@ name: release
 #   verify -> goreleaser (Linux desktop, native x86_64)
 #   verify -> android-apk (Linux, SDK+NDK)
 #   verify -> ios-simulator-app (macos-14)
+#
+# THE RELEASED VERSION REACHES THE COMPILED CODE. Every leg that compiles Rust
+# exports `WERUST_VERSION` from the tag ref name; `crates/werust-core/build.rs`
+# resolves it (stripping the leading `v`) into the ONE version accessor the
+# desktop startup banner and the ⋮ browser menu on all three platforms read.
+# GoReleaser derives only the ARCHIVE NAME from the tag, never the compiled
+# binary, so without this injection a tagged `v0.2.6` release would ship every
+# menu reading `werust 0.0.0`. On the dispatch dry-run the variable is simply
+# empty (there is no tag), and the build script falls through to `git describe`.
+# Pinned by `crates/werust-core/tests/release_plumbing_shape.rs`.
 
 on:
   push:
@@ -83,11 +93,20 @@ jobs:
   goreleaser:
     needs: verify
     runs-on: ubuntu-latest
+    env:
+      # The released version, compiled INTO the desktop binary. On a tag push this
+      # is the tag ref name (`v0.2.6`); `crates/werust-core/build.rs` strips the
+      # leading `v` and emits it as the one version accessor the startup banner
+      # and the ⋮ menu read. On the dispatch dry-run there is no tag, so it is
+      # empty and the build script falls through to `git describe`.
+      WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
           # GoReleaser reads the full git history to build the conventional-commit
-          # changelog; a shallow checkout would truncate it.
+          # changelog; a shallow checkout would truncate it. It is ALSO what lets
+          # `build.rs`'s `git describe` fallback resolve a real version on the
+          # dry-run path (a shallow checkout has no tags).
           fetch-depth: 0
 
       - name: Install the desktop build toolchain (WebKitGTK system deps)
@@ -152,8 +171,17 @@ jobs:
   android-apk:
     needs: verify
     runs-on: ubuntu-latest
+    env:
+      # The released version, cross-compiled INTO the Rust core the APK carries,
+      # so the Android ⋮ menu reports the SAME version as desktop and iOS. Same
+      # tag-or-empty rule as the desktop leg above.
+      WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags + history, so `build.rs`'s `git describe` fallback resolves a real
+          # version on the dry-run path (where WERUST_VERSION is empty).
+          fetch-depth: 0
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -217,8 +245,17 @@ jobs:
   ios-simulator-app:
     needs: verify
     runs-on: macos-14
+    env:
+      # The released version, cross-compiled INTO the Rust core the `.app` carries,
+      # so the iOS ⋮ menu reports the SAME version as desktop and Android. Same
+      # tag-or-empty rule as the desktop leg above.
+      WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags + history, so `build.rs`'s `git describe` fallback resolves a real
+          # version on the dry-run path (where WERUST_VERSION is empty).
+          fetch-depth: 0
 
       - name: Show Xcode + iOS runtimes
         run: |

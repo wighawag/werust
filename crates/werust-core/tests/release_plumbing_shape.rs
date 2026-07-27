@@ -35,6 +35,11 @@
 //!    tree.
 //! 6. The desktop leg carries NO Zig: no `command: zigbuild`, no cargo-zigbuild
 //!    install hook, and the release workflow has no "Set up Zig" step.
+//! 7. Every leg that COMPILES Rust injects `WERUST_VERSION` from the tag, so the
+//!    shipped binary/APK/`.app` reports the released version instead of the
+//!    un-injected placeholder (task
+//!    `general-browser-menu-with-version-and-debug-entry`; the resolution itself
+//!    is `crates/werust-core/build.rs`).
 
 use std::path::{Path, PathBuf};
 
@@ -457,6 +462,83 @@ fn ios_job_builds_the_simulator_app_on_macos_and_runs_the_bundle_check() {
         contains_substr(&j, "WerustShell.app"),
         "the iOS leg must reference the built Simulator `.app` (WerustShell.app)"
     );
+}
+
+// --- Criterion 7: the released version reaches the compiled Rust ---
+
+#[test]
+fn every_rust_compiling_leg_injects_the_tag_version_into_the_build() {
+    // The version werust SHOWS (the desktop startup banner + the ⋮ browser menu
+    // on all three platforms) is `werust_core::version()`, which its `build.rs`
+    // resolves from `WERUST_VERSION` when CI injects it. GoReleaser derives only
+    // the ARCHIVE NAME from the tag, never the compiled code, so WITHOUT this
+    // injection a tagged `v0.2.6` release shipped every menu reading
+    // `werust 0.0.0`. Each leg that compiles Rust must therefore export
+    // `WERUST_VERSION` derived from the tag ref name.
+    //
+    // All three legs qualify: the desktop leg `cargo build`s the binary, and both
+    // mobile legs cross-compile the shared core into their artifact.
+    //
+    // Asserted on the job's `env:` MAPPING (not a substring sweep) so the
+    // variable really is exported to every step of the leg, which is what makes
+    // the cargo invocation — wherever it lives, GoReleaser's or Gradle's — see it.
+    for leg in ["goreleaser", "android-apk", "ios-simulator-app"] {
+        let j = job(leg);
+        let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
+            panic!(
+                "the `{leg}` leg compiles Rust, so it must declare an `env:` block injecting \
+                 WERUST_VERSION, or its artifact reports the un-injected placeholder version"
+            )
+        });
+        let injected = env
+            .get(Value::String("WERUST_VERSION".into()))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!("the `{leg}` leg's `env:` must set WERUST_VERSION (a string expression)")
+            });
+        // Derived from the TAG, not hardcoded: the ref name is the only thing
+        // that tracks the release being cut. (`build.rs` strips the leading `v`,
+        // so passing the ref name through verbatim is correct.)
+        assert!(
+            injected.contains("github.ref_name"),
+            "the `{leg}` leg must derive WERUST_VERSION from the tag ref name, not hardcode it; \
+             got {injected:?}"
+        );
+        // Only on a TAG: on the dispatch dry-run there is no release version, so
+        // the variable must be empty and `build.rs` falls through to
+        // `git describe` rather than labelling a snapshot with a stale tag.
+        assert!(
+            injected.contains("refs/tags/"),
+            "the `{leg}` leg must inject the version only on a TAG (empty on the dispatch \
+             dry-run, so build.rs falls through to `git describe`); got {injected:?}"
+        );
+        // The `git describe` fallback needs the tags, which a default shallow
+        // checkout does not fetch — without this the dry-run artifacts would
+        // silently report the last-resort Cargo version.
+        assert_eq!(
+            checkout_fetch_depth(&j),
+            Some(0),
+            "the `{leg}` leg must check out with `fetch-depth: 0` so build.rs's `git describe` \
+             fallback can see the tags on the non-tag path"
+        );
+    }
+}
+
+/// The `fetch-depth` the job's `actions/checkout` step requests, or [`None`] when
+/// the job has no checkout step or sets no depth (cargo's default shallow
+/// checkout, which carries no tags).
+fn checkout_fetch_depth(job: &Value) -> Option<u64> {
+    job.get("steps")
+        .and_then(Value::as_sequence)?
+        .iter()
+        .find(|s| {
+            s.get("uses")
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.starts_with("actions/checkout"))
+        })?
+        .get("with")?
+        .get("fetch-depth")?
+        .as_u64()
 }
 
 #[test]

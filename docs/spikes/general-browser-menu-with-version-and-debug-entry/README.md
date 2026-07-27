@@ -18,7 +18,9 @@ The ITEMS are not written three times: the shared toolkit-free core owns the ord
 
 ## The one version source
 
-`werust_core::version()` (the Rust workspace `CARGO_PKG_VERSION`) is the single source. Desktop reads it directly (the startup banner reads it too now, instead of its own `env!`); mobile reads it over the FFI (`nativeVersion` / `werust_ios_version`). No edge carries a version literal, the Gradle `versionName`, or the iOS bundle version in its menu. The guard `crates/werust-core/tests/browser_menu_edge_wiring_shape.rs` fails if one appears.
+`werust_core::version()` is the single source. Desktop reads it directly (the startup banner reads it too now, instead of its own `env!`); mobile reads it over the FFI (`nativeVersion` / `werust_ios_version`). No edge carries a version literal, the Gradle `versionName`, or the iOS bundle version in its menu. The guard `crates/werust-core/tests/browser_menu_edge_wiring_shape.rs` fails if one appears.
+
+That accessor returns a version RESOLVED at build time by `crates/werust-core/build.rs`: the injected `WERUST_VERSION` (the release workflow exports it from the tag for every leg that compiles Rust), else `git describe --tags --always` with the leading `v` stripped (an informative dev build, `0.2.6-3-gabc1234`), else `CARGO_PKG_VERSION`. Without that injection a tagged release would ship every menu reading `werust 0.0.0`, since GoReleaser derives only the archive NAME from the tag. See Decision 2 in [`DECISIONS.md`](DECISIONS.md); the precedence lives in `crates/werust-core/src/version_resolution.rs` and is unit-tested.
 
 ## Growing the menu
 
@@ -38,7 +40,9 @@ Each currently states, honestly, that the view is not built yet (naming the vers
 
 In the pure-Rust `verify` gate (`cargo fmt && clippy && build && test` — no Android SDK, no Xcode):
 
-- `crates/werust-core/src/menu.rs` unit tests: the version line comes from the one source, the Debug entry exists and is activatable, the menu is a growable ordered list with unique ids, and the wire document carries everything the mobile edges need.
+- `crates/werust-core/src/menu.rs` unit tests: the version line comes from the one source and is never empty or the un-injected `0.0.0` placeholder, the Debug entry exists and is activatable, the menu is a growable ordered list with unique ids, and the wire document carries everything the mobile edges need.
+- `crates/werust-core/src/version_resolution.rs` unit tests: the build-time version precedence (injection beats `git describe` beats the Cargo version), the tag's leading `v` stripped, `git describe`'s trailing newline trimmed, and the no-git path never failing.
+- `crates/werust-core/tests/release_plumbing_shape.rs`: every release leg that compiles Rust injects `WERUST_VERSION` from the tag ref name (and checks out with tags, so the `git describe` fallback works on the dry-run path).
 - `crates/werust-android/rust/src/lib.rs` / `crates/werust-ios/rust/src/lib.rs` tests: the same version + menu document over each FFI (including the raw C-ABI exports and their string ownership), and that both accessors are session-free.
 - `crates/werust/src/main.rs` tests: the desktop popover is built from the shared model, the banner and the menu agree on the version, and the Debug hook's placebo-free wording.
 - `crates/werust-core/tests/browser_menu_edge_wiring_shape.rs`: a source-shape guard over all three edges (the ⋮ affordance + native surface, iterating the core's items, no hardcoded version, the Debug id routed to a named hook, and no debug-build gate on the menu).
@@ -55,7 +59,7 @@ Not yet executed (no device/emulator session was run for this task). Each step i
 1. `cargo run -p werust` on a machine with a display.
 2. The toolbar shows a menu button (the hamburger icon) at its right-hand end, after the trust indicator, with a "Menu" tooltip.
 3. Click it: a popover opens with two entries — a greyed, non-clickable `werust <version>` line, and a clickable `Debug` entry.
-4. The version in the popover matches the version in the startup banner printed on stdout (`werust <version> — a Rust web browser (webview backend)`).
+4. The version in the popover matches the version in the startup banner printed on stdout (`werust <version> — a Rust web browser (webview backend)`), and it is NOT `0.0.0`: on a dev checkout it reads like `0.2.6-<n>-g<sha>`; on a tagged CI build it reads exactly the released version.
 5. Click `Debug`: the popover closes and a dialog appears saying the in-app debug view is not built yet, naming the same version.
 6. The menu opens the same way in a release build (`cargo run --release -p werust`): it is NOT debug-gated (unlike F12, which is).
 

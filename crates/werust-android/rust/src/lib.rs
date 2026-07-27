@@ -301,8 +301,9 @@ impl CoreSession {
 }
 
 /// werust's version string for the Kotlin edge's browser MENU: the ONE shared
-/// source ([`werust_core::version`], the Rust workspace version), so the Android
-/// menu shows exactly what the desktop popover and the iOS menu show.
+/// source ([`werust_core::version`], resolved once at build time from the release
+/// tag / `git describe` / the Cargo version), so the Android menu shows exactly
+/// what the desktop popover and the iOS menu show.
 ///
 /// SESSION-FREE on purpose (unlike every accessor above): the version and the
 /// menu are properties of the BUILD, not of a browsing session, so the Kotlin

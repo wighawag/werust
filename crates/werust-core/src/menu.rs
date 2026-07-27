@@ -27,11 +27,12 @@
 //!
 //! # One version, three menus
 //!
-//! The version shown is [`crate::version`] — the SINGLE source (the Rust
-//! workspace version, `CARGO_PKG_VERSION`), read here and handed to the mobile
-//! edges over the FFI (`werust_ios_version` / `nativeVersion`, plus the whole
-//! menu as [`menu_json`]) so no edge hardcodes a version string of its own and
-//! all three menus can never disagree.
+//! The version shown is [`crate::version`] — the SINGLE source (`WERUST_VERSION`,
+//! resolved once at build time by `werust-core`'s `build.rs` from the release
+//! tag, else `git describe`, else the Cargo version), read here and handed to the
+//! mobile edges over the FFI (`werust_ios_version` / `nativeVersion`, plus the
+//! whole menu as [`menu_json`]) so no edge hardcodes a version string of its own
+//! and all three menus can never disagree.
 //!
 //! # The Debug entry is a HOOK
 //!
@@ -195,17 +196,17 @@ mod tests {
     #[test]
     fn the_menu_shows_the_werust_version_from_the_one_shared_source() {
         // Acceptance: the menu shows the werust VERSION, sourced from ONE place
-        // (`crate::version`, the workspace `CARGO_PKG_VERSION`) so the desktop,
-        // Android and iOS menus can never disagree — no edge builds its own
-        // version string.
+        // (`crate::version`, the build-time-resolved `WERUST_VERSION`) so the
+        // desktop, Android and iOS menus can never disagree — no edge builds its
+        // own version string.
         let menu = BrowserMenu::new();
         let version_item = menu
             .item(MENU_ITEM_VERSION)
             .expect("the menu has a version entry");
         assert_eq!(version_item.label, format!("werust {}", crate::version()));
         assert!(
-            version_item.label.contains(env!("CARGO_PKG_VERSION")),
-            "the label carries the real workspace version: {}",
+            version_item.label.contains(crate::version()),
+            "the label carries the real resolved version: {}",
             version_item.label
         );
         // The version is a LINE, not something to activate.
@@ -311,10 +312,23 @@ mod tests {
     }
 
     #[test]
-    fn the_version_is_the_workspace_version_and_never_empty() {
+    fn the_version_is_resolved_at_build_time_and_is_never_empty_or_a_placeholder() {
         // The ONE version source. If this were empty the menus would silently show
-        // "werust " on all three platforms.
-        assert!(!crate::version().is_empty());
-        assert_eq!(crate::version(), env!("CARGO_PKG_VERSION"));
+        // "werust " on all three platforms — and if it were the un-injected
+        // `0.0.0` placeholder they would all confidently show a LIE, which is the
+        // exact defect `build.rs` exists to prevent (nothing used to inject a
+        // version into the Rust build, so a tagged v0.2.6 release shipped menus
+        // reading "werust 0.0.0").
+        let version = crate::version();
+        assert!(!version.is_empty());
+        assert_ne!(
+            version, "0.0.0",
+            "the version must be resolved (injected / git-described / the real Cargo version), \
+             never the 0.0.0 placeholder"
+        );
+        // It is the build-time-resolved value, not a second `env!` of the Cargo
+        // metadata: a dev checkout resolves `git describe`, which carries the
+        // commit distance the bare Cargo version cannot.
+        assert_eq!(version, env!("WERUST_VERSION"));
     }
 }

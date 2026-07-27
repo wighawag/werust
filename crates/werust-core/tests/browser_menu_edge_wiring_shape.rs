@@ -199,8 +199,17 @@ fn no_edge_hardcodes_a_version_string() {
         "the iOS edge must not show the bundle version: it would drift from the core"
     );
 
-    // And the core's own accessor really is the workspace version.
-    assert_eq!(werust_core::version(), env!("CARGO_PKG_VERSION"));
+    // And the core's own accessor really resolves a version rather than shipping
+    // the un-injected `0.0.0` placeholder every menu would then display
+    // (`crates/werust-core/build.rs`; the resolution rules are unit-tested in
+    // `crates/werust-core/src/version_resolution.rs`).
+    assert!(!werust_core::version().is_empty());
+    assert_ne!(
+        werust_core::version(),
+        "0.0.0",
+        "the one version source must resolve a REAL version, or all three menus \
+         confidently show `werust 0.0.0`"
+    );
 }
 
 #[test]

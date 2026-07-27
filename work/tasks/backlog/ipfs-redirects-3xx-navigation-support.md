@@ -79,3 +79,7 @@ THE PRESCRIBED FIX (core-only, the standard emulation): remember the redirect SO
 ALSO RECORD IT: add a Decision to docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md (following the Decision 7 precedent for the main-frame flag) covering HISTORY SEMANTICS explicitly — that werust PUSHES rather than replaces because the seam and WebKitGTK offer no replace-current-entry, that Back therefore skips remembered redirect sources as the emulation, the first-entry edge case, and that a proper replace-current-entry seam is the named future fix. DECISIONS.md currently says nothing about history semantics at all; that silence is part of what Gate-2 flagged.
 
 TESTS: update the shell test a_queued_redirect_navigates_the_shell_on_the_pump_and_moves_the_bar_and_history (it currently asserts can_go_back == true after a redirect as a SUCCESS) so it asserts the SKIP behaviour instead, and add a test that Back after a redirect does not bounce forward. Keep everything network-isolated and every parent behaviour unregressed.
+
+## Requeue 2026-07-27
+
+CONDUCTOR: the previous run was KILLED mid-Gate-2 by an external interruption (not a defect). Gate-1 had already passed on the rebased tip. The branch is preserved. CONTINUE from the tip: change nothing unless a genuine problem is found, and let the review gate run.

@@ -403,7 +403,7 @@ android = { state = "implemented" }
 
 [[capability]]
 name = "ipfs-redirects-3xx-navigation"
-description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-0002) as a real NAVIGATION to the rule's `to` target under the SAME root CID: the URL bar and history move, the target is hash-verified by the retrieval that navigation triggers, and the chain is bounded so a cycle fails closed."
+description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-0002) as a real NAVIGATION to the rule's `to` target under the SAME root CID: the URL bar and history move, the target is hash-verified by the retrieval that navigation triggers, only the MAIN-FRAME document redirects (a sub-resource never navigates the page away), and the chain is bounded PER CHAIN so a cycle fails closed."
 # DISTINCT from `ipfs-web-pathing-fallback` above (which SERVES a target in place,
 # leaving the bar untouched) precisely because a 3xx changes the page's identity.
 # The decision + the bound are SHARED core: `werust-core`'s `redirects` module
@@ -417,7 +417,12 @@ description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-
 # `main.rs` hands it to the shell via `with_redirect_sink` (crates/werust,
 # crates/webview-renderer); Android and iOS do the same in their `CoreSession::new`
 # and drain the resulting pending load on their existing load-signal path
-# (`afterCoreAction` in BrowserActivity.kt / WKWebViewShellController.swift) — which
+# (`afterCoreAction` in BrowserActivity.kt / WKWebViewShellController.swift). That
+# same load-signal path is ALSO what keeps the chain bound per-chain and the
+# main-frame check current on every context: reporting a load event into the core
+# runs `BrowserShell::pump`, which tells the sink the new TOP-LEVEL document URL
+# (`RedirectSink::note_navigation`) — the only signal an in-page LINK CLICK gives
+# the core at all. Which
 # is ALSO why no edge tries to return a 3xx status from its interception hook
 # (Android's `WebResourceResponse` refuses a 300-399 status outright, and a status
 # on `SchemeResponse` is explicitly not a redirect channel). Task

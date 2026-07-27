@@ -170,7 +170,29 @@ impl FixtureSite {
     /// redirect target the way the shell's navigation would (a fresh request,
     /// re-entering the handler, so the target is hash-verified by the SAME
     /// retrieval).
+    ///
+    /// This is a TOP-LEVEL document load, so it first reports `uri` to the sink
+    /// exactly as `BrowserShell` does before every navigation it starts — that is
+    /// what marks the intercepted request as the MAIN FRAME (only the main frame
+    /// may redirect). Use [`get_sub_resource`](FixtureSite::get_sub_resource) for
+    /// a request made BY the loaded page.
     fn get_url(&self, uri: &str) -> Result<renderer::SchemeResponse, renderer::RendererError> {
+        self.redirects.note_navigation(uri);
+        self.request(uri)
+    }
+
+    /// Resolve a SUB-RESOURCE of the page currently loaded (an image, a
+    /// stylesheet, a script): the same intercepted-request path, but WITHOUT
+    /// reporting a top-level navigation, so the resolver sees it for what it is.
+    fn get_sub_resource(
+        &self,
+        path: &str,
+    ) -> Result<renderer::SchemeResponse, renderer::RendererError> {
+        self.request(&format!("ipfs://{root}{path}", root = self.root))
+    }
+
+    /// The raw intercepted request, with no navigation reported.
+    fn request(&self, uri: &str) -> Result<renderer::SchemeResponse, renderer::RendererError> {
         resolve_ipfs_request(
             &self.retriever,
             &SchemeRequest {
@@ -506,6 +528,50 @@ fn a_3xx_target_injects_the_splat_and_may_not_leave_the_root_cid() {
             "an off-root target is NEVER queued as a navigation"
         );
     }
+}
+
+#[test]
+fn a_3xx_matched_by_a_sub_resource_of_the_page_never_navigates_the_page_away() {
+    // ACCEPTANCE (the main-frame rule, over a real DAG): the scheme handler
+    // answers the main document AND every sub-resource of it. A page with a stale
+    // `<img src="/old/logo.png">` whose path matches a 3xx rule must keep
+    // rendering: the sub-resource fails closed (or gets the site's 404 page) and
+    // queues NOTHING, so the browser stays on the page the user is reading.
+    let site = site(&[
+        ("index.html", INDEX_HTML),
+        ("404.html", NOT_FOUND_HTML),
+        ("new/deep.html", APP_HTML),
+        ("_redirects", b"/old/* /new/:splat 301\n"),
+    ]);
+
+    // The page the user is reading (the top-level document).
+    let home = site
+        .get("/index.html")
+        .expect("the page itself resolves normally");
+    assert_eq!(home.body, INDEX_HTML);
+
+    // Its stale sub-resource, whose path matches the 3xx rule.
+    let logo = site
+        .get_sub_resource("/old/logo.png")
+        .expect("a matched sub-resource falls through to the site's 404 page");
+    assert_eq!(
+        logo.status, 404,
+        "a sub-resource is answered, not navigated"
+    );
+    assert_eq!(
+        site.pending_redirect(),
+        None,
+        "a sub-resource must NEVER yank the top-level page onto the rewritten path"
+    );
+
+    // The MAIN-FRAME request for the same shape still redirects: excluding
+    // sub-resources must not break the feature.
+    let _ = site.get("/old/deep.html");
+    assert_eq!(
+        site.pending_redirect(),
+        Some(format!("ipfs://{root}/new/deep.html", root = site.root)),
+        "the top-level document still redirects"
+    );
 }
 
 #[test]

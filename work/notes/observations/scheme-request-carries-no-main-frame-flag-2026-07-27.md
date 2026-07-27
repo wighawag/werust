@@ -1,0 +1,5 @@
+# `renderer::SchemeRequest` carries no is-main-frame flag, so 3xx main-frame detection is inferred (2026-07-27)
+
+Task `ipfs-redirects-3xx-navigation-support` needed to redirect ONLY the main-frame document (a `_redirects` 3xx matched by a stale sub-resource must not navigate the whole page away), but the seam's `SchemeRequest` (`crates/renderer/src/lib.rs`) carries only `uri`. So `werust_core::ipfs::RedirectSink::is_main_frame` INFERS it by comparing the intercepted URI against the top-level document URL the shell reports (`note_navigation`), which fails safe (a misread degrades a legitimate redirect to a not-found, never lets a sub-resource move the browser) but is a guess.
+
+Follow-up worth tasking: add an explicit main-frame flag to `SchemeRequest`. Every platform already has it (WebKitGTK's `WebKitURISchemeRequest`, Android's `WebResourceRequest.isForMainFrame`, iOS's `WKURLSchemeTask` request), so this is a seam change touching desktop + both mobile edges + the parity matrix. Rationale and the current limitation are recorded in `docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`, Decision 7.

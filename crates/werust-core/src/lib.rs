@@ -855,10 +855,16 @@ impl BrowserShell {
                 return Ok(());
             }
         };
-        self.renderer.navigate(&target)?;
         // A USER-initiated navigation starts a FRESH redirect chain, so the hop
         // budget bounds one site's `_redirects` chain rather than a whole session.
+        // And `target` is the TOP-LEVEL document about to load, which is what tells
+        // the scheme handler that an intercepted request for it is the MAIN FRAME
+        // (a 3xx on a SUB-RESOURCE must never navigate the page away). Both are
+        // reported BEFORE the backend starts the load, so the main document's own
+        // request cannot be intercepted before the sink knows about it.
         self.redirects.reset();
+        self.redirects.note_navigation(&target);
+        self.renderer.navigate(&target)?;
         // A plain navigation follows the backend's URL: drop any ENS name that was
         // pinned in the bar so it never lingers on a later page. It is a CONTENT
         // load (no ENS/IPNS resolution step), so clear any pinned resolution step;
@@ -1015,6 +1021,13 @@ impl BrowserShell {
         // Resolution is done; the backend now drives the CONTENT step. Hand the
         // step off to the backend's load state (via `refresh_chrome`).
         self.resolving_step = None;
+        // The ENS front door is a USER-initiated navigation too (a typed `.eth`, or
+        // a reload re-resolving one), so it starts a FRESH redirect chain and
+        // reports the resolved `ipfs://<cid><path>` as the top-level document,
+        // before the load starts — exactly as the plain branch of
+        // [`navigate`](BrowserShell::navigate) does for its target.
+        self.redirects.reset();
+        self.redirects.note_navigation(&target);
         if let Err(e) = self.renderer.navigate(&target) {
             // A backend that cannot even start the content load failed at the
             // content step, not resolution.
@@ -1137,6 +1150,7 @@ impl BrowserShell {
         self.renderer.go_back();
         // A user-initiated history move starts a FRESH redirect chain.
         self.redirects.reset();
+        self.note_top_level_navigation();
         // History navigation follows the backend's URL, not the pinned ENS name.
         self.url_override = None;
         self.pinned_root_key = None;
@@ -1151,6 +1165,7 @@ impl BrowserShell {
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
         self.redirects.reset();
+        self.note_top_level_navigation();
         self.url_override = None;
         self.pinned_root_key = None;
         self.resolving_step = None;
@@ -1210,6 +1225,7 @@ impl BrowserShell {
         }
         self.renderer.reload()?;
         self.redirects.reset();
+        self.note_top_level_navigation();
         self.url_override = None;
         self.pinned_root_key = None;
         self.resolving_step = None;
@@ -1303,6 +1319,23 @@ impl BrowserShell {
         Some((display, entry.mutable))
     }
 
+    /// Report the backend's CURRENT top-level URL to the redirect sink, for a
+    /// navigation whose target the shell does not name itself (`go_back` /
+    /// `go_forward` / `reload`): the backend knows which entry it moved to, so the
+    /// sink learns which intercepted request is the MAIN FRAME from it.
+    ///
+    /// Best-effort: a backend whose history move settles ASYNCHRONOUSLY has no
+    /// current URL yet, and the load event that follows reports the settled URL
+    /// through [`pump`](BrowserShell::pump) anyway. A stale value cannot mislead
+    /// either — the worst case is that a redirect on the FIRST intercepted request
+    /// of the new page is treated as a sub-resource and fails closed, which is the
+    /// pre-3xx behaviour, never a wrong navigation.
+    fn note_top_level_navigation(&self) {
+        if let Some(url) = self.renderer.current_url() {
+            self.redirects.note_navigation(&url);
+        }
+    }
+
     /// Perform a `_redirects` 3xx NAVIGATION the `ipfs://` scheme handler queued,
     /// if any: the IPIP-0002 redirect, made real.
     ///
@@ -1320,15 +1353,22 @@ impl BrowserShell {
     ///   root-CID-prefix `ens_pages` association re-derives `name/<new-path>` in
     ///   the bar for a redirect inside an ENS site, rather than leaking a raw CID.
     ///
-    /// The chain is NOT reset here (only a user-initiated navigation does that),
-    /// which is what bounds a chain of redirects: the sink refuses a cycle or an
-    /// over-long chain and queues nothing, leaving the legible fail-closed error
-    /// the handler already surfaced. Returns `true` when a navigation was
-    /// performed, so the caller repaints.
+    /// The chain is NOT reset here (only a navigation that is NOT this chain's own
+    /// target does that), which is what bounds a chain of redirects: the sink
+    /// refuses a cycle or an over-long chain and queues nothing, leaving the
+    /// legible fail-closed error the handler already surfaced. Returns `true` when
+    /// a navigation was performed, so the caller repaints.
     fn follow_pending_redirect(&mut self) -> bool {
         let Some(target) = self.redirects.take_pending() else {
             return false;
         };
+        // The redirect target is the new TOP-LEVEL document, so an intercepted
+        // request for it is the MAIN FRAME (and may itself redirect again, up to
+        // the chain bound). Draining it above already marked it as the target this
+        // chain is FOLLOWING, so this reports the top level WITHOUT ending the
+        // chain — which is exactly the one navigation that must not reset the
+        // budget.
+        self.redirects.note_navigation(&target);
         if self.renderer.navigate(&target).is_err() {
             // A backend that cannot even start the redirected load leaves the
             // handler's fail-closed error standing: nothing is rendered, and no
@@ -1371,6 +1411,15 @@ impl BrowserShell {
             // URL is the pinned root (the front-door root still loading) keeps the
             // pin, so the name holds for the whole root load.
             self.drop_pin_on_in_page_nav(event.url());
+            // Tell the redirect sink which TOP-LEVEL document the backend is on.
+            // This is the ONLY signal an IN-PAGE navigation (a link click, an SPA
+            // push) gives the core — it never passes through `navigate` /
+            // `go_back` / `reload` — so it is what makes the redirect chain
+            // PER-CHAIN rather than per-session: any load that is NOT this chain's
+            // own target ENDS the chain and restores the full hop budget. It also
+            // re-establishes which intercepted request is the MAIN FRAME, so a 3xx
+            // matched on a sub-resource of the new page cannot navigate it away.
+            self.redirects.note_navigation(event.url());
             // While an ENS name is pinned in the bar (`url_override`), the
             // lifecycle events carry the underlying `ipfs://<cid>` URL, which must
             // NOT overwrite the displayed name — the user keeps seeing `ronan.eth`
@@ -3751,6 +3800,98 @@ mod tests {
         assert!(
             queue_for_test(&redirects, "ipfs://bafyroot/hop-0"),
             "a user-initiated navigation starts a fresh chain"
+        );
+    }
+
+    #[test]
+    fn an_in_page_link_click_resets_the_redirect_chain_budget_too() {
+        // The chain bound must be PER-CHAIN, and an IN-PAGE LINK CLICK is the case
+        // `shell.navigate` does NOT cover: the webview loads the link itself and
+        // only REPORTS it back as a load event, so the shell's `navigate` /
+        // `go_back` / `reload` reset points never fire. Without the pump reporting
+        // that load to the sink, the visited set accumulates for the whole session
+        // and the SAME redirecting link is refused as a cycle the second time it is
+        // clicked (Gate-2 finding).
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/home").unwrap();
+        settle(&mut shell, &handle);
+
+        // The user clicks the site's `/docs` nav link, which its `_redirects` sends
+        // to `/docs/index.html`. Twice, with an unrelated page in between.
+        for round in 0..3 {
+            handle.navigate_in_page("ipfs://bafyroot/docs");
+            shell.pump();
+            assert!(
+                queue_for_test(&redirects, "ipfs://bafyroot/docs/index.html"),
+                "click {round} on the SAME redirecting link must still be followed, \
+                 not refused as a cycle"
+            );
+            shell.pump();
+            settle(&mut shell, &handle);
+            assert_eq!(shell.chrome().url_text, "ipfs://bafyroot/docs/index.html");
+
+            handle.navigate_in_page("ipfs://bafyroot/about");
+            shell.pump();
+            settle(&mut shell, &handle);
+        }
+    }
+
+    #[test]
+    fn many_unrelated_redirected_link_clicks_never_exhaust_the_session() {
+        // The other half of the same defect: MORE than `MAX_REDIRECT_HOPS`
+        // DIFFERENT redirecting links clicked in one session must each get the full
+        // budget. Session-scoped state would refuse the sixth.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/home").unwrap();
+        settle(&mut shell, &handle);
+
+        for click in 0..(crate::ipfs::MAX_REDIRECT_HOPS * 2 + 1) {
+            handle.navigate_in_page(&format!("ipfs://bafyroot/link-{click}"));
+            shell.pump();
+            assert!(
+                queue_for_test(&redirects, &format!("ipfs://bafyroot/dest-{click}")),
+                "unrelated click {click} must get a fresh budget"
+            );
+            shell.pump();
+            settle(&mut shell, &handle);
+        }
+    }
+
+    #[test]
+    fn the_chain_bound_still_holds_across_the_redirect_hops_the_shell_itself_performs() {
+        // The bound must survive the per-chain reset: each hop the SHELL performs
+        // is reported to the sink as a top-level navigation too, and that one
+        // report must CONTINUE the chain (it is the chain's own target) rather than
+        // restore the budget — otherwise the reset that fixes the link-click gap
+        // would reintroduce the unbounded loop.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/a").unwrap();
+        settle(&mut shell, &handle);
+        for hop in 0..crate::ipfs::MAX_REDIRECT_HOPS {
+            assert!(
+                queue_for_test(&redirects, &format!("ipfs://bafyroot/hop-{hop}")),
+                "hop {hop} is within the bound"
+            );
+            // The shell performs the hop and the backend reports the load: neither
+            // may restore the budget.
+            shell.pump();
+            settle(&mut shell, &handle);
+        }
+        assert!(
+            !queue_for_test(&redirects, "ipfs://bafyroot/hop-over"),
+            "the hop past the cap is still refused after the shell followed every hop"
         );
     }
 

@@ -171,20 +171,30 @@ impl RedirectSink {
     ///    URL [`is_main_frame`](RedirectSink::is_main_frame) accepts, so a matched
     ///    3xx on a SUB-RESOURCE cannot navigate the page away.
     /// 2. **Where a redirect chain ends.** If `url` is NOT the target this chain
-    ///    queued, the chain is over: the hop budget and the visited set are
-    ///    cleared. This is what makes the bound PER-CHAIN — an in-page LINK CLICK
-    ///    never passes through the shell's `navigate`/`go_back`/`reload` entry
-    ///    points, so without this the same redirecting link would be refused as a
-    ///    cycle the second time it is clicked.
+    ///    queued (nor the document the chain is already on), the chain is over:
+    ///    the hop budget and the visited set are cleared. This is what makes the
+    ///    bound PER-CHAIN — an in-page LINK CLICK never passes through the shell's
+    ///    `navigate`/`go_back`/`reload` entry points, so without this the same
+    ///    redirecting link would be refused as a cycle the second time it is
+    ///    clicked, and five unrelated redirected clicks would exhaust the budget
+    ///    for the whole session.
+    ///
+    /// Reported MANY times for one document (the shell's own `navigate`, then
+    /// each `Started`/`Committed`/`UrlChanged` the backend emits for the same
+    /// URL), so it is idempotent: a re-report of the document already in flight
+    /// changes nothing.
     pub fn note_navigation(&self, url: &str) {
         let key = frame_key(url);
         let Ok(mut chain) = self.chain.lock() else {
             return;
         };
-        // The chain continues ONLY for its own target: the one the shell drained
-        // and is now loading, or one queued but not yet drained (the shell has not
-        // pumped it yet, and losing it here would drop the redirect entirely).
+        // The chain continues for its own target — the one the shell drained and
+        // is now loading, or one queued but not yet drained (the shell has not
+        // pumped it yet, and losing it here would drop the redirect entirely) —
+        // and for a RE-REPORT of the document already in flight (the same load's
+        // later lifecycle signals, which say nothing new).
         let continues = chain.following.as_deref() == Some(key.as_str())
+            || chain.top_level.as_deref() == Some(key.as_str())
             || chain.pending.as_deref().map(frame_key) == Some(key.clone());
         if !continues {
             chain.pending = None;
@@ -551,7 +561,6 @@ pub fn resolve_ipfs_request(
     redirects: &RedirectSink,
 ) -> Result<SchemeResponse, RendererError> {
     let reference = parse_ipfs_uri(&request.uri)?;
-    let main_frame = redirects.is_main_frame(&request.uri);
     // Route THROUGH the verifying retriever: bytes come back only after every
     // block in the resolved resource's DAG hashed to its own CID. Any failure is
     // a hard failure that fails the load, never a silent render of unverified
@@ -567,7 +576,7 @@ pub fn resolve_ipfs_request(
         // never shadow a real page and a site without the opt-in files pays no
         // cost at all.
         Err(not_found @ RetrieveError::PathNotFound { .. }) => {
-            resolve_not_found_fallback(retriever, &reference, not_found, redirects, main_frame)
+            resolve_not_found_fallback(retriever, &reference, &request.uri, not_found, redirects)
         }
         Err(other) => Err(retrieve_error_to_renderer_error(other)),
     }
@@ -593,9 +602,9 @@ pub fn resolve_ipfs_request(
 fn resolve_not_found_fallback(
     retriever: &dyn ContentRetriever,
     reference: &IpfsRef,
+    uri: &str,
     not_found: RetrieveError,
     redirects: &RedirectSink,
-    main_frame: bool,
 ) -> Result<SchemeResponse, RendererError> {
     match probe_optional(retriever, &reference.cid, REDIRECTS_PATH)? {
         Some(file) => {
@@ -608,7 +617,15 @@ fn resolve_not_found_fallback(
                 // to the honest not-found (the default `404.html`, then the
                 // original `PathNotFound`) WITHOUT queueing anything or spending a
                 // hop, so a stale image reference cannot move the browser.
-                Some(Ok(FallbackAction::Redirect { .. })) if !main_frame => {
+                //
+                // Asked HERE, at the last possible moment, rather than on the way
+                // in: the shell learns the new top-level URL on its pump, and both
+                // retrievals above (the requested path, then the `_redirects`
+                // probe) are network round trips, so by now the shell has had every
+                // chance to report an IN-PAGE navigation it only observed. Asking
+                // on the way in would race that pump and misread a link-clicked
+                // main document as a sub-resource.
+                Some(Ok(FallbackAction::Redirect { .. })) if !redirects.is_main_frame(uri) => {
                     serve_default_404(retriever, reference, not_found)
                 }
                 Some(Ok(FallbackAction::Redirect { path, status })) => {
@@ -746,6 +763,17 @@ mod tests {
     use super::*;
     use fetcher::RetrievedContent;
     use std::collections::HashMap;
+
+    /// A sink already told that `top_level` is the TOP-LEVEL document being
+    /// loaded, i.e. that an intercepted request for exactly that URL is the MAIN
+    /// FRAME. This is what `BrowserShell` reports before every navigation it
+    /// starts; without it, EVERY intercepted request looks like a sub-resource and
+    /// nothing may redirect (the deliberate fail-closed default).
+    fn main_frame_sink(top_level: &str) -> RedirectSink {
+        let sink = RedirectSink::new();
+        sink.note_navigation(top_level);
+        sink
+    }
 
     /// A pinned, in-memory [`ContentRetriever`] double, isolated from the live
     /// network, that returns pre-registered verified bytes for a `(cid, path)`
@@ -1391,7 +1419,9 @@ mod tests {
         let mut retriever = PinnedRetriever::default();
         retriever.put(cid, "/_redirects", b"/old/* /new/:splat 301\n");
         retriever.put(cid, "/404.html", b"<h1>404</h1>");
-        let redirects = RedirectSink::new();
+        // Even with a `404.html` present, the MAIN-FRAME request redirects rather
+        // than serving it: the rule wins for the top-level document.
+        let redirects = main_frame_sink(&format!("ipfs://{cid}/old/thing"));
 
         let err = resolve_ipfs_request(
             &retriever,
@@ -1441,7 +1471,7 @@ mod tests {
             let cid = "bafyeach3xx";
             let mut retriever = PinnedRetriever::default();
             retriever.put(cid, "/_redirects", rule.as_bytes());
-            let redirects = RedirectSink::new();
+            let redirects = main_frame_sink(&format!("ipfs://{cid}/old"));
             let err = resolve_ipfs_request(
                 &retriever,
                 &SchemeRequest {
@@ -1462,6 +1492,50 @@ mod tests {
     }
 
     #[test]
+    fn a_matched_3xx_on_a_sub_resource_never_navigates_and_spends_no_hop_budget() {
+        // A 3xx is a navigation of the WHOLE page, but this resolver also answers
+        // every SUB-RESOURCE (image, CSS, JS). A stale `<img src="/blog/logo.png">`
+        // whose path happens to match `/blog/* /posts/:splat 301` must NOT yank the
+        // browser off the page the user is reading. So a sub-resource gets the
+        // honest fail-closed not-found (via the site's `404.html` if it has one),
+        // queues nothing, and spends NO hop budget.
+        let cid = "bafysubresource";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/blog/* /posts/:splat 301\n");
+        retriever.put(cid, "/404.html", b"<h1>404</h1>");
+        // The page the user is READING is the top-level document...
+        let redirects = main_frame_sink(&format!("ipfs://{cid}/blog/post-1"));
+
+        // ...and this is a sub-resource OF it whose path also matches the rule.
+        let response = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/blog/logo.png"),
+            },
+            &redirects,
+        )
+        .expect("a sub-resource falls through to the site's own 404 page");
+        assert_eq!(response.status, 404);
+        assert_eq!(
+            redirects.take_pending(),
+            None,
+            "a sub-resource must NEVER queue a top-level navigation"
+        );
+
+        // And the hop budget is untouched: the MAIN-FRAME request that follows
+        // still gets the full chain, so a page full of matching sub-resources
+        // cannot starve a legitimate redirect.
+        for hop in 0..MAX_REDIRECT_HOPS {
+            let target = format!("ipfs://{cid}/hop-{hop}");
+            assert!(
+                redirects.queue(&target).is_ok(),
+                "hop {hop} is still within the untouched budget"
+            );
+            let _ = redirects.take_pending();
+        }
+    }
+
+    #[test]
     fn an_off_root_3xx_target_is_refused_and_never_queued_for_navigation() {
         // The unique-origin rule holds for a NAVIGATION too, and it is the
         // load-bearing one here: queueing an off-root target would navigate the
@@ -1470,7 +1544,7 @@ mod tests {
         let cid = "bafyimpersonator";
         let mut retriever = PinnedRetriever::default();
         retriever.put(cid, "/_redirects", b"/* https://evil.example/landing 302\n");
-        let redirects = RedirectSink::new();
+        let redirects = main_frame_sink(&format!("ipfs://{cid}/unknown"));
 
         let err = resolve_ipfs_request(
             &retriever,
@@ -1504,11 +1578,15 @@ mod tests {
         let mut retriever = PinnedRetriever::default();
         // A/B ping-pong: each path redirects to the other, forever.
         retriever.put(cid, "/_redirects", b"/a /b 301\n/b /a 301\n");
-        let redirects = RedirectSink::new();
+        let redirects = main_frame_sink(&format!("ipfs://{cid}/a"));
 
         let mut next = format!("ipfs://{cid}/a");
         let mut hops = 0;
         let reason = loop {
+            // Each hop is a fresh TOP-LEVEL load of the target the shell drained,
+            // which is what `BrowserShell::follow_pending_redirect` reports; it
+            // CONTINUES the chain rather than resetting it.
+            redirects.note_navigation(&next);
             let err = resolve_ipfs_request(&retriever, &SchemeRequest { uri: next }, &redirects)
                 .expect_err("a redirect renders nothing in place");
             let RendererError::Backend(reason) = err else {
@@ -1534,6 +1612,7 @@ mod tests {
         // A user-initiated navigation starts a FRESH chain, so a bounded chain
         // never poisons later browsing.
         redirects.reset();
+        redirects.note_navigation(&format!("ipfs://{cid}/a"));
         let err = resolve_ipfs_request(
             &retriever,
             &SchemeRequest {
@@ -1559,7 +1638,7 @@ mod tests {
         let cid = "bafydeadend";
         let mut retriever = PinnedRetriever::default();
         retriever.put(cid, "/_redirects", b"/old /gone.html 301\n");
-        let redirects = RedirectSink::new();
+        let redirects = main_frame_sink(&format!("ipfs://{cid}/old"));
 
         let _ = resolve_ipfs_request(
             &retriever,
@@ -1569,6 +1648,7 @@ mod tests {
             &redirects,
         );
         let target = redirects.take_pending().expect("the redirect is queued");
+        redirects.note_navigation(&target);
         let err = resolve_ipfs_request(&retriever, &SchemeRequest { uri: target }, &redirects)
             .expect_err("a missing redirect target fails closed");
         let RendererError::Backend(reason) = err else {
@@ -1648,5 +1728,95 @@ mod tests {
             reason.contains("mismatch"),
             "the real verify failure is surfaced, got: {reason}"
         );
+    }
+
+    // ---- The `RedirectSink`'s own chain/frame bookkeeping ------------------
+
+    #[test]
+    fn a_navigation_that_is_not_this_chains_target_ends_the_chain() {
+        // The PER-CHAIN bound. An in-page LINK CLICK never passes through the
+        // shell's `navigate`/`go_back`/`reload` entry points — the webview just
+        // loads it and reports a load event — so `note_navigation` is the ONLY
+        // signal the core gets. A load that is NOT this chain's own target must
+        // therefore END the chain: otherwise the visited set accumulates for the
+        // whole session and the SAME redirecting link is refused as a cycle the
+        // second time it is clicked.
+        let sink = RedirectSink::new();
+        sink.note_navigation("ipfs://bafyroot/docs");
+        assert!(sink.queue("ipfs://bafyroot/docs/index.html").is_ok());
+        let target = sink.take_pending().expect("the hop was accepted");
+        sink.note_navigation(&target);
+
+        // The user clicks a link to somewhere else, then clicks the SAME
+        // redirecting link again. Both are plain load events, not shell calls.
+        sink.note_navigation("ipfs://bafyroot/about");
+        sink.note_navigation("ipfs://bafyroot/docs");
+        assert!(
+            sink.queue("ipfs://bafyroot/docs/index.html").is_ok(),
+            "the same redirecting link must work again: the chain was over"
+        );
+    }
+
+    #[test]
+    fn unrelated_redirected_link_clicks_never_exhaust_the_hop_budget() {
+        // The other half of session-scoped state: N unrelated one-hop redirects in
+        // one session must each get the full budget, not eat one hop each until the
+        // cap is hit. Walk MORE than `MAX_REDIRECT_HOPS` separate link clicks.
+        let sink = RedirectSink::new();
+        for click in 0..(MAX_REDIRECT_HOPS * 3) {
+            // A link click: a fresh top-level load the shell only OBSERVES.
+            sink.note_navigation(&format!("ipfs://bafyroot/link-{click}"));
+            assert!(
+                sink.queue(&format!("ipfs://bafyroot/dest-{click}")).is_ok(),
+                "click {click} must get a fresh budget, not the previous chain's"
+            );
+            let target = sink.take_pending().expect("the hop was accepted");
+            sink.note_navigation(&target);
+        }
+    }
+
+    #[test]
+    fn a_re_reported_top_level_url_neither_ends_nor_advances_the_chain() {
+        // One document is reported MANY times (the shell's own `navigate`, then
+        // each `Started`/`Committed`/`Finished` the backend emits for it), so the
+        // signal must be idempotent: a re-report of the document already in flight
+        // must not drop an undrained redirect target on the floor.
+        let sink = RedirectSink::new();
+        sink.note_navigation("ipfs://bafyroot/old");
+        assert!(sink.queue("ipfs://bafyroot/new").is_ok());
+        sink.note_navigation("ipfs://bafyroot/old");
+        assert!(
+            sink.has_pending(),
+            "a re-report of the SAME in-flight document must not discard the queued redirect"
+        );
+        assert_eq!(
+            sink.take_pending().as_deref(),
+            Some("ipfs://bafyroot/new"),
+            "the queued target survives the redundant report"
+        );
+    }
+
+    #[test]
+    fn the_main_frame_check_survives_the_webkit_authority_less_url_form() {
+        // WebKitGTK re-reports `ipfs://<cid>/x` as the authority-LESS
+        // `ipfs:///<cid>/x`, and a request may carry a query/fragment the DAG path
+        // does not. The shell's top-level URL and the intercepted request URI for
+        // the SAME document must still reduce to ONE key, or the main-frame check
+        // misfires and a legitimate top-level redirect is silently treated as a
+        // sub-resource.
+        let sink = RedirectSink::new();
+        sink.note_navigation("ipfs:///bafyroot/old/");
+        assert!(sink.is_main_frame("ipfs://bafyroot/old"));
+        assert!(sink.is_main_frame("ipfs://bafyroot/old?x=1#frag"));
+        assert!(!sink.is_main_frame("ipfs://bafyroot/old/logo.png"));
+    }
+
+    #[test]
+    fn a_sink_nobody_reported_a_top_level_url_to_treats_every_request_as_a_sub_resource() {
+        // Fail closed on the unknown: a sink no shell drives cannot know what the
+        // main frame is, and GUESSING would let a sub-resource navigate. Answering
+        // "not the main frame" degrades to the exact pre-3xx behaviour instead.
+        let sink = RedirectSink::new();
+        assert!(!sink.is_main_frame("ipfs://bafyroot/anything"));
     }
 }

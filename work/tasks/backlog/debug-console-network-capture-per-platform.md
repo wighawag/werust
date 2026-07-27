@@ -69,3 +69,23 @@ NETWORK — per platform's real reach:
 THE FORWARD-POINTER IN THE TASK BODY IS BINDING — re-read it. In particular capture must NOT go through the session lock (push through a CLONED DebugCapture handle; onConsoleMessage is on the Android UI thread and resolve_ipfs can hold the session lock for seconds on a worker thread — that is the ANR shape user story 4 forbids), entries must be built via new()/with_* so MAX_TEXT_CHARS truncation is not bypassed, and the MAIN-DOCUMENT network entry's posture must come from the load's own posture (ADR-0006) so the Network tab cannot contradict the trust indicator.
 
 Capture is READ-ONLY observation: it must not alter the load path, the verification, or the posture. Always-on for now. Unit-test the event-to-entry MAPPING on each platform (that is the testable seam) plus recorded manual steps; network-isolated.
+
+## Requeue 2026-07-27
+
+CONDUCTOR ATTEMPT 3 — WORK IN SLICES AND COMMIT EACH ONE. Read this first, it changes HOW you work, not what to build.
+
+WHY: your two previous attempts both spent the ENTIRE output budget on internal reasoning and wrote ZERO code, so nothing was salvageable. This task is 6 integration points; it does NOT have to be done in one sitting. Your work branch is KEPT between attempts and the next attempt CONTINUES from your commits. So a slice committed is a slice banked.
+
+HOW TO WORK — this is binding:
+* Spend AT MOST a handful of read/grep calls before your FIRST edit. Every API and file location you need is already written down below and in the previous handoff note; it has been verified against this repo's pinned deps. Do not go re-derive or re-research any of it.
+* Do the slices IN THIS ORDER and COMMIT after EACH one. A commit per slice, not one commit at the end.
+  SLICE 1: the shared console shim JS string in werust-core (one place, shared by desktop+iOS) + the ConsoleEntry mapping + unit tests. COMMIT.
+  SLICE 2: desktop console — inject_script + register_script_message_handler in crates/webview-renderer. COMMIT.
+  SLICE 3: desktop network — WebView::connect_resource_load_started, then per-resource connect_finished/connect_failed reading resource.response() for status_code/mime_type/content_length. COMMIT.
+  SLICE 4: Android — onConsoleMessage on the existing CoreWebChromeClient (BrowserActivity.kt ~line 564) + a NetworkEntry recorded in the existing shouldInterceptRequest for BOTH intercepted and passed-through requests. COMMIT.
+  SLICE 5: iOS — add the console wrapper AND a best-effort fetch/XHR wrapper to the shared shim, wire the message handler like the existing provider shim (WKWebViewShellController.swift ~168-177), plus the scheme handler and nav-delegate capture points; record iOS coverage limits in DECISIONS.md. COMMIT.
+  SLICE 6: DECISIONS.md + the capability matrix row + recorded manual steps. COMMIT.
+* If you run low on room, STOP CLEANLY after a committed slice. Finishing 3 of 6 slices with everything committed and the tree green is a GOOD outcome and the next attempt continues from it. Running out mid-thought with nothing committed is the ONLY real failure.
+* Keep the tree compiling at every commit.
+
+Everything else (the decided mechanisms per platform, and the BINDING forward-pointer in the task body about pushing off the session lock, constructing entries via new()/with_*, and the main-document posture) is unchanged from the previous handoff note — re-read it and follow it.

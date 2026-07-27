@@ -4,6 +4,7 @@ slug: ipfs-redirects-3xx-navigation-support
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
 blockedBy: []
 covers: [1]
+needsAnswers: true
 ---
 
 ## What to build

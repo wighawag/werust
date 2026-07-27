@@ -51,3 +51,7 @@ BUILD IT LIKE THIS:
 5. ENS identity: the target keeps the same root CID, so the existing root-CID-prefix ens_pages association already keeps the site identity in the bar. Verify it does; do not build a new mechanism.
 
 UNCHANGED + must stay green: placeholder/:splat injection, same-root confinement, hash verification, 200-rewrite / custom-404 / no-_redirects behaviours. Tests network-isolated: a 3xx yields a Redirect action, placeholder injection into a 3xx to, off-root 3xx rejected, the chain cap fails closed, and the parent behaviours unregressed.
+
+## Requeue 2026-07-27
+
+CONDUCTOR (attempt 3 recovery): the BUILD SUCCEEDED — commit 8630c7d is pushed on work/task-ipfs-redirects-3xx-navigation-support with Gate-1 green (core Redirect action + sink, desktop/iOS wiring, chain cap, DECISIONS.md, tests). Gate 2 did NOT block: its review agent failed to LAUNCH on a transient anthropic overloaded_error. Nothing is wrong with the work. CONTINUE from the kept branch tip: re-verify it still builds, do NOT rewrite or re-litigate the design, and let the review gate run. If everything is already in place, make no further source change beyond any genuine fix.

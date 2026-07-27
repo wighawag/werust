@@ -83,3 +83,7 @@ TESTS: update the shell test a_queued_redirect_navigates_the_shell_on_the_pump_a
 ## Requeue 2026-07-27
 
 CONDUCTOR: the previous run was KILLED mid-Gate-2 by an external interruption (not a defect). Gate-1 had already passed on the rebased tip. The branch is preserved. CONTINUE from the tip: change nothing unless a genuine problem is found, and let the review gate run.
+
+## Requeue 2026-07-27
+
+CONDUCTOR: previous run KILLED again by an external interruption (environment, not a defect). Branch b4ccf97 is pushed and the job worktree still holds uncommitted WIP for the back-skip fix. CONTINUE: finish that fix, commit, and let the gates run.

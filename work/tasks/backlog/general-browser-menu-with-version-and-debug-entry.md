@@ -43,3 +43,19 @@ Design + coherence:
 > Where to look: desktop `crates/werust/src/main.rs` (toolbar today; add a GTK `MenuButton` + `PopoverMenu`, or a HeaderBar), Android `crates/werust-android/.../BrowserActivity.kt` (toolbar; add a ⋮ button + PopupMenu), iOS `crates/werust-ios/...` (add a menu button + UIMenu/SwiftUI menu). Version from ONE source: `CARGO_PKG_VERSION`, exposed to mobile via a small FFI `werust_version()` accessor so all three menus agree. Structure the menu to grow (not debug-only). The Debug item calls an open-debug-view hook (filled by the debug-view tasks) - recommended: land the menu + version + Debug-item-hook now; the debug-view tasks (blockedBy this + the store) provide the view. The menu is user-facing, always available (not debug-gated).
 >
 > Done = a growable general menu on all 3 showing the version (one source via FFI) + a Debug entry that opens the debug view (hook or real view, recorded), user-facing, parity-tracked, tested where testable + recorded manual steps. FIRST re-check no menu exists on any platform.
+
+## Requeue 2026-07-27
+
+CONDUCTOR FIX-UP (Gate-2 is RIGHT — one defect, the fix is DECIDED). The branch is green and preserved; CONTINUE from its tip. The menu itself was accepted: do NOT redesign the menu, the FFI version accessor, or the Debug hook. Fix ONLY the version-is-a-lie defect, then finish.
+
+THE DEFECT (verified by the conductor, not just claimed): the workspace Cargo.toml is version = 0.0.0, it is 0.0.0 at tag v0.2.6 too, and NOTHING injects a version into the Rust build — GoReleaser derives only the ARCHIVE NAME from the tag, never the compiled binary. So env!(CARGO_PKG_VERSION) is 0.0.0 and all three menus (plus the desktop startup banner) would ship reading 'werust 0.0.0'. That defeats the entire point of the feature, and a release is being cut off this work immediately.
+
+THE PRESCRIBED FIX — make the version REAL, resolved once in core:
+1. Add a build.rs for werust-core that resolves the version in this precedence and emits it as cargo:rustc-env=WERUST_VERSION: (a) the WERUST_VERSION env var when set and non-empty (CI injects it), else (b) git describe --tags --always with any leading v stripped (an informative dev build, e.g. 0.2.6-3-gabc1234), else (c) CARGO_PKG_VERSION as the last resort. Emit cargo:rerun-if-env-changed=WERUST_VERSION so a changed injection rebuilds. The build must NOT fail when git is absent or the source is an unpacked tarball — fall through to (c).
+2. core's version() returns env!(WERUST_VERSION) instead of env!(CARGO_PKG_VERSION). Every menu already reads the version from this ONE core accessor over the FFI, so fixing it here fixes all three menus and the desktop banner at once. Do not add a second version source.
+3. .github/workflows/release.yml: export WERUST_VERSION from the tag (the ref name with the leading v stripped) for EVERY build leg that compiles Rust — the GoReleaser/desktop job, the android-apk job and the ios-simulator job — so a tagged build shows the exact released version.
+4. Bump the workspace Cargo.toml version from 0.0.0 to 0.2.6 (the current released version) so the Cargo metadata stops lying even without injection, and a future release bump is meaningful.
+5. Correct DECISIONS.md: Decision 2 currently implies the workspace version is meaningful while the Gradle versionName is the hand-maintained 0.0.0. Say what is now true — core resolves the real version at build time and the menus read THAT; the Gradle versionName remains a separate packaging string and is explicitly NOT the menu's source.
+6. Extend crates/werust-core/tests/release_plumbing_shape.rs (it already asserts release-workflow shape) with a test that the release workflow injects WERUST_VERSION from the tag into every Rust-compiling leg, so this cannot silently regress to 0.0.0 again.
+
+Keep everything else as built. Network-isolated tests.

@@ -4,6 +4,7 @@ slug: general-browser-menu-with-version-and-debug-entry
 spec: in-app-debug-menu-console-and-network
 blockedBy: []
 covers: [2]
+needsAnswers: true
 ---
 
 ## What to build

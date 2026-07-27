@@ -242,12 +242,20 @@ impl WebViewRenderer {
     /// against real CAR fixtures by the `fetcher::retriever` and
     /// `werust_core::ipfs` tests.
     ///
+    /// It RETURNS the `_redirects` 3xx [`RedirectSink`](werust_core::ipfs::RedirectSink)
+    /// the handler pushes redirect targets into: a matched 3xx rule is a
+    /// NAVIGATION, which a scheme handler cannot perform (this one does not even
+    /// run on the UI thread), so the caller hands the sink to the shell
+    /// (`BrowserShell::with_redirect_sink`) and the shell drains it on its pump.
+    /// Ignoring the returned sink is safe and simply means a matched 3xx fails
+    /// closed without navigating.
+    ///
     /// [`resolve_ipfs_request`]: werust_core::ipfs::resolve_ipfs_request
-    pub fn install_ipfs(&mut self) {
+    pub fn install_ipfs(&mut self) -> werust_core::ipfs::RedirectSink {
         use std::sync::Arc;
 
         use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
-        use werust_core::ipfs::IPFS_SCHEME;
+        use werust_core::ipfs::{RedirectSink, IPFS_SCHEME};
 
         use crate::offthread::{complete_ipfs_request, retrieve_off_thread};
 
@@ -291,10 +299,15 @@ impl WebViewRenderer {
         // runs this handler only on its own GTK loop, so capturing the `Rc`-shared
         // lifecycle here is sound — exactly the non-`Send` wiring the provider path
         // does for its live-page response push.
+        // The `_redirects` 3xx hand-off: the handler pushes a redirect target here
+        // (it cannot navigate) and the shell drains it on its pump. Cloned into the
+        // handler, returned to the caller — both clones are the SAME sink.
+        let redirects = RedirectSink::new();
         let Some(context) = self.view.web_context() else {
-            return;
+            return redirects;
         };
         let life = self.life.clone();
+        let redirects_for_handler = redirects.clone();
         context.register_uri_scheme(IPFS_SCHEME, move |request| {
             // OFF THE UI THREAD (`docs/adr/0008`). The scheme-handler closure fires
             // on the single GTK main thread, once per request (the main document
@@ -319,11 +332,15 @@ impl WebViewRenderer {
             let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
             let retriever = retriever.clone();
             let life = life.clone();
+            // The redirect sink is `Send + Sync`, so the worker may push into it;
+            // the `!Send` lifecycle still never leaves this thread.
+            let redirects = redirects_for_handler.clone();
             // A `WebKitURISchemeRequest` is a refcounted GObject; clone bumps the
             // refcount so the request lives until the completion future finishes it.
             let request = request.clone();
-            let blocking =
-                gtk4::gio::spawn_blocking(move || retrieve_off_thread(retriever.as_ref(), uri));
+            let blocking = gtk4::gio::spawn_blocking(move || {
+                retrieve_off_thread(retriever.as_ref(), uri, &redirects)
+            });
             glib::MainContext::default().spawn_local(async move {
                 // If the worker panicked, `join` is an `Err`; surface that as a
                 // fail-closed load rather than rendering anything.
@@ -362,6 +379,8 @@ impl WebViewRenderer {
                 }
             }
         });
+
+        redirects
     }
 
     /// Wire WebKitGTK's new-window (`create`) hook so a `target="_blank"` link /

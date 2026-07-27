@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashMap};
 use cid::multihash::Multihash;
 use fetcher::{Cid, FetchError, Fetcher, Response, TrustlessGatewayCarRetriever};
 use renderer::SchemeRequest;
-use werust_core::ipfs::resolve_ipfs_request;
+use werust_core::ipfs::{resolve_ipfs_request, RedirectSink, MAX_REDIRECT_HOPS};
 
 const DAG_PB_CODEC: u64 = 0x70;
 const SHA2_256: u64 = 0x12;
@@ -151,6 +151,11 @@ impl Fetcher for CannedCarFetcher {
 struct FixtureSite {
     root: Cid,
     retriever: TrustlessGatewayCarRetriever<CannedCarFetcher>,
+    /// The `_redirects` 3xx hand-off the resolver pushes a navigation target
+    /// into, exactly as a platform edge's scheme handler owns one. Shared across
+    /// every [`get`](FixtureSite::get) on this site, so a redirect CHAIN is
+    /// bounded the same way it is in production.
+    redirects: RedirectSink,
 }
 
 impl FixtureSite {
@@ -158,12 +163,27 @@ impl FixtureSite {
     /// path (`resolve_ipfs_request` -> verified retrieval -> `_redirects`/404
     /// fallback).
     fn get(&self, path: &str) -> Result<renderer::SchemeResponse, renderer::RendererError> {
+        self.get_url(&format!("ipfs://{root}{path}", root = self.root))
+    }
+
+    /// Resolve an ABSOLUTE `ipfs://` url through the same path, for following a
+    /// redirect target the way the shell's navigation would (a fresh request,
+    /// re-entering the handler, so the target is hash-verified by the SAME
+    /// retrieval).
+    fn get_url(&self, uri: &str) -> Result<renderer::SchemeResponse, renderer::RendererError> {
         resolve_ipfs_request(
             &self.retriever,
             &SchemeRequest {
-                uri: format!("ipfs://{root}{path}", root = self.root),
+                uri: uri.to_string(),
             },
+            &self.redirects,
         )
+    }
+
+    /// The navigation the last [`get`](FixtureSite::get) queued, if it matched a
+    /// 3xx rule (drained once, as the shell drains it).
+    fn pending_redirect(&self) -> Option<String> {
+        self.redirects.take_pending()
     }
 }
 
@@ -213,6 +233,7 @@ fn site(files: &[(&str, &[u8])]) -> FixtureSite {
             CannedCarFetcher { car },
             "http://gateway.test",
         ),
+        redirects: RedirectSink::new(),
     }
 }
 
@@ -388,6 +409,143 @@ fn an_off_root_target_is_rejected_so_one_site_cannot_impersonate_another() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The 3xx NAVIGATION (task `ipfs-redirects-3xx-navigation-support`), driven over
+// the SAME real DAG so the redirected target's hash verification is proven, not
+// asserted.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_3xx_rule_navigates_to_the_target_and_the_target_is_hash_verified_by_the_same_retrieval() {
+    // ACCEPTANCE: a matching 3xx NAVIGATES. Nothing is served for the
+    // redirected-FROM url (the shell must move the bar, not silently render the
+    // new page under the old address); the absolute `ipfs://<rootcid>/<to>` target
+    // is handed to the shell, and FOLLOWING it (a fresh request, exactly as the
+    // shell's navigation does) resolves the target's bytes through the SAME
+    // per-block-verified retrieval as any other resource.
+    let site = site(&[
+        ("index.html", INDEX_HTML),
+        ("new.html", APP_HTML),
+        ("_redirects", b"/old /new.html 301\n"),
+    ]);
+
+    let err = site
+        .get("/old")
+        .expect_err("a redirect renders nothing under the OLD url");
+    let renderer::RendererError::Backend(reason) = err else {
+        panic!("expected a fail-closed backend error");
+    };
+    assert!(
+        reason.contains("301") && reason.contains("/new.html"),
+        "the redirect is legible in the reason, got: {reason}"
+    );
+
+    let target = site
+        .pending_redirect()
+        .expect("a matching 3xx queues a navigation");
+    assert_eq!(
+        target,
+        format!("ipfs://{root}/new.html", root = site.root),
+        "the navigation target is absolute, under the site's OWN root cid"
+    );
+
+    // The shell's navigation: a fresh request for the target, re-entering the
+    // resolver, so the redirected page is verified by the SAME retrieval.
+    let response = site
+        .get_url(&target)
+        .expect("the redirect target resolves through the verified path");
+    assert_eq!(response.body, APP_HTML);
+    assert_eq!(
+        response.status, 200,
+        "the redirected page is an ordinary OK page at its own url"
+    );
+}
+
+#[test]
+fn a_3xx_target_injects_the_splat_and_may_not_leave_the_root_cid() {
+    // ACCEPTANCE: placeholder/`:splat` injection works for a 3xx exactly as it
+    // does for 200/404, and the same-root confinement still holds for a
+    // navigation (the load-bearing case: an off-root target would navigate the
+    // browser to another content root on a site's own say-so).
+    let splat_site = site(&[
+        ("index.html", INDEX_HTML),
+        ("new/deep.html", APP_HTML),
+        ("_redirects", b"/old/* /new/:splat 302\n"),
+    ]);
+    let _ = splat_site.get("/old/deep.html");
+    assert_eq!(
+        splat_site.pending_redirect(),
+        Some(format!(
+            "ipfs://{root}/new/deep.html",
+            root = splat_site.root
+        )),
+        "the captured splat is injected into the navigation target"
+    );
+
+    for off_root in [
+        "https://evil.example/landing",
+        "ipfs://bafyotherroot/landing",
+        "//evil.example/landing",
+        "/../bafyotherroot/landing",
+    ] {
+        let rules = format!("/* {off_root} 301\n");
+        let site = site(&[("index.html", INDEX_HTML), ("_redirects", rules.as_bytes())]);
+        let err = site
+            .get("/unknown")
+            .expect_err("an off-root redirect must be rejected");
+        let renderer::RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("root cid"),
+            "the refusal names the unique-origin rule for `{off_root}`, got: {reason}"
+        );
+        assert_eq!(
+            site.pending_redirect(),
+            None,
+            "an off-root target is NEVER queued as a navigation"
+        );
+    }
+}
+
+#[test]
+fn a_redirect_cycle_over_a_real_dag_is_bounded_and_fails_closed() {
+    // ACCEPTANCE (the loop guard): a `_redirects` whose targets redirect again
+    // must not loop unboundedly. Each hop is a fresh navigation, so the bound is
+    // the shared sink's: a cycle (or an over-long chain) is refused, the chain
+    // stops, and the last thing the user sees is a legible fail-closed error.
+    let site = site(&[
+        ("index.html", INDEX_HTML),
+        ("_redirects", b"/a /b 301\n/b /a 301\n"),
+    ]);
+
+    let mut next = format!("ipfs://{root}/a", root = site.root);
+    let mut hops = 0usize;
+    let reason = loop {
+        let err = site
+            .get_url(&next)
+            .expect_err("a redirect renders nothing in place");
+        let renderer::RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        match site.pending_redirect() {
+            Some(target) => {
+                hops += 1;
+                assert!(
+                    hops <= MAX_REDIRECT_HOPS,
+                    "the chain must stop at {MAX_REDIRECT_HOPS} hops, walked {hops}"
+                );
+                next = target;
+            }
+            None => break reason,
+        }
+    };
+    assert!(
+        reason.contains("cycle") || reason.contains("hop limit"),
+        "the bounded chain says WHY it stopped, got: {reason}"
+    );
+}
+
 #[test]
 fn the_fallback_content_is_hash_verified_through_the_same_retrieval() {
     // ACCEPTANCE (NO verification bypass): the fallback target is fetched through
@@ -427,6 +585,7 @@ fn the_fallback_content_is_hash_verified_through_the_same_retrieval() {
             CannedCarFetcher { car },
             "http://gateway.test",
         ),
+        redirects: RedirectSink::new(),
     };
 
     let err = site
@@ -609,6 +768,7 @@ fn a_scoped_gateway_site_serves_its_custom_404_page() {
         &SchemeRequest {
             uri: format!("ipfs://{root_cid}/unknown"),
         },
+        &RedirectSink::new(),
     )
     .expect("the site's custom 404 page is served over the scoped gateway shape");
     assert_eq!(response.body, NOT_FOUND_HTML);
@@ -634,6 +794,7 @@ fn a_scoped_gateway_site_with_no_redirects_keeps_its_honest_not_found() {
         &SchemeRequest {
             uri: format!("ipfs://{root_cid}/unknown"),
         },
+        &RedirectSink::new(),
     )
     .expect_err("a site that opted into nothing keeps its hard not-found");
     let renderer::RendererError::Backend(reason) = err else {
@@ -669,6 +830,7 @@ fn a_gateway_that_http_404s_the_optional_probes_is_tolerated_as_absence() {
         &SchemeRequest {
             uri: format!("ipfs://{root_cid}/unknown"),
         },
+        &RedirectSink::new(),
     )
     .expect_err("a site that opted into nothing keeps its hard not-found");
     let renderer::RendererError::Backend(reason) = err else {

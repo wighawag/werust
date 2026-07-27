@@ -48,7 +48,7 @@
 
 use fetcher::ContentRetriever;
 use renderer::{RendererError, SchemeRequest, SchemeResponse};
-use werust_core::ipfs::resolve_ipfs_request;
+use werust_core::ipfs::{resolve_ipfs_request, RedirectSink};
 
 use crate::SharedLifecycle;
 
@@ -72,8 +72,20 @@ pub type RetrievalOutcome = Result<SchemeResponse, RendererError>;
 /// retriever and the request URI, and returns a plain value. Verification is
 /// UNCHANGED: a tamper / incomplete / budget / path failure comes back as the
 /// same `Err` it always did, so the completion half fails the load closed.
-pub fn retrieve_off_thread<R: ContentRetriever>(retriever: &R, uri: String) -> RetrievalOutcome {
-    resolve_ipfs_request(retriever, &SchemeRequest { uri })
+///
+/// `redirects` is the shell's `_redirects` 3xx [`RedirectSink`]: a matched
+/// redirect rule pushes its `ipfs://<rootcid><to>` target there (nothing is ever
+/// served for the redirected-FROM url, so this still returns an `Err` for it) and
+/// the shell drains it on its pump to perform the navigation. The sink is
+/// `Send + Sync` (an `Arc<Mutex<_>>` inside), so it crosses the worker boundary
+/// like the retriever does — unlike the `!Send` lifecycle, which still never
+/// leaves the main thread.
+pub fn retrieve_off_thread<R: ContentRetriever>(
+    retriever: &R,
+    uri: String,
+    redirects: &RedirectSink,
+) -> RetrievalOutcome {
+    resolve_ipfs_request(retriever, &SchemeRequest { uri }, redirects)
 }
 
 /// The sink a completed `ipfs://` request is delivered to on the marshalling
@@ -244,10 +256,11 @@ mod tests {
         // (the marshalling) thread. A std::thread + join stands in for
         // gio::spawn_blocking + spawn_local without a GTK loop.
         let retriever_for_worker = retriever.clone();
-        let outcome =
-            std::thread::spawn(move || retrieve_off_thread(retriever_for_worker.as_ref(), uri))
-                .join()
-                .expect("worker thread completes");
+        let outcome = std::thread::spawn(move || {
+            retrieve_off_thread(retriever_for_worker.as_ref(), uri, &RedirectSink::new())
+        })
+        .join()
+        .expect("worker thread completes");
 
         // The retrieval ran on the worker thread, NOT the marshalling thread.
         let ran_on = retriever.ran_on_thread.load(Ordering::SeqCst);
@@ -295,7 +308,7 @@ mod tests {
 
         let uri = format!("ipfs://{cid}/index.html");
         let outcome = std::thread::scope(|s| {
-            s.spawn(|| retrieve_off_thread(&retriever, uri))
+            s.spawn(|| retrieve_off_thread(&retriever, uri, &RedirectSink::new()))
                 .join()
                 .unwrap()
         });
@@ -339,7 +352,9 @@ mod tests {
                 let r = retriever.clone();
                 (
                     page.clone(),
-                    std::thread::spawn(move || retrieve_off_thread(r.as_ref(), uri)),
+                    std::thread::spawn(move || {
+                        retrieve_off_thread(r.as_ref(), uri, &RedirectSink::new())
+                    }),
                 )
             })
             .collect();

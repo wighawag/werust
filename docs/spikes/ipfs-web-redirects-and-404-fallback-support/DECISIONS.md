@@ -23,7 +23,7 @@ Durable record of the design choices this task made and of exactly WHICH SUBSET 
 | Trailing `*` catch-all with `:splat` injection (§2.4.1) | **landed** |
 | Default root `404.html` convention (no `_redirects` needed) | **landed** |
 | Error handling: a broken/unparseable `_redirects` surfaces as a failed load, never ignored (§3.4) | **landed** (as a fail-closed load failure, see Decision 4) |
-| `301` / `302` / `303` / `307` / `308` **redirects** (a NAVIGATION) | **NOT landed** — parsed, but a MATCHING one fails the load with a legible reason (Decision 3) |
+| `301` / `302` / `303` / `307` / `308` **redirects** (a NAVIGATION) | **NOT landed HERE** — parsed, but a MATCHING one failed the load with a legible reason (Decision 3). **Since landed** by the follow-on `ipfs-redirects-3xx-navigation-support` (`docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`): a matching 3xx now navigates. |
 | §3.5 query-parameter merging into a `Location` header | **NOT landed** (it only affects 3xx `Location`, which is not supported) |
 | The spec's shared conformance fixture CIDs (§5.1) | **NOT used** (they need the live network; the fixtures here are synthesized offline — see Tests) |
 
@@ -56,6 +56,8 @@ Durable record of the design choices this task made and of exactly WHICH SUBSET 
 **Alternatives considered:** (a) skip to the next rule (rejected above); (b) serve the 3xx target's content in place as if it were a 200 rewrite (rejected: it changes the meaning of the site's rule — a redirect is supposed to change the URL, and pretending otherwise would leave the bar showing a URL whose content is not what the site serves there).
 
 **Touches:** a follow-on "follow `_redirects` 3xx as a real navigation" task, which needs a navigation path out of the scheme-resolution edge (the same plumbing an `ipfs://` -> `ipfs://` in-page redirect would need). The refusal message is the discoverable pointer.
+
+**SUPERSEDED (2026-07-27)** by `ipfs-redirects-3xx-navigation-support`: that navigation path now exists (a shared `RedirectSink` the scheme handler pushes into and `BrowserShell::pump` drains), so a matching 3xx NAVIGATES and `RedirectsError::RedirectNotSupported` is gone. The rationale for the mechanism, the chain bound, and what is still deliberately not differentiated live in `docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`. Everything else in this document still stands.
 
 ## Decision 4 — a broken `_redirects` FAILS THE LOAD (the werust analogue of §3.4's "500")
 

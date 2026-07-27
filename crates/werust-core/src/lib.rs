@@ -651,6 +651,22 @@ pub struct BrowserShell {
     /// [`Rendering`](LoadStep::Rendering)) from the backend's load state. This is
     /// what lets a resolution-phase FAILURE surface the step it failed at.
     resolving_step: Option<LoadStep>,
+    /// The hand-off from the `ipfs://` scheme handler for a site's `_redirects`
+    /// 3xx rule: the `ipfs://<rootcid><to>` URL to NAVIGATE to (IPIP-0002's
+    /// redirect, [`crate::ipfs::RedirectSink`]).
+    ///
+    /// A 3xx is a navigation, not an answer to the intercepted request, and the
+    /// scheme handler cannot navigate (it is a `Send` closure that on desktop runs
+    /// off the UI thread entirely). So it PUSHES the target into this shared sink
+    /// and [`pump`](BrowserShell::pump) DRAINS it on the shell's existing cadence,
+    /// navigating through the normal path so the URL bar + history move and the
+    /// target is hash-verified by the fresh retrieval that navigation triggers.
+    ///
+    /// The edge that installs the scheme handler holds the OTHER clone of this
+    /// sink ([`with_redirect_sink`](BrowserShell::with_redirect_sink)); a shell
+    /// built without one keeps an unused empty sink, so nothing changes for a
+    /// caller that does not wire `ipfs://` at all.
+    redirects: crate::ipfs::RedirectSink,
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -747,9 +763,25 @@ impl BrowserShell {
             pinned_root_key: None,
             ens_pages: HashMap::new(),
             resolving_step: None,
+            redirects: crate::ipfs::RedirectSink::new(),
         };
         shell.refresh_chrome();
         shell
+    }
+
+    /// Share the `_redirects` 3xx [`RedirectSink`](crate::ipfs::RedirectSink) the
+    /// platform's `ipfs://` scheme handler pushes redirect targets into, so
+    /// [`pump`](BrowserShell::pump) performs them as real navigations.
+    ///
+    /// The scheme handler is installed on the backend BEFORE the shell owns it
+    /// (every edge's `install_ipfs`), so the sink is created at the edge, cloned
+    /// into the handler, and handed here — both clones are the same sink. Without
+    /// this call a matched 3xx still fails closed (nothing is served for the old
+    /// URL); it simply never navigates, which is the pre-3xx behaviour.
+    #[must_use]
+    pub fn with_redirect_sink(mut self, redirects: crate::ipfs::RedirectSink) -> Self {
+        self.redirects = redirects;
+        self
     }
 
     /// The current chrome state to paint the window from.
@@ -824,6 +856,9 @@ impl BrowserShell {
             }
         };
         self.renderer.navigate(&target)?;
+        // A USER-initiated navigation starts a FRESH redirect chain, so the hop
+        // budget bounds one site's `_redirects` chain rather than a whole session.
+        self.redirects.reset();
         // A plain navigation follows the backend's URL: drop any ENS name that was
         // pinned in the bar so it never lingers on a later page. It is a CONTENT
         // load (no ENS/IPNS resolution step), so clear any pinned resolution step;
@@ -1100,6 +1135,8 @@ impl BrowserShell {
     /// [`Renderer::go_back`]).
     pub fn go_back(&mut self) {
         self.renderer.go_back();
+        // A user-initiated history move starts a FRESH redirect chain.
+        self.redirects.reset();
         // History navigation follows the backend's URL, not the pinned ENS name.
         self.url_override = None;
         self.pinned_root_key = None;
@@ -1113,6 +1150,7 @@ impl BrowserShell {
     /// Go one step forward in session history, through the seam.
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
+        self.redirects.reset();
         self.url_override = None;
         self.pinned_root_key = None;
         self.resolving_step = None;
@@ -1171,6 +1209,7 @@ impl BrowserShell {
             return self.navigate_ens_name(&name, &path);
         }
         self.renderer.reload()?;
+        self.redirects.reset();
         self.url_override = None;
         self.pinned_root_key = None;
         self.resolving_step = None;
@@ -1264,13 +1303,61 @@ impl BrowserShell {
         Some((display, entry.mutable))
     }
 
+    /// Perform a `_redirects` 3xx NAVIGATION the `ipfs://` scheme handler queued,
+    /// if any: the IPIP-0002 redirect, made real.
+    ///
+    /// Drained on the shell's existing pump cadence (no new loop, no busy poll).
+    /// The target is an absolute `ipfs://<rootcid><to>` under the SAME root CID as
+    /// the request that matched the rule (the sink's producer enforces that), so:
+    ///
+    /// * it is a REAL navigation through the seam — the URL bar and session
+    ///   history move, exactly as a browser follows a 3xx;
+    /// * it re-enters the `ipfs://` scheme handler, so the redirect target is
+    ///   hash-verified by the SAME retrieval as any other page (werust never
+    ///   vouches for a target it did not fetch), and a target that does not
+    ///   resolve fails closed there;
+    /// * the site IDENTITY survives: the root CID is unchanged, so the existing
+    ///   root-CID-prefix `ens_pages` association re-derives `name/<new-path>` in
+    ///   the bar for a redirect inside an ENS site, rather than leaking a raw CID.
+    ///
+    /// The chain is NOT reset here (only a user-initiated navigation does that),
+    /// which is what bounds a chain of redirects: the sink refuses a cycle or an
+    /// over-long chain and queues nothing, leaving the legible fail-closed error
+    /// the handler already surfaced. Returns `true` when a navigation was
+    /// performed, so the caller repaints.
+    fn follow_pending_redirect(&mut self) -> bool {
+        let Some(target) = self.redirects.take_pending() else {
+            return false;
+        };
+        if self.renderer.navigate(&target).is_err() {
+            // A backend that cannot even start the redirected load leaves the
+            // handler's fail-closed error standing: nothing is rendered, and no
+            // further hop is attempted.
+            return false;
+        }
+        // The redirect proceeded, so the "navigating" failure the intercepted (old)
+        // request answered with is spent; the redirected load's own outcome is what
+        // the chrome should show from here.
+        self.chrome.last_error = None;
+        // The bar FOLLOWS the redirect target (it is a different in-site path than
+        // the pinned root), so drop any pin; `refresh_chrome` then re-derives the
+        // ENS identity for the new address off the site's root CID.
+        self.url_override = None;
+        self.pinned_root_key = None;
+        self.resolving_step = None;
+        true
+    }
+
     /// Drain every pending [`LoadEvent`] off the seam and fold it into the chrome.
     ///
     /// The window calls this on its main loop (a periodic pump). Each event moves
     /// the URL bar / load indicator: a `Started` clears any error and shows the
     /// target, `Committed`/`Finished` settle the URL bar on the effective URL,
-    /// and a `Failed` surfaces the reason. Returns `true` if any event was
-    /// processed, so a caller can repaint only on change.
+    /// and a `Failed` surfaces the reason. It also performs any `_redirects` 3xx
+    /// NAVIGATION the `ipfs://` scheme handler queued
+    /// ([`follow_pending_redirect`](BrowserShell::follow_pending_redirect)).
+    /// Returns `true` if any event was processed (or a redirect followed), so a
+    /// caller can repaint only on change.
     pub fn pump(&mut self) -> bool {
         let mut changed = false;
         while let Some(event) = self.renderer.poll_event() {
@@ -1317,10 +1404,28 @@ impl BrowserShell {
                     if !pinned {
                         self.chrome.url_text = url;
                     }
-                    self.chrome.last_error = Some(reason);
+                    // A `_redirects` 3xx answers the intercepted request
+                    // fail-closed (nothing may render under the redirected-FROM
+                    // url), which the backend reports as a failed load. That is
+                    // BOOKKEEPING for a navigation about to happen, not something
+                    // to show the user, so its banner is suppressed by the marker
+                    // the reason carries. A REFUSED redirect (off-root, or a chain
+                    // the sink bounded) carries no marker and surfaces normally —
+                    // it is a real failure and the chain stops there.
+                    if reason.contains(crate::ipfs::REDIRECT_NAVIGATING_MARKER) {
+                        self.chrome.last_error = None;
+                    } else {
+                        self.chrome.last_error = Some(reason);
+                    }
                 }
             }
         }
+        // A site's `_redirects` 3xx: the scheme handler queued a navigation target
+        // (it cannot navigate itself). Perform it here, on the SAME cadence, so the
+        // redirect is a real bar+history move whose target re-enters the verified
+        // `ipfs://` path. Done AFTER the events are folded so the intercepted
+        // request's own fail-closed outcome is recorded first and then superseded.
+        changed |= self.follow_pending_redirect();
         // The lifecycle state and history availability are read straight from the
         // seam (they are the backend's truth), so refresh them whether or not an
         // event fired — a failed/settled load and can_go_* can change without a
@@ -3480,6 +3585,181 @@ mod tests {
             LoadState::Finished,
             "a same-document URL change is not a load"
         );
+    }
+
+    // ---- A site's `_redirects` 3xx: a REAL navigation, chain-bounded ---------
+    // (task `ipfs-redirects-3xx-navigation-support`)
+
+    #[test]
+    fn a_queued_redirect_navigates_the_shell_on_the_pump_and_moves_the_bar_and_history() {
+        // Acceptance: a matching 3xx rule NAVIGATES. The scheme handler cannot
+        // navigate (it is a `Send` closure, off the UI thread on desktop), so it
+        // pushes the absolute `ipfs://<rootcid><to>` into the shared sink; the
+        // shell drains it on its EXISTING pump cadence and performs a real
+        // navigation — bar + history move, and the target re-enters the verified
+        // `ipfs://` path (that is what hash-verifies it).
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/old/thing").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyroot/old/thing");
+        assert!(!shell.chrome().can_go_back, "one entry so far");
+
+        // The scheme handler matched `/old/* -> /new/:splat 301` and queued the
+        // target (the producer side is unit-tested in `crate::ipfs`).
+        assert!(queue_for_test(&redirects, "ipfs://bafyroot/new/thing"));
+        assert!(shell.pump(), "the pump follows the queued redirect");
+        settle(&mut shell, &handle);
+
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs://bafyroot/new/thing",
+            "the redirect target is in the bar (a real navigation, not a rewrite)"
+        );
+        assert!(
+            shell.chrome().can_go_back,
+            "the redirect added a history entry, so back is available"
+        );
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "the intercepted request's `navigating` failure is spent once the redirect runs"
+        );
+        assert!(
+            !shell.pump(),
+            "the sink drains ONCE, so the pump cannot re-navigate the same target"
+        );
+    }
+
+    #[test]
+    fn a_redirect_inside_an_ens_site_keeps_the_eth_identity_in_the_bar() {
+        // Acceptance (compose with the root-CID-prefix `ens_pages` association): a
+        // 3xx WITHIN an ENS site lands on the SAME root CID, so the site identity
+        // survives — the bar shows `ronan.eth/<new-path>` and the ENS posture is
+        // re-marked, never the raw `ipfs://<rootcid>/<path>`. No new mechanism:
+        // this is the existing association doing its job because the redirect is
+        // confined to the root CID.
+        let page = b"<!doctype html><title>ronan</title>";
+        let (contenthash, _ipfs_uri) = ipfs_contenthash_fixture(page);
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let provider = ScriptedProvider::new(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+        let mut shell = BrowserShell::with_provider(Box::new(backend), Box::new(provider))
+            .with_redirect_sink(redirects.clone());
+
+        shell.navigate("ronan.eth").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ronan.eth");
+
+        // The site's `_redirects` sends `/old` to `/new/page` — under the SAME root
+        // CID (the only kind of target the rules may name).
+        let root = ipfs_root_of(&handle);
+        assert!(queue_for_test(&redirects, &format!("{root}/new/page")));
+        shell.pump();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+
+        assert_eq!(
+            shell.chrome().url_text,
+            "ronan.eth/new/page",
+            "a redirect inside an ENS site keeps the site identity in the bar"
+        );
+        assert!(
+            !shell.chrome().url_text.starts_with("ipfs://"),
+            "the raw root cid must never leak into the bar on a redirect"
+        );
+        assert_eq!(
+            shell.chrome().trust_posture,
+            TrustPosture::NameViaTrustedRpc,
+            "the redirected page keeps the ENS site's posture"
+        );
+    }
+
+    #[test]
+    fn the_redirected_from_requests_own_failure_is_not_shown_but_a_refusal_is() {
+        // A matched 3xx answers the intercepted request fail-closed (nothing may
+        // render under the OLD url), which the backend reports as a FAILED load.
+        // That failure is bookkeeping for a navigation about to happen, so its
+        // banner is suppressed — the user should see the redirected page, not an
+        // error flash. A REFUSED redirect (off-root, or a chain the sink bounded)
+        // carries no such marker and MUST still surface: the chain stops there and
+        // nothing will render.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("ipfs://bafyroot/old").unwrap();
+        handle.drive_to_failed(&format!(
+            "ipfs:// {marker}: 301 to `/new.html`",
+            marker = crate::ipfs::REDIRECT_NAVIGATING_MARKER
+        ));
+        shell.pump();
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "the redirected-FROM request's own failure is not shown to the user"
+        );
+
+        shell.navigate("ipfs://bafyroot/off").unwrap();
+        handle.drive_to_failed(
+            "ipfs:// _redirects fallback failed: target `https://evil.example/x` leaves the \
+             site's root cid",
+        );
+        shell.pump();
+        let shown = shell
+            .chrome()
+            .last_error
+            .as_deref()
+            .expect("a refused redirect is a real failure the user must see");
+        assert!(shown.contains("root cid"), "got: {shown}");
+    }
+
+    #[test]
+    fn a_user_navigation_resets_the_redirect_chain_budget() {
+        // The chain bound is PER-CHAIN, not per-session: a user-initiated
+        // navigation (typed URL, back/forward, reload) starts fresh, so a site that
+        // legitimately redirects on every visit is never progressively starved.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/a").unwrap();
+        settle(&mut shell, &handle);
+        // Walk the chain to its bound: the sink refuses the hop past the cap.
+        for hop in 0..crate::ipfs::MAX_REDIRECT_HOPS {
+            assert!(
+                queue_for_test(&redirects, &format!("ipfs://bafyroot/hop-{hop}")),
+                "hop {hop} is within the bound"
+            );
+            shell.pump();
+            settle(&mut shell, &handle);
+        }
+        assert!(
+            !queue_for_test(&redirects, "ipfs://bafyroot/hop-over"),
+            "the hop past the cap is refused, so the chain cannot loop"
+        );
+
+        // A USER navigation resets the budget.
+        shell.navigate("ipfs://bafyroot/fresh").unwrap();
+        settle(&mut shell, &handle);
+        assert!(
+            queue_for_test(&redirects, "ipfs://bafyroot/hop-0"),
+            "a user-initiated navigation starts a fresh chain"
+        );
+    }
+
+    /// Stand in for the `ipfs://` scheme handler queueing a redirect target into
+    /// the shared sink (the producer side is exercised for real in
+    /// `crate::ipfs`'s tests). Returns whether the sink ACCEPTED the hop, so a
+    /// test can assert the chain bound refusing one.
+    fn queue_for_test(sink: &crate::ipfs::RedirectSink, target: &str) -> bool {
+        sink.queue(target).is_ok()
     }
 
     /// The `ipfs://<rootcid>` root URL the backend currently reports (the RAW,

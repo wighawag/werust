@@ -30,6 +30,8 @@
 //! response push is; this module owns the pure resolution the installer delegates
 //! to, exercised headlessly by its tests against a pinned fixture CID.
 
+use std::sync::{Arc, Mutex};
+
 use fetcher::{ContentRetriever, RetrieveError};
 use renderer::{RendererError, SchemeRequest, SchemeResponse};
 
@@ -46,6 +48,29 @@ use crate::redirects::{
 /// [`resolve_ipfs_request`].
 pub const IPFS_SCHEME: &str = "ipfs";
 
+/// The marker every "this request is being redirected" failure reason carries, so
+/// the shell can tell its OWN redirect hand-off apart from a real load failure.
+///
+/// A matched 3xx answers the intercepted request with a fail-closed error (nothing
+/// may render under the redirected-FROM url), and the backend surfaces that as a
+/// failed load whose reason is this string. That failure is BOOKKEEPING, not
+/// something to show the user: the shell is about to navigate to the target, so it
+/// suppresses the banner for a reason carrying this marker
+/// (`BrowserShell::pump`). A refusal (an off-root target, or a chain the sink
+/// bounded) deliberately does NOT carry it — those are real failures the user must
+/// see.
+pub const REDIRECT_NAVIGATING_MARKER: &str = "_redirects redirect pending navigation";
+
+/// The maximum number of consecutive `_redirects` 3xx hops werust follows before
+/// it refuses (IPIP-0002 names no bound; browsers cap around 20, werust is
+/// deliberately tighter because each hop is a full content-addressed retrieval).
+///
+/// A site whose rules genuinely need more than this is indistinguishable from a
+/// site whose rules loop, so the chain fails closed with a legible reason rather
+/// than spinning. Reset on every user-initiated navigation
+/// ([`RedirectSink::reset`]), so a bounded chain never poisons later browsing.
+pub const MAX_REDIRECT_HOPS: usize = 5;
+
 /// The default MIME type for an `ipfs://` response whose path gives no better
 /// hint (the CID root, or a path with no recognized extension).
 ///
@@ -53,6 +78,111 @@ pub const IPFS_SCHEME: &str = "ipfs";
 /// `ipfs://<cid>` (or `ipfs://<cid>/`) load renders as a document at parity with
 /// a served page, rather than being offered for download.
 const DEFAULT_MIME_TYPE: &str = "text/html";
+
+/// The hand-off for a `_redirects` 3xx: the `ipfs://` URL the SHELL must navigate
+/// to, plus the chain bound that keeps a redirecting site from looping.
+///
+/// # Why a shared sink rather than a return value
+///
+/// A 3xx is a NAVIGATION, not an answer to the intercepted request: it moves the
+/// URL bar and the session history, which the scheme-resolution seam cannot
+/// express ([`SchemeResponse::status`] is explicitly NOT a redirect channel). But
+/// the scheme handler is a `Send` closure owned by the backend, while the shell
+/// that can actually navigate is `!Send` and lives on the UI thread — and on
+/// desktop the resolution runs on a WORKER thread entirely
+/// (`docs/adr/0008`). So the resolver PUSHES the target here (an
+/// `Arc<Mutex<_>>` clone the handler owns, the same idiom as the Android
+/// backend's `pending_eval` queue) and the shell DRAINS it on its existing pump
+/// cadence, navigating through the normal path. That navigation re-enters the
+/// `ipfs://` handler, so the redirect target is hash-verified by the SAME
+/// retrieval as any other page — werust never vouches for a target it did not
+/// fetch.
+///
+/// (Distinct from `webview-renderer`'s `RequestSink`, which is where a COMPLETED
+/// request's bytes are delivered. This sink carries a NAVIGATION the shell must
+/// perform; nothing is ever served through it.)
+///
+/// # The chain bound (the loop guard)
+///
+/// Because each hop is a fresh navigation, the bound cannot live in a recursion
+/// depth: it lives here. The sink counts hops and remembers the targets already
+/// visited in the CURRENT chain, so a cycle (`/a -> /b -> /a`) or a chain longer
+/// than [`MAX_REDIRECT_HOPS`] is refused with a legible reason and queues
+/// NOTHING. [`reset`](RedirectSink::reset) starts a fresh chain and is called by
+/// every user-initiated navigation.
+///
+/// Cloning shares one chain (it is an `Arc` handle), which is the point: the
+/// handler's clone and the shell's clone are the same sink.
+#[derive(Debug, Clone, Default)]
+pub struct RedirectSink {
+    chain: Arc<Mutex<RedirectChain>>,
+}
+
+/// The interior of a [`RedirectSink`]: one in-flight redirect chain.
+#[derive(Debug, Default)]
+struct RedirectChain {
+    /// The absolute `ipfs://` URL the shell has not navigated to yet.
+    pending: Option<String>,
+    /// The targets already redirected TO in this chain, so a repeat is a cycle.
+    visited: Vec<String>,
+}
+
+impl RedirectSink {
+    /// A fresh sink with an empty chain.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Queue `target` (an absolute `ipfs://<rootcid><path>` URL) as the next
+    /// navigation, or refuse it with the reason the chain may not continue.
+    ///
+    /// Refuses — queueing nothing — when the target has already been redirected
+    /// to in this chain (a cycle) or the chain has reached
+    /// [`MAX_REDIRECT_HOPS`]. A poisoned lock is treated as a refusal for the
+    /// same fail-closed reason: werust would rather not redirect than redirect
+    /// blind.
+    pub(crate) fn queue(&self, target: &str) -> Result<(), String> {
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err("the redirect chain state is unusable".to_string());
+        };
+        if chain.visited.iter().any(|seen| seen == target) {
+            return Err(format!(
+                "it revisits `{target}`, so the site's rules form a redirect cycle"
+            ));
+        }
+        if chain.visited.len() >= MAX_REDIRECT_HOPS {
+            return Err(format!(
+                "the redirect chain is longer than the {MAX_REDIRECT_HOPS} hop limit"
+            ));
+        }
+        chain.visited.push(target.to_string());
+        chain.pending = Some(target.to_string());
+        Ok(())
+    }
+
+    /// Take the `ipfs://` URL the shell must navigate to, if a matched 3xx rule
+    /// queued one. Drained ONCE (a second call yields [`None`] until another
+    /// redirect is queued), so a shell that pumps on a timer cannot re-navigate
+    /// the same target in a loop of its own.
+    #[must_use]
+    pub fn take_pending(&self) -> Option<String> {
+        self.chain.lock().ok()?.pending.take()
+    }
+
+    /// Start a FRESH chain: forget the hops walked so far (and any undrained
+    /// target).
+    ///
+    /// Called by every USER-initiated navigation, so the hop budget bounds one
+    /// site's redirect chain rather than a whole session: a user who types a URL,
+    /// clicks a link, or goes back gets the full budget again.
+    pub fn reset(&self) {
+        if let Ok(mut chain) = self.chain.lock() {
+            chain.pending = None;
+            chain.visited.clear();
+        }
+    }
+}
 
 /// A parsed `ipfs://<cid>[/path]` reference: the CID to resolve-and-verify plus
 /// the path used only to infer the response MIME type.
@@ -281,9 +411,21 @@ fn redirects_error_to_renderer_error(err: RedirectsError) -> RendererError {
 /// fetched through the SAME verifying retrieval, by path under the SAME root CID,
 /// so this adds NO verification bypass and NO cross-site reach; a site that ships
 /// neither file is completely unchanged (the feature is opt-in per site).
+///
+/// # A matched 3xx rule NAVIGATES (it is not answered here)
+///
+/// A rule asking for `301`/`302`/`303`/`307`/`308` is a REDIRECT: nothing is
+/// served for the intercepted (old) URL. The absolute `ipfs://<rootcid><to>`
+/// target is pushed into `redirects` for the shell to navigate to, and this
+/// request is answered with a fail-closed error naming the redirect, so no page
+/// is ever rendered under the old URL. The shell's navigation re-enters this
+/// resolver for the target, so the redirected page is hash-verified by the SAME
+/// retrieval; the [`RedirectSink`] bounds the hop count so a redirecting site
+/// cannot loop.
 pub fn resolve_ipfs_request(
     retriever: &dyn ContentRetriever,
     request: &SchemeRequest,
+    redirects: &RedirectSink,
 ) -> Result<SchemeResponse, RendererError> {
     let reference = parse_ipfs_uri(&request.uri)?;
     // Route THROUGH the verifying retriever: bytes come back only after every
@@ -301,7 +443,7 @@ pub fn resolve_ipfs_request(
         // never shadow a real page and a site without the opt-in files pays no
         // cost at all.
         Err(not_found @ RetrieveError::PathNotFound { .. }) => {
-            resolve_not_found_fallback(retriever, &reference, not_found)
+            resolve_not_found_fallback(retriever, &reference, not_found, redirects)
         }
         Err(other) => Err(retrieve_error_to_renderer_error(other)),
     }
@@ -328,6 +470,7 @@ fn resolve_not_found_fallback(
     retriever: &dyn ContentRetriever,
     reference: &IpfsRef,
     not_found: RetrieveError,
+    redirects: &RedirectSink,
 ) -> Result<SchemeResponse, RendererError> {
     match probe_optional(retriever, &reference.cid, REDIRECTS_PATH)? {
         Some(file) => {
@@ -335,6 +478,9 @@ fn resolve_not_found_fallback(
             match match_fallback(&rules, &reference.path) {
                 Some(Ok(FallbackAction::Serve { path, status })) => {
                     serve_fallback_target(retriever, reference, &path, status)
+                }
+                Some(Ok(FallbackAction::Redirect { path, status })) => {
+                    Err(queue_redirect(redirects, reference, &path, status))
                 }
                 Some(Err(e)) => Err(redirects_error_to_renderer_error(e)),
                 // The file exists but says nothing about this path: fall through
@@ -345,6 +491,41 @@ fn resolve_not_found_fallback(
         }
         // No `_redirects` at all: the site simply did not opt in to rules.
         None => serve_default_404(retriever, reference, not_found),
+    }
+}
+
+/// Hand a matched 3xx rule's target to the shell as a NAVIGATION, and answer the
+/// intercepted (old) request with the fail-closed error that says so.
+///
+/// The target is made ABSOLUTE against the request's OWN root CID
+/// (`ipfs://<cid><path>`) — never against anything the rule could name, because
+/// [`match_fallback`] already refused any `to` that leaves the root. So the
+/// navigation stays inside the same content root, which is also what keeps the
+/// shell's root-CID-prefix `ens_pages` association intact: a redirect inside an
+/// ENS site lands on the SAME root CID, so the bar keeps showing the site's
+/// `.eth` identity (plus the new in-site path) instead of leaking a raw CID.
+///
+/// The return value is ALWAYS an error: nothing may render for the old URL. When
+/// the chain bound refuses the hop, the error says THAT instead and nothing is
+/// queued, so the redirect chain terminates rather than looping.
+fn queue_redirect(
+    redirects: &RedirectSink,
+    reference: &IpfsRef,
+    target: &str,
+    status: u16,
+) -> RendererError {
+    let url = format!("{IPFS_SCHEME}://{cid}{target}", cid = reference.cid);
+    match redirects.queue(&url) {
+        // Carries `REDIRECT_NAVIGATING_MARKER`: the shell is about to navigate, so
+        // this failure is bookkeeping and its banner is suppressed.
+        Ok(()) => RendererError::Backend(format!(
+            "ipfs:// {REDIRECT_NAVIGATING_MARKER}: {status} to `{target}`"
+        )),
+        // A REFUSAL (off-root, cycle, over-long chain) carries no marker: the
+        // chain stops here and the user must see why.
+        Err(reason) => RendererError::Backend(format!(
+            "ipfs:// _redirects {status} redirect to `{target}` refused: {reason}"
+        )),
     }
 }
 
@@ -665,6 +846,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/"),
             },
+            &RedirectSink::new(),
         )
         .expect("directory root resolves index.html");
         assert_eq!(response.body, index);
@@ -691,6 +873,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/blog/__data.json?x-sveltekit-invalidated=01"),
             },
+            &RedirectSink::new(),
         )
         .expect("the nested __data.json resolves despite the client-nav query");
         assert_eq!(response.body, data_json);
@@ -714,6 +897,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/style.css"),
             },
+            &RedirectSink::new(),
         )
         .expect("a sub-resource resolves into the dag");
         assert_eq!(response.body, css);
@@ -734,6 +918,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}"),
             },
+            &RedirectSink::new(),
         )
         .expect("a bare cid resolves and renders");
         assert_eq!(response.body, page);
@@ -760,6 +945,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/index.html"),
             },
+            &RedirectSink::new(),
         );
         let err = result.expect_err("a hash mismatch must fail the load, not render");
         assert!(
@@ -785,6 +971,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("an incomplete dag fails the load");
         assert!(matches!(err, RendererError::Backend(_)));
@@ -801,6 +988,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("a budget overflow fails the load");
         assert!(
@@ -820,6 +1008,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/x"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("an unverifiable cid fails the load");
         assert!(matches!(err, RendererError::Backend(_)));
@@ -835,6 +1024,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/missing.js"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("a missing sub-resource fails the load");
         assert!(matches!(err, RendererError::Backend(_)));
@@ -865,6 +1055,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect("the site's rules resolve the not-found path");
         assert_eq!(response.body, page, "the site's own 404 page is served");
@@ -892,6 +1083,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/app/deep/client-route"),
             },
+            &RedirectSink::new(),
         )
         .expect("the spa rewrite resolves");
         assert_eq!(response.body, app);
@@ -915,6 +1107,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/"),
             },
+            &RedirectSink::new(),
         )
         .expect("an existing page resolves normally");
         assert_eq!(response.body, index);
@@ -938,6 +1131,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("an opt-out site keeps the hard not-found");
         let RendererError::Backend(reason) = err else {
@@ -963,6 +1157,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/nope"),
             },
+            &RedirectSink::new(),
         )
         .expect("the default 404.html is honoured");
         assert_eq!(response.body, page);
@@ -985,6 +1180,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/elsewhere"),
             },
+            &RedirectSink::new(),
         )
         .expect("an unmatched path falls through to the default 404 page");
         assert_eq!(response.body, page);
@@ -1004,6 +1200,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("a missing target must fail closed");
         let RendererError::Backend(reason) = err else {
@@ -1033,6 +1230,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("an off-root target must be refused");
         let RendererError::Backend(reason) = err else {
@@ -1050,28 +1248,208 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_redirect_rule_fails_with_its_reason_rather_than_silently_serving() {
-        // What did NOT land: 3xx NAVIGATION. A matching redirect rule fails the
-        // load with a legible reason instead of falling through to a later rule
-        // (which would serve a page the author never named for this path).
+    fn a_matching_3xx_rule_queues_a_navigation_to_the_target_under_the_same_root_cid() {
+        // The 3xx NAVIGATION: a matching redirect rule does NOT serve anything in
+        // place; it queues an absolute `ipfs://<rootcid><to>` navigation for the
+        // shell (bar + history move), with the `:splat` injected. The intercepted
+        // request itself is answered fail-closed (nothing is rendered for the OLD
+        // url), so the only page the user ever sees is the redirect target,
+        // hash-verified by the fresh retrieval that navigation triggers.
         let cid = "bafyredirect";
         let mut retriever = PinnedRetriever::default();
         retriever.put(cid, "/_redirects", b"/old/* /new/:splat 301\n");
         retriever.put(cid, "/404.html", b"<h1>404</h1>");
+        let redirects = RedirectSink::new();
 
         let err = resolve_ipfs_request(
             &retriever,
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/old/thing"),
             },
+            &redirects,
         )
-        .expect_err("an unsupported redirect rule fails the load");
+        .expect_err("the redirected request itself renders nothing");
         let RendererError::Backend(reason) = err else {
             panic!("expected a fail-closed backend error");
         };
         assert!(
             reason.contains("301") && reason.contains("/new/thing"),
-            "the refusal names the status and the target, got: {reason}"
+            "the reason names the status and the target, got: {reason}"
+        );
+        assert_eq!(
+            redirects.take_pending(),
+            Some(format!("ipfs://{cid}/new/thing")),
+            "the navigation target is absolute, under the SAME root cid"
+        );
+        assert_eq!(
+            redirects.take_pending(),
+            None,
+            "the sink is drained once, so the shell cannot re-navigate"
+        );
+        assert_eq!(
+            retriever.asked_paths(),
+            vec!["/old/thing".to_string(), "/_redirects".to_string()],
+            "the target is NOT fetched here: the navigation re-enters the handler"
+        );
+    }
+
+    #[test]
+    fn every_3xx_status_navigates_and_a_defaulted_status_redirects_too() {
+        // All five codes navigate identically (werust caches nothing, so it has no
+        // permanence to honour differently), and a rule with NO status is the
+        // spec's default 301, i.e. also a navigation.
+        for (rule, status) in [
+            ("/old /new.html 301\n", "301"),
+            ("/old /new.html 302\n", "302"),
+            ("/old /new.html 303\n", "303"),
+            ("/old /new.html 307\n", "307"),
+            ("/old /new.html 308\n", "308"),
+            ("/old /new.html\n", "301"),
+        ] {
+            let cid = "bafyeach3xx";
+            let mut retriever = PinnedRetriever::default();
+            retriever.put(cid, "/_redirects", rule.as_bytes());
+            let redirects = RedirectSink::new();
+            let err = resolve_ipfs_request(
+                &retriever,
+                &SchemeRequest {
+                    uri: format!("ipfs://{cid}/old"),
+                },
+                &redirects,
+            )
+            .expect_err("a redirect renders nothing in place");
+            assert!(
+                matches!(&err, RendererError::Backend(msg) if msg.contains(status)),
+                "`{rule}` must redirect with status {status}, got: {err:?}"
+            );
+            assert_eq!(
+                redirects.take_pending(),
+                Some(format!("ipfs://{cid}/new.html"))
+            );
+        }
+    }
+
+    #[test]
+    fn an_off_root_3xx_target_is_refused_and_never_queued_for_navigation() {
+        // The unique-origin rule holds for a NAVIGATION too, and it is the
+        // load-bearing one here: queueing an off-root target would navigate the
+        // shell to ANOTHER content root (or an `https://` origin) on a site's own
+        // say-so. Refused before anything is fetched or queued.
+        let cid = "bafyimpersonator";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/* https://evil.example/landing 302\n");
+        let redirects = RedirectSink::new();
+
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/unknown"),
+            },
+            &redirects,
+        )
+        .expect_err("an off-root redirect must be refused");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("root cid"),
+            "the refusal names the unique-origin rule, got: {reason}"
+        );
+        assert_eq!(
+            redirects.take_pending(),
+            None,
+            "an off-root target is NEVER queued as a navigation"
+        );
+    }
+
+    #[test]
+    fn a_redirect_chain_is_bounded_and_a_cycle_fails_closed() {
+        // The loop guard. Each hop is a fresh navigation, so the bound lives in
+        // the sink: a chain longer than `MAX_REDIRECT_HOPS`, or a hop back onto an
+        // already-visited target, fails closed with a legible reason and queues
+        // NOTHING — there is no unbounded loop.
+        let cid = "bafyloop";
+        let mut retriever = PinnedRetriever::default();
+        // A/B ping-pong: each path redirects to the other, forever.
+        retriever.put(cid, "/_redirects", b"/a /b 301\n/b /a 301\n");
+        let redirects = RedirectSink::new();
+
+        let mut next = format!("ipfs://{cid}/a");
+        let mut hops = 0;
+        let reason = loop {
+            let err = resolve_ipfs_request(&retriever, &SchemeRequest { uri: next }, &redirects)
+                .expect_err("a redirect renders nothing in place");
+            let RendererError::Backend(reason) = err else {
+                panic!("expected a fail-closed backend error");
+            };
+            match redirects.take_pending() {
+                Some(target) => {
+                    hops += 1;
+                    assert!(
+                        hops <= MAX_REDIRECT_HOPS,
+                        "the chain must stop at {MAX_REDIRECT_HOPS} hops, did {hops}"
+                    );
+                    next = target;
+                }
+                // The chain refused to go further: this is the fail-closed end.
+                None => break reason,
+            }
+        };
+        assert!(
+            reason.contains("redirect"),
+            "the chain stops with a legible redirect reason, got: {reason}"
+        );
+        // A user-initiated navigation starts a FRESH chain, so a bounded chain
+        // never poisons later browsing.
+        redirects.reset();
+        let err = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/a"),
+            },
+            &redirects,
+        )
+        .expect_err("a redirect renders nothing in place");
+        assert!(matches!(err, RendererError::Backend(_)));
+        assert_eq!(
+            redirects.take_pending(),
+            Some(format!("ipfs://{cid}/b")),
+            "after a reset the chain budget is fresh"
+        );
+    }
+
+    #[test]
+    fn a_redirect_target_that_does_not_resolve_fails_closed_on_the_next_hop() {
+        // Verification intact: werust does not pre-fetch or vouch for the target;
+        // the NAVIGATION re-enters the handler, and a target that is not in the
+        // dag (and that no rule covers) is the honest fail-closed not-found —
+        // nothing is invented for it.
+        let cid = "bafydeadend";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/old /gone.html 301\n");
+        let redirects = RedirectSink::new();
+
+        let _ = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/old"),
+            },
+            &redirects,
+        );
+        let target = redirects.take_pending().expect("the redirect is queued");
+        let err = resolve_ipfs_request(&retriever, &SchemeRequest { uri: target }, &redirects)
+            .expect_err("a missing redirect target fails closed");
+        let RendererError::Backend(reason) = err else {
+            panic!("expected a fail-closed backend error");
+        };
+        assert!(
+            reason.contains("gone.html"),
+            "the failure names the path that did not resolve, got: {reason}"
+        );
+        assert_eq!(
+            redirects.take_pending(),
+            None,
+            "a dead end queues no further navigation"
         );
     }
 
@@ -1100,6 +1478,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect("an absent _redirects must not fail the fallback");
         assert_eq!(response.body, page);
@@ -1127,6 +1506,7 @@ mod tests {
             &SchemeRequest {
                 uri: format!("ipfs://{cid}/unknown"),
             },
+            &RedirectSink::new(),
         )
         .expect_err("a tampered _redirects must fail the load");
         let RendererError::Backend(reason) = err else {

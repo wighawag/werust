@@ -423,7 +423,13 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // content-addressed page at parity with a served page; a hash mismatch fails
     // the load rather than rendering unverified bytes (task
     // `ipfs-scheme-resolution-through-renderer-seam`).
-    backend.install_ipfs();
+    // `install_ipfs` hands back the `_redirects` 3xx redirect sink: a matching
+    // 3xx rule (IPIP-0002) is a NAVIGATION the scheme handler cannot perform (it
+    // runs off the UI thread), so it queues the `ipfs://<rootcid><to>` target here
+    // and the shell drains it on its existing pump, navigating for real (bar +
+    // history move) with the target hash-verified by the fresh retrieval that
+    // navigation triggers (task `ipfs-redirects-3xx-navigation-support`).
+    let redirects = backend.install_ipfs();
     // Make a `target="_blank"` link / `window.open(url)` navigate IN THE CURRENT
     // view instead of being silently dropped. werust has no tab/window model yet,
     // so WebKitGTK's new-window (`create`) request is routed into the existing
@@ -453,7 +459,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // backend (which owns the view) outlives the window (task
     // `enable-web-inspector-devtools-all-platforms`).
     let inspector_view = backend.web_view().clone();
-    let shell = Rc::new(RefCell::new(BrowserShell::new(Box::new(backend))));
+    let shell = Rc::new(RefCell::new(
+        BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects),
+    ));
 
     // Make the two trust-indicator states VISUALLY DISTINCT: a green verified
     // badge vs an amber unverified-origin one. Loaded once for the display so the

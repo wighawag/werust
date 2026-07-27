@@ -393,8 +393,35 @@ description = "Resolve a NOT-FOUND path under an `ipfs://` site per the SITE's o
 # `WKURLSchemeTask` (WKWebViewShellController.swift, via
 # `werust_ios_resolution_status`). Task
 # `ipfs-web-redirects-and-404-fallback-support`; the subset that landed (served
-# 200/404/410/451 + placeholders/splat; 3xx navigation NOT followed) is recorded in
-# docs/spikes/ipfs-web-redirects-and-404-fallback-support/DECISIONS.md.
+# 200/404/410/451 + placeholders/splat) is recorded in
+# docs/spikes/ipfs-web-redirects-and-404-fallback-support/DECISIONS.md. The 3xx
+# half is its OWN capability row below (`ipfs-redirects-3xx-navigation`) because it
+# is a NAVIGATION, not a served response.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "ipfs-redirects-3xx-navigation"
+description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-0002) as a real NAVIGATION to the rule's `to` target under the SAME root CID: the URL bar and history move, the target is hash-verified by the retrieval that navigation triggers, and the chain is bounded so a cycle fails closed."
+# DISTINCT from `ipfs-web-pathing-fallback` above (which SERVES a target in place,
+# leaving the bar untouched) precisely because a 3xx changes the page's identity.
+# The decision + the bound are SHARED core: `werust-core`'s `redirects` module
+# yields `FallbackAction::Redirect`, `werust_core::ipfs::resolve_ipfs_request`
+# turns it into an absolute `ipfs://<rootcid><to>` pushed into the shared
+# `RedirectSink` (which counts hops and refuses a cycle / an over-long chain), and
+# `BrowserShell::pump` drains the sink and navigates through the SEAM. So every
+# context gets identical rules, identical same-root confinement, and identical
+# verification. What each edge adds is only OWNING the sink and letting the
+# navigation reach its webview: desktop's `install_ipfs` returns the sink and
+# `main.rs` hands it to the shell via `with_redirect_sink` (crates/werust,
+# crates/webview-renderer); Android and iOS do the same in their `CoreSession::new`
+# and drain the resulting pending load on their existing load-signal path
+# (`afterCoreAction` in BrowserActivity.kt / WKWebViewShellController.swift) — which
+# is ALSO why no edge tries to return a 3xx status from its interception hook
+# (Android's `WebResourceResponse` refuses a 300-399 status outright, and a status
+# on `SchemeResponse` is explicitly not a redirect channel). Task
+# `ipfs-redirects-3xx-navigation-support`.
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }

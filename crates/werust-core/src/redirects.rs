@@ -32,26 +32,35 @@
 //! through to a LATER rule and serve a different page than the site's author
 //! wrote, so the honest answer is a legible fail-closed refusal.
 //!
-//! # The subset that landed (recorded per the task's "record what landed")
+//! # The two kinds of action a rule names
 //!
 //! * `200` (rewrite / SPA + PWA), `404` (custom not-found page), `410`, `451` —
-//!   SERVED: the target's verified content is returned for the requested URL
-//!   with that status, nothing navigates, the URL bar is untouched.
-//! * `301`/`302`/`303`/`307`/`308` — PARSED (so an unrelated redirect line never
-//!   breaks a file whose catch-all is what matters) but NOT applied: a redirect
-//!   is a NAVIGATION (it changes the URL bar and the trust identity shown with
-//!   it), which the scheme-resolution seam cannot express today. A rule of this
-//!   kind that actually MATCHES fails the load with a legible
-//!   [`RedirectsError::RedirectNotSupported`] rather than silently falling
-//!   through to a later rule (which would serve a page the author did not name
-//!   for that path). Landing navigation is a follow-on task.
+//!   [`FallbackAction::Serve`]: the target's verified content is returned for
+//!   the requested URL with that status, nothing navigates, the URL bar is
+//!   untouched.
+//! * `301`/`302`/`303`/`307`/`308` — [`FallbackAction::Redirect`]: a real
+//!   NAVIGATION to the target (the URL bar and history DO move), the
+//!   browser-idiomatic redirect. The caller
+//!   ([`crate::ipfs::resolve_ipfs_request`]) turns it into an
+//!   `ipfs://<rootcid><path>` navigation the shell performs, which re-enters the
+//!   scheme handler so the target is hash-verified by the SAME retrieval; the
+//!   hop count is BOUNDED by the shell ([`crate::ipfs::RedirectSink`]) so a
+//!   `_redirects` that redirects onto another redirect can never loop.
+//!   Distinguishing permanent (301/308) from temporary (302/303/307) is only
+//!   surfaced honestly: werust performs the same navigation for all five and
+//!   caches nothing, so it never claims a permanence it does not implement.
 //! * Placeholders (`:name`) and the trailing catch-all splat (`*` / `:splat`)
-//!   are supported in both `from` matching and `to` injection.
-//! * A `to`'s query string (`/target?a=b`) is DROPPED when the target is served:
-//!   a query is a request modifier, not part of the content-addressed DAG path
-//!   (the same rule [`crate::ipfs::parse_ipfs_uri`] applies to a request URI).
-//!   IPIP-0002 §3.5's query-parameter merging only affects the `Location` of a
-//!   3xx redirect, which is not supported yet.
+//!   are supported in both `from` matching and `to` injection, for BOTH kinds.
+//! * A `to`'s query string (`/target?a=b`) is DROPPED, for both kinds: a query
+//!   is a request modifier, not part of the content-addressed DAG path (the same
+//!   rule [`crate::ipfs::parse_ipfs_uri`] applies to a request URI). IPIP-0002
+//!   §3.5's query-parameter merging is a gateway `Location`-header concern with
+//!   no `ipfs://` equivalent.
+//!
+//! The 3xx navigation's own decisions (why a shared sink rather than a
+//! `SchemeResponse` field, the chain bound, and what is deliberately NOT
+//! differentiated) live in
+//! `docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`.
 //!
 //! The full supported/unsupported table, the alternatives weighed for each
 //! choice, and the security rationale in long form live in
@@ -95,12 +104,13 @@ pub struct RedirectRule {
 
 /// What a matched rule asks werust to do for a not-found path.
 ///
-/// Only [`Serve`](FallbackAction::Serve) exists today: the target's verified
-/// content is returned FOR THE REQUESTED URL with the rule's status (a `200`
-/// rewrite, or a `404`/`410`/`451` error page), so nothing navigates and the URL
-/// bar is untouched. A matched 3xx rule is a navigation and is refused (see the
-/// module docs); it is not represented here so a caller cannot accidentally
-/// treat it as a same-URL serve.
+/// The two kinds are deliberately DISTINCT types, not one struct with a status
+/// a caller must re-classify: a [`Serve`](FallbackAction::Serve) answers the
+/// REQUESTED url in place (the URL bar never moves) while a
+/// [`Redirect`](FallbackAction::Redirect) is a NAVIGATION (the URL bar and
+/// history do move, and the target is loaded by a fresh request). Mixing them up
+/// would either lie about the page's identity or silently swallow a redirect, so
+/// the type makes the difference impossible to miss.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FallbackAction {
     /// Serve the verified content of `path` (a path under the SAME root CID) as
@@ -110,6 +120,20 @@ pub enum FallbackAction {
         /// root CID (validated by [`match_fallback`]).
         path: String,
         /// The status to answer the requested URL with.
+        status: u16,
+    },
+    /// NAVIGATE to `path` (a path under the SAME root CID): the browser-idiomatic
+    /// 3xx redirect. The caller turns this into an `ipfs://<rootcid><path>`
+    /// navigation of the shell, so the URL bar + history update and the target is
+    /// hash-verified by the fresh retrieval that navigation triggers.
+    Redirect {
+        /// The in-site path to navigate to, always root-relative and inside the
+        /// root CID (validated by [`match_fallback`]).
+        path: String,
+        /// The 3xx status the rule asked for, carried so the reason a redirect
+        /// happened stays legible. werust performs the SAME navigation for all
+        /// five codes (it caches nothing, so permanent vs temporary has no
+        /// behavioural difference to honour).
         status: u16,
     },
 }
@@ -144,15 +168,6 @@ pub enum RedirectsError {
         /// The offending target as written.
         to: String,
     },
-    /// The matching rule asks for a 3xx REDIRECT (a navigation), which the
-    /// scheme-resolution path cannot express yet. Refused rather than silently
-    /// serving some other rule's page.
-    RedirectNotSupported {
-        /// The status the rule asked for.
-        status: u16,
-        /// The target the rule named.
-        to: String,
-    },
 }
 
 impl fmt::Display for RedirectsError {
@@ -169,10 +184,6 @@ impl fmt::Display for RedirectsError {
             RedirectsError::OffRootTarget { to } => write!(
                 f,
                 "_redirects target `{to}` leaves the site's root cid; a site's rules may only name content under its own root"
-            ),
-            RedirectsError::RedirectNotSupported { status, to } => write!(
-                f,
-                "_redirects rule asks for a {status} redirect to `{to}`, which werust does not follow yet"
             ),
         }
     }
@@ -271,8 +282,8 @@ fn check_unique_placeholders(from: &str, line: usize) -> Result<(), RedirectsErr
 ///
 /// The matched rule's target is expanded (placeholders/`:splat` injected), its
 /// query string dropped, and it is CHECKED to stay within the root CID; a target
-/// that leaves the root, or a rule asking for an unsupported 3xx navigation, is
-/// a distinct fail-closed [`RedirectsError`] rather than a fall-through.
+/// that leaves the root is a distinct fail-closed [`RedirectsError`] rather than
+/// a fall-through, whether the rule serves or redirects.
 pub fn match_fallback(
     rules: &[RedirectRule],
     path: &str,
@@ -299,18 +310,21 @@ fn resolve_target(
     let target = within_root_path(&expanded).ok_or_else(|| RedirectsError::OffRootTarget {
         to: expanded.clone(),
     })?;
-    if !matches!(rule.status, 200 | 404 | 410 | 451) {
-        // A 3xx: a NAVIGATION, not a same-url serve. Refused with its reason (see
-        // the module docs) rather than falling through to another rule.
-        return Err(RedirectsError::RedirectNotSupported {
+    // The status decides WHICH action, but never whether the unique-origin check
+    // above applies: a redirect may no more leave the root cid than a rewrite may.
+    if matches!(rule.status, 200 | 404 | 410 | 451) {
+        Ok(FallbackAction::Serve {
+            path: target,
             status: rule.status,
-            to: expanded,
-        });
+        })
+    } else {
+        // A 3xx (the only remaining allowed set, enforced by `ALLOWED_STATUSES`):
+        // a NAVIGATION to the target, not a same-url serve.
+        Ok(FallbackAction::Redirect {
+            path: target,
+            status: rule.status,
+        })
     }
-    Ok(FallbackAction::Serve {
-        path: target,
-        status: rule.status,
-    })
 }
 
 /// The non-empty segments of a path (`/a/b/` -> `["a", "b"]`).
@@ -655,21 +669,86 @@ mod tests {
     }
 
     #[test]
-    fn a_matching_3xx_rule_is_refused_with_its_reason_not_silently_skipped() {
-        // What did NOT land (recorded in the module docs): a redirect is a
-        // NAVIGATION the scheme-resolution seam cannot express yet. A matching
-        // 3xx rule fails the load with a legible reason; falling through to the
-        // next rule would serve a page the author never named for this path.
+    fn a_matching_3xx_rule_is_a_navigation_to_the_target_not_a_same_url_serve() {
+        // A 3xx is the browser-idiomatic REDIRECT: the first matching rule names
+        // a target the shell NAVIGATES to (bar + history updated), so it is a
+        // `Redirect` action, distinct from a same-url `Serve`. Falling through to
+        // the next rule would serve a page the author never named for this path.
         for status in [301u16, 302, 303, 307, 308] {
             let parsed = rules(&format!("/old/* /new/:splat {status}\n/* /404.html 404\n"));
             assert_eq!(
                 match_fallback(&parsed, "/old/thing"),
-                Some(Err(RedirectsError::RedirectNotSupported {
+                Some(Ok(FallbackAction::Redirect {
+                    path: "/new/thing".into(),
                     status,
-                    to: "/new/thing".into(),
-                }))
+                })),
+                "a {status} rule injects the splat and names a navigation target"
             );
         }
+    }
+
+    #[test]
+    fn an_omitted_status_is_the_specs_default_301_redirect() {
+        // IPIP-0002 §2.3: a rule with no status means 301, which is a REDIRECT
+        // (the spec's own default), not a same-url serve.
+        let parsed = rules("/redirect-one /one.html\n");
+        assert_eq!(
+            match_fallback(&parsed, "/redirect-one"),
+            Some(Ok(FallbackAction::Redirect {
+                path: "/one.html".into(),
+                status: 301,
+            }))
+        );
+    }
+
+    #[test]
+    fn an_off_root_3xx_target_is_refused_exactly_like_an_off_root_serve() {
+        // The unique-origin rule is status-INDEPENDENT: a redirect may no more
+        // leave the site's root cid than a rewrite may. The check runs AFTER
+        // placeholder injection, so an escape smuggled through a capture is
+        // refused too.
+        for to in [
+            "https://evil.example/landing",
+            "ipfs://bafyotherroot/landing",
+            "//evil.example/landing",
+            "relative.html",
+            "/../bafyotherroot/landing",
+        ] {
+            let parsed = rules(&format!("/* {to} 301\n"));
+            let got = match_fallback(&parsed, "/unknown");
+            assert!(
+                matches!(got, Some(Err(RedirectsError::OffRootTarget { .. }))),
+                "a 3xx to `{to}` must be refused as off-root, got: {got:?}"
+            );
+        }
+        // A `..` climbing out of the root through a CAPTURED segment is refused
+        // on the redirect path too.
+        let parsed = rules("/x/* /assets/:splat 302\n");
+        let got = match_fallback(&parsed, "/x/../../etc/passwd");
+        assert!(
+            matches!(got, Some(Err(RedirectsError::OffRootTarget { .. })))
+                || matches!(
+                    got,
+                    Some(Ok(FallbackAction::Redirect { ref path, .. })) if !path.contains("..")
+                ),
+            "a capture may never escape the root on a redirect either, got: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_3xx_target_query_string_is_dropped_from_the_dag_path() {
+        // A redirect target is still a content-addressed DAG path: the query is a
+        // request modifier werust cannot carry into a CID path, so it is dropped
+        // exactly as it is for a served target (IPIP-0002 §3.5's query merging is
+        // a gateway `Location` concern werust has no equivalent of).
+        let parsed = rules("/s/:code /target.html?code=:code 302\n");
+        assert_eq!(
+            match_fallback(&parsed, "/s/42"),
+            Some(Ok(FallbackAction::Redirect {
+                path: "/target.html".into(),
+                status: 302,
+            }))
+        );
     }
 
     #[test]

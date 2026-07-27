@@ -39,7 +39,7 @@ use std::path::{Path, PathBuf};
 use fetcher::{cid_v1_raw_sha256, ContentRetriever, RetrieveError, RetrievedContent};
 use native_renderer::{NativeRenderer, RenderOutput};
 use renderer::{LoadState, Renderer, SchemeRequest};
-use werust_core::ipfs::resolve_ipfs_request;
+use werust_core::ipfs::{resolve_ipfs_request, RedirectSink};
 
 /// The `raw` IPLD multicodec code (a leaf block's bytes ARE the content).
 const RAW_CODEC: u64 = 0x55;
@@ -184,6 +184,7 @@ fn resolve_verified_html(retriever: &PinnedRawRetriever, cid: &str) -> String {
         &SchemeRequest {
             uri: format!("ipfs://{cid}/index.html"),
         },
+        &RedirectSink::new(),
     )
     .expect("verified content-addressed bytes resolve to render");
     // The content-addressed floor renders a page: the resolver infers text/html
@@ -257,6 +258,7 @@ fn a_hash_mismatch_fails_the_content_addressed_load_and_never_renders() {
         &SchemeRequest {
             uri: format!("ipfs://{honest_cid}/index.html"),
         },
+        &RedirectSink::new(),
     );
 
     let err = result.expect_err("a hash mismatch must fail the load, never render");

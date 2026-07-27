@@ -107,7 +107,13 @@ impl CoreSession {
         // A `WKWebView` loads `ipfs://` only via a registered `WKURLSchemeHandler`,
         // so Swift's handler drives the intercepted request through
         // [`resolve_ipfs`](CoreSession::resolve_ipfs) into this handler.
-        install_ipfs(&mut backend);
+        // `install_ipfs` hands back the `_redirects` 3xx redirect sink: a matched
+        // 3xx rule (IPIP-0002) is a NAVIGATION the scheme handler cannot perform,
+        // so it queues the `ipfs://<rootcid><to>` target there and the shell drains
+        // it on its pump, surfacing the target as an ordinary pending load the
+        // platform webview performs (bar + history move, target hash-verified by the
+        // fresh retrieval it triggers). Task `ipfs-redirects-3xx-navigation-support`.
+        let redirects = install_ipfs(&mut backend);
         // Wire the FIRST trust hook exactly as the desktop backend's
         // `install_provider` does: register the EIP-1193 provider bridge handler
         // and inject the page-side provider shim at document start, both routed
@@ -117,7 +123,7 @@ impl CoreSession {
         // [`handle_provider_message`](CoreSession::handle_provider_message).
         install_provider(&mut backend);
         Self {
-            shell: BrowserShell::new(Box::new(backend)),
+            shell: BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects),
             backend: handle,
         }
     }
@@ -322,9 +328,9 @@ impl CoreSession {
 /// Unlike desktop, the mobile backend does not own a native webview, so the
 /// handler is dispatched by the OS edge (Swift's `WKURLSchemeHandler`) via
 /// [`CoreSession::resolve_ipfs`], not by a webview signal.
-fn install_ipfs(backend: &mut IosBackend) {
+fn install_ipfs(backend: &mut IosBackend) -> werust_core::ipfs::RedirectSink {
     use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
-    use werust_core::ipfs::{resolve_ipfs_request, IPFS_SCHEME};
+    use werust_core::ipfs::{resolve_ipfs_request, RedirectSink, IPFS_SCHEME};
     use werust_core::retrieval::{active_gateway_endpoint, apply_settings_request, WERUST_SCHEME};
 
     // Point the retriever at the USER'S CHOSEN retrieval backend (persisted via
@@ -333,9 +339,14 @@ fn install_ipfs(backend: &mut IosBackend) {
     // `retrieval-backend-user-setting`); the per-block verify is unchanged.
     let retriever =
         TrustlessGatewayCarRetriever::with_gateway(HttpFetcher::new(), &active_gateway_endpoint());
+    // The `_redirects` 3xx hand-off, shared between the handler (which pushes a
+    // redirect target) and the shell (which drains it and navigates). Cloned into
+    // the handler, returned to the caller: both clones are the SAME sink.
+    let redirects = RedirectSink::new();
+    let redirects_for_handler = redirects.clone();
     backend.register_scheme_handler(
         IPFS_SCHEME,
-        Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+        Box::new(move |request| resolve_ipfs_request(&retriever, &request, &redirects_for_handler)),
     );
     // The internal `werust://settings` page, resolved through the SAME scheme
     // seam so Swift's `WKURLSchemeHandler` for `werust` serves it and a
@@ -344,6 +355,7 @@ fn install_ipfs(backend: &mut IosBackend) {
         WERUST_SCHEME,
         Box::new(|request| apply_settings_request(&request)),
     );
+    redirects
 }
 
 /// Install the native EIP-1193 provider bridge on `backend`, the twin of the

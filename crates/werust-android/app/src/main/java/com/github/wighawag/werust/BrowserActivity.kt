@@ -638,7 +638,16 @@ class BrowserActivity : ComponentActivity() {
 
         override fun onPageFinished(view: WebView, url: String) {
             core.onPageFinished(url)
-            refreshChrome()
+            // `afterCoreAction` (not a bare `refreshChrome`) because driving the
+            // core here may produce a PENDING LOAD the WebView must perform: a
+            // site's `_redirects` 3xx rule (IPIP-0002) is a NAVIGATION the
+            // intercepted request cannot answer (`WebResourceResponse` refuses a
+            // 3xx status outright), so the core queues the `ipfs://<rootcid><to>`
+            // target and its pump turns it into an ordinary pending load. Draining
+            // it here is what makes the redirect real — bar + history move, and the
+            // target hash-verified by the fresh `shouldInterceptRequest` it
+            // triggers (task `ipfs-redirects-3xx-navigation-support`).
+            afterCoreAction()
         }
 
         override fun doUpdateVisitedHistory(view: WebView, url: String, isReload: Boolean) {
@@ -651,7 +660,7 @@ class BrowserActivity : ComponentActivity() {
             // pin / re-deriving the ENS name) without faking a load lifecycle.
             // Task `track-webview-url-on-spa-clientside-navigation`.
             core.onUrlChanged(url)
-            refreshChrome()
+            afterCoreAction()
         }
 
         override fun onReceivedError(
@@ -661,7 +670,11 @@ class BrowserActivity : ComponentActivity() {
         ) {
             if (request.isForMainFrame) {
                 core.onPageFailed(request.url.toString(), error.description.toString())
-                refreshChrome()
+                // A `_redirects` 3xx answers the intercepted request fail-closed (no
+                // page renders under the OLD url), so THIS is the signal that
+                // follows it: drain the pending load the core's pump queued and
+                // perform the redirect.
+                afterCoreAction()
             }
         }
     }

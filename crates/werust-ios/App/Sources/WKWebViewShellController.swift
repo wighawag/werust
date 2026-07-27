@@ -397,12 +397,23 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
     func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
         core.onPageFinished(wv.url?.absoluteString ?? "")
-        refreshChrome()
+        // `afterCoreAction` (not a bare `refreshChrome`) because driving the core
+        // here may produce a PENDING LOAD the WKWebView must perform: a site's
+        // `_redirects` 3xx rule (IPIP-0002) is a NAVIGATION the intercepted
+        // `WKURLSchemeTask` cannot answer in place, so the core queues the
+        // `ipfs://<rootcid><to>` target and its pump turns it into an ordinary
+        // pending load. Draining it here is what makes the redirect real — bar +
+        // history move, and the target hash-verified by the fresh scheme task it
+        // triggers (task `ipfs-redirects-3xx-navigation-support`).
+        afterCoreAction()
     }
 
     func webView(_ wv: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         core.onPageFailed(wv.url?.absoluteString ?? "", error.localizedDescription)
-        refreshChrome()
+        // A `_redirects` 3xx answers the intercepted task fail-closed (no page
+        // renders under the OLD url), so THIS is the signal that follows it: drain
+        // the pending load the core's pump queued and perform the redirect.
+        afterCoreAction()
     }
 
     func webView(
@@ -412,7 +423,7 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     ) {
         let failed = (error as NSError).userInfo[NSURLErrorFailingURLStringErrorKey] as? String
         core.onPageFailed(failed ?? wv.url?.absoluteString ?? "", error.localizedDescription)
-        refreshChrome()
+        afterCoreAction()
     }
 
     /// The URL the app opens on launch, so it shows a browsing surface.

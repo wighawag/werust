@@ -789,7 +789,13 @@ mod tests {
         let mut r = SeamHarness::default();
         r.register_scheme_handler(
             IPFS_SCHEME,
-            Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+            Box::new(move |request| {
+                resolve_ipfs_request(
+                    &retriever,
+                    &request,
+                    &werust_core::ipfs::RedirectSink::new(),
+                )
+            }),
         );
         assert_eq!(r.scheme_handlers, ["ipfs"]);
 
@@ -820,7 +826,13 @@ mod tests {
         let mut r = SeamHarness::default();
         r.register_scheme_handler(
             IPFS_SCHEME,
-            Box::new(move |request| resolve_ipfs_request(&retriever, &request)),
+            Box::new(move |request| {
+                resolve_ipfs_request(
+                    &retriever,
+                    &request,
+                    &werust_core::ipfs::RedirectSink::new(),
+                )
+            }),
         );
 
         let result = r.deliver_scheme_request(IPFS_SCHEME, &format!("ipfs://{cid}/index.html"));
@@ -856,7 +868,11 @@ mod tests {
         // `Send`-bounded `SchemeHandler`) because this stands in for the webview's
         // own GTK-thread scheme registration.
         let ipfs_handler = move |request: renderer::SchemeRequest| {
-            let response = resolve_ipfs_request(&retriever, &request)?;
+            let response = resolve_ipfs_request(
+                &retriever,
+                &request,
+                &werust_core::ipfs::RedirectSink::new(),
+            )?;
             life_for_handler.borrow_mut().mark_content_verified();
             Ok::<_, RendererError>(response)
         };
@@ -912,7 +928,11 @@ mod tests {
         let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
         let life_for_handler = life.clone();
         let ipfs_handler = move |request: renderer::SchemeRequest| {
-            let response = resolve_ipfs_request(&retriever, &request)?;
+            let response = resolve_ipfs_request(
+                &retriever,
+                &request,
+                &werust_core::ipfs::RedirectSink::new(),
+            )?;
             life_for_handler.borrow_mut().mark_content_verified();
             Ok::<_, RendererError>(response)
         };

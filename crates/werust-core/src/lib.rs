@@ -33,6 +33,7 @@ use crate::ethereum::{EthereumProvider, RpcProvider};
 use crate::ipns::{GatewayIpnsRecordSource, IpnsRecordSource};
 
 pub mod contenthash;
+pub mod debug;
 pub mod ens;
 pub mod ethereum;
 pub mod ipfs;
@@ -697,6 +698,24 @@ pub struct BrowserShell {
     /// the main frame and re-queue the very redirect the skip exists to avoid.
     /// Cleared as soon as an event for any other url arrives.
     back_skip_issued: Option<String>,
+    /// The bounded CONSOLE + NETWORK capture store behind werust's in-app debug
+    /// menu ([`crate::debug::DebugCapture`]).
+    ///
+    /// The shell owns it so it reaches every edge over the SAME surface the
+    /// chrome does ([`debug_json`](BrowserShell::debug_json)), and shares it with
+    /// the per-platform CAPTURE POINTS by handle: they hold a clone (created at
+    /// the edge and handed here via
+    /// [`with_debug_capture`](BrowserShell::with_debug_capture), or taken from
+    /// [`debug_capture`](BrowserShell::debug_capture)) and push entries into the
+    /// same store, possibly off the UI thread: the same shared-sink shape
+    /// [`redirects`](BrowserShell::redirects) uses.
+    ///
+    /// Capture is READ-ONLY observation: nothing here feeds back into the load
+    /// path, the verification, or the chrome's own
+    /// [`trust_posture`](ChromeState::trust_posture). A shell whose edge wires no
+    /// capture point simply keeps an empty store, so nothing changes for a caller
+    /// that does not use the debug menu at all.
+    debug: crate::debug::DebugCapture,
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -796,6 +815,7 @@ impl BrowserShell {
             redirects: crate::ipfs::RedirectSink::new(),
             back_skip: Vec::new(),
             back_skip_issued: None,
+            debug: crate::debug::DebugCapture::new(),
         };
         shell.refresh_chrome();
         shell
@@ -814,6 +834,51 @@ impl BrowserShell {
     pub fn with_redirect_sink(mut self, redirects: crate::ipfs::RedirectSink) -> Self {
         self.redirects = redirects;
         self
+    }
+
+    /// Share the [`DebugCapture`](crate::debug::DebugCapture) the platform's
+    /// console/network CAPTURE POINTS push into, so the debug view renders the
+    /// entries they captured.
+    ///
+    /// The capture points are installed on the backend BEFORE the shell owns it
+    /// (each edge's console/resource-load hooks), so the store is created at the
+    /// edge, cloned into the hooks, and handed here, so both clones are the same
+    /// store. This mirrors [`with_redirect_sink`](BrowserShell::with_redirect_sink)
+    /// exactly. Without this call the shell keeps its own empty store, which is
+    /// simply never fed (the pre-capture behaviour); an edge may equally take the
+    /// shell's own store via [`debug_capture`](BrowserShell::debug_capture)
+    /// instead of building one.
+    #[must_use]
+    pub fn with_debug_capture(mut self, debug: crate::debug::DebugCapture) -> Self {
+        self.debug = debug;
+        self
+    }
+
+    /// The shell's bounded console + network capture store.
+    ///
+    /// Both a READ surface (the debug view lists
+    /// [`console`](crate::debug::DebugCapture::console) /
+    /// [`network`](crate::debug::DebugCapture::network) and its Clear button calls
+    /// [`clear`](crate::debug::DebugCapture::clear)) and the PUSH surface a
+    /// capture point clones. It is `&` rather than `&mut` because the store is a
+    /// shared handle with its own interior locking, so a `Send` capture closure
+    /// can own a clone.
+    #[must_use]
+    pub fn debug_capture(&self) -> &crate::debug::DebugCapture {
+        &self.debug
+    }
+
+    /// The capture store as the debug JSON document each edge's debug view
+    /// renders ([`crate::debug::debug_json`]).
+    ///
+    /// A DEDICATED accessor beside [`chrome`](BrowserShell::chrome) rather than a
+    /// section of the chrome JSON: the chrome is re-encoded on every refresh,
+    /// while this is read only while the debug view is open (the recorded FFI
+    /// decision, see the [`debug`](crate::debug) module docs). Additive either
+    /// way: no existing chrome field is touched.
+    #[must_use]
+    pub fn debug_json(&self) -> String {
+        crate::debug::debug_json(&self.debug)
     }
 
     /// The current chrome state to paint the window from.
@@ -4743,6 +4808,98 @@ mod tests {
             handle.focus_calls(),
             [true],
             "focus was forwarded via the seam"
+        );
+    }
+
+    // ---- The debug capture store on the shell (task -------------------------
+    // `debug-capture-store-console-and-network-in-core`)
+
+    #[test]
+    fn the_shell_owns_a_debug_capture_the_edges_read_and_the_capture_points_feed() {
+        use crate::debug::{ConsoleEntry, ConsoleLevel, NetworkEntry};
+
+        // The shell owns ONE bounded store; a capture point pushes into the clone
+        // it holds and the shell's own accessor sees the SAME entries, so every
+        // edge renders one shared fact (exactly as `RedirectSink` is shared).
+        let (shell, _handle) = shell_with_backend();
+        let capture_point = shell.debug_capture().clone();
+        capture_point.push_console(ConsoleEntry::new(ConsoleLevel::Error, "boom"));
+        capture_point.push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/x").with_trust(TrustPosture::ContentVerified),
+        );
+
+        assert_eq!(shell.debug_capture().console().len(), 1);
+        assert_eq!(shell.debug_capture().network().len(), 1);
+        assert_eq!(
+            shell.debug_capture().network()[0].trust,
+            TrustPosture::ContentVerified,
+            "the entry keeps its honest per-request posture"
+        );
+    }
+
+    #[test]
+    fn a_shared_debug_capture_can_be_installed_at_the_edge_before_the_shell_owns_it() {
+        use crate::debug::{DebugCapture, NetworkEntry};
+
+        // The platform capture points are installed on the backend BEFORE the
+        // shell owns it (the same shape as `with_redirect_sink`), so the edge can
+        // create the store, clone it into its hooks, and hand it to the shell.
+        let capture = DebugCapture::new();
+        let backend = FakeBackend::default();
+        let shell = BrowserShell::new(Box::new(backend)).with_debug_capture(capture.clone());
+        capture.push_network(NetworkEntry::new("GET", "https://x/y"));
+        assert_eq!(
+            shell.debug_capture().network().len(),
+            1,
+            "the edge's clone and the shell's are the same store"
+        );
+    }
+
+    #[test]
+    fn the_shell_exposes_the_capture_as_the_debug_json_document_the_edges_render() {
+        use crate::debug::{ConsoleEntry, ConsoleLevel, NetworkEntry};
+
+        let (shell, _handle) = shell_with_backend();
+        shell
+            .debug_capture()
+            .push_console(ConsoleEntry::new(ConsoleLevel::Warn, "careful"));
+        shell.debug_capture().push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/x")
+                .with_status(200)
+                .with_trust(TrustPosture::ContentVerified),
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&shell.debug_json()).expect("valid debug JSON");
+        assert_eq!(json["console"][0]["level"], "warn");
+        assert_eq!(json["network"][0]["trust"], "content-verified");
+        assert_eq!(json["networkCaptureEnabled"], true);
+    }
+
+    #[test]
+    fn the_debug_capture_does_not_disturb_the_chrome_state() {
+        use crate::debug::{ConsoleEntry, ConsoleLevel, NetworkEntry};
+
+        // Capture is READ-ONLY observation: pushing entries must not touch the URL
+        // bar, the load state, or the PAGE's trust posture (a captured
+        // unverified subresource can never downgrade a verified page, and a
+        // captured verified entry can never upgrade an unverified one).
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("https://example.com/").expect("navigate");
+        settle(&mut shell, &handle);
+        let before = shell.chrome().clone();
+
+        shell
+            .debug_capture()
+            .push_console(ConsoleEntry::new(ConsoleLevel::Error, "page error"));
+        shell.debug_capture().push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/x").with_trust(TrustPosture::ContentVerified),
+        );
+
+        assert_eq!(
+            shell.chrome(),
+            &before,
+            "capturing entries changes nothing about the page's chrome"
         );
     }
 }

@@ -275,6 +275,29 @@ impl CoreSession {
     pub fn chrome_json(&self) -> String {
         ffi_json::chrome_to_json(self.shell.chrome())
     }
+
+    /// The shared bounded CONSOLE + NETWORK capture store behind the in-app debug
+    /// menu ([`werust_core::debug::DebugCapture`]).
+    ///
+    /// Both the PUSH surface the Android capture points feed (Kotlin's
+    /// `WebChromeClient.onConsoleMessage` and `shouldInterceptRequest`, task
+    /// `debug-console-network-capture-per-platform`) and the store the debug view
+    /// reads/clears. It is the SHELL's store, so the Kotlin debug view renders
+    /// exactly what desktop and iOS render.
+    #[must_use]
+    pub fn debug_capture(&self) -> &werust_core::debug::DebugCapture {
+        self.shell.debug_capture()
+    }
+
+    /// The capture store as its own JSON document, the wire form Kotlin's debug
+    /// view reads across JNI: a DEDICATED accessor beside
+    /// [`chrome_json`](CoreSession::chrome_json) rather than a section of the
+    /// chrome JSON, so the chrome (re-encoded on every refresh) stays lean and
+    /// every existing chrome reader is unaffected.
+    #[must_use]
+    pub fn debug_json(&self) -> String {
+        self.shell.debug_json()
+    }
 }
 
 /// The thread-safety boundary between the Kotlin edge's TWO threads and the
@@ -433,6 +456,33 @@ impl SyncSession {
     #[must_use]
     pub fn chrome_json(&self) -> String {
         self.with(|s| s.chrome_json())
+    }
+
+    /// The debug capture store as a JSON document, under the lock. See
+    /// [`CoreSession::debug_json`].
+    #[must_use]
+    pub fn debug_json(&self) -> String {
+        self.with(|s| s.debug_json())
+    }
+
+    /// Capture one CONSOLE entry, under the lock. This is called from the WebView
+    /// UI/worker thread (`WebChromeClient.onConsoleMessage`), so it goes through
+    /// the SAME boundary `resolve_ipfs` does. See
+    /// [`werust_core::debug::DebugCapture::push_console`].
+    pub fn push_console_entry(&self, entry: werust_core::debug::ConsoleEntry) {
+        self.with(|s| s.debug_capture().push_console(entry));
+    }
+
+    /// Capture one NETWORK entry, under the lock. Called from the WebView WORKER
+    /// thread (`shouldInterceptRequest`), exactly like `resolve_ipfs`. See
+    /// [`werust_core::debug::DebugCapture::push_network`].
+    pub fn push_network_entry(&self, entry: werust_core::debug::NetworkEntry) {
+        self.with(|s| s.debug_capture().push_network(entry));
+    }
+
+    /// Empty the capture store (the debug view's Clear action), under the lock.
+    pub fn clear_debug_capture(&self) {
+        self.with(|s| s.debug_capture().clear());
     }
 }
 
@@ -883,6 +933,32 @@ mod jni_exports {
         env.new_string(json)
             .map(|js| js.into_raw())
             .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The debug capture store (console + network) as a JSON document, for the
+    /// Kotlin debug view. A DEDICATED accessor beside `nativeChromeJson`: the
+    /// chrome JSON is polled on every chrome refresh, this only while the debug
+    /// view is open.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeDebugJson(
+        env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jstring {
+        let json = unsafe { session(handle) }.debug_json();
+        env.new_string(json)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// Empty the debug capture store: the debug view's Clear action.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeDebugClear(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) {
+        unsafe { session(handle) }.clear_debug_capture();
     }
 }
 
@@ -1412,5 +1488,90 @@ mod tests {
                 .contains("\"url\":\"https://after.example/\""),
             "the session is still coherent after the off-UI-thread drive"
         );
+    }
+
+    // --- The debug capture store over the FFI (task ------------------------
+    // `debug-capture-store-console-and-network-in-core`)
+
+    #[test]
+    fn debug_json_round_trips_console_and_network_entries_including_their_trust() {
+        // The Kotlin debug view reads the capture store as ONE JSON document over
+        // JNI, exactly as it reads the chrome. It must carry every field the view
+        // paints, including the HONEST per-request trust posture, in the SAME
+        // wire vocabulary the chrome's `trustPosture` uses (ADR-0006).
+        use werust_core::debug::{ConsoleEntry, ConsoleLevel, NetworkEntry};
+
+        let s = CoreSession::new();
+        s.debug_capture().push_console(
+            ConsoleEntry::new(ConsoleLevel::Error, "boom")
+                .with_source("https://x/app.js")
+                .with_line(7)
+                .with_timestamp(1_700_000_000_001),
+        );
+        s.debug_capture().push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/pic.png")
+                .with_status(200)
+                .with_mime("image/png")
+                .with_size(99)
+                .with_trust(renderer::TrustPosture::ContentVerified)
+                .with_duration(12)
+                .with_timestamp(1_700_000_000_002),
+        );
+        s.debug_capture()
+            .push_network(NetworkEntry::new("GET", "https://cdn.example/a.js"));
+
+        let json = s.debug_json();
+        assert!(json.contains("\"level\":\"error\""), "{json}");
+        assert!(json.contains("\"message\":\"boom\""), "{json}");
+        assert!(json.contains("\"source\":\"https://x/app.js\""), "{json}");
+        assert!(json.contains("\"line\":7"), "{json}");
+        assert!(json.contains("\"url\":\"ipfs://bafy/pic.png\""), "{json}");
+        assert!(json.contains("\"status\":200"), "{json}");
+        assert!(json.contains("\"mime\":\"image/png\""), "{json}");
+        assert!(json.contains("\"scheme\":\"ipfs\""), "{json}");
+        assert!(json.contains("\"trust\":\"content-verified\""), "{json}");
+        assert!(json.contains("\"duration\":12"), "{json}");
+        // The https subresource is honestly UNVERIFIED: the debug view can never
+        // imply a request was trusted that was not.
+        assert!(json.contains("\"trust\":\"unverified-origin\""), "{json}");
+        assert!(json.contains("\"networkCaptureEnabled\":true"), "{json}");
+
+        // Clear (the debug view's Clear button) empties both lists.
+        s.debug_capture().clear();
+        let json = s.debug_json();
+        assert!(json.contains("\"console\":[]"), "{json}");
+        assert!(json.contains("\"network\":[]"), "{json}");
+    }
+
+    #[test]
+    fn the_debug_document_is_separate_so_existing_chrome_readers_are_unaffected() {
+        // The capture is a DEDICATED accessor, not an additive chrome field: the
+        // chrome JSON keeps its exact prior shape, so every existing Kotlin chrome
+        // reader is untouched.
+        use werust_core::debug::{ConsoleEntry, ConsoleLevel};
+        let s = CoreSession::new();
+        s.debug_capture()
+            .push_console(ConsoleEntry::new(ConsoleLevel::Log, "hello"));
+        let chrome = s.chrome_json();
+        assert!(!chrome.contains("console"), "{chrome}");
+        assert!(!chrome.contains("debug"), "{chrome}");
+        assert!(s.debug_json().contains("hello"));
+    }
+
+    #[test]
+    fn the_sync_session_exposes_the_debug_document_under_the_lock() {
+        // Kotlin reads the debug JSON through the SAME `SyncSession` boundary
+        // every other call goes through (the capture points run on the WebView
+        // worker thread), so the accessor must exist there too.
+        use werust_core::debug::NetworkEntry;
+        let s = SyncSession::new();
+        s.push_network_entry(NetworkEntry::new("GET", "ipfs://bafy/x"));
+        assert!(
+            s.debug_json().contains("ipfs://bafy/x"),
+            "{}",
+            s.debug_json()
+        );
+        s.clear_debug_capture();
+        assert!(s.debug_json().contains("\"network\":[]"));
     }
 }

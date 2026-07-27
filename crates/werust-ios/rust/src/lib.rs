@@ -308,6 +308,31 @@ impl CoreSession {
     pub fn chrome_json(&self) -> String {
         ffi_json::chrome_to_json(self.shell.chrome())
     }
+
+    /// The shared bounded CONSOLE + NETWORK capture store behind the in-app debug
+    /// menu ([`werust_core::debug::DebugCapture`]).
+    ///
+    /// Both the PUSH surface the iOS capture points feed (an injected `console.*`
+    /// user-script plus the reachable network points: the custom-scheme handler,
+    /// main-frame navigation, and a best-effort fetch/XHR script; task
+    /// `debug-console-network-capture-per-platform`) and the store the debug view
+    /// reads/clears. It is the SHELL's store, so the Swift debug view renders
+    /// exactly what desktop and Android render.
+    #[must_use]
+    pub fn debug_capture(&self) -> &werust_core::debug::DebugCapture {
+        self.shell.debug_capture()
+    }
+
+    /// The capture store as its own JSON document, the wire form Swift's debug
+    /// view reads across the C-ABI: a DEDICATED accessor beside
+    /// [`chrome_json`](CoreSession::chrome_json) rather than a section of the
+    /// chrome JSON, so the chrome (re-encoded on every refresh) stays lean and
+    /// every existing chrome reader is unaffected. The twin of the Android core's
+    /// `debug_json`.
+    #[must_use]
+    pub fn debug_json(&self) -> String {
+        self.shell.debug_json()
+    }
 }
 
 /// Install the native `ipfs://` scheme handler on `backend`, the twin of the
@@ -842,6 +867,32 @@ mod ffi {
             None => std::ptr::null_mut(),
         }
     }
+
+    /// The debug capture store (console + network) as a heap C string (JSON), for
+    /// the Swift debug view. Free with [`werust_ios_string_free`]. A DEDICATED
+    /// accessor beside [`werust_ios_chrome_json`]: the chrome JSON is polled on
+    /// every chrome refresh, this only while the debug view is open.
+    ///
+    /// # Safety
+    /// `session` is a live handle from `werust_ios_session_new`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_debug_json(session: *mut CoreSession) -> *mut c_char {
+        match session_mut(session) {
+            Some(s) => into_c_string(s.debug_json()),
+            None => std::ptr::null_mut(),
+        }
+    }
+
+    /// Empty the debug capture store: the debug view's Clear action.
+    ///
+    /// # Safety
+    /// `session` is a live handle from `werust_ios_session_new`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_debug_clear(session: *mut CoreSession) {
+        if let Some(s) = session_mut(session) {
+            s.debug_capture().clear();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1160,6 +1211,107 @@ mod tests {
         assert!(json.contains("\"canGoForward\":false"), "{json}");
         assert!(json.contains("\"loading\":false"), "{json}");
         assert!(json.contains("\"loadState\":\"finished\""), "{json}");
+    }
+
+    // --- The debug capture store over the FFI (task ------------------------
+    // `debug-capture-store-console-and-network-in-core`)
+
+    #[test]
+    fn debug_json_round_trips_console_and_network_entries_including_their_trust() {
+        // The Swift debug view reads the capture store as ONE JSON document over
+        // the C-ABI, exactly as it reads the chrome. It must carry every field the
+        // view paints, including the HONEST per-request trust posture, in the
+        // SAME wire vocabulary the chrome's `trustPosture` uses (ADR-0006). The
+        // byte-for-byte twin of the Android core's debug document.
+        use werust_core::debug::{ConsoleEntry, ConsoleLevel, NetworkEntry};
+
+        let s = CoreSession::new();
+        s.debug_capture().push_console(
+            ConsoleEntry::new(ConsoleLevel::Error, "boom")
+                .with_source("https://x/app.js")
+                .with_line(7)
+                .with_timestamp(1_700_000_000_001),
+        );
+        s.debug_capture().push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/pic.png")
+                .with_status(200)
+                .with_mime("image/png")
+                .with_size(99)
+                .with_trust(renderer::TrustPosture::ContentVerified)
+                .with_duration(12)
+                .with_timestamp(1_700_000_000_002),
+        );
+        s.debug_capture()
+            .push_network(NetworkEntry::new("GET", "https://cdn.example/a.js"));
+
+        let json = s.debug_json();
+        assert!(json.contains("\"level\":\"error\""), "{json}");
+        assert!(json.contains("\"message\":\"boom\""), "{json}");
+        assert!(json.contains("\"source\":\"https://x/app.js\""), "{json}");
+        assert!(json.contains("\"line\":7"), "{json}");
+        assert!(json.contains("\"url\":\"ipfs://bafy/pic.png\""), "{json}");
+        assert!(json.contains("\"status\":200"), "{json}");
+        assert!(json.contains("\"mime\":\"image/png\""), "{json}");
+        assert!(json.contains("\"scheme\":\"ipfs\""), "{json}");
+        assert!(json.contains("\"trust\":\"content-verified\""), "{json}");
+        assert!(json.contains("\"duration\":12"), "{json}");
+        // The https subresource is honestly UNVERIFIED: the debug view can never
+        // imply a request was trusted that was not.
+        assert!(json.contains("\"trust\":\"unverified-origin\""), "{json}");
+        assert!(json.contains("\"networkCaptureEnabled\":true"), "{json}");
+
+        // Clear (the debug view's Clear button) empties both lists.
+        s.debug_capture().clear();
+        let json = s.debug_json();
+        assert!(json.contains("\"console\":[]"), "{json}");
+        assert!(json.contains("\"network\":[]"), "{json}");
+    }
+
+    #[test]
+    fn the_debug_document_is_separate_so_existing_chrome_readers_are_unaffected() {
+        // The capture is a DEDICATED accessor, not an additive chrome field: the
+        // chrome JSON keeps its exact prior shape, so every existing Swift chrome
+        // reader is untouched.
+        use werust_core::debug::{ConsoleEntry, ConsoleLevel};
+        let s = CoreSession::new();
+        s.debug_capture()
+            .push_console(ConsoleEntry::new(ConsoleLevel::Log, "hello"));
+        let chrome = s.chrome_json();
+        assert!(!chrome.contains("console"), "{chrome}");
+        assert!(!chrome.contains("debug"), "{chrome}");
+        assert!(s.debug_json().contains("hello"));
+    }
+
+    #[test]
+    fn the_c_abi_reads_and_clears_the_debug_capture_and_frees_its_string() {
+        // The Swift debug view reaches the store through the raw C-ABI exports
+        // exactly as it reaches the chrome: one heap C string it frees, plus a
+        // Clear export. Null handles are tolerated.
+        use super::ffi::*;
+        use std::ffi::CStr;
+        use werust_core::debug::NetworkEntry;
+
+        unsafe {
+            let s = werust_ios_session_new();
+            (*s).debug_capture()
+                .push_network(NetworkEntry::new("GET", "ipfs://bafy/x"));
+
+            let json_ptr = werust_ios_debug_json(s);
+            assert!(!json_ptr.is_null());
+            let json = CStr::from_ptr(json_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(json_ptr);
+            assert!(json.contains("ipfs://bafy/x"), "{json}");
+
+            werust_ios_debug_clear(s);
+            let json_ptr = werust_ios_debug_json(s);
+            let json = CStr::from_ptr(json_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(json_ptr);
+            assert!(json.contains("\"network\":[]"), "{json}");
+
+            werust_ios_session_free(s);
+            assert!(werust_ios_debug_json(std::ptr::null_mut()).is_null());
+            werust_ios_debug_clear(std::ptr::null_mut());
+        }
     }
 
     /// Drive the whole Swift↔core protocol across the raw C-ABI exports exactly

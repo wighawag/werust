@@ -46,7 +46,8 @@ WerustCoreSession *werust_ios_session_new(void);
 /* Free a session created by werust_ios_session_new (null tolerated). */
 void werust_ios_session_free(WerustCoreSession *session);
 
-/* Free a char* returned by werust_ios_take_pending_load / _chrome_json. */
+/* Free a char* returned by werust_ios_take_pending_load / _chrome_json /
+ * _debug_json. */
 void werust_ios_string_free(char *s);
 
 /* Navigate to `url` (URL-bar Enter). Returns true on success, false if rejected
@@ -150,6 +151,19 @@ void werust_ios_on_url_changed(WerustCoreSession *session, const char *url);
  * bar, nav-control enablement, status line, and the trust indicator. Free with
  * werust_ios_string_free. */
 char *werust_ios_chrome_json(WerustCoreSession *session);
+
+/* The in-app debug menu's capture store as a heap C string (JSON:
+ * {"console":[{level,message,source,line,ts}],
+ *  "network":[{method,url,status,mime,size,fromCache,scheme,trust,ts,duration}],
+ *  "networkCaptureEnabled":bool}), for Swift's tabbed debug view. `trust` is the
+ * HONEST per-request trust posture in the SAME wire vocabulary chrome_json's
+ * trustPosture uses. A DEDICATED accessor rather than a chrome_json section: the
+ * chrome is polled on every refresh, this only while the debug view is open.
+ * Free with werust_ios_string_free. */
+char *werust_ios_debug_json(WerustCoreSession *session);
+
+/* Empty the debug capture store: the debug view's Clear action. */
+void werust_ios_debug_clear(WerustCoreSession *session);
 
 #ifdef __cplusplus
 }

@@ -108,8 +108,27 @@ const DEFAULT_MIME_TYPE: &str = "text/html";
 /// depth: it lives here. The sink counts hops and remembers the targets already
 /// visited in the CURRENT chain, so a cycle (`/a -> /b -> /a`) or a chain longer
 /// than [`MAX_REDIRECT_HOPS`] is refused with a legible reason and queues
-/// NOTHING. [`reset`](RedirectSink::reset) starts a fresh chain and is called by
-/// every user-initiated navigation.
+/// NOTHING.
+///
+/// The chain is PER-CHAIN, not per-session: [`note_navigation`](RedirectSink::note_navigation)
+/// reports every navigation the shell sees, and ANY navigation that is not this
+/// chain's own target ENDS the chain (a typed URL, an in-page LINK CLICK, a
+/// history move, an SPA URL change), restoring the full budget.
+/// [`reset`](RedirectSink::reset) does the same explicitly for the shell's
+/// user-intent entry points.
+///
+/// # Only the MAIN FRAME redirects
+///
+/// The scheme handler fires for the main document AND every sub-resource, but a
+/// 3xx is a navigation of the WHOLE page: a stale image/CSS/JS whose path happens
+/// to match a 3xx rule must never yank the browser off the page the user is
+/// reading. The seam's `SchemeRequest` carries no is-main-frame flag, so the sink
+/// remembers the TOP-LEVEL document URL the shell is loading
+/// ([`note_navigation`](RedirectSink::note_navigation)) and
+/// [`is_main_frame`](RedirectSink::is_main_frame) treats exactly that one
+/// intercepted URL as the main frame; every other intercepted URL is a
+/// sub-resource and redirects nothing (see
+/// `docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`, Decision 7).
 ///
 /// Cloning shares one chain (it is an `Arc` handle), which is the point: the
 /// handler's clone and the shell's clone are the same sink.
@@ -118,13 +137,21 @@ pub struct RedirectSink {
     chain: Arc<Mutex<RedirectChain>>,
 }
 
-/// The interior of a [`RedirectSink`]: one in-flight redirect chain.
+/// The interior of a [`RedirectSink`]: one in-flight redirect chain, plus the
+/// top-level document URL that says which intercepted request is the main frame.
 #[derive(Debug, Default)]
 struct RedirectChain {
     /// The absolute `ipfs://` URL the shell has not navigated to yet.
     pending: Option<String>,
     /// The targets already redirected TO in this chain, so a repeat is a cycle.
     visited: Vec<String>,
+    /// The [`frame_key`] of the target the shell is CURRENTLY following as part
+    /// of this chain (the last drained `pending`). A navigation to this URL
+    /// CONTINUES the chain; a navigation to anything else ENDS it.
+    following: Option<String>,
+    /// The [`frame_key`] of the TOP-LEVEL document URL the shell is loading, i.e.
+    /// the ONE intercepted request that is the main frame.
+    top_level: Option<String>,
 }
 
 impl RedirectSink {
@@ -132,6 +159,56 @@ impl RedirectSink {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Report that the shell is navigating (or has started/committed a load of)
+    /// the TOP-LEVEL document `url`.
+    ///
+    /// Two things hang off this one signal, both of which need the top-level URL
+    /// and nothing else:
+    ///
+    /// 1. **Which request is the main frame.** `url` becomes the one intercepted
+    ///    URL [`is_main_frame`](RedirectSink::is_main_frame) accepts, so a matched
+    ///    3xx on a SUB-RESOURCE cannot navigate the page away.
+    /// 2. **Where a redirect chain ends.** If `url` is NOT the target this chain
+    ///    queued, the chain is over: the hop budget and the visited set are
+    ///    cleared. This is what makes the bound PER-CHAIN — an in-page LINK CLICK
+    ///    never passes through the shell's `navigate`/`go_back`/`reload` entry
+    ///    points, so without this the same redirecting link would be refused as a
+    ///    cycle the second time it is clicked.
+    pub fn note_navigation(&self, url: &str) {
+        let key = frame_key(url);
+        let Ok(mut chain) = self.chain.lock() else {
+            return;
+        };
+        // The chain continues ONLY for its own target: the one the shell drained
+        // and is now loading, or one queued but not yet drained (the shell has not
+        // pumped it yet, and losing it here would drop the redirect entirely).
+        let continues = chain.following.as_deref() == Some(key.as_str())
+            || chain.pending.as_deref().map(frame_key) == Some(key.clone());
+        if !continues {
+            chain.pending = None;
+            chain.visited.clear();
+            chain.following = None;
+        }
+        chain.top_level = Some(key);
+    }
+
+    /// Whether an intercepted request for `uri` is the MAIN FRAME (the top-level
+    /// document the shell is loading) rather than a sub-resource of it.
+    ///
+    /// Inferred from the top-level URL [`note_navigation`](RedirectSink::note_navigation)
+    /// last reported, because the seam carries no is-main-frame flag. Unknown
+    /// (nothing reported yet) is answered `false`: a sink nobody drives cannot
+    /// navigate anything, which is the pre-3xx fail-closed behaviour rather than a
+    /// guess.
+    pub(crate) fn is_main_frame(&self, uri: &str) -> bool {
+        let key = frame_key(uri);
+        self.chain
+            .lock()
+            .ok()
+            .and_then(|chain| chain.top_level.clone())
+            .is_some_and(|top| top == key)
     }
 
     /// Queue `target` (an absolute `ipfs://<rootcid><path>` URL) as the next
@@ -161,27 +238,66 @@ impl RedirectSink {
         Ok(())
     }
 
+    /// Whether a redirect target is queued and not yet drained, for a caller that
+    /// must not lose it (a test, or a shell deciding whether it has work).
+    #[cfg(test)]
+    fn has_pending(&self) -> bool {
+        self.chain
+            .lock()
+            .ok()
+            .is_some_and(|chain| chain.pending.is_some())
+    }
+
     /// Take the `ipfs://` URL the shell must navigate to, if a matched 3xx rule
     /// queued one. Drained ONCE (a second call yields [`None`] until another
     /// redirect is queued), so a shell that pumps on a timer cannot re-navigate
     /// the same target in a loop of its own.
     #[must_use]
     pub fn take_pending(&self) -> Option<String> {
-        self.chain.lock().ok()?.pending.take()
+        let mut chain = self.chain.lock().ok()?;
+        let target = chain.pending.take()?;
+        // The shell is about to navigate HERE, so a load of this URL CONTINUES the
+        // current chain while a load of anything else ends it
+        // (`note_navigation`).
+        chain.following = Some(frame_key(&target));
+        Some(target)
     }
 
     /// Start a FRESH chain: forget the hops walked so far (and any undrained
     /// target).
     ///
-    /// Called by every USER-initiated navigation, so the hop budget bounds one
-    /// site's redirect chain rather than a whole session: a user who types a URL,
-    /// clicks a link, or goes back gets the full budget again.
+    /// Called by every USER-initiated navigation the shell itself performs
+    /// (`navigate` / `go_back` / `go_forward` / `reload`); a navigation the shell
+    /// only OBSERVES (an in-page link click) ends the chain through
+    /// [`note_navigation`](RedirectSink::note_navigation) instead. Either way the
+    /// hop budget bounds one site's redirect chain rather than a whole session.
+    ///
+    /// The top-level document URL is NOT cleared: which request is the main frame
+    /// is a fact about the load in flight, not about the chain, and the shell
+    /// re-reports it on the very next navigation signal anyway.
     pub fn reset(&self) {
         if let Ok(mut chain) = self.chain.lock() {
             chain.pending = None;
             chain.visited.clear();
+            chain.following = None;
         }
     }
+}
+
+/// The comparison key for "is this the same document?": an `ipfs://`-family URL
+/// reduced to `<cid>[/path]` with any query/fragment dropped, a non-`ipfs://` URL
+/// left as it is.
+///
+/// Built on [`normalize_ens_page_key`] so it collapses the SAME authority-form /
+/// authority-less / trailing-slash variance the `ens_pages` association already
+/// has to survive (WebKitGTK re-reports `ipfs://<cid>` as `ipfs:///<cid>`), and
+/// strips the query/fragment exactly as [`parse_ipfs_uri`] does — the shell's
+/// top-level URL and the intercepted request URI for the SAME document must
+/// reduce to one key or the main-frame check would misfire.
+fn frame_key(url: &str) -> String {
+    let head = url.split_once('#').map_or(url, |(head, _)| head);
+    let head = head.split_once('?').map_or(head, |(head, _)| head);
+    normalize_ens_page_key(head)
 }
 
 /// A parsed `ipfs://<cid>[/path]` reference: the CID to resolve-and-verify plus
@@ -422,12 +538,20 @@ fn redirects_error_to_renderer_error(err: RedirectsError) -> RendererError {
 /// resolver for the target, so the redirected page is hash-verified by the SAME
 /// retrieval; the [`RedirectSink`] bounds the hop count so a redirecting site
 /// cannot loop.
+///
+/// ONLY the MAIN-FRAME request redirects. This resolver also answers every
+/// SUB-RESOURCE of the page (image, CSS, JS), and navigating the whole browser
+/// because a stale image path matched a 3xx rule would yank the user off the page
+/// they are reading. A sub-resource whose path matches a 3xx therefore queues
+/// nothing, spends no hop budget, and gets the honest fail-closed not-found —
+/// exactly the pre-3xx behaviour ([`RedirectSink::is_main_frame`]).
 pub fn resolve_ipfs_request(
     retriever: &dyn ContentRetriever,
     request: &SchemeRequest,
     redirects: &RedirectSink,
 ) -> Result<SchemeResponse, RendererError> {
     let reference = parse_ipfs_uri(&request.uri)?;
+    let main_frame = redirects.is_main_frame(&request.uri);
     // Route THROUGH the verifying retriever: bytes come back only after every
     // block in the resolved resource's DAG hashed to its own CID. Any failure is
     // a hard failure that fails the load, never a silent render of unverified
@@ -443,7 +567,7 @@ pub fn resolve_ipfs_request(
         // never shadow a real page and a site without the opt-in files pays no
         // cost at all.
         Err(not_found @ RetrieveError::PathNotFound { .. }) => {
-            resolve_not_found_fallback(retriever, &reference, not_found, redirects)
+            resolve_not_found_fallback(retriever, &reference, not_found, redirects, main_frame)
         }
         Err(other) => Err(retrieve_error_to_renderer_error(other)),
     }
@@ -471,6 +595,7 @@ fn resolve_not_found_fallback(
     reference: &IpfsRef,
     not_found: RetrieveError,
     redirects: &RedirectSink,
+    main_frame: bool,
 ) -> Result<SchemeResponse, RendererError> {
     match probe_optional(retriever, &reference.cid, REDIRECTS_PATH)? {
         Some(file) => {
@@ -478,6 +603,13 @@ fn resolve_not_found_fallback(
             match match_fallback(&rules, &reference.path) {
                 Some(Ok(FallbackAction::Serve { path, status })) => {
                     serve_fallback_target(retriever, reference, &path, status)
+                }
+                // A 3xx on a SUB-RESOURCE is not a page navigation: fall through
+                // to the honest not-found (the default `404.html`, then the
+                // original `PathNotFound`) WITHOUT queueing anything or spending a
+                // hop, so a stale image reference cannot move the browser.
+                Some(Ok(FallbackAction::Redirect { .. })) if !main_frame => {
+                    serve_default_404(retriever, reference, not_found)
                 }
                 Some(Ok(FallbackAction::Redirect { path, status })) => {
                     Err(queue_redirect(redirects, reference, &path, status))

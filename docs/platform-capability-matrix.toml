@@ -402,6 +402,47 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "browser-menu"
+description = "A GENERAL browser menu (the \u22ee menu every browser has, structured to GROW into the usual items) reachable from the shell on every platform, showing the werust VERSION from ONE shared source and a DEBUG entry that opens the in-app debug view. User-facing and ALWAYS available — never debug-build-gated (distinct from `web-inspector`, which is)."
+# The AFFORDANCE is platform-idiomatic (GNOME's standard `open-menu-symbolic`
+# hamburger on desktop, `⋮` on the phones) - the recognisable PRIMARY-menu button
+# on each platform, not one glyph forced everywhere; the MENU behind it is
+# identical. The menu MODEL is the SHARED toolkit-free core (`werust-core`'s
+# `menu` module: the ordered `BrowserMenu` items, each with a stable id + label +
+# `MenuItemKind`), and the VERSION is the ONE shared `werust_core::version()` (the
+# Rust workspace `CARGO_PKG_VERSION`) — reached directly on desktop, and over the
+# FFI on mobile (`nativeVersion`/`nativeMenuJson` JNI, `werust_ios_version`/
+# `werust_ios_menu_json` C-ABI, both SESSION-FREE because the menu is a property of
+# the BUILD). So all three menus show the SAME version and the SAME items by
+# construction; no edge hardcodes either. What each edge adds is only the NATIVE
+# menu surface, built by ITERATING the core's items and rendering each by its kind
+# (an `info` item non-interactive, an `action` item dispatched by its stable id):
+# desktop a GTK `MenuButton` + `Popover` at the end of the toolbar
+# (`build_menu_button` in crates/werust/src/main.rs); Android a `PopupMenu`
+# anchored on a ⋮ toolbar button (`showBrowserMenu` in BrowserActivity.kt, over
+# `WerustCore.Menu` in WerustCore.kt); iOS a `UIMenu` on a ⋮ toolbar button with
+# `showsMenuAsPrimaryAction` (`browserMenu()` in WKWebViewShellController.swift,
+# over `WerustCore.Menu` in WerustCore.swift). That iteration is what makes the
+# menu GROW in one place: a future bookmarks/settings item is a `werust-core`
+# change plus (only if it is an action) one dispatch branch per edge.
+# The DEBUG entry is wired to a per-edge open-debug-view HOOK
+# (`open_debug_view` / `openDebugView`), which today states honestly that the view
+# is not built yet; the tabbed view itself is the follow-on tasks
+# `debug-view-console-network-tabs-{desktop,mobile}` (blockedBy this + the store),
+# and replacing that ONE function per edge is their whole edge-side job — so this
+# row is `implemented` for the MENU capability it names, not for the view. The
+# runtime-only Kotlin/Swift menu wiring (which the pure-Rust gate never compiles)
+# is guarded source-shape-wise by
+# crates/werust-core/tests/browser_menu_edge_wiring_shape.rs, and the native menu
+# surfaces carry recorded manual steps at
+# docs/spikes/general-browser-menu-with-version-and-debug-entry/README.md.
+# Task `general-browser-menu-with-version-and-debug-entry`, spec
+# `in-app-debug-menu-console-and-network`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "ipfs-redirects-3xx-navigation"
 description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-0002) as a real NAVIGATION to the rule's `to` target under the SAME root CID: the URL bar and history move, the target is hash-verified by the retrieval that navigation triggers, only the MAIN-FRAME document redirects (a sub-resource never navigates the page away), and the chain is bounded PER CHAIN so a cycle fails closed."
 # DISTINCT from `ipfs-web-pathing-fallback` above (which SERVES a target in place,

@@ -165,6 +165,23 @@ char *werust_ios_debug_json(WerustCoreSession *session);
 /* Empty the debug capture store: the debug view's Clear action. */
 void werust_ios_debug_clear(WerustCoreSession *session);
 
+/* werust's version string as a heap C string, for the browser menu's version
+ * line (free with werust_ios_string_free). Takes NO session: the version is a
+ * property of the BUILD, and it is the ONE shared source all three platforms'
+ * menus read (`werust_core::version`, the Rust workspace version), so no edge
+ * hardcodes a version of its own. */
+char *werust_ios_version(void);
+
+/* The GENERAL browser menu (the ⋮ menu, structured to grow) as a heap C string
+ * (JSON: {"version":"...","items":[{"id","label","kind":"info"|"action"}]}), for
+ * Swift to build its native UIMenu from. `kind` says how to render each item:
+ * `info` is a non-interactive line (the `werust <version>` entry), `action` an
+ * activatable one dispatched by its stable `id` (`debug` opens the in-app debug
+ * view). Rendering whatever items this lists is what lets a FUTURE menu item be
+ * added in werust-core alone. Session-free, like werust_ios_version. Free with
+ * werust_ios_string_free. */
+char *werust_ios_menu_json(void);
+
 #ifdef __cplusplus
 }
 #endif

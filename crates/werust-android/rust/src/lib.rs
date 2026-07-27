@@ -300,6 +300,32 @@ impl CoreSession {
     }
 }
 
+/// werust's version string for the Kotlin edge's browser MENU: the ONE shared
+/// source ([`werust_core::version`], the Rust workspace version), so the Android
+/// menu shows exactly what the desktop popover and the iOS menu show.
+///
+/// SESSION-FREE on purpose (unlike every accessor above): the version and the
+/// menu are properties of the BUILD, not of a browsing session, so the Kotlin
+/// edge can show them without a live native session, and no `CoreSession` is
+/// borrowed to read a constant. The recorded rationale is in
+/// `docs/spikes/general-browser-menu-with-version-and-debug-entry/DECISIONS.md`.
+#[must_use]
+pub fn version() -> &'static str {
+    werust_core::version()
+}
+
+/// The general browser MENU as the JSON document the Kotlin edge builds its
+/// native `PopupMenu` from ([`werust_core::menu::menu_json`]): the version line
+/// plus the Debug entry, each with its stable id and kind.
+///
+/// Session-free for the same reason as [`version`]. The Kotlin edge renders
+/// whatever items this lists, so a FUTURE menu item added in `werust-core`
+/// appears on Android with no Kotlin change.
+#[must_use]
+pub fn menu_json() -> String {
+    werust_core::menu::menu_json(&werust_core::menu::BrowserMenu::new())
+}
+
 /// The thread-safety boundary between the Kotlin edge's TWO threads and the
 /// single-threaded [`CoreSession`].
 ///
@@ -960,6 +986,35 @@ mod jni_exports {
     ) {
         unsafe { session(handle) }.clear_debug_capture();
     }
+
+    /// werust's version string, for the Kotlin browser menu's version line. Takes
+    /// NO session handle: the version is a property of the BUILD, and it is the
+    /// ONE shared source all three menus read (`werust_core::version`), so no
+    /// edge hardcodes a version of its own. (Declared on the Kotlin side as an
+    /// ordinary instance external — like every other export here — so its symbol
+    /// is this plain `Java_..._WerustCore_nativeVersion`; it simply threads no
+    /// handle.)
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeVersion(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        env.new_string(super::version())
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The general browser MENU as a JSON document, for the Kotlin edge to build
+    /// its native `PopupMenu` from. Session-free, like `nativeVersion`.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeMenuJson(
+        env: JNIEnv,
+        _class: JClass,
+    ) -> jstring {
+        env.new_string(super::menu_json())
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
+    }
 }
 
 #[cfg(test)]
@@ -1556,6 +1611,52 @@ mod tests {
         assert!(!chrome.contains("console"), "{chrome}");
         assert!(!chrome.contains("debug"), "{chrome}");
         assert!(s.debug_json().contains("hello"));
+    }
+
+    // --- The general browser MENU over the FFI (task ----------------------
+    // `general-browser-menu-with-version-and-debug-entry`)
+
+    #[test]
+    fn the_menu_version_is_the_one_shared_source_not_a_kotlin_hardcode() {
+        // Acceptance: the version the Android menu shows comes from ONE place
+        // (`werust_core::version`) over the FFI, so it can never drift from the
+        // desktop popover or the iOS menu. The Kotlin edge reads THIS, never a
+        // literal of its own.
+        assert_eq!(super::version(), werust_core::version());
+        assert!(!super::version().is_empty());
+    }
+
+    #[test]
+    fn the_menu_document_carries_the_version_line_and_the_debug_entry_for_kotlin() {
+        // The Kotlin edge builds its native `PopupMenu` from this ONE document,
+        // so it must carry the version and every item with its stable id + kind:
+        // a non-interactive `werust <version>` line and an activatable Debug entry
+        // that opens the debug view. The byte-for-byte twin of the iOS core's menu
+        // document, which is what makes the three menus agree.
+        let json = super::menu_json();
+        assert!(
+            json.contains(&format!("\"version\":\"{}\"", werust_core::version())),
+            "{json}"
+        );
+        assert!(json.contains("\"id\":\"version\""), "{json}");
+        assert!(
+            json.contains(&format!("\"label\":\"werust {}\"", werust_core::version())),
+            "{json}"
+        );
+        assert!(json.contains("\"kind\":\"info\""), "{json}");
+        assert!(json.contains("\"id\":\"debug\""), "{json}");
+        assert!(json.contains("\"label\":\"Debug\""), "{json}");
+        assert!(json.contains("\"kind\":\"action\""), "{json}");
+    }
+
+    #[test]
+    fn the_menu_accessors_need_no_session_so_the_menu_is_always_available() {
+        // The menu is a USER-FACING, ALWAYS-AVAILABLE surface (never debug-build-
+        // gated, never dependent on a live browsing session): both accessors are
+        // session-free, so the Kotlin edge can show the menu whatever the core's
+        // state is. Calling them with no `CoreSession` in existence is the test.
+        assert!(super::menu_json().contains("\"items\""));
+        assert!(!super::version().is_empty());
     }
 
     #[test]

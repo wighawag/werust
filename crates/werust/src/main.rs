@@ -22,11 +22,12 @@ use std::time::Duration;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
-    Orientation, Widget,
+    MenuButton, Orientation, Popover, Widget,
 };
 
 use webkit6::prelude::WebViewExt;
 use webview_renderer::WebViewRenderer;
+use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::{BrowserShell, ChromeState};
 
 /// The URL werust opens when none is given on the command line.
@@ -64,11 +65,104 @@ fn should_open_web_inspector(keyval: gdk::Key, modifiers: gdk::ModifierType) -> 
 }
 
 /// Builds the startup banner shown when the browser launches.
+///
+/// The version comes from [`werust_core::version`], the ONE shared version source
+/// the browser menu and the mobile edges also read, so the banner and the menu
+/// can never disagree.
 fn banner() -> String {
     format!(
         "werust {} — a Rust web browser (webview backend)",
-        env!("CARGO_PKG_VERSION")
+        werust_core::version()
     )
+}
+
+/// The message the DEBUG menu entry shows until the debug VIEW exists.
+///
+/// The menu (this task) lands BEFORE the tabbed debug view (the follow-on tasks
+/// `debug-view-console-network-tabs-desktop` / `-mobile`, which are blocked on
+/// this menu plus the capture store). So the Debug entry is wired to an
+/// open-debug-view HOOK — [`open_debug_view`] — that today states honestly that
+/// the view is not built yet rather than silently doing nothing. Pure, so the
+/// wording is pinned without a display; the recorded decision is in
+/// `docs/spikes/general-browser-menu-with-version-and-debug-entry/DECISIONS.md`.
+fn debug_view_placeholder_message() -> String {
+    format!(
+        "werust {} — the in-app debug view (Console + Network) is not built yet.",
+        werust_core::version()
+    )
+}
+
+/// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
+///
+/// THIS is the one function `debug-view-console-network-tabs-desktop` replaces:
+/// it will open the tabbed Console/Network panel over the capture store
+/// ([`BrowserShell::debug_capture`]). Until then it states the placeholder
+/// ([`debug_view_placeholder_message`]) so activating the entry has an honest,
+/// visible effect. Keeping the hook a named function (rather than an inline
+/// closure) is what makes the swap a one-site change.
+fn open_debug_view(parent: &ApplicationWindow) {
+    gtk4::AlertDialog::builder()
+        .message("Debug")
+        .detail(debug_view_placeholder_message())
+        .build()
+        .show(Some(parent));
+}
+
+/// Build the general browser MENU button: the ⋮ affordance every browser has,
+/// opening a popover of the core's [`BrowserMenu`] items.
+///
+/// The menu is USER-FACING and always available (it is NOT debug-build-gated —
+/// only its Debug ENTRY leads anywhere debug-ish, and the in-app debug view is
+/// itself a user feature). The item LIST is the shared core's, so this function
+/// only maps each [`MenuItemKind`] onto a widget: an
+/// [`Info`](MenuItemKind::Info) item (the `werust <version>` line) becomes a
+/// non-interactive label, an [`Action`](MenuItemKind::Action) item a flat button
+/// dispatched by its stable id. A FUTURE menu item therefore needs no change
+/// here at all unless it is an action with new behaviour — that is the
+/// "structured to grow" property, expressed in code.
+fn build_menu_button(window: &ApplicationWindow) -> MenuButton {
+    let menu = BrowserMenu::new();
+    let list = GtkBox::new(Orientation::Vertical, 2);
+    for item in menu.items() {
+        match item.kind {
+            MenuItemKind::Info => {
+                let label = Label::builder()
+                    .label(&item.label)
+                    .xalign(0.0)
+                    .sensitive(false)
+                    .build();
+                label.add_css_class("menu-info-item");
+                list.append(&label);
+            }
+            MenuItemKind::Action => {
+                let button = Button::builder().label(&item.label).build();
+                button.add_css_class("flat");
+                // Dispatch on the STABLE id, never the display label.
+                let id = item.id.clone();
+                let window = window.clone();
+                button.connect_clicked(move |button| {
+                    // Close the popover first, so the menu does not sit over
+                    // whatever the entry opens.
+                    if let Some(popover) = button.ancestor(Popover::static_type()) {
+                        if let Ok(popover) = popover.downcast::<Popover>() {
+                            popover.popdown();
+                        }
+                    }
+                    if id == MENU_ITEM_DEBUG {
+                        open_debug_view(&window);
+                    }
+                });
+                list.append(&button);
+            }
+        }
+    }
+
+    let popover = Popover::builder().child(&list).build();
+    MenuButton::builder()
+        .icon_name("open-menu-symbolic")
+        .tooltip_text("Menu")
+        .popover(&popover)
+        .build()
 }
 
 fn main() -> glib::ExitCode {
@@ -385,6 +479,7 @@ const TRUST_INDICATOR_CSS: &str = "\
 .error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .invalid-url-badge { color: #c01c28; font-weight: bold; padding: 0 6px; }\
+.menu-info-item { padding: 4px 8px; }\
 .url-invalid { color: #c01c28; text-decoration: underline; text-decoration-color: #c01c28; }";
 
 /// Load the trust-indicator stylesheet onto the default display, so the
@@ -522,6 +617,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     toolbar.append(&url_entry);
     toolbar.append(&invalid_badge);
     toolbar.append(&trust);
+    // The general browser MENU (⋮) sits at the END of the toolbar, where every
+    // other browser puts it. Appended after the window exists so the Debug entry
+    // can parent its hook's dialog; see below.
 
     let chrome = Rc::new(Chrome {
         url_entry: url_entry.clone(),
@@ -551,6 +649,14 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         .title("werust")
         .child(&root)
         .build();
+
+    // The GENERAL browser menu: a ⋮ button at the end of the toolbar opening a
+    // popover of the shared core's `BrowserMenu` items — today the werust version
+    // line and a Debug entry that calls `open_debug_view`. User-facing and always
+    // available (never debug-build-gated), and built to grow: a new core menu item
+    // shows up here with no layout change (task
+    // `general-browser-menu-with-version-and-debug-entry`).
+    toolbar.append(&build_menu_button(&window));
 
     // Wire each control to drive the shell THROUGH the seam, then repaint chrome.
     // Shared as an `Rc<dyn Fn()>` so every handler (and the pump) can hold it.
@@ -649,13 +755,14 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, error_banner_css_class, error_banner_text, error_banner_visible,
-        invalid_entry_badge_text, invalid_entry_badge_visible, should_open_web_inspector,
-        status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail,
-        DEFAULT_URL,
+        banner, debug_view_placeholder_message, error_banner_css_class, error_banner_text,
+        error_banner_visible, invalid_entry_badge_text, invalid_entry_badge_visible,
+        should_open_web_inspector, status_line, trust_indicator, trust_indicator_css_class,
+        trust_indicator_detail, DEFAULT_URL,
     };
     use gtk4::gdk;
     use renderer::{LoadState, TrustPosture};
+    use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
     use werust_core::{ChromeState, LoadStep};
 
     #[test]
@@ -805,6 +912,63 @@ mod tests {
     #[test]
     fn banner_names_werust() {
         assert!(banner().starts_with("werust "));
+    }
+
+    #[test]
+    fn the_desktop_menu_renders_the_shared_core_items_with_the_one_shared_version() {
+        // Acceptance (desktop): the ⋮ menu is built from the SHARED core
+        // `BrowserMenu`, so the desktop popover shows the SAME version line and
+        // the SAME Debug entry the Android and iOS menus show — one source, three
+        // native surfaces. Asserted on the model the GTK builder consumes, since
+        // the widget tree itself needs a display (the manual steps for the real
+        // popover are recorded in the task's spike dir).
+        let menu = BrowserMenu::new();
+
+        let version = menu.item(MENU_ITEM_VERSION).expect("a version entry");
+        assert_eq!(version.label, format!("werust {}", werust_core::version()));
+        assert_eq!(
+            version.kind,
+            MenuItemKind::Info,
+            "the version line is rendered non-interactive in the popover"
+        );
+        // The startup banner and the menu read the SAME version source, so the
+        // two can never drift apart.
+        assert!(
+            banner().contains(werust_core::version()),
+            "the banner and the menu agree on the version: {}",
+            banner()
+        );
+
+        let debug = menu.item(MENU_ITEM_DEBUG).expect("a debug entry");
+        assert_eq!(debug.label, "Debug");
+        assert_eq!(
+            debug.kind,
+            MenuItemKind::Action,
+            "the Debug entry is the activatable one: it opens the debug view"
+        );
+    }
+
+    #[test]
+    fn the_debug_entry_hook_states_the_view_is_not_built_yet_rather_than_doing_nothing() {
+        // Acceptance: the Debug entry opens the debug view via an
+        // OPEN-DEBUG-VIEW HOOK the debug-view task fills. This task lands the menu
+        // FIRST (the view tasks are blocked on it), so the hook must have an
+        // HONEST visible effect meanwhile — not a silent no-op that reads as a
+        // broken menu item. The wording names the version and the view's real
+        // content (Console + Network) so the user knows what is coming.
+        let message = debug_view_placeholder_message();
+        assert!(
+            message.contains(werust_core::version()),
+            "the placeholder names the running version: {message}"
+        );
+        assert!(
+            message.contains("Console") && message.contains("Network"),
+            "the placeholder names what the debug view will show: {message}"
+        );
+        assert!(
+            message.contains("not built yet"),
+            "the placeholder is honest that the view does not exist yet: {message}"
+        );
     }
 
     #[test]

@@ -23,7 +23,9 @@ import java.io.ByteArrayInputStream
 import android.widget.Button
 import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import java.util.concurrent.ExecutorService
@@ -83,6 +85,19 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var forwardButton: Button
     private lateinit var reloadButton: Button
     private lateinit var stopButton: Button
+
+    /**
+     * The GENERAL browser menu affordance: the ⋮ button every browser has, at the
+     * end of the toolbar, opening a [PopupMenu] of the SHARED core's menu items
+     * (task `general-browser-menu-with-version-and-debug-entry`).
+     *
+     * USER-FACING and always available — deliberately NOT debug-build-gated (the
+     * native `chrome://inspect` inspector above is; this menu is not). It is a
+     * CONTAINER meant to GROW: [showBrowserMenu] iterates whatever items the core
+     * lists, so a future bookmarks/settings entry is a `werust-core` change plus
+     * (only if it is an action) one branch in [onBrowserMenuItem].
+     */
+    private lateinit var menuButton: Button
     private lateinit var status: TextView
     private lateinit var trust: TextView
     private lateinit var errorBanner: TextView
@@ -163,6 +178,11 @@ class BrowserActivity : ComponentActivity() {
         // Stop is a cheap non-blocking core call (no resolve/network), so it can
         // run inline on the UI thread; still refresh the chrome afterwards.
         stopButton = compactNavButton("✕") { core.stop(); afterCoreAction() }
+        // The general browser menu button. Opening the menu is a cheap, non-
+        // blocking read of a BUILD constant (no session, no network), so it runs
+        // inline on the UI thread — it cannot regress the ANR fix the way a core
+        // session-driving action would.
+        menuButton = compactNavButton("⋮") { showBrowserMenu() }
         urlBar = EditText(this).apply {
             hint = "Enter a URL and press Enter"
             layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
@@ -201,6 +221,9 @@ class BrowserActivity : ComponentActivity() {
         toolbar.addView(stopButton)
         toolbar.addView(urlBar)
         toolbar.addView(invalidBadge)
+        // The ⋮ menu sits at the END of the toolbar, where every other browser
+        // puts it.
+        toolbar.addView(menuButton)
 
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
@@ -351,6 +374,64 @@ class BrowserActivity : ComponentActivity() {
             value.toFloat(),
             resources.displayMetrics,
         ).toInt()
+
+    /**
+     * Show the GENERAL browser menu: a [PopupMenu] anchored on the ⋮ button,
+     * built from the SHARED core's menu items (the werust version line + the
+     * Debug entry).
+     *
+     * The core owns the item LIST, so this method only maps each item's `kind`
+     * onto a platform affordance: an `info` item (the `werust <version>` line)
+     * becomes a DISABLED entry (shown, not tappable), an `action` item an enabled
+     * one dispatched by its STABLE id (never its label) in [onBrowserMenuItem].
+     * Adding a future menu item therefore needs no change here at all unless it is
+     * an action with new behaviour — the "structured to grow" property.
+     */
+    private fun showBrowserMenu() {
+        val menu = core.menu()
+        val popup = PopupMenu(this, menuButton)
+        menu.items.forEachIndexed { index, item ->
+            val entry = popup.menu.add(android.view.Menu.NONE, index, index, item.label)
+            // A non-interactive line (the version) is shown but not tappable.
+            entry.isEnabled = item.isAction()
+        }
+        popup.setOnMenuItemClickListener { clicked ->
+            val item = menu.items.getOrNull(clicked.itemId)
+            if (item == null) false else onBrowserMenuItem(item.id)
+        }
+        popup.show()
+    }
+
+    /**
+     * Dispatch an activated browser-menu entry by its STABLE core id. Returns
+     * whether the entry was handled (an unknown id is not, so a core item this
+     * build does not know about fails visibly rather than silently doing nothing).
+     */
+    private fun onBrowserMenuItem(id: String): Boolean = when (id) {
+        WerustCore.Menu.ITEM_DEBUG -> {
+            openDebugView()
+            true
+        }
+        else -> false
+    }
+
+    /**
+     * The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
+     *
+     * THIS is the one method `debug-view-console-network-tabs-mobile` replaces: it
+     * will open the full-screen tabbed Console/Network view over the core's
+     * capture store (`WerustCore.debugJson`). Until then it states honestly that
+     * the view is not built yet, so activating the entry has a visible effect
+     * rather than reading as a broken menu item. The version comes from the ONE
+     * shared source over the FFI, like the menu's version line.
+     */
+    private fun openDebugView() {
+        Toast.makeText(
+            this,
+            "werust ${core.version()} — the in-app debug view (Console + Network) is not built yet.",
+            Toast.LENGTH_LONG,
+        ).show()
+    }
 
     /** After driving the core, apply any pending load to the WebView and repaint. */
     private fun afterCoreAction() {

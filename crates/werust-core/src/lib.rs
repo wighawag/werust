@@ -38,9 +38,27 @@ pub mod ens;
 pub mod ethereum;
 pub mod ipfs;
 pub mod ipns;
+pub mod menu;
 pub mod provider;
 pub mod redirects;
 pub mod retrieval;
+
+/// werust's version string: the SINGLE source every surface that shows a version
+/// reads.
+///
+/// It is the Rust workspace version (`CARGO_PKG_VERSION` of this crate, which
+/// inherits `workspace.package.version`), so the desktop startup banner, the
+/// browser [`menu`]'s version line, and the mobile menus (which read it over the
+/// FFI — `werust_ios_version` / `nativeVersion`) all report the SAME version.
+/// Before this, the version existed only as an `env!` in the desktop binary and
+/// a hand-maintained Gradle `versionName`; the menu task made a second, third
+/// and fourth reader, so it is centralised here rather than re-`env!`'d per edge
+/// (an `env!` in a mobile crate would read THAT crate's version, which is the
+/// same today only by workspace inheritance).
+#[must_use]
+pub fn version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
 
 /// The URL-bar suffix that marks a bare entry as an ENS name to resolve: a
 /// `.eth` TLD.

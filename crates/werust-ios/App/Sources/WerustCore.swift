@@ -215,6 +215,81 @@ final class WerustCore {
         return Chrome.fromJSON(String(cString: c))
     }
 
+    /// werust's version string, from the ONE shared source (`werust_core::version`,
+    /// the Rust workspace version) over the C-ABI — never a Swift literal and never
+    /// the bundle's `CFBundleShortVersionString`, so the iOS menu can never disagree
+    /// with the desktop and Android menus.
+    ///
+    /// `static` because the export takes NO session handle: the version is a
+    /// property of the BUILD, not of a browsing session.
+    static func version() -> String {
+        guard let c = werust_ios_version() else { return "" }
+        defer { werust_ios_string_free(c) }
+        return String(cString: c)
+    }
+
+    /// The GENERAL browser menu (the ⋮ menu) the controller builds its native
+    /// `UIMenu` from: the werust VERSION line + a Debug entry that opens the in-app
+    /// debug view, decoded from the core's JSON wire form.
+    ///
+    /// The item list is the SHARED core's, so the iOS menu shows exactly what the
+    /// desktop popover and the Android menu show, and a FUTURE menu item added in
+    /// `werust-core` appears here with no Swift change. `static` for the same
+    /// reason as ``version()``: the menu is session-free, hence always available.
+    static func menu() -> Menu {
+        guard let c = werust_ios_menu_json() else { return .empty }
+        defer { werust_ios_string_free(c) }
+        return Menu.fromJSON(String(cString: c))
+    }
+
+    /// The GENERAL browser menu, decoded from the core's JSON wire form: the werust
+    /// `version` plus the ordered `items` every platform renders.
+    ///
+    /// A CONTAINER meant to GROW into the usual browser items (bookmarks, settings,
+    /// history, …): the controller maps `items` onto `UIAction`s by each item's
+    /// `kind`, so a new item added in `werust-core` needs no Swift change unless it
+    /// is an action with new behaviour.
+    struct Menu {
+        let version: String
+        let items: [Item]
+
+        /// One menu entry: the stable cross-platform `id` the controller dispatches
+        /// on (never the `label`, which is display text), the `label` to show, and
+        /// the `kind` telling the controller whether to render it as a
+        /// non-interactive line or a tappable entry.
+        struct Item {
+            let id: String
+            let label: String
+            let kind: String
+
+            /// Whether this entry is activatable (vs a non-interactive line).
+            func isAction() -> Bool { kind == Menu.kindAction }
+        }
+
+        /// The stable id of the non-interactive `werust <version>` line.
+        static let itemVersion = "version"
+        /// The stable id of the entry that opens the in-app debug view.
+        static let itemDebug = "debug"
+        /// The `kind` of an activatable entry (vs `"info"`, a plain line).
+        static let kindAction = "action"
+
+        /// The fail-soft fallback if the wire form is unreadable.
+        static let empty = Menu(version: "", items: [])
+
+        static func fromJSON(_ json: String) -> Menu {
+            guard let data = json.data(using: .utf8),
+                  let o = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else { return .empty }
+            let raw = o["items"] as? [[String: Any]] ?? []
+            let items = raw.compactMap { entry -> Item? in
+                guard let id = entry["id"] as? String, let label = entry["label"] as? String
+                else { return nil }
+                return Item(id: id, label: label, kind: entry["kind"] as? String ?? "info")
+            }
+            return Menu(version: o["version"] as? String ?? "", items: items)
+        }
+    }
+
     /// The chrome the controller paints, decoded from the core's JSON wire form.
     /// Every field is the core's truth; the controller holds none of this logic.
     struct Chrome {

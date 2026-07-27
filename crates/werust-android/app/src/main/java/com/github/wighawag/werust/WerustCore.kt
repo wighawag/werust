@@ -115,6 +115,33 @@ class WerustCore : AutoCloseable {
     /** The current chrome the Activity paints (URL bar, nav enablement, status). */
     fun chrome(): Chrome = Chrome.fromJson(nativeChromeJson(handle))
 
+    /**
+     * The GENERAL browser menu (the ⋮ menu) the Activity builds its native
+     * `PopupMenu` from: the werust VERSION line + a Debug entry that opens the
+     * in-app debug view, decoded from the core's JSON wire form.
+     *
+     * The item list is the SHARED core's ([items][Menu.items]), so the Android menu
+     * shows exactly what the desktop popover and the iOS menu show, and a FUTURE
+     * menu item added in `werust-core` appears here with no Kotlin change.
+     *
+     * Note the native call threads NO session [handle] (unlike every other method
+     * here): the menu is a property of the BUILD, not of a browsing session, so it
+     * is always available and no native session is borrowed to read a constant.
+     * (It is still declared as an instance external, so its JNI symbol is the
+     * plain `Java_..._WerustCore_nativeMenuJson` the Rust side exports — a
+     * companion-object `@JvmStatic external` would emit the native symbol on
+     * `WerustCore$Companion` instead.)
+     */
+    fun menu(): Menu = Menu.fromJson(nativeMenuJson())
+
+    /**
+     * werust's version string, from the ONE shared source
+     * (`werust_core::version`, the Rust workspace version) over the FFI — never a
+     * Kotlin literal and never the Gradle `versionName`, so the Android menu can
+     * never disagree with the desktop and iOS menus. Session-free, like [menu].
+     */
+    fun version(): String = nativeVersion()
+
     override fun close() {
         if (handle != 0L) {
             nativeFree(handle)
@@ -137,6 +164,57 @@ class WerustCore : AutoCloseable {
     sealed class Resolution {
         data class Ok(val mimeType: String, val body: ByteArray, val status: Int) : Resolution()
         data class Error(val reason: String) : Resolution()
+    }
+
+    /**
+     * The GENERAL browser menu, decoded from the core's JSON wire form: the
+     * werust [version] plus the ordered [items] every platform renders.
+     *
+     * This is a CONTAINER meant to GROW into the usual browser items (bookmarks,
+     * settings, history, …): the Activity iterates [items] and renders each by its
+     * [Item.kind], so a new item added in `werust-core` needs no Kotlin change
+     * unless it is an action with new behaviour.
+     */
+    data class Menu(val version: String, val items: List<Item>) {
+        /**
+         * One menu entry: the stable cross-platform [id] the Activity dispatches
+         * on (never the [label], which is display text), the [label] to show, and
+         * the [kind] telling the Activity whether to render it as a
+         * non-interactive line or a tappable entry.
+         */
+        data class Item(val id: String, val label: String, val kind: String) {
+            /** Whether this entry is activatable (vs a non-interactive line). */
+            fun isAction(): Boolean = kind == KIND_ACTION
+        }
+
+        companion object {
+            /** The stable id of the non-interactive `werust <version>` line. */
+            const val ITEM_VERSION = "version"
+
+            /** The stable id of the entry that opens the in-app debug view. */
+            const val ITEM_DEBUG = "debug"
+
+            /** The `kind` of an activatable entry (vs `"info"`, a plain line). */
+            const val KIND_ACTION = "action"
+
+            fun fromJson(json: String): Menu {
+                val o = JSONObject(json)
+                val array = o.optJSONArray("items")
+                    ?: return Menu(o.optString("version", ""), emptyList())
+                val items = ArrayList<Item>(array.length())
+                for (i in 0 until array.length()) {
+                    val item = array.getJSONObject(i)
+                    items.add(
+                        Item(
+                            id = item.getString("id"),
+                            label = item.getString("label"),
+                            kind = item.optString("kind", "info"),
+                        )
+                    )
+                }
+                return Menu(version = o.optString("version", ""), items = items)
+            }
+        }
     }
 
     /**
@@ -304,6 +382,12 @@ class WerustCore : AutoCloseable {
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)
     private external fun nativeOnUrlChanged(handle: Long, url: String)
     private external fun nativeChromeJson(handle: Long): String
+
+    // The browser-menu accessors thread NO session handle: the version and the
+    // menu are properties of the BUILD, so the menu is available whatever the
+    // session state is.
+    private external fun nativeVersion(): String
+    private external fun nativeMenuJson(): String
 
     companion object {
         init {

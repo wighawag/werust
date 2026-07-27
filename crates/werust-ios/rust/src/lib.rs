@@ -335,6 +335,33 @@ impl CoreSession {
     }
 }
 
+/// werust's version string for the Swift edge's browser MENU: the ONE shared
+/// source ([`werust_core::version`], the Rust workspace version), so the iOS menu
+/// shows exactly what the desktop popover and the Android menu show.
+///
+/// SESSION-FREE on purpose (unlike every accessor above): the version and the
+/// menu are properties of the BUILD, not of a browsing session, so the Swift edge
+/// can show them without a live native session, and no `CoreSession` is borrowed
+/// to read a constant. The twin of the Android core's `version`; the recorded
+/// rationale is in
+/// `docs/spikes/general-browser-menu-with-version-and-debug-entry/DECISIONS.md`.
+#[must_use]
+pub fn version() -> &'static str {
+    werust_core::version()
+}
+
+/// The general browser MENU as the JSON document the Swift edge builds its native
+/// `UIMenu` from ([`werust_core::menu::menu_json`]): the version line plus the
+/// Debug entry, each with its stable id and kind.
+///
+/// Session-free for the same reason as [`version`]. The Swift edge renders
+/// whatever items this lists, so a FUTURE menu item added in `werust-core`
+/// appears on iOS with no Swift change.
+#[must_use]
+pub fn menu_json() -> String {
+    werust_core::menu::menu_json(&werust_core::menu::BrowserMenu::new())
+}
+
 /// Install the native `ipfs://` scheme handler on `backend`, the twin of the
 /// desktop backend's `install_ipfs`.
 ///
@@ -893,6 +920,24 @@ mod ffi {
             s.debug_capture().clear();
         }
     }
+
+    /// werust's version string as a heap C string, for the Swift browser menu's
+    /// version line. Free with [`werust_ios_string_free`]. Takes NO session
+    /// handle: the version is a property of the BUILD, and it is the ONE shared
+    /// source all three menus read ([`werust_core::version`]), so no edge
+    /// hardcodes a version of its own.
+    #[no_mangle]
+    pub extern "C" fn werust_ios_version() -> *mut c_char {
+        into_c_string(super::version().to_string())
+    }
+
+    /// The general browser MENU as a heap C string (JSON), for the Swift edge to
+    /// build its native `UIMenu` from. Free with [`werust_ios_string_free`].
+    /// Session-free, like [`werust_ios_version`].
+    #[no_mangle]
+    pub extern "C" fn werust_ios_menu_json() -> *mut c_char {
+        into_c_string(super::menu_json())
+    }
 }
 
 #[cfg(test)]
@@ -1311,6 +1356,68 @@ mod tests {
             werust_ios_session_free(s);
             assert!(werust_ios_debug_json(std::ptr::null_mut()).is_null());
             werust_ios_debug_clear(std::ptr::null_mut());
+        }
+    }
+
+    // --- The general browser MENU over the FFI (task ----------------------
+    // `general-browser-menu-with-version-and-debug-entry`)
+
+    #[test]
+    fn the_menu_version_is_the_one_shared_source_not_a_swift_hardcode() {
+        // Acceptance: the version the iOS menu shows comes from ONE place
+        // (`werust_core::version`) over the FFI, so it can never drift from the
+        // desktop popover or the Android menu. The Swift edge reads THIS, never a
+        // literal (or an Info.plist `CFBundleShortVersionString`) of its own.
+        assert_eq!(super::version(), werust_core::version());
+        assert!(!super::version().is_empty());
+    }
+
+    #[test]
+    fn the_menu_document_carries_the_version_line_and_the_debug_entry_for_swift() {
+        // The Swift edge builds its native `UIMenu` from this ONE document, so it
+        // must carry the version and every item with its stable id + kind: a
+        // non-interactive `werust <version>` line and an activatable Debug entry
+        // that opens the debug view. The byte-for-byte twin of the Android core's
+        // menu document, which is what makes the three menus agree.
+        let json = super::menu_json();
+        assert!(
+            json.contains(&format!("\"version\":\"{}\"", werust_core::version())),
+            "{json}"
+        );
+        assert!(json.contains("\"id\":\"version\""), "{json}");
+        assert!(
+            json.contains(&format!("\"label\":\"werust {}\"", werust_core::version())),
+            "{json}"
+        );
+        assert!(json.contains("\"kind\":\"info\""), "{json}");
+        assert!(json.contains("\"id\":\"debug\""), "{json}");
+        assert!(json.contains("\"label\":\"Debug\""), "{json}");
+        assert!(json.contains("\"kind\":\"action\""), "{json}");
+    }
+
+    #[test]
+    fn the_c_abi_menu_exports_need_no_session_and_hand_back_freeable_strings() {
+        // The menu is a USER-FACING, ALWAYS-AVAILABLE surface (never debug-build-
+        // gated, never dependent on a live browsing session), so both exports take
+        // NO session handle — Swift can build the menu before/without one. They
+        // follow the same string-ownership contract as every other export: a heap
+        // C string the caller frees with `werust_ios_string_free`.
+        use super::ffi::*;
+        use std::ffi::CStr;
+
+        unsafe {
+            let version_ptr = werust_ios_version();
+            assert!(!version_ptr.is_null());
+            let version = CStr::from_ptr(version_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(version_ptr);
+            assert_eq!(version, werust_core::version());
+
+            let menu_ptr = werust_ios_menu_json();
+            assert!(!menu_ptr.is_null());
+            let menu = CStr::from_ptr(menu_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(menu_ptr);
+            assert!(menu.contains("\"id\":\"debug\""), "{menu}");
+            assert!(menu.contains(&format!("werust {version}")), "{menu}");
         }
     }
 

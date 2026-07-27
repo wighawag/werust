@@ -32,6 +32,16 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private let forwardButton = UIButton(type: .system)
     private let reloadButton = UIButton(type: .system)
     private let stopButton = UIButton(type: .system)
+    /// The GENERAL browser menu affordance: the ⋮ button every browser has, at the
+    /// end of the toolbar, presenting a `UIMenu` of the SHARED core's menu items
+    /// (task `general-browser-menu-with-version-and-debug-entry`).
+    ///
+    /// USER-FACING and always available — deliberately NOT debug-build-gated (the
+    /// Safari `isInspectable` inspector below is; this menu is not). It is a
+    /// CONTAINER meant to GROW: ``browserMenu()`` maps whatever items the core
+    /// lists, so a future bookmarks/settings entry is a `werust-core` change plus
+    /// (only if it is an action) one branch in ``onBrowserMenuItem(_:)``.
+    private let menuButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let trustLabel = UILabel()
     /// The small "invalid URL" badge next to the URL bar, shown ONLY when the last
@@ -83,6 +93,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         forwardButton.setTitle("▶︎", for: .normal)
         reloadButton.setTitle("⟳", for: .normal)
         stopButton.setTitle("✕", for: .normal)
+        // The general browser menu: a ⋮ button presenting the core's menu on tap.
+        // `showsMenuAsPrimaryAction` makes a single tap open the menu (no long
+        // press), which is what a browser's ⋮ button does.
+        menuButton.setTitle("⋮", for: .normal)
+        menuButton.menu = browserMenu()
+        menuButton.showsMenuAsPrimaryAction = true
         backButton.addTarget(self, action: #selector(onBack), for: .touchUpInside)
         forwardButton.addTarget(self, action: #selector(onForward), for: .touchUpInside)
         reloadButton.addTarget(self, action: #selector(onReload), for: .touchUpInside)
@@ -92,7 +108,7 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // content tightly and resist being stretched. The URL field, by contrast,
         // hugs weakly and is the first to stretch, so it takes the MAJORITY of the
         // row while the four buttons keep only the width their glyphs need.
-        for button in [backButton, forwardButton, reloadButton, stopButton] {
+        for button in [backButton, forwardButton, reloadButton, stopButton, menuButton] {
             button.setContentHuggingPriority(.required, for: .horizontal)
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
         }
@@ -106,8 +122,11 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         invalidBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
         invalidBadge.isHidden = true
 
+        // The ⋮ menu sits at the END of the toolbar, where every other browser
+        // puts it.
         let toolbar = UIStackView(arrangedSubviews: [
             backButton, forwardButton, reloadButton, stopButton, urlField, invalidBadge,
+            menuButton,
         ])
         toolbar.axis = .horizontal
         toolbar.spacing = 8
@@ -329,6 +348,53 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         errorBanner.backgroundColor = chrome.errorIsRetryable()
             ? UIColor(red: 0.71, green: 0.51, blue: 0.04, alpha: 1.0)
             : UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
+    }
+
+    // --- the general browser menu ---------------------------------------------
+
+    /// Build the `UIMenu` from the SHARED core's menu items.
+    ///
+    /// The core owns the item LIST, so this only maps each item's `kind` onto a
+    /// platform affordance: an `info` item (the `werust <version>` line) becomes a
+    /// DISABLED `UIAction` (shown, not tappable), an `action` item an enabled one
+    /// dispatched by its STABLE id (never its label) in ``onBrowserMenuItem(_:)``.
+    /// Adding a future menu item therefore needs no change here at all unless it is
+    /// an action with new behaviour — the "structured to grow" property.
+    private func browserMenu() -> UIMenu {
+        let actions = WerustCore.menu().items.map { item -> UIAction in
+            let action = UIAction(title: item.label) { [weak self] _ in
+                self?.onBrowserMenuItem(item.id)
+            }
+            // A non-interactive line (the version) is shown but not tappable.
+            if !item.isAction() { action.attributes = [.disabled] }
+            return action
+        }
+        return UIMenu(title: "", children: actions)
+    }
+
+    /// Dispatch an activated browser-menu entry by its STABLE core id. An id this
+    /// build does not know about is ignored (the core is the source of the list; a
+    /// newer item simply has no iOS behaviour yet).
+    private func onBrowserMenuItem(_ id: String) {
+        if id == WerustCore.Menu.itemDebug { openDebugView() }
+    }
+
+    /// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
+    ///
+    /// THIS is the one method `debug-view-console-network-tabs-mobile` replaces: it
+    /// will present the full-screen tabbed Console/Network view over the core's
+    /// capture store (`werust_ios_debug_json`). Until then it states honestly that
+    /// the view is not built yet, so activating the entry has a visible effect
+    /// rather than reading as a broken menu item. The version comes from the ONE
+    /// shared source over the FFI, like the menu's version line.
+    private func openDebugView() {
+        let alert = UIAlertController(
+            title: "Debug",
+            message:
+                "werust \(WerustCore.version()) — the in-app debug view (Console + Network) is not built yet.",
+            preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default))
+        present(alert, animated: true)
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------

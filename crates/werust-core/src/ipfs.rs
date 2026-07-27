@@ -145,6 +145,18 @@ struct RedirectChain {
     pending: Option<String>,
     /// The targets already redirected TO in this chain, so a repeat is a cycle.
     visited: Vec<String>,
+    /// The [`frame_key`]s of the urls REDIRECTED AWAY FROM in this chain (each
+    /// hop's source, the url whose `_redirects` rule matched).
+    ///
+    /// werust PUSHES a history entry for a redirect rather than REPLACING the
+    /// redirecting entry (the seam has no replace-current-entry, and WebKitGTK
+    /// exposes no public API to replace or remove a back-forward-list entry), so
+    /// the redirected-FROM url stays in session history. `BrowserShell` reads
+    /// these back to SKIP over such an entry on Back instead of re-following its
+    /// rule forward, the standard emulation of a replaced entry
+    /// (`docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`,
+    /// Decision 8).
+    sources: Vec<String>,
     /// The [`frame_key`] of the target the shell is CURRENTLY following as part
     /// of this chain (the last drained `pending`). A navigation to this URL
     /// CONTINUES the chain; a navigation to anything else ENDS it.
@@ -199,6 +211,7 @@ impl RedirectSink {
         if !continues {
             chain.pending = None;
             chain.visited.clear();
+            chain.sources.clear();
             chain.following = None;
         }
         chain.top_level = Some(key);
@@ -223,13 +236,15 @@ impl RedirectSink {
 
     /// Queue `target` (an absolute `ipfs://<rootcid><path>` URL) as the next
     /// navigation, or refuse it with the reason the chain may not continue.
+    /// `source` is the url whose `_redirects` rule matched (the redirected-FROM
+    /// document), remembered so Back can skip over it.
     ///
-    /// Refuses — queueing nothing — when the target has already been redirected
-    /// to in this chain (a cycle) or the chain has reached
-    /// [`MAX_REDIRECT_HOPS`]. A poisoned lock is treated as a refusal for the
-    /// same fail-closed reason: werust would rather not redirect than redirect
-    /// blind.
-    pub(crate) fn queue(&self, target: &str) -> Result<(), String> {
+    /// Refuses (queueing nothing, and remembering no source) when the target has
+    /// already been redirected to in this chain (a cycle) or the chain has
+    /// reached [`MAX_REDIRECT_HOPS`]. A poisoned lock is treated as a refusal for
+    /// the same fail-closed reason: werust would rather not redirect than
+    /// redirect blind.
+    pub(crate) fn queue(&self, source: &str, target: &str) -> Result<(), String> {
         let Ok(mut chain) = self.chain.lock() else {
             return Err("the redirect chain state is unusable".to_string());
         };
@@ -245,7 +260,27 @@ impl RedirectSink {
         }
         chain.visited.push(target.to_string());
         chain.pending = Some(target.to_string());
+        let source_key = frame_key(source);
+        if !chain.sources.contains(&source_key) {
+            chain.sources.push(source_key);
+        }
         Ok(())
+    }
+
+    /// The [`frame_key`]s of the urls this chain redirected AWAY from, for a
+    /// shell about to move BACK through session history.
+    ///
+    /// Read (and snapshotted) by [`BrowserShell::go_back`](crate::BrowserShell::go_back)
+    /// BEFORE it resets the chain, because a Back that lands on one of these
+    /// entries must skip over it rather than re-trigger its rule; see
+    /// [`RedirectChain::sources`] for why the entry is in history at all.
+    /// Bounded by [`MAX_REDIRECT_HOPS`] (at most one source per accepted hop).
+    pub(crate) fn redirect_sources(&self) -> Vec<String> {
+        self.chain
+            .lock()
+            .ok()
+            .map(|chain| chain.sources.clone())
+            .unwrap_or_default()
     }
 
     /// Whether a redirect target is queued and not yet drained, for a caller that
@@ -284,12 +319,37 @@ impl RedirectSink {
     ///
     /// The top-level document URL is NOT cleared: which request is the main frame
     /// is a fact about the load in flight, not about the chain, and the shell
-    /// re-reports it on the very next navigation signal anyway.
+    /// re-reports it on the very next navigation signal anyway. A shell LEAVING
+    /// the reported document before it finished wants
+    /// [`abandon_navigation`](RedirectSink::abandon_navigation) instead.
     pub fn reset(&self) {
         if let Ok(mut chain) = self.chain.lock() {
             chain.pending = None;
             chain.visited.clear();
+            chain.sources.clear();
             chain.following = None;
+        }
+    }
+
+    /// Give up on the top-level document last reported: reset the chain AND
+    /// forget which request is the main frame.
+    ///
+    /// Used when the shell moves AWAY from a document it already started loading
+    /// and reported — today, a Back that SKIPS over a remembered redirect source
+    /// (`BrowserShell::go_back`). Without forgetting the top level, a request for
+    /// the abandoned url that the scheme handler resolves LATE (it runs off the
+    /// UI thread) would still look like the main frame and queue the very
+    /// redirect the skip exists to avoid, bouncing the user forward again. With
+    /// it, that late request looks like a sub-resource and redirects nothing —
+    /// the deliberate fail-closed default — until the next navigation reports a
+    /// new top-level document.
+    pub(crate) fn abandon_navigation(&self) {
+        if let Ok(mut chain) = self.chain.lock() {
+            chain.pending = None;
+            chain.visited.clear();
+            chain.sources.clear();
+            chain.following = None;
+            chain.top_level = None;
         }
     }
 }
@@ -304,7 +364,7 @@ impl RedirectSink {
 /// strips the query/fragment exactly as [`parse_ipfs_uri`] does — the shell's
 /// top-level URL and the intercepted request URI for the SAME document must
 /// reduce to one key or the main-frame check would misfire.
-fn frame_key(url: &str) -> String {
+pub(crate) fn frame_key(url: &str) -> String {
     let head = url.split_once('#').map_or(url, |(head, _)| head);
     let head = head.split_once('?').map_or(head, |(head, _)| head);
     normalize_ens_page_key(head)
@@ -629,7 +689,7 @@ fn resolve_not_found_fallback(
                     serve_default_404(retriever, reference, not_found)
                 }
                 Some(Ok(FallbackAction::Redirect { path, status })) => {
-                    Err(queue_redirect(redirects, reference, &path, status))
+                    Err(queue_redirect(redirects, reference, uri, &path, status))
                 }
                 Some(Err(e)) => Err(redirects_error_to_renderer_error(e)),
                 // The file exists but says nothing about this path: fall through
@@ -657,14 +717,21 @@ fn resolve_not_found_fallback(
 /// The return value is ALWAYS an error: nothing may render for the old URL. When
 /// the chain bound refuses the hop, the error says THAT instead and nothing is
 /// queued, so the redirect chain terminates rather than looping.
+///
+/// `source_uri` is the intercepted (redirected-FROM) URL. It is handed to the
+/// sink because werust PUSHES the redirect as a new history entry rather than
+/// replacing the redirecting one (no replace-current-entry exists at the seam),
+/// so the shell needs to know which entries to SKIP on Back
+/// ([`RedirectSink::redirect_sources`]).
 fn queue_redirect(
     redirects: &RedirectSink,
     reference: &IpfsRef,
+    source_uri: &str,
     target: &str,
     status: u16,
 ) -> RendererError {
     let url = format!("{IPFS_SCHEME}://{cid}{target}", cid = reference.cid);
-    match redirects.queue(&url) {
+    match redirects.queue(source_uri, &url) {
         // Carries `REDIRECT_NAVIGATING_MARKER`: the shell is about to navigate, so
         // this failure is bookkeeping and its banner is suppressed.
         Ok(()) => RendererError::Backend(format!(
@@ -1528,7 +1595,9 @@ mod tests {
         for hop in 0..MAX_REDIRECT_HOPS {
             let target = format!("ipfs://{cid}/hop-{hop}");
             assert!(
-                redirects.queue(&target).is_ok(),
+                redirects
+                    .queue(&format!("ipfs://{cid}/from-{hop}"), &target)
+                    .is_ok(),
                 "hop {hop} is still within the untouched budget"
             );
             let _ = redirects.take_pending();
@@ -1743,7 +1812,9 @@ mod tests {
         // second time it is clicked.
         let sink = RedirectSink::new();
         sink.note_navigation("ipfs://bafyroot/docs");
-        assert!(sink.queue("ipfs://bafyroot/docs/index.html").is_ok());
+        assert!(sink
+            .queue("ipfs://bafyroot/docs", "ipfs://bafyroot/docs/index.html")
+            .is_ok());
         let target = sink.take_pending().expect("the hop was accepted");
         sink.note_navigation(&target);
 
@@ -1752,7 +1823,8 @@ mod tests {
         sink.note_navigation("ipfs://bafyroot/about");
         sink.note_navigation("ipfs://bafyroot/docs");
         assert!(
-            sink.queue("ipfs://bafyroot/docs/index.html").is_ok(),
+            sink.queue("ipfs://bafyroot/docs", "ipfs://bafyroot/docs/index.html")
+                .is_ok(),
             "the same redirecting link must work again: the chain was over"
         );
     }
@@ -1767,7 +1839,11 @@ mod tests {
             // A link click: a fresh top-level load the shell only OBSERVES.
             sink.note_navigation(&format!("ipfs://bafyroot/link-{click}"));
             assert!(
-                sink.queue(&format!("ipfs://bafyroot/dest-{click}")).is_ok(),
+                sink.queue(
+                    &format!("ipfs://bafyroot/link-{click}"),
+                    &format!("ipfs://bafyroot/dest-{click}")
+                )
+                .is_ok(),
                 "click {click} must get a fresh budget, not the previous chain's"
             );
             let target = sink.take_pending().expect("the hop was accepted");
@@ -1783,7 +1859,9 @@ mod tests {
         // must not drop an undrained redirect target on the floor.
         let sink = RedirectSink::new();
         sink.note_navigation("ipfs://bafyroot/old");
-        assert!(sink.queue("ipfs://bafyroot/new").is_ok());
+        assert!(sink
+            .queue("ipfs://bafyroot/old", "ipfs://bafyroot/new")
+            .is_ok());
         sink.note_navigation("ipfs://bafyroot/old");
         assert!(
             sink.has_pending(),
@@ -1818,5 +1896,85 @@ mod tests {
         // "not the main frame" degrades to the exact pre-3xx behaviour instead.
         let sink = RedirectSink::new();
         assert!(!sink.is_main_frame("ipfs://bafyroot/anything"));
+    }
+
+    #[test]
+    fn an_accepted_hop_remembers_the_url_it_redirected_away_from() {
+        // werust PUSHES the redirect target as a NEW history entry (the seam has
+        // no replace-current-entry), so the redirected-FROM url stays in history
+        // and Back would land on it and re-trigger its rule. The sink therefore
+        // remembers each hop's SOURCE so the shell can skip that entry
+        // (`BrowserShell::go_back`). Stored as a `frame_key`, because the url the
+        // shell reads back from the backend is the WebKit-normalized form of the
+        // one the scheme handler intercepted.
+        let cid = "bafysources";
+        let mut retriever = PinnedRetriever::default();
+        retriever.put(cid, "/_redirects", b"/old/* /new/:splat 301\n");
+        let sink = main_frame_sink(&format!("ipfs://{cid}/old/thing"));
+
+        let _ = resolve_ipfs_request(
+            &retriever,
+            &SchemeRequest {
+                uri: format!("ipfs://{cid}/old/thing"),
+            },
+            &sink,
+        )
+        .expect_err("a redirect renders nothing in place");
+
+        assert_eq!(
+            sink.redirect_sources(),
+            vec![frame_key(&format!("ipfs://{cid}/old/thing"))],
+            "the redirected-FROM url is remembered so Back can skip it"
+        );
+        assert!(
+            sink.redirect_sources()
+                .contains(&frame_key(&format!("ipfs:///{cid}/old/thing"))),
+            "the webkit authority-less form of the SAME url must match the remembered source"
+        );
+    }
+
+    #[test]
+    fn a_refused_hop_remembers_no_source_and_a_reset_forgets_them_all() {
+        // Only an ACCEPTED hop puts an entry in history, so only an accepted hop
+        // has anything to skip. And the remembered sources are chain state: they
+        // are cleared exactly when the chain resets, so a later Back in a fresh
+        // chain never silently skips an entry the user reached by other means.
+        let sink = RedirectSink::new();
+        assert!(sink.queue("ipfs://bafyroot/a", "ipfs://bafyroot/b").is_ok());
+        let _ = sink.take_pending();
+        // A cycle: refused, so nothing was pushed and nothing is remembered.
+        assert!(sink
+            .queue("ipfs://bafyroot/b", "ipfs://bafyroot/b")
+            .is_err());
+        assert_eq!(
+            sink.redirect_sources(),
+            vec![frame_key("ipfs://bafyroot/a")],
+            "a refused hop adds no source"
+        );
+
+        sink.reset();
+        assert!(
+            sink.redirect_sources().is_empty(),
+            "the chain reset forgets the remembered sources too"
+        );
+    }
+
+    #[test]
+    fn an_abandoned_navigation_stops_being_the_main_frame() {
+        // A Back that SKIPS over a redirect source leaves a load the shell had
+        // already started and reported. The scheme handler runs off the UI thread,
+        // so a request for that abandoned url can resolve LATE — and if it still
+        // looked like the main frame it would queue the very redirect the skip
+        // exists to avoid, bouncing the user forward again.
+        let sink = RedirectSink::new();
+        sink.note_navigation("ipfs://bafyroot/old");
+        assert!(sink.is_main_frame("ipfs://bafyroot/old"));
+
+        sink.abandon_navigation();
+        assert!(
+            !sink.is_main_frame("ipfs://bafyroot/old"),
+            "an abandoned load must not still count as the main frame"
+        );
+        assert!(sink.redirect_sources().is_empty());
     }
 }

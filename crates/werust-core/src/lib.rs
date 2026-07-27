@@ -667,6 +667,36 @@ pub struct BrowserShell {
     /// built without one keeps an unused empty sink, so nothing changes for a
     /// caller that does not wire `ipfs://` at all.
     redirects: crate::ipfs::RedirectSink,
+    /// The history entries the IN-FLIGHT Back move must SKIP over: the
+    /// `frame_key`s of the urls the redirect chain being left redirected AWAY
+    /// from ([`crate::ipfs::RedirectSink::redirect_sources`]), snapshotted by
+    /// [`go_back`](BrowserShell::go_back).
+    ///
+    /// werust PUSHES a redirect target as a NEW history entry rather than
+    /// REPLACING the redirecting one (the seam has no replace-current-entry), so
+    /// the redirected-FROM url is still in history and a plain Back would land on
+    /// it, re-match its 3xx rule, and bounce the user forward again. Skipping it
+    /// is the standard emulation of the entry a real browser would have replaced.
+    ///
+    /// The skip is driven from [`pump`](BrowserShell::pump) rather than from
+    /// `go_back` itself because a history move settles ASYNCHRONOUSLY: right after
+    /// `Renderer::go_back` the backend still reports the PREVIOUS entry as its
+    /// `current_url` (WebKitGTK lands it only on the `load-changed` signal), so the
+    /// LOAD EVENT is the first place the landed url is knowable. Emptied as soon as
+    /// a load lands on anything that is not a remembered source, so it can never
+    /// skip an entry the user reached deliberately later.
+    back_skip: Vec<String>,
+    /// The `frame_key` of the entry the in-flight Back skip has ALREADY stepped
+    /// off, so the trailing lifecycle events of that abandoned load
+    /// (`Committed`/`Finished`, already queued when the skip was issued) are
+    /// dropped instead of folded in.
+    ///
+    /// Without this the bar would flash the entry the user is not staying on, and
+    /// — worse — `pump`'s `note_navigation` would re-adopt it as the TOP-LEVEL
+    /// document, so a scheme-handler request for it resolving late would look like
+    /// the main frame and re-queue the very redirect the skip exists to avoid.
+    /// Cleared as soon as an event for any other url arrives.
+    back_skip_issued: Option<String>,
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -764,6 +794,8 @@ impl BrowserShell {
             ens_pages: HashMap::new(),
             resolving_step: None,
             redirects: crate::ipfs::RedirectSink::new(),
+            back_skip: Vec::new(),
+            back_skip_issued: None,
         };
         shell.refresh_chrome();
         shell
@@ -864,6 +896,8 @@ impl BrowserShell {
         // request cannot be intercepted before the sink knows about it.
         self.redirects.reset();
         self.redirects.note_navigation(&target);
+        // Any pending Back skip belongs to a Back the user has now overtaken.
+        self.end_back_skip();
         self.renderer.navigate(&target)?;
         // A plain navigation follows the backend's URL: drop any ENS name that was
         // pinned in the bar so it never lingers on a later page. It is a CONTENT
@@ -1028,6 +1062,7 @@ impl BrowserShell {
         // [`navigate`](BrowserShell::navigate) does for its target.
         self.redirects.reset();
         self.redirects.note_navigation(&target);
+        self.end_back_skip();
         if let Err(e) = self.renderer.navigate(&target) {
             // A backend that cannot even start the content load failed at the
             // content step, not resolution.
@@ -1146,7 +1181,34 @@ impl BrowserShell {
     /// A no-op when [`ChromeState::can_go_back`] is `false`. Delegates to the
     /// backend's session history (the shell keeps no URL stack of its own — see
     /// [`Renderer::go_back`]).
+    ///
+    /// # Back SKIPS a `_redirects` redirect source
+    ///
+    /// A real browser REPLACES the current history entry when it follows a 3xx,
+    /// so Back from the target lands on whatever preceded the redirecting url. The
+    /// seam has no replace-current-entry (and WebKitGTK exposes no public API to
+    /// replace or remove a back-forward-list entry), so werust PUSHES instead and
+    /// the redirected-FROM url stays in history. Landing on it would re-match its
+    /// 3xx rule and bounce the user straight forward again, making Back unusable
+    /// after any redirect. So a Back that lands on a url this chain redirected
+    /// AWAY from ([`RedirectSink::redirect_sources`]) goes back ONCE MORE,
+    /// transparently skipping it — the standard emulation of a replaced entry.
+    ///
+    /// Bounded by the same hop cap as the chain itself (a chain records at most
+    /// [`MAX_REDIRECT_HOPS`](crate::ipfs::MAX_REDIRECT_HOPS) sources, and each
+    /// skip consumes one), so a pathological history cannot spin here. If the
+    /// redirect source is the FIRST history entry there is nothing further back:
+    /// the user is left there and the redirect re-fires, rather than being trapped
+    /// in a no-op Back
+    /// (`docs/spikes/ipfs-redirects-3xx-navigation-support/DECISIONS.md`,
+    /// Decision 8). The skip itself happens in [`pump`](BrowserShell::pump), which
+    /// is where the landed url first becomes knowable — see
+    /// [`back_skip`](BrowserShell::back_skip).
     pub fn go_back(&mut self) {
+        // Snapshot the sources BEFORE the chain is reset below — they are what says
+        // which entry this Back must skip over.
+        self.back_skip = self.redirects.redirect_sources();
+        self.back_skip_issued = None;
         self.renderer.go_back();
         // A user-initiated history move starts a FRESH redirect chain.
         self.redirects.reset();
@@ -1165,6 +1227,9 @@ impl BrowserShell {
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
         self.redirects.reset();
+        // Forward is the user overruling the skip: whatever entry they are heading
+        // to, they asked for it explicitly.
+        self.end_back_skip();
         self.note_top_level_navigation();
         self.url_override = None;
         self.pinned_root_key = None;
@@ -1225,6 +1290,7 @@ impl BrowserShell {
         }
         self.renderer.reload()?;
         self.redirects.reset();
+        self.end_back_skip();
         self.note_top_level_navigation();
         self.url_override = None;
         self.pinned_root_key = None;
@@ -1319,6 +1385,62 @@ impl BrowserShell {
         Some((display, entry.mutable))
     }
 
+    /// Step further BACK when an IN-FLIGHT Back landed on `url`, a url the
+    /// redirect chain it is leaving redirected AWAY from: the user skips the
+    /// redirecting entry instead of being bounced forward by its rule again (see
+    /// [`go_back`](BrowserShell::go_back) for why that entry is in history at
+    /// all). Returns whether it skipped, so the caller can drop the load event on
+    /// the floor rather than paint an entry the user is not staying on.
+    ///
+    /// Bounded twice over: [`back_skip`](BrowserShell::back_skip) holds at most
+    /// [`MAX_REDIRECT_HOPS`](crate::ipfs::MAX_REDIRECT_HOPS) sources and each skip
+    /// consumes one, and a landing on anything else empties it — so it terminates
+    /// even on a history of nothing but redirect sources. The skipped load is
+    /// ABANDONED in the sink: the shell started (and is now leaving) it, and a
+    /// scheme-handler request for it resolving LATE (it runs off the UI thread)
+    /// must not still look like the main frame and re-queue the very redirect this
+    /// skip avoids.
+    fn skip_back_over_redirect_source(&mut self, url: &str) -> bool {
+        if self.back_skip.is_empty() && self.back_skip_issued.is_none() {
+            return false;
+        }
+        let landed = crate::ipfs::frame_key(url);
+        if self.back_skip_issued.as_deref() == Some(landed.as_str()) {
+            // A trailing event of the load this skip already stepped off (its
+            // `Committed`/`Finished` were queued before the further Back was
+            // issued). Dropped whole: see
+            // [`back_skip_issued`](BrowserShell::back_skip_issued).
+            return true;
+        }
+        let Some(at) = self.back_skip.iter().position(|source| *source == landed) else {
+            // Landed somewhere the user means to stay: this Back is done.
+            self.end_back_skip();
+            return false;
+        };
+        // Spend this source whatever happens next, so a history of repeated
+        // redirect sources cannot spin.
+        self.back_skip.swap_remove(at);
+        if !self.renderer.can_go_back() {
+            // The redirect source is the FIRST entry: there is nothing further
+            // back, so leave the user here (its rule re-fires) rather than trapping
+            // Back in a no-op.
+            self.end_back_skip();
+            return false;
+        }
+        self.redirects.abandon_navigation();
+        self.back_skip_issued = Some(landed);
+        self.renderer.go_back();
+        true
+    }
+
+    /// Forget the in-flight Back skip: no further entry is skipped, and no event
+    /// is dropped. Called wherever the user takes over (any navigation they ask
+    /// for) and as soon as a Back lands somewhere they mean to stay.
+    fn end_back_skip(&mut self) {
+        self.back_skip.clear();
+        self.back_skip_issued = None;
+    }
+
     /// Report the backend's CURRENT top-level URL to the redirect sink, for a
     /// navigation whose target the shell does not name itself (`go_back` /
     /// `go_forward` / `reload`): the backend knows which entry it moved to, so the
@@ -1402,6 +1524,17 @@ impl BrowserShell {
         let mut changed = false;
         while let Some(event) = self.renderer.poll_event() {
             changed = true;
+            // A Back that landed on a url THIS page was redirected away from must
+            // skip over it (werust pushes rather than replaces the redirecting
+            // entry, so it is still in history and its rule would bounce the user
+            // straight forward again). Checked FIRST, on the load event, because a
+            // history move settles asynchronously: this is the earliest the landed
+            // url is knowable. The skipped-over entry is not painted — the user is
+            // not staying on it — and the further Back it just issued reports its
+            // own events on a later turn of this same loop.
+            if self.skip_back_over_redirect_source(event.url()) {
+                continue;
+            }
             // An IN-PAGE navigation off the pinned ENS root (a link click) is a
             // FRESH backend load whose event URL normalizes to a DIFFERENT key than
             // the resolved root the name was pinned FOR. When that happens, the
@@ -3659,7 +3792,11 @@ mod tests {
 
         // The scheme handler matched `/old/* -> /new/:splat 301` and queued the
         // target (the producer side is unit-tested in `crate::ipfs`).
-        assert!(queue_for_test(&redirects, "ipfs://bafyroot/new/thing"));
+        assert!(queue_for_test(
+            &shell,
+            &redirects,
+            "ipfs://bafyroot/new/thing"
+        ));
         assert!(shell.pump(), "the pump follows the queued redirect");
         settle(&mut shell, &handle);
 
@@ -3670,7 +3807,8 @@ mod tests {
         );
         assert!(
             shell.chrome().can_go_back,
-            "the redirect added a history entry, so back is available"
+            "the redirect PUSHES an entry (the seam has no replace-current-entry), \
+             so back is available"
         );
         assert_eq!(
             shell.chrome().last_error,
@@ -3680,6 +3818,136 @@ mod tests {
         assert!(
             !shell.pump(),
             "the sink drains ONCE, so the pump cannot re-navigate the same target"
+        );
+
+        // And Back SKIPS the redirecting entry rather than landing on it: because
+        // werust pushes, `ipfs://bafyroot/old/thing` is still in history, and
+        // landing there would re-match its 3xx rule and bounce the user forward
+        // again. There is nothing BEFORE it here (it is the first entry), so the
+        // documented edge case applies: the user is left there rather than trapped
+        // in a no-op Back.
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs:///bafyroot/old/thing",
+            "with no entry before the redirect source, back lands on it (Decision 8's edge case)"
+        );
+    }
+
+    #[test]
+    fn back_after_a_redirect_skips_the_redirecting_entry_instead_of_bouncing_forward() {
+        // Gate-2 defect: werust PUSHES the redirect target instead of REPLACING the
+        // redirecting entry (the seam has no replace-current-entry, and WebKitGTK
+        // exposes no public API to replace/remove a back-forward-list entry). So
+        // the redirected-FROM url stays in history, and a plain Back lands on it,
+        // re-matches its 3xx rule, and bounces the user straight forward again —
+        // Back is unusable after any redirect. The fix: Back SKIPS a remembered
+        // redirect source, the standard emulation of the replaced entry.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        // The page the user actually wants to get BACK to.
+        shell.navigate("ipfs://bafyroot/home").unwrap();
+        settle(&mut shell, &handle);
+
+        // They click a link to `/old/thing`, whose `_redirects` sends them to
+        // `/new/thing`.
+        handle.navigate_in_page("ipfs://bafyroot/old/thing");
+        shell.pump();
+        assert!(queue_for_test(
+            &shell,
+            &redirects,
+            "ipfs://bafyroot/new/thing"
+        ));
+        shell.pump();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyroot/new/thing");
+
+        // Back must land on `/home`, NOT on the redirecting `/old/thing`. The skip
+        // issues a SECOND history move, whose load signals arrive on a later turn
+        // (the same async lag every history move has), so the shell is settled
+        // again.
+        shell.go_back();
+        settle(&mut shell, &handle);
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs:///bafyroot/home",
+            "back skips the redirecting entry and reaches the page the user came from"
+        );
+        assert_eq!(
+            redirects.take_pending(),
+            None,
+            "the skipped-over entry must not re-queue its redirect and bounce the user forward"
+        );
+        assert!(
+            !redirects.is_main_frame("ipfs://bafyroot/old/thing"),
+            "the abandoned load must stop counting as the main frame, or a late \
+             scheme-handler request for it would re-queue the redirect"
+        );
+    }
+
+    #[test]
+    fn back_skips_every_hop_of_a_multi_hop_redirect_chain() {
+        // A chain `/a -> /b -> /c` pushes an entry for EACH hop, so one skip is not
+        // enough: Back must skip every remembered source to reach the page the user
+        // came from. Bounded by the hop cap, so this can never spin.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/home").unwrap();
+        settle(&mut shell, &handle);
+
+        handle.navigate_in_page("ipfs://bafyroot/a");
+        shell.pump();
+        for hop in ["ipfs://bafyroot/b", "ipfs://bafyroot/c"] {
+            assert!(queue_for_test(&shell, &redirects, hop));
+            shell.pump();
+            settle(&mut shell, &handle);
+        }
+        assert_eq!(shell.chrome().url_text, "ipfs://bafyroot/c");
+
+        shell.go_back();
+        // One settle per history move: the skip walks back over BOTH redirecting
+        // entries, each an async move of its own.
+        for _ in 0..3 {
+            settle(&mut shell, &handle);
+        }
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs:///bafyroot/home",
+            "back skips BOTH redirecting entries of the chain"
+        );
+    }
+
+    #[test]
+    fn back_over_an_ordinary_entry_is_untouched_by_the_redirect_skip() {
+        // The skip must be surgical: only a url THIS chain redirected away from is
+        // skipped. Ordinary browsing history is unaffected — no page is ever
+        // silently jumped over.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects.clone());
+
+        shell.navigate("ipfs://bafyroot/one").unwrap();
+        settle(&mut shell, &handle);
+        handle.navigate_in_page("ipfs://bafyroot/two");
+        settle(&mut shell, &handle);
+        handle.navigate_in_page("ipfs://bafyroot/three");
+        settle(&mut shell, &handle);
+
+        shell.go_back();
+        settle(&mut shell, &handle);
+        assert_eq!(
+            shell.chrome().url_text,
+            "ipfs:///bafyroot/two",
+            "a plain back moves exactly one entry, skipping nothing"
         );
     }
 
@@ -3711,7 +3979,11 @@ mod tests {
         // The site's `_redirects` sends `/old` to `/new/page` — under the SAME root
         // CID (the only kind of target the rules may name).
         let root = ipfs_root_of(&handle);
-        assert!(queue_for_test(&redirects, &format!("{root}/new/page")));
+        assert!(queue_for_test(
+            &shell,
+            &redirects,
+            &format!("{root}/new/page")
+        ));
         shell.pump();
         handle.serve_via_verified_content_path();
         settle(&mut shell, &handle);
@@ -3783,14 +4055,14 @@ mod tests {
         // Walk the chain to its bound: the sink refuses the hop past the cap.
         for hop in 0..crate::ipfs::MAX_REDIRECT_HOPS {
             assert!(
-                queue_for_test(&redirects, &format!("ipfs://bafyroot/hop-{hop}")),
+                queue_for_test(&shell, &redirects, &format!("ipfs://bafyroot/hop-{hop}")),
                 "hop {hop} is within the bound"
             );
             shell.pump();
             settle(&mut shell, &handle);
         }
         assert!(
-            !queue_for_test(&redirects, "ipfs://bafyroot/hop-over"),
+            !queue_for_test(&shell, &redirects, "ipfs://bafyroot/hop-over"),
             "the hop past the cap is refused, so the chain cannot loop"
         );
 
@@ -3798,7 +4070,7 @@ mod tests {
         shell.navigate("ipfs://bafyroot/fresh").unwrap();
         settle(&mut shell, &handle);
         assert!(
-            queue_for_test(&redirects, "ipfs://bafyroot/hop-0"),
+            queue_for_test(&shell, &redirects, "ipfs://bafyroot/hop-0"),
             "a user-initiated navigation starts a fresh chain"
         );
     }
@@ -3826,7 +4098,7 @@ mod tests {
             handle.navigate_in_page("ipfs://bafyroot/docs");
             shell.pump();
             assert!(
-                queue_for_test(&redirects, "ipfs://bafyroot/docs/index.html"),
+                queue_for_test(&shell, &redirects, "ipfs://bafyroot/docs/index.html"),
                 "click {round} on the SAME redirecting link must still be followed, \
                  not refused as a cycle"
             );
@@ -3857,7 +4129,7 @@ mod tests {
             handle.navigate_in_page(&format!("ipfs://bafyroot/link-{click}"));
             shell.pump();
             assert!(
-                queue_for_test(&redirects, &format!("ipfs://bafyroot/dest-{click}")),
+                queue_for_test(&shell, &redirects, &format!("ipfs://bafyroot/dest-{click}")),
                 "unrelated click {click} must get a fresh budget"
             );
             shell.pump();
@@ -3881,7 +4153,7 @@ mod tests {
         settle(&mut shell, &handle);
         for hop in 0..crate::ipfs::MAX_REDIRECT_HOPS {
             assert!(
-                queue_for_test(&redirects, &format!("ipfs://bafyroot/hop-{hop}")),
+                queue_for_test(&shell, &redirects, &format!("ipfs://bafyroot/hop-{hop}")),
                 "hop {hop} is within the bound"
             );
             // The shell performs the hop and the backend reports the load: neither
@@ -3890,7 +4162,7 @@ mod tests {
             settle(&mut shell, &handle);
         }
         assert!(
-            !queue_for_test(&redirects, "ipfs://bafyroot/hop-over"),
+            !queue_for_test(&shell, &redirects, "ipfs://bafyroot/hop-over"),
             "the hop past the cap is still refused after the shell followed every hop"
         );
     }
@@ -3899,8 +4171,20 @@ mod tests {
     /// the shared sink (the producer side is exercised for real in
     /// `crate::ipfs`'s tests). Returns whether the sink ACCEPTED the hop, so a
     /// test can assert the chain bound refusing one.
-    fn queue_for_test(sink: &crate::ipfs::RedirectSink, target: &str) -> bool {
-        sink.queue(target).is_ok()
+    ///
+    /// The hop's SOURCE is the backend's current URL, because that is exactly what
+    /// the real handler intercepts: a 3xx is only ever matched on the top-level
+    /// document the shell is loading. The sink remembers it so `go_back` can skip
+    /// the redirecting entry.
+    fn queue_for_test(
+        shell: &BrowserShell,
+        sink: &crate::ipfs::RedirectSink,
+        target: &str,
+    ) -> bool {
+        let source = shell
+            .current_url_for_test()
+            .expect("a redirect is matched on a document the backend is loading");
+        sink.queue(&source, target).is_ok()
     }
 
     /// The `ipfs://<rootcid>` root URL the backend currently reports (the RAW,

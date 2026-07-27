@@ -12,3 +12,16 @@
 <!-- q1 fields: id=q1 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q2
+
+**'task:ipfs-redirects-3xx-navigation-support' was bounced — how should we proceed?**
+
+> PR/code review (Gate 2) blocked this work:
+> - The redirect chain state is session-scoped, not per-chain: RedirectSink.visited is only cleared by BrowserShell::navigate / go_back / go_forward / reload, i.e. shell-level entry points. An in-page LINK CLICK never goes through those (the webview loads it directly; Android/iOS only report onPageFinished/onPageFailed back into the core), so visited accumulates across a browsing session. Consequence in ordinary use: a site whose nav links to a redirecting path (e.g. /docs -> /docs/index.html 301) works the FIRST time and, on any later visit to the same link in the same session, is refused as a redirect cycle and the page fails closed with an error banner; likewise 5 unrelated redirected link clicks exhaust the hop cap. Should the chain instead reset when a navigation other than the pending redirect target commits/finishes (a LoadEvent::Started/Committed whose url is not the queued target)? (crates/werust-core/src/ipfs.rs RedirectSink::queue pushes into visited and only reset() clears it; crates/werust-core/src/lib.rs:861,1139,1153,1212 are the only reset() call sites. DECISIONS.md Decision 2 asserts the opposite: a user who types a URL, CLICKS A LINK, or goes back gets the full budget again. The lib.rs test a_user_navigation_resets_the_redirect_chain_budget only exercises shell.navigate, so the gap is untested.)
+> - Every intercepted ipfs:// request goes through resolve_ipfs_request, including SUB-RESOURCES (backend.rs says the handler fires for the main document AND every sub-resource), but a matched 3xx always queues a TOP-LEVEL navigation the shell performs. So a missing image/CSS/JS whose path matches a 3xx rule (e.g. /blog/* /posts/:splat 301 and a stale /blog/logo.png reference) yanks the whole browser off the page the user is reading onto the rewritten sub-resource path. Should a redirect only be queued for the main-frame request, and if the seam cannot distinguish that today (SchemeRequest carries only uri), should this be recorded as a named limitation plus a follow-up? (crates/webview-renderer/src/backend.rs install_ipfs comment (once per request, main document AND every sub-resource); crates/werust-core/src/ipfs.rs queue_redirect; no main-frame check anywhere, and DECISIONS.md does not mention sub-resources. Single-slot pending also means concurrent sub-resource matches drop all but the last while still consuming the hop budget.)
+> PR/code review (Gate 2) did not reach a unanimous approve across reviewMaxRounds=2 round(s) (a block is terminal and is never re-rolled); forcing needs-attention (never silently merged or looped).
+
+<!-- q2 fields: id=q2 kind=stuck -->
+
+**Your answer** (write below this line):

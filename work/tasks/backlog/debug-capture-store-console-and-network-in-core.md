@@ -3,7 +3,7 @@ title: "A bounded console + network capture store in werust-core, exposed over t
 slug: debug-capture-store-console-and-network-in-core
 spec: in-app-debug-menu-console-and-network
 blockedBy: []
-covers: [2]
+covers: [5, 6]
 ---
 
 ## What to build

@@ -3,7 +3,7 @@ title: "Wire console + network capture on every platform to feed the core debug 
 slug: debug-console-network-capture-per-platform
 spec: in-app-debug-menu-console-and-network
 blockedBy: [debug-capture-store-console-and-network-in-core]
-covers: [2]
+covers: [4, 5]
 ---
 
 ## What to build

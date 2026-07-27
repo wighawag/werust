@@ -3,7 +3,7 @@ title: "Desktop debug view: a tabbed screen (Console + Network) opened from the 
 slug: debug-view-console-network-tabs-desktop
 spec: in-app-debug-menu-console-and-network
 blockedBy: [debug-capture-store-console-and-network-in-core, general-browser-menu-with-version-and-debug-entry]
-covers: [2]
+covers: [1, 3]
 ---
 
 ## What to build

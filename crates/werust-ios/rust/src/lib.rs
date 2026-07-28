@@ -319,7 +319,13 @@ impl CoreSession {
             epoch_millis(),
         );
         if main_frame || self.shell.is_main_frame(url) {
-            entry = entry.with_trust(self.shell.chrome().trust_posture);
+            // Read the LIVE load posture, NOT the cached `chrome().trust_posture`
+            // snapshot: this capture runs BEFORE `didCommit`/`didFinish` refresh
+            // the chrome, so the cache still holds the stale pre-verify
+            // `unverified-origin` here and would DOWNGRADE the main-document row
+            // below the honest posture the indicator is about to show. Desktop
+            // reads the same fact straight from its load lifecycle.
+            entry = entry.with_trust(self.shell.live_trust_posture());
         }
         self.shell.debug_capture().push_network(entry);
     }
@@ -1702,7 +1708,26 @@ mod tests {
     fn the_ios_main_document_row_takes_the_loads_own_posture() {
         // The store's DECISIONS.md Decision 4: the main-document row must mirror
         // the chrome trust indicator so the two surfaces cannot disagree.
-        let s = CoreSession::new();
+        //
+        // THE ORDERING TRAP this pins: the production order is navigate -> the
+        // WKWebView asks for the document -> the shared resolve MARKS the backend
+        // content-verified -> the capture runs, all BEFORE `didCommit` /
+        // `didFinish` pump the shell and `refresh_chrome` re-caches the posture.
+        // Reading the CACHED `chrome().trust_posture` here would stamp the stale
+        // pre-verify `unverified-origin`, so the row must read the LIVE posture
+        // (the seam's `Renderer::trust_posture`), exactly as the desktop capture
+        // reads its load lifecycle directly.
+        let mut s = CoreSession::new();
+        assert!(s.navigate("ipfs://bafy/index.html"));
+        s.backend.mark_content_verified();
+        // Deliberately NO on_page_committed / on_page_finished: the chrome cache
+        // is still the stale pre-verify snapshot, which is the whole point of
+        // this test.
+        assert_eq!(
+            s.chrome().trust_posture,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "the cached chrome is still stale — the trap this test pins"
+        );
         s.capture_network(
             "GET",
             "ipfs://bafy/index.html",
@@ -1714,8 +1739,8 @@ mod tests {
         );
         assert_eq!(
             s.debug_capture().network()[0].trust,
-            s.chrome().trust_posture,
-            "the main-document row mirrors the chrome's posture exactly"
+            renderer::TrustPosture::ContentVerified,
+            "the main-document row carries the LIVE posture, not the stale cache"
         );
     }
 

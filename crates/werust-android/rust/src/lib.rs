@@ -626,8 +626,14 @@ impl SyncSession {
             // The two-axis reconciliation (the store's DECISIONS.md Decision 4):
             // on an ENS-named page the indicator shows `name-via-trusted-rpc`, so
             // the main-document row must show that too rather than the plainer
-            // per-request `content-verified`.
-            entry = entry.with_trust(self.with(|s| s.chrome().trust_posture));
+            // per-request `content-verified`. Read the LIVE posture (the seam's
+            // `Renderer::trust_posture`, the same fact the desktop capture reads
+            // from its load lifecycle), NOT the cached `chrome().trust_posture`
+            // snapshot: this capture runs BEFORE `onPageCommitted`/
+            // `onPageFinished` pump the shell and `refresh_chrome` re-caches, so
+            // the cache still holds the stale pre-verify `unverified-origin`
+            // here and would DOWNGRADE the row below the honest posture.
+            entry = entry.with_trust(self.with(|s| s.shell.live_trust_posture()));
         }
         self.push_network_entry(entry);
     }
@@ -1968,7 +1974,28 @@ mod tests {
         // The store's DECISIONS.md Decision 4: the main-document row must show the
         // SAME posture the chrome trust indicator shows, so the Network tab and the
         // indicator cannot disagree on the same screen.
+        //
+        // THE ORDERING TRAP this pins: the production order is navigate -> the
+        // WebView asks for the document -> the shared resolve MARKS the backend
+        // content-verified -> the capture runs, all BEFORE `onPageCommitted` /
+        // `onPageFinished` pump the shell and `refresh_chrome` re-caches the
+        // posture. Reading the CACHED `chrome().trust_posture` here would stamp
+        // the stale pre-verify `unverified-origin`, so the row must read the
+        // LIVE posture (the seam's `Renderer::trust_posture`), exactly as the
+        // desktop capture reads its load lifecycle directly.
         let s = SyncSession::new();
+        s.with(|c| {
+            assert!(c.navigate("ipfs://bafy/index.html"));
+            c.backend.mark_content_verified();
+            // Deliberately NO on_page_committed / on_page_finished: the chrome
+            // cache is still the stale pre-verify snapshot, which is the whole
+            // point of this test.
+            assert_eq!(
+                c.chrome().trust_posture,
+                renderer::TrustPosture::UnverifiedOrigin,
+                "the cached chrome is still stale — the trap this test pins"
+            );
+        });
         s.capture_network(
             "GET",
             "ipfs://bafy/index.html",
@@ -1981,8 +2008,8 @@ mod tests {
         let entries = s.debug_capture().network();
         assert_eq!(
             entries[0].trust,
-            s.with(|c| c.chrome().trust_posture),
-            "the main-document row mirrors the chrome's posture exactly"
+            renderer::TrustPosture::ContentVerified,
+            "the main-document row carries the LIVE posture, not the stale cache"
         );
     }
 

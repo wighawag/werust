@@ -927,6 +927,24 @@ impl BrowserShell {
         self.redirects.is_main_frame(uri)
     }
 
+    /// The LIVE trust posture of the current load, read fresh from the backend
+    /// (the seam's [`Renderer::trust_posture`]), NOT the CACHED
+    /// [`ChromeState::trust_posture`] snapshot.
+    ///
+    /// The cached snapshot is only as fresh as the last `refresh_chrome`, which
+    /// runs on the page commit/finish load signals — AFTER the `ipfs://` scheme
+    /// handler has already resolved, marked the backend content-verified, and
+    /// the debug NETWORK capture has recorded the main-document row. A capture
+    /// that reads the cache in that window stamps the stale pre-verify
+    /// `unverified-origin`, DOWNGRADING the row below the honest posture the
+    /// indicator is about to show. The debug capture's main-document
+    /// reconciliation reads THIS, the same fact the desktop capture reads
+    /// directly from its load lifecycle.
+    #[must_use]
+    pub fn live_trust_posture(&self) -> TrustPosture {
+        self.renderer.trust_posture()
+    }
+
     /// The capture store as the debug JSON document each edge's debug view
     /// renders ([`crate::debug::debug_json`]).
     ///

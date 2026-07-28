@@ -111,3 +111,7 @@ THE DEFECT: on Android and iOS the main-document row takes a STALE posture, so i
 THE FIX: read the LIVE load posture at capture time, not the cached chrome snapshot — exactly what DESKTOP already does correctly at crates/webview-renderer/src/backend.rs:791 (self.life.borrow().posture()). Give the mobile capture points the same live read (the backend/renderer posture, or refresh before reading) instead of self.chrome().trust_posture. Sites: crates/werust-android/rust/src/lib.rs:625 and crates/werust-ios/rust/src/lib.rs:321-322. Desktop is the reference implementation here; make mobile match it rather than inventing anything.
 
 Then make the README manual steps honest: Android step 5 and iOS step 6 cannot pass as written today, so they must describe the fixed behaviour. Add a test that pins the ordering trap — a main-document capture that happens BEFORE any refresh_chrome must still carry the live posture, not the stale cached one. Network-isolated.
+
+## Requeue 2026-07-28
+
+CONDUCTOR: the previous run died on a transient Anthropic 429 rate_limit_error (capacity, NOT a defect). Branch preserved; CONTINUE from its tip. The one remaining defect is as prescribed in the prior note (mobile main-document row must read the LIVE posture like desktop at backend.rs:791, not the cached chrome snapshot). The build model is being switched off the rate-limited opus-5.

@@ -136,8 +136,9 @@ fn open_debug_view(parent: &ApplicationWindow, state: &Rc<DebugViewState>) {
 ///
 /// The view is refreshed on the EXISTING chrome pump cadence (the 50ms timeout
 /// in [`open_window`]), never a busy loop: the refresh is INCREMENTAL, appending
-/// only the rows captured since the last tick, so an idle tick is one sequence
-/// comparison. The anchor is the store's MONOTONIC per-entry
+/// only the rows captured since the last tick and DROPPING from the top the
+/// rows the ring buffer evicted from the store's front, so an idle tick is one
+/// sequence comparison. The anchor is the store's MONOTONIC per-entry
 /// [`sequence`](ConsoleEntry::sequence), NOT the store's length: a ring buffer
 /// AT its cap never changes length (every push is paired with a `pop_front`
 /// eviction), so a length-anchored refresh silently freezes exactly in the
@@ -156,6 +157,14 @@ struct DebugView {
     /// anchor), or `None` before the first paint / after a clear.
     last_console_sequence: Option<u64>,
     last_network_sequence: Option<u64>,
+    /// How many rows each tab's list currently holds. Tracked alongside the
+    /// anchor so an at-cap append can DROP the rows the ring buffer evicted
+    /// from the store's front (the view's rows end at the anchor, so the rows
+    /// above the anchor's snapshot position are the evicted ones); without it
+    /// the append path only ever grew the list past the cap (the round-2
+    /// Gate-2 defect).
+    console_rows: usize,
+    network_rows: usize,
 }
 
 impl DebugView {
@@ -223,6 +232,8 @@ impl DebugView {
             network_scrolled,
             last_console_sequence: None,
             last_network_sequence: None,
+            console_rows: 0,
+            network_rows: 0,
         }));
 
         clear.connect_clicked({
@@ -238,13 +249,14 @@ impl DebugView {
     }
 
     /// Catch the view up with the store: append the rows captured since the last
-    /// refresh, or REBUILD a list when the refresh anchor is gone (a `clear`,
-    /// or the ring buffer evicting past the last-rendered entry at the cap).
-    /// Called on the existing pump cadence while the view is open.
+    /// refresh, DROPPING from the top the rows the ring buffer evicted from the
+    /// store's front, or REBUILD a list when the refresh anchor is gone (a
+    /// `clear`, or the ring buffer evicting past the last-rendered entry at the
+    /// cap). Called on the existing pump cadence while the view is open.
     fn refresh(&mut self) {
         let console = self.capture.console();
         let sequences: Vec<u64> = console.iter().map(ConsoleEntry::sequence).collect();
-        match tail_plan(&sequences, self.last_console_sequence) {
+        match tail_plan(&sequences, self.console_rows, self.last_console_sequence) {
             TailPlan::Rebuild => {
                 clear_list_box(&self.console_list);
                 let stick = is_at_bottom(&self.console_scrolled);
@@ -253,8 +265,9 @@ impl DebugView {
                 }
                 stick_to_bottom(&self.console_scrolled, stick);
             }
-            TailPlan::AppendFrom(from) => {
+            TailPlan::AppendFrom { drop, from } => {
                 let stick = is_at_bottom(&self.console_scrolled);
+                drop_top_rows(&self.console_list, drop);
                 for entry in &console[from..] {
                     self.console_list.append(&console_row(entry));
                 }
@@ -263,10 +276,11 @@ impl DebugView {
             TailPlan::Noop => {}
         }
         self.last_console_sequence = sequences.last().copied();
+        self.console_rows = sequences.len();
 
         let network = self.capture.network();
         let sequences: Vec<u64> = network.iter().map(NetworkEntry::sequence).collect();
-        match tail_plan(&sequences, self.last_network_sequence) {
+        match tail_plan(&sequences, self.network_rows, self.last_network_sequence) {
             TailPlan::Rebuild => {
                 clear_list_box(&self.network_list);
                 let stick = is_at_bottom(&self.network_scrolled);
@@ -275,8 +289,9 @@ impl DebugView {
                 }
                 stick_to_bottom(&self.network_scrolled, stick);
             }
-            TailPlan::AppendFrom(from) => {
+            TailPlan::AppendFrom { drop, from } => {
                 let stick = is_at_bottom(&self.network_scrolled);
+                drop_top_rows(&self.network_list, drop);
                 for entry in &network[from..] {
                     self.network_list.append(&network_row(entry));
                 }
@@ -285,6 +300,7 @@ impl DebugView {
             TailPlan::Noop => {}
         }
         self.last_network_sequence = sequences.last().copied();
+        self.network_rows = sequences.len();
     }
 }
 
@@ -299,17 +315,21 @@ enum TailPlan {
     /// buffer having evicted past the last-rendered entry, so every row the
     /// view holds is stale.
     Rebuild,
-    /// Append only the snapshot entries from this index onward: the tail AFTER
-    /// the last-rendered entry. The rows above it stay, except any the store
-    /// evicted from the front, which this drop-from-the-top implicitly
-    /// discards (the view's rows then match the snapshot exactly).
-    AppendFrom(usize),
+    /// Append only the snapshot entries from `from` onward (the tail AFTER the
+    /// last-rendered entry), first DROPPING `drop` rows from the view's top:
+    /// the rows the ring buffer has already evicted from the store's front.
+    /// The drop is EXPLICIT, not implicit: appending alone leaves the view
+    /// holding rows the store discarded, its count climbing past the cap until
+    /// the anchor itself is evicted (the round-2 Gate-2 defect). After the
+    /// drop + append the view's rows match the snapshot exactly.
+    AppendFrom { drop: usize, from: usize },
     /// Nothing new to render (the steady idle tick).
     Noop,
 }
 
 /// Plan one tab's refresh from the snapshot's entry SEQUENCES (oldest first,
-/// strictly increasing) and the sequence of the last entry the view rendered.
+/// strictly increasing), how many rows the view currently holds, and the
+/// sequence of the last entry the view rendered.
 ///
 /// The anchor is the sequence, never the length, because a ring buffer AT its
 /// cap never changes length: `pop_front` eviction keeps it pinned, so "same
@@ -317,7 +337,13 @@ enum TailPlan {
 /// those apart: if the anchor still falls inside the snapshot, exactly the
 /// entries after it are new; if it is ABSENT, everything the view holds was
 /// evicted (or the store was cleared) and only a rebuild is honest.
-fn tail_plan(sequences: &[u64], last_rendered: Option<u64>) -> TailPlan {
+///
+/// `rendered_rows` makes the eviction REMOVAL explicit: the view's rows end at
+/// the anchor, so of them only the snapshot rows up to and including the
+/// anchor's position are still in the store; the rest were evicted from the
+/// store's front and drop off the view's TOP on the append (zero while the
+/// buffer sits below its cap).
+fn tail_plan(sequences: &[u64], rendered_rows: usize, last_rendered: Option<u64>) -> TailPlan {
     let Some(anchor) = last_rendered else {
         // Nothing rendered yet (the first paint, or just after a clear): an
         // empty snapshot is a no-op, a non-empty one renders everything.
@@ -328,7 +354,10 @@ fn tail_plan(sequences: &[u64], last_rendered: Option<u64>) -> TailPlan {
         };
     };
     match sequences.iter().position(|&s| s == anchor) {
-        Some(index) if index + 1 < sequences.len() => TailPlan::AppendFrom(index + 1),
+        Some(index) if index + 1 < sequences.len() => TailPlan::AppendFrom {
+            drop: rendered_rows.saturating_sub(index + 1),
+            from: index + 1,
+        },
         Some(_) => TailPlan::Noop,
         None => TailPlan::Rebuild,
     }
@@ -337,6 +366,19 @@ fn tail_plan(sequences: &[u64], last_rendered: Option<u64>) -> TailPlan {
 /// Remove every row of a [`ListBox`] (after the store's `clear()` shrank it).
 fn clear_list_box(list: &ListBox) {
     while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+/// Remove the FIRST `n` rows of a [`ListBox`]: the rows the ring buffer
+/// evicted from the store's front, dropped off the view's TOP on an at-cap
+/// append so the list keeps mirroring the store instead of climbing past the
+/// cap on rows the store already discarded.
+fn drop_top_rows(list: &ListBox, n: usize) {
+    for _ in 0..n {
+        let Some(child) = list.first_child() else {
+            break;
+        };
         list.remove(&child);
     }
 }
@@ -1547,25 +1589,40 @@ mod tests {
     fn the_refresh_plan_appends_after_the_last_rendered_sequence_or_rebuilds() {
         // First paint (nothing rendered yet): an empty store is a no-op, a
         // non-empty one renders everything.
-        assert_eq!(tail_plan(&[], None), TailPlan::Noop);
-        assert_eq!(tail_plan(&[1, 2, 3], None), TailPlan::Rebuild);
-        // The steady state: append exactly the entries AFTER the anchor.
-        assert_eq!(tail_plan(&[1, 2, 3], Some(1)), TailPlan::AppendFrom(1));
-        assert_eq!(tail_plan(&[1, 2, 3], Some(2)), TailPlan::AppendFrom(2));
+        assert_eq!(tail_plan(&[], 0, None), TailPlan::Noop);
+        assert_eq!(tail_plan(&[1, 2, 3], 0, None), TailPlan::Rebuild);
+        // The steady state BELOW the cap: append exactly the entries AFTER the
+        // anchor, dropping nothing (nothing was evicted).
+        assert_eq!(
+            tail_plan(&[1, 2, 3], 1, Some(1)),
+            TailPlan::AppendFrom { drop: 0, from: 1 }
+        );
+        assert_eq!(
+            tail_plan(&[1, 2, 3], 2, Some(2)),
+            TailPlan::AppendFrom { drop: 0, from: 2 }
+        );
         // Caught up: the anchor is the snapshot's last entry.
-        assert_eq!(tail_plan(&[1, 2, 3], Some(3)), TailPlan::Noop);
+        assert_eq!(tail_plan(&[1, 2, 3], 3, Some(3)), TailPlan::Noop);
         // AT-CAP EVICTION (the defect Gate-2 caught): the ring buffer's length
         // is pinned at the cap, but the anchor still falls inside the snapshot,
-        // so the view appends only the entries after it and drops the evicted
-        // rows from its top.
-        assert_eq!(tail_plan(&[4, 5, 6], Some(4)), TailPlan::AppendFrom(1));
-        assert_eq!(tail_plan(&[4, 5, 6], Some(5)), TailPlan::AppendFrom(2));
+        // so the view appends only the entries after it AND drops the evicted
+        // rows from its top. The view's rows end at the anchor, so of the 3 it
+        // holds only the snapshot rows up to and including the anchor's
+        // position are still in the store; the rest drop.
+        assert_eq!(
+            tail_plan(&[4, 5, 6], 3, Some(4)),
+            TailPlan::AppendFrom { drop: 2, from: 1 }
+        );
+        assert_eq!(
+            tail_plan(&[4, 5, 6], 3, Some(5)),
+            TailPlan::AppendFrom { drop: 1, from: 2 }
+        );
         // The anchor itself was evicted (a full buffer turned over while the
         // view was open): everything the view holds is stale, so REBUILD.
-        assert_eq!(tail_plan(&[4, 5, 6], Some(2)), TailPlan::Rebuild);
+        assert_eq!(tail_plan(&[4, 5, 6], 3, Some(2)), TailPlan::Rebuild);
         // A CLEAR: the snapshot is shorter than what the view rendered (here
         // empty), so rebuild.
-        assert_eq!(tail_plan(&[], Some(2)), TailPlan::Rebuild);
+        assert_eq!(tail_plan(&[], 3, Some(2)), TailPlan::Rebuild);
     }
 
     #[test]
@@ -1574,51 +1631,107 @@ mod tests {
         // no display): once a ring buffer sits AT its cap its length never
         // changes, so a length-anchored refresh freezes on rows the store has
         // already discarded. The sequence-anchored plan must keep the view
-        // showing exactly what the store holds.
+        // showing exactly what the store holds. The "view" here is a Vec of the
+        // rendered messages, applying `tail_plan` EXACTLY as
+        // `DebugView::refresh` applies it to the `ListBox` (drop the evicted
+        // rows off the top, append the new tail, rebuild when the anchor is
+        // gone), so the assertions are about what the real view shows.
+        fn apply(
+            capture: &DebugCapture,
+            view: &mut Vec<String>,
+            last: &mut Option<u64>,
+        ) -> TailPlan {
+            let snapshot = capture.console();
+            let sequences: Vec<u64> = snapshot.iter().map(ConsoleEntry::sequence).collect();
+            let plan = tail_plan(&sequences, view.len(), *last);
+            match plan {
+                TailPlan::Rebuild => {
+                    view.clear();
+                    view.extend(snapshot.iter().map(|e| e.message.clone()));
+                }
+                TailPlan::AppendFrom { drop, from } => {
+                    view.drain(..drop);
+                    view.extend(snapshot[from..].iter().map(|e| e.message.clone()));
+                }
+                TailPlan::Noop => {}
+            }
+            *last = sequences.last().copied();
+            plan
+        }
+
         let capture = DebugCapture::new();
+        let mut view: Vec<String> = Vec::new();
+        let mut last_rendered: Option<u64> = None;
         for i in 0..werust_core::debug::MAX_CONSOLE_ENTRIES {
             capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("m{i}")));
         }
-        let snapshot = capture.console();
-        let sequences: Vec<u64> = snapshot.iter().map(ConsoleEntry::sequence).collect();
-        assert_eq!(tail_plan(&sequences, None), TailPlan::Rebuild);
-        let mut last_rendered = sequences.last().copied();
+        // The first paint rebuilds from the full (capped) store.
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert_eq!(view.len(), werust_core::debug::MAX_CONSOLE_ENTRIES);
 
-        // Push 10 past the cap: the length is UNCHANGED (the freeze the old
-        // length-only refresh hit), but 10 rows were evicted from the front.
+        // Push 10 past the cap ONE AT A TIME with a refresh between each (the
+        // pump-tick case): the store's length is UNCHANGED at every tick (the
+        // freeze the old length-only refresh hit), but each tick evicts one row
+        // from the front. The view must stay AT the cap and mirror the store
+        // after every INCREMENTAL append, not only after a rebuild (the round-2
+        // Gate-2 defect: an append-only path climbs past the cap on stale rows).
         for i in 0..10 {
             capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("new{i}")));
+            let snapshot = capture.console();
+            assert_eq!(snapshot.len(), werust_core::debug::MAX_CONSOLE_ENTRIES);
+            let plan = apply(&capture, &mut view, &mut last_rendered);
+            assert_eq!(
+                plan,
+                TailPlan::AppendFrom {
+                    drop: 1,
+                    from: werust_core::debug::MAX_CONSOLE_ENTRIES - 1
+                },
+                "each at-cap tick appends the one new entry and drops the one evicted row"
+            );
+            assert_eq!(
+                view.len(),
+                werust_core::debug::MAX_CONSOLE_ENTRIES,
+                "the row count STAYS AT the cap across incremental at-cap appends"
+            );
+            assert_eq!(
+                view.last().unwrap(),
+                &format!("new{i}"),
+                "the newest entry renders even at the cap"
+            );
+            assert!(
+                view.iter()
+                    .zip(snapshot.iter())
+                    .all(|(v, e)| v == &e.message),
+                "the view mirrors the store exactly: its top rows are never ones the store evicted"
+            );
         }
-        let snapshot = capture.console();
-        assert_eq!(snapshot.len(), werust_core::debug::MAX_CONSOLE_ENTRIES);
-        let sequences: Vec<u64> = snapshot.iter().map(ConsoleEntry::sequence).collect();
-        let plan = tail_plan(&sequences, last_rendered);
-        let TailPlan::AppendFrom(from) = plan else {
-            panic!("at-cap eviction must still append the new tail, got {plan:?}");
-        };
-        // Exactly the 10 newest entries append; the NEWEST entry renders.
-        assert_eq!(from, werust_core::debug::MAX_CONSOLE_ENTRIES - 10);
-        assert_eq!(snapshot.last().unwrap().message, "new9");
-        // The rows the store evicted are gone from the snapshot, so the view
-        // drops them from its top rather than going stale on them.
-        assert_eq!(snapshot[0].message, "m10");
-        last_rendered = sequences.last().copied();
 
-        // A FULL buffer turns over while the view is open: the anchor itself is
-        // evicted, so the view rebuilds instead of appending onto stale rows.
+        // A FULL buffer turns over between ticks: the anchor itself is evicted,
+        // so the view rebuilds instead of appending onto stale rows.
         for i in 0..werust_core::debug::MAX_CONSOLE_ENTRIES {
             capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("x{i}")));
         }
-        let sequences: Vec<u64> = capture
-            .console()
-            .iter()
-            .map(ConsoleEntry::sequence)
-            .collect();
-        assert_eq!(tail_plan(&sequences, last_rendered), TailPlan::Rebuild);
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert!(
+            view.iter()
+                .zip(capture.console().iter())
+                .all(|(v, e)| v == &e.message),
+            "a rebuild re-mirrors the store exactly"
+        );
 
         // A clear: the snapshot is shorter than rendered, a rebuild empties it.
         capture.clear();
-        assert_eq!(tail_plan(&[], last_rendered), TailPlan::Rebuild);
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert!(view.is_empty());
     }
 
     #[test]
@@ -1650,6 +1763,20 @@ mod tests {
             child = widget.next_sibling();
         }
         let Some(row) = last.and_then(|w| w.downcast::<gtk4::ListBoxRow>().ok()) else {
+            return String::new();
+        };
+        row.child()
+            .and_then(|w| w.downcast::<Label>().ok())
+            .map_or_else(String::new, |label| label.label().to_string())
+    }
+
+    /// The text of the FIRST (top) row of a debug-view list, or an empty string
+    /// when the list is empty. Test-only.
+    fn first_row_text(list: &gtk4::ListBox) -> String {
+        let Some(row) = list
+            .first_child()
+            .and_then(|w| w.downcast::<gtk4::ListBoxRow>().ok())
+        else {
             return String::new();
         };
         row.child()
@@ -1769,6 +1896,39 @@ mod tests {
             last_row_text(&view.borrow().console_list).contains("newest"),
             "a push at the cap still reaches the view"
         );
+
+        // The round-2 half of the defect: an INCREMENTAL at-cap append must also
+        // DROP the evicted rows off the top, so the row count STAYS AT the cap
+        // (an append-only path climbs past it) and the top row is never one the
+        // store already discarded. Drive several more pushes one at a time (the
+        // pump-tick case), asserting the count and the mirror after each.
+        assert_eq!(
+            row_count(&view.borrow().console_list),
+            werust_core::debug::MAX_CONSOLE_ENTRIES,
+            "an at-cap append drops the evicted row: the count stays at the cap"
+        );
+        for i in 0..5 {
+            capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("extra{i}")));
+            view.borrow_mut().refresh();
+            assert_eq!(
+                row_count(&view.borrow().console_list),
+                werust_core::debug::MAX_CONSOLE_ENTRIES,
+                "the row count STAYS AT the cap across incremental at-cap appends"
+            );
+            assert!(
+                last_row_text(&view.borrow().console_list).contains(&format!("extra{i}")),
+                "the newest entry renders at every at-cap tick"
+            );
+            let store_head = capture.console()[0].message.clone();
+            assert!(
+                first_row_text(&view.borrow().console_list).contains(&store_head),
+                "the view's top row is the store's head, not an evicted row"
+            );
+            assert!(
+                !first_row_text(&view.borrow().console_list).contains("m10"),
+                "the long-evicted row is gone from the view's top"
+            );
+        }
 
         // Activating Debug again PRESENTS the same window rather than opening a
         // second copy (the slot still holds it, so no new view is built).

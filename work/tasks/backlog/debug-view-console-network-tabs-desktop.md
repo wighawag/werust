@@ -52,3 +52,15 @@ THE DEFECT: DebugView::refresh (crates/werust/src/main.rs) appends only when the
 THE FIX: make the store eviction-observable with a MONOTONIC SEQUENCE on each entry (assign an incrementing u64 on push; it survives pop_front). In the view, remember the LAST sequence rendered. On refresh, find where that last-seen sequence falls in the current snapshot and append only the entries AFTER it; when it is ABSENT (everything the view holds was evicted) do a full rebuild; when the snapshot is shorter than rendered (a clear) rebuild. That drops exactly the evicted rows and is still incremental, not a rebuild-per-tick. Add the sequence to the ConsoleEntry/NetworkEntry internals (or carry it alongside); it does not need to reach the FFI/edges. Correct DECISIONS.md Decision 2, which describes the incremental design but misses the at-capacity eviction case.
 
 TEST it — this is the whole point: pushing past the cap must still render the newest entry and must not leave the view showing rows the store evicted. Network-isolated.
+
+## Requeue 2026-07-28
+
+CONDUCTOR FIX-UP ROUND 2 (Gate-2 caught the second half of the same defect — your sequence detection works, but the append path still never REMOVES the evicted rows). Branch green + preserved; CONTINUE from its tip. The Notebook/tabs/columns/Clear and the sequence + tail_plan logic were accepted; do NOT redesign them. Close this one gap and finish.
+
+THE RESIDUAL: after a rebuild the view mirrors the store (300 rows, anchor = last sequence). Each at-cap push evicts one from the store's front and appends one at the back. tail_plan finds the anchor in the snapshot and returns AppendFrom, which only APPENDS the new tail — and the ONLY row removal in the whole view is clear_list_box, reachable only on a Rebuild. So the view's row count climbs 300 toward ~600, its top rows are entries the store has already discarded, and it stays stale for ~300 more pushes until the anchor itself is evicted and a Rebuild finally fires. That is still the stale-view defect, just deferred.
+
+THE FIX: on the AppendFrom path, DROP from the top of the ListBox the rows the store has evicted. Track the FIRST-rendered sequence (or the rendered row count) as well as the last; on AppendFrom the rows whose sequence is BELOW the current snapshot head are no longer in the store, so remove exactly those from the top of the list (the drop count is snapshot_len minus the rows the view still legitimately holds), then append the new tail. That keeps the view's row count at the cap and its contents mirroring the store continuously, still incremental.
+
+CORRECT the two claims the review falsified: DECISIONS.md Decision 2's correction paragraph currently says evicted rows are dropped from the view's top implicitly — they are NOT on the append path; and README manual step 10 claims row counts stay at 300 — they do not. Make both say what is true after this fix.
+
+EXTEND the past-cap display test: it must assert the row count STAYS AT MAX after incremental at-cap appends (not merely after a rebuild), and that the view's top rows are not entries the store evicted. Network-isolated.

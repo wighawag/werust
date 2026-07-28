@@ -172,16 +172,37 @@ fn clear_empties_the_shared_store_and_the_view_updates_on_the_existing_pump() {
         1,
         "no NEW timer may be added for the debug view: the one existing pump drives it"
     );
+
+    // The incremental refresh must anchor on the store's MONOTONIC per-entry
+    // SEQUENCE, never the store's length: a ring buffer AT its cap never
+    // changes length (every push pairs with a `pop_front` eviction), so a
+    // length-anchored refresh silently freezes exactly in the long-session
+    // case the ring buffer exists for (the Gate-2 defect; the fix is recorded
+    // in DECISIONS.md Decision 2).
+    let view = between(&desktop, "struct DebugView {", "fn build_menu_button(");
+    assert!(
+        view.contains("tail_plan(") && view.contains("::sequence"),
+        "the refresh must anchor on the store's monotonic entry sequence so \
+         eviction at the cap cannot freeze the view: {view:?}"
+    );
 }
 
 #[test]
 fn the_view_is_read_only_and_the_f12_inspector_is_untouched() {
     // Criterion 4: the debug view is READ-ONLY (it renders the store; a typeable
     // REPL is the native inspector's job). Bounded to the debug-view code, it
-    // must construct no input widget (`Entry`, `TextView`, `SearchEntry`).
+    // must construct no input widget (`Entry`, `TextView`, `SearchEntry`). The
+    // patterns name the CONSTRUCTIONS, not the bare `Entry::` prefix, so the
+    // store's own `ConsoleEntry` / `NetworkEntry` types (which the refresh
+    // maps over) do not trip it.
     let desktop = desktop_shell();
     let view = between(&desktop, "struct DebugView {", "fn build_menu_button(");
-    for input in ["Entry::", "TextView::", "SearchEntry::"] {
+    for input in [
+        "Entry::new",
+        "Entry::builder",
+        "TextView::",
+        "SearchEntry::",
+    ] {
         assert!(
             !view.contains(input),
             "the debug view must be READ-ONLY, but it builds a `{input}`: {view:?}"

@@ -24,6 +24,18 @@
 //! truncated to [`MAX_TEXT_CHARS`] so one pathological `console.log` of a whole
 //! document cannot blow the bound sideways.
 //!
+//! # Eviction is OBSERVABLE (the monotonic sequence)
+//!
+//! A buffer AT its cap never changes length (every push is paired with a
+//! `pop_front`), so a view that anchors its incremental refresh on the LENGTH
+//! freezes exactly then. The store therefore stamps every pushed entry with a
+//! MONOTONIC [`sequence`](ConsoleEntry::sequence) (one shared counter,
+//! surviving `pop_front`, never rewound by [`clear`](DebugCapture::clear)): a
+//! view anchors on the last sequence it rendered and appends only what follows
+//! it in the next snapshot, rebuilding when the anchor itself was evicted. The
+//! sequence is a store/render-path concern; it never reaches the FFI debug
+//! JSON (the edges re-render from each snapshot).
+//!
 //! # Shared like a sink, not owned by one thread
 //!
 //! [`DebugCapture`] is an `Arc<Mutex<_>>` handle (the same idiom as
@@ -185,6 +197,10 @@ pub struct ConsoleEntry {
     /// point supplies it; `0` when unknown). Kept as a plain number so the core
     /// binds no clock/time crate and a test can pin it.
     pub timestamp: u64,
+    /// The store-assigned MONOTONIC sequence (`0` until pushed). Private: a
+    /// capture point reports an entry, it never numbers one; the store stamps
+    /// it on push so the sequence always reflects store order.
+    sequence: u64,
 }
 
 impl ConsoleEntry {
@@ -198,7 +214,19 @@ impl ConsoleEntry {
             source: String::new(),
             line: None,
             timestamp: 0,
+            sequence: 0,
         }
+    }
+
+    /// The MONOTONIC sequence the store stamped on push (`0` for an entry that
+    /// was never pushed): it survives the ring buffer's `pop_front` eviction,
+    /// so a debug VIEW can anchor on the last sequence it rendered and tell "N
+    /// appended" from "N appended AND M evicted", which a length alone cannot,
+    /// because a buffer AT its cap never changes length. A store/render-path
+    /// concern only: it never reaches the FFI debug JSON.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Set the source URL (truncated to [`MAX_TEXT_CHARS`]).
@@ -260,6 +288,9 @@ pub struct NetworkEntry {
     pub timestamp: u64,
     /// How long the request took, in milliseconds, or [`None`] when unknown.
     pub duration: Option<u64>,
+    /// The store-assigned MONOTONIC sequence (`0` until pushed); see
+    /// [`ConsoleEntry::sequence`]. Private for the same reason.
+    sequence: u64,
 }
 
 impl NetworkEntry {
@@ -281,7 +312,16 @@ impl NetworkEntry {
             trust: TrustPosture::default(),
             timestamp: 0,
             duration: None,
+            sequence: 0,
         }
+    }
+
+    /// The MONOTONIC sequence the store stamped on push (`0` for an entry that
+    /// was never pushed); see [`ConsoleEntry::sequence`], whose eviction-anchor
+    /// rationale this shares.
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
     }
 
     /// Set the response status.
@@ -383,6 +423,12 @@ pub struct DebugCapture {
 struct CaptureInner {
     console: VecDeque<ConsoleEntry>,
     network: VecDeque<NetworkEntry>,
+    /// The next MONOTONIC sequence to stamp, shared by both buffers (each
+    /// buffer's sequences stay strictly increasing). Starts at `1` so `0` on an
+    /// entry always means "never pushed", and is NEVER rewound, not even by
+    /// `clear()`, so a post-clear entry can never carry a sequence a view
+    /// already rendered and be mistaken for an old row.
+    next_sequence: u64,
     /// Whether NETWORK capture is on. Phase 1 is ALWAYS-on (this defaults to
     /// `true`), and the flag exists so the Phase-2 debug-menu toggle
     /// (`debug-network-capture-toggle-config`) is a small addition (a setting
@@ -395,6 +441,7 @@ impl Default for CaptureInner {
         Self {
             console: VecDeque::new(),
             network: VecDeque::new(),
+            next_sequence: 1,
             // Phase 1 captures network ALWAYS (spec
             // `in-app-debug-menu-console-and-network`): the default is on.
             network_capture_enabled: true,
@@ -420,6 +467,9 @@ impl DebugCapture {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
+        let mut entry = entry;
+        entry.sequence = inner.next_sequence;
+        inner.next_sequence += 1;
         if inner.console.len() >= MAX_CONSOLE_ENTRIES {
             inner.console.pop_front();
         }
@@ -436,6 +486,9 @@ impl DebugCapture {
         if !inner.network_capture_enabled {
             return;
         }
+        let mut entry = entry;
+        entry.sequence = inner.next_sequence;
+        inner.next_sequence += 1;
         if inner.network.len() >= MAX_NETWORK_ENTRIES {
             inner.network.pop_front();
         }
@@ -1074,6 +1127,75 @@ mod tests {
         let entries = capture.network();
         assert_eq!(entries.len(), MAX_NETWORK_ENTRIES);
         assert_eq!(entries.first().unwrap().url, "https://x/3");
+    }
+
+    #[test]
+    fn pushed_entries_carry_a_monotonic_sequence_that_survives_eviction() {
+        // The ring buffer's length PINNED AT THE CAP cannot distinguish "10
+        // appended" from "10 appended AND 10 evicted"; the per-entry monotonic
+        // sequence can, and it survives the `pop_front` eviction. This is the
+        // fact the debug view's refresh anchors on.
+        let capture = DebugCapture::new();
+        for i in 0..(MAX_CONSOLE_ENTRIES + 3) {
+            capture.push_console(console(&format!("m{i}")));
+        }
+        let entries = capture.console();
+        assert_eq!(entries.len(), MAX_CONSOLE_ENTRIES);
+        assert!(
+            entries
+                .windows(2)
+                .all(|w| w[0].sequence() < w[1].sequence()),
+            "console sequences strictly increase in capture order"
+        );
+        // The first three pushes were evicted, so the surviving sequences span
+        // exactly the surviving window.
+        let first = entries.first().unwrap().sequence();
+        let last = entries.last().unwrap().sequence();
+        assert_eq!(last - first, (MAX_CONSOLE_ENTRIES - 1) as u64);
+
+        let capture = DebugCapture::new();
+        for i in 0..(MAX_NETWORK_ENTRIES + 3) {
+            capture.push_network(network(&format!("https://x/{i}")));
+        }
+        let entries = capture.network();
+        assert!(
+            entries
+                .windows(2)
+                .all(|w| w[0].sequence() < w[1].sequence()),
+            "network sequences strictly increase in capture order"
+        );
+    }
+
+    #[test]
+    fn a_clear_does_not_rewind_the_sequence() {
+        // If a clear rewound the counter, a post-clear entry could carry the
+        // SAME sequence a view remembers rendering before the clear, and the
+        // view would mistake brand-new rows for already-rendered ones. The
+        // counter is monotonic for the life of the store.
+        let capture = DebugCapture::new();
+        capture.push_console(console("before"));
+        let before = capture.console()[0].sequence();
+        capture.clear();
+        capture.push_console(console("after"));
+        let after = capture.console()[0].sequence();
+        assert!(
+            after > before,
+            "a post-clear entry never reuses a pre-clear sequence"
+        );
+    }
+
+    #[test]
+    fn the_sequence_is_internal_and_never_reaches_the_debug_json() {
+        // The sequence is a store/render-path concern (the desktop view's
+        // incremental refresh); the edges re-render from each snapshot, so the
+        // wire document stays exactly as recorded.
+        let capture = DebugCapture::new();
+        capture.push_console(console("hello"));
+        capture.push_network(network("https://x/1"));
+        let json: serde_json::Value =
+            serde_json::from_str(&debug_json(&capture)).expect("valid JSON");
+        assert!(json["console"][0].get("sequence").is_none());
+        assert!(json["network"][0].get("sequence").is_none());
     }
 
     #[test]

@@ -115,3 +115,7 @@ Then make the README manual steps honest: Android step 5 and iOS step 6 cannot p
 ## Requeue 2026-07-28
 
 CONDUCTOR: the previous run died on a transient Anthropic 429 rate_limit_error (capacity, NOT a defect). Branch preserved; CONTINUE from its tip. The one remaining defect is as prescribed in the prior note (mobile main-document row must read the LIVE posture like desktop at backend.rs:791, not the cached chrome snapshot). The build model is being switched off the rate-limited opus-5.
+
+## Requeue 2026-07-28
+
+CONDUCTOR: released a stale lock so the run can proceed on the new kimi-k3 model. The round-2 fix prescription (live posture read on mobile) still stands: continue from the kept branch and apply it.

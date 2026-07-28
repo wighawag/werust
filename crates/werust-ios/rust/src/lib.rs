@@ -122,8 +122,16 @@ impl CoreSession {
         // shim + the response push, driving
         // [`handle_provider_message`](CoreSession::handle_provider_message).
         install_provider(&mut backend);
+        // Wire the iOS CONSOLE + best-effort NETWORK capture points that feed the
+        // in-app debug menu (task `debug-console-network-capture-per-platform`).
+        // The store is created HERE and shared with the shell below, so the capture
+        // handler and the debug view are the SAME store.
+        let debug = werust_core::debug::DebugCapture::new();
+        install_debug_capture(&mut backend, debug.clone());
         Self {
-            shell: BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects),
+            shell: BrowserShell::new(Box::new(backend))
+                .with_redirect_sink(redirects)
+                .with_debug_capture(debug),
             backend: handle,
         }
     }
@@ -229,6 +237,73 @@ impl CoreSession {
     #[must_use]
     pub fn handle_provider_message(&self, name: &str, body: &str) -> Vec<String> {
         self.backend.handle_script_message(name, body)
+    }
+
+    /// Capture one envelope the injected debug shim posted up the capture channel
+    /// (Swift's `WKScriptMessageHandler` for
+    /// [`CAPTURE_BRIDGE`](werust_core::debug::CAPTURE_BRIDGE)), for the in-app
+    /// debug menu's Console tab and the best-effort half of its Network tab.
+    ///
+    /// WKWebView has NO native console callback and no per-resource load callback,
+    /// so iOS captures the console by injecting the SHARED
+    /// [`console_shim`](werust_core::debug::console_shim) (byte-for-byte the one
+    /// desktop injects) and its reachable network by injecting the
+    /// [`network_shim`](werust_core::debug::network_shim) (`fetch`/`XHR` only — see
+    /// the honestly-recorded coverage limits in
+    /// `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`).
+    ///
+    /// The body is PAGE-CONTROLLED text (a hostile page can post on this channel
+    /// directly), so it goes through the core's total, fail-quiet
+    /// [`route_capture_message`](werust_core::debug::route_capture_message): an
+    /// unreadable body is dropped, never fabricated into an entry, and a
+    /// shim-reported request never claims verification.
+    pub fn capture_script_message(&self, name: &str, body: &str) {
+        // Routed through the registered script-message handler so the channel
+        // name is respected (an unregistered channel captures nothing), exactly as
+        // the provider channel is dispatched.
+        let _ = self.backend.handle_script_message(name, body);
+    }
+
+    /// Capture one NETWORK request from an iOS point that CAN see it natively: the
+    /// `WKURLSchemeHandler` custom-scheme tasks and the main-frame navigations the
+    /// `WKNavigationDelegate` reports.
+    ///
+    /// These are the points where iOS knows the REAL outcome, so they are the only
+    /// ones that may report a verified posture: `verified` must say whether THIS
+    /// request's bytes actually came back through the hash-verified
+    /// content-addressed path (a successful `ipfs://` resolution), never whether
+    /// the URL looks content-addressed (ADR-0006). `main_frame` marks the
+    /// main-document row, which additionally takes the LOAD's own two-axis posture
+    /// so the Network tab cannot contradict the chrome trust indicator.
+    ///
+    /// A `0` status/size means unknown and stays honestly absent in the store.
+    // The flat argument list MIRRORS the C-ABI export Swift calls
+    // (`werust_ios_capture_network`), which cannot take a Rust struct: grouping
+    // them here would only move the same marshalling one layer down.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_network(
+        &self,
+        method: &str,
+        url: &str,
+        status: u16,
+        mime: &str,
+        size: u64,
+        verified: bool,
+        main_frame: bool,
+    ) {
+        let mut entry = werust_core::debug::network_entry(
+            method,
+            url,
+            Some(status),
+            mime,
+            Some(size),
+            verified,
+            epoch_millis(),
+        );
+        if main_frame {
+            entry = entry.with_trust(self.shell.chrome().trust_posture);
+        }
+        self.shell.debug_capture().push_network(entry);
     }
 
     /// Serve (and apply) an intercepted `werust://settings[?backend=…]` request
@@ -454,6 +529,67 @@ fn install_provider(backend: &mut IosBackend) {
     );
     // Make the provider detectable from document start, exactly as desktop does.
     backend.inject_script(&provider_shim());
+}
+
+/// Milliseconds since the Unix epoch, for a captured debug entry's timestamp
+/// (`0` if the clock is before the epoch).
+///
+/// The core store takes a caller-supplied timestamp so it binds no clock (the
+/// store's DECISIONS.md Decision 6); this is the iOS edge's supply, taken here
+/// rather than in Swift so all three edges stamp entries the same way.
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Install the iOS CONSOLE + best-effort NETWORK capture points on `backend`, the
+/// twin of the desktop backend's `install_debug_capture` (task
+/// `debug-console-network-capture-per-platform`).
+///
+/// # Why iOS injects a shim (and why its network coverage is honestly partial)
+///
+/// WKWebView exposes NO console callback and NO per-resource load callback, so
+/// the only page-wide reach iOS has is INJECTED JS:
+///
+/// * CONSOLE: the SHARED [`console_shim`](werust_core::debug::console_shim) — the
+///   byte-for-byte same string desktop injects, from ONE place in `werust-core`,
+///   so the two shim platforms cannot drift. It chains to the original
+///   `console.*`, so the page's console and Safari's remote inspector are
+///   unchanged.
+/// * NETWORK: the [`network_shim`](werust_core::debug::network_shim), a
+///   best-effort `fetch`/`XHR` wrapper. It sees only requests the PAGE makes
+///   through those APIs — NOT the browser-internal subresource loads (`<img>`,
+///   `<script>`, CSS `url()`, navigation preloads). Those gaps are covered as far
+///   as iOS allows by the NATIVE points Swift drives through
+///   [`CoreSession::capture_network`] (the `WKURLSchemeHandler` custom-scheme
+///   tasks and the `WKNavigationDelegate` main-frame navigations), and what
+///   remains uncovered is recorded honestly in
+///   `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`
+///   rather than silently presented as complete.
+///
+/// Desktop does NOT inject the network shim: its resource-load signals already
+/// see every resource, so it would only double-record a subset.
+///
+/// Both shims post on the DEDICATED
+/// [`CAPTURE_BRIDGE`](werust_core::debug::CAPTURE_BRIDGE) channel (never the
+/// EIP-1193 provider's trust channel), and the registered handler routes each
+/// body through the core's total, fail-quiet
+/// [`route_capture_message`](werust_core::debug::route_capture_message). Capture
+/// is READ-ONLY observation: nothing here answers a request, alters a load, or
+/// changes a trust posture.
+fn install_debug_capture(backend: &mut IosBackend, capture: werust_core::debug::DebugCapture) {
+    use werust_core::debug::{console_shim, network_shim, route_capture_message, CAPTURE_BRIDGE};
+
+    backend.register_script_message_handler(
+        CAPTURE_BRIDGE,
+        Box::new(move |message| route_capture_message(&capture, &message.body)),
+    );
+    // Document-start user scripts, so a page's very first `console.log` and its
+    // earliest `fetch` are captured.
+    backend.inject_script(&console_shim());
+    backend.inject_script(&network_shim());
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1058,61 @@ mod ffi {
         }
     }
 
+    /// Capture one envelope the injected debug shim posted, from Swift's
+    /// `WKScriptMessageHandler` for the capture channel (task
+    /// `debug-console-network-capture-per-platform`).
+    ///
+    /// The body is PAGE-CONTROLLED text; the core parse is total and fail-quiet,
+    /// so an unreadable or hostile body is dropped rather than fabricated into an
+    /// entry.
+    ///
+    /// # Safety
+    /// `session` is a live handle; `name` and `body` are valid NUL-terminated C
+    /// strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_capture_script_message(
+        session: *mut CoreSession,
+        name: *const c_char,
+        body: *const c_char,
+    ) {
+        let name = read(name);
+        let body = read(body);
+        if let Some(s) = session_mut(session) {
+            s.capture_script_message(&name, &body);
+        }
+    }
+
+    /// Capture one NETWORK request from an iOS point that sees it NATIVELY: the
+    /// `WKURLSchemeHandler` custom-scheme tasks and the `WKNavigationDelegate`
+    /// main-frame navigations.
+    ///
+    /// `verified` must reflect what the request ACTUALLY did (a successful
+    /// `ipfs://` resolution through the hash-verified path), never what the URL
+    /// looks like; `main_frame` marks the main-document row, which takes the
+    /// load's own two-axis posture. A `0` status/size means unknown.
+    ///
+    /// # Safety
+    /// `session` is a live handle; `method`, `url` and `mime` are valid
+    /// NUL-terminated C strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_capture_network(
+        session: *mut CoreSession,
+        method: *const c_char,
+        url: *const c_char,
+        status: u16,
+        mime: *const c_char,
+        size: u64,
+        verified: bool,
+        main_frame: bool,
+    ) {
+        let method = read(method);
+        let url = read(url);
+        let mime = read(mime);
+        if let Some(s) = session_mut(session) {
+            s.capture_network(&method, &url, status, &mime, size, verified, main_frame);
+        }
+    }
+
     /// werust's version string as a heap C string, for the Swift browser menu's
     /// version line. Free with [`werust_ios_string_free`]. Takes NO session
     /// handle: the version is a property of the BUILD, and it is the ONE shared
@@ -1114,16 +1305,16 @@ mod tests {
         let s = CoreSession::new();
 
         let scripts = s.document_start_scripts();
-        assert_eq!(
-            scripts.len(),
-            1,
-            "the provider shim is injected at document start"
-        );
-        assert!(
-            scripts[0].contains("isWerust: true"),
-            "the injected shim is the provider shim"
-        );
-        assert!(scripts[0].contains("ethereum"));
+        // The session now injects several document-start scripts (the provider shim
+        // plus the debug capture shims, task
+        // `debug-console-network-capture-per-platform`), so this asserts the
+        // PROVIDER one is among them rather than pinning the count — which would
+        // red every time another edge capability adds a user script.
+        let provider = scripts
+            .iter()
+            .find(|script| script.contains("isWerust: true"))
+            .expect("the provider shim is injected at document start");
+        assert!(provider.contains("ethereum"));
 
         let pushed = s.handle_provider_message(
             "werustProvider",
@@ -1357,6 +1548,204 @@ mod tests {
             werust_ios_session_free(s);
             assert!(werust_ios_debug_json(std::ptr::null_mut()).is_null());
             werust_ios_debug_clear(std::ptr::null_mut());
+        }
+    }
+
+    // --- The iOS CAPTURE POINTS (task -------------------------------------
+    // `debug-console-network-capture-per-platform`)
+
+    #[test]
+    fn the_injected_console_shim_is_installed_at_document_start_alongside_the_provider() {
+        // Acceptance: WKWebView has NO native console callback, so iOS captures the
+        // console by injecting the SHARED core shim — the byte-for-byte same string
+        // desktop injects, from ONE place — as a document-start user script, on its
+        // OWN capture channel (never the EIP-1193 provider's trust channel).
+        use werust_core::debug::{console_shim, network_shim, CAPTURE_BRIDGE};
+        let s = CoreSession::new();
+        let scripts = s.document_start_scripts();
+        assert!(
+            scripts.iter().any(|script| *script == console_shim()),
+            "the SHARED core console shim is injected verbatim, not a local copy"
+        );
+        assert!(
+            scripts.iter().any(|script| *script == network_shim()),
+            "iOS also injects the best-effort fetch/XHR shim (its only page-wide \
+             network reach)"
+        );
+        assert_ne!(CAPTURE_BRIDGE, werust_core::provider::PROVIDER_BRIDGE);
+    }
+
+    #[test]
+    fn a_shim_posted_console_message_reaches_the_shared_store_through_the_capture_channel() {
+        use werust_core::debug::{ConsoleLevel, CAPTURE_BRIDGE};
+        let s = CoreSession::new();
+        s.capture_script_message(
+            CAPTURE_BRIDGE,
+            r#"{"kind":"console","level":"error","message":"boom",
+               "source":"https://x/app.js","line":9,"ts":5}"#,
+        );
+        let entries = s.debug_capture().console();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].level, ConsoleLevel::Error);
+        assert_eq!(entries[0].message, "boom");
+        assert_eq!(entries[0].line, Some(9));
+    }
+
+    #[test]
+    fn a_shim_posted_fetch_reaches_the_store_but_can_never_claim_verification() {
+        // Page-side JS proves NOTHING about the load path, so the best-effort
+        // network shim's rows are always honestly unverified.
+        use werust_core::debug::CAPTURE_BRIDGE;
+        let s = CoreSession::new();
+        s.capture_script_message(
+            CAPTURE_BRIDGE,
+            r#"{"kind":"network","method":"GET","url":"https://api.example/x",
+               "status":200,"mime":"application/json","size":4,"ts":1,"duration":9}"#,
+        );
+        let entries = s.debug_capture().network();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].url, "https://api.example/x");
+        assert_eq!(entries[0].status, Some(200));
+        assert_eq!(entries[0].duration, Some(9));
+        assert_eq!(entries[0].trust, renderer::TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn a_hostile_page_posting_on_the_capture_channel_cannot_fabricate_an_entry() {
+        // The capture channel is reachable from page JS directly, so the parse must
+        // be total and fail-quiet: junk is dropped, never turned into an entry and
+        // never a panic that would take the browser down.
+        use werust_core::debug::CAPTURE_BRIDGE;
+        let s = CoreSession::new();
+        for body in ["", "not json", "[]", r#"{"kind":"nope"}"#] {
+            s.capture_script_message(CAPTURE_BRIDGE, body);
+        }
+        assert!(s.debug_capture().console().is_empty());
+        assert!(s.debug_capture().network().is_empty());
+    }
+
+    #[test]
+    fn an_unregistered_channel_captures_nothing() {
+        // Capture is dispatched by channel name, exactly as the provider is: a
+        // message on a channel nobody registered reaches no store.
+        let s = CoreSession::new();
+        s.capture_script_message("werustNotAChannel", r#"{"kind":"console","message":"x"}"#);
+        assert!(s.debug_capture().console().is_empty());
+    }
+
+    #[test]
+    fn the_native_ios_capture_points_report_the_honest_per_request_posture() {
+        // The scheme handler and the nav delegate are the iOS points that KNOW the
+        // outcome, so they are the only ones that may report a verified posture —
+        // and only when the bytes really came back hash-verified (ADR-0006).
+        let s = CoreSession::new();
+        s.capture_network(
+            "GET",
+            "ipfs://bafy/pic.png",
+            200,
+            "image/png",
+            9,
+            true,
+            false,
+        );
+        s.capture_network(
+            "GET",
+            "werust://settings",
+            200,
+            "text/html",
+            10,
+            false,
+            false,
+        );
+        s.capture_network("GET", "ipfs://bafy/gone", 0, "", 0, false, false);
+
+        let entries = s.debug_capture().network();
+        assert_eq!(entries[0].trust, renderer::TrustPosture::ContentVerified);
+        assert_eq!(
+            entries[1].trust,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "an internal werust:// page is not content-verified"
+        );
+        assert_eq!(
+            entries[2].trust,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "a failed ipfs:// request claims nothing"
+        );
+        assert_eq!(
+            entries[2].status, None,
+            "an unknown status stays unknown, never a fake 0"
+        );
+    }
+
+    #[test]
+    fn the_ios_main_document_row_takes_the_loads_own_posture() {
+        // The store's DECISIONS.md Decision 4: the main-document row must mirror
+        // the chrome trust indicator so the two surfaces cannot disagree.
+        let s = CoreSession::new();
+        s.capture_network(
+            "GET",
+            "ipfs://bafy/index.html",
+            200,
+            "text/html",
+            12,
+            true,
+            true,
+        );
+        assert_eq!(
+            s.debug_capture().network()[0].trust,
+            s.chrome().trust_posture,
+            "the main-document row mirrors the chrome's posture exactly"
+        );
+    }
+
+    #[test]
+    fn the_c_abi_feeds_the_capture_points_and_tolerates_a_null_session() {
+        use super::ffi::*;
+        use std::ffi::{CStr, CString};
+        unsafe {
+            let s = werust_ios_session_new();
+            let channel = CString::new(werust_core::debug::CAPTURE_BRIDGE).unwrap();
+            let body = CString::new(r#"{"kind":"console","level":"warn","message":"hi"}"#).unwrap();
+            werust_ios_capture_script_message(s, channel.as_ptr(), body.as_ptr());
+
+            let method = CString::new("GET").unwrap();
+            let url = CString::new("ipfs://bafy/pic.png").unwrap();
+            let mime = CString::new("image/png").unwrap();
+            werust_ios_capture_network(
+                s,
+                method.as_ptr(),
+                url.as_ptr(),
+                200,
+                mime.as_ptr(),
+                9,
+                true,
+                false,
+            );
+
+            let json_ptr = werust_ios_debug_json(s);
+            let json = CStr::from_ptr(json_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(json_ptr);
+            assert!(json.contains("\"message\":\"hi\""), "{json}");
+            assert!(json.contains("\"level\":\"warn\""), "{json}");
+            assert!(json.contains("\"trust\":\"content-verified\""), "{json}");
+
+            werust_ios_session_free(s);
+            // A null session is tolerated (no panic across the C boundary).
+            werust_ios_capture_script_message(
+                std::ptr::null_mut(),
+                channel.as_ptr(),
+                body.as_ptr(),
+            );
+            werust_ios_capture_network(
+                std::ptr::null_mut(),
+                method.as_ptr(),
+                url.as_ptr(),
+                200,
+                mime.as_ptr(),
+                9,
+                true,
+                false,
+            );
         }
     }
 

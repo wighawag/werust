@@ -218,6 +218,140 @@ impl WebViewRenderer {
         self.inject_script(&provider_shim());
     }
 
+    /// Wire the DESKTOP console + network CAPTURE POINTS into this webview, so
+    /// the in-app debug menu's Console and Network tabs are fed by the real page
+    /// (task `debug-console-network-capture-per-platform`, spec
+    /// `in-app-debug-menu-console-and-network`).
+    ///
+    /// Capture is READ-ONLY OBSERVATION: nothing here answers a request, alters a
+    /// load, touches the `ipfs://` verification, or changes a trust posture. It
+    /// only pushes entries into the SHARED [`DebugCapture`] the shell also holds
+    /// (`BrowserShell::with_debug_capture`), which the debug view renders.
+    /// Always-on for Phase 1; the store's own `network_capture_enabled` flag is
+    /// the seam the Phase-2 toggle drives.
+    ///
+    /// # CONSOLE: an injected shim, because WebKitGTK 6 has no console signal
+    ///
+    /// WebKitGTK's `WebView` exposes NO console-message signal in the pinned
+    /// `webkit6` binding (the GTK3-era `WebKitWebView::console-message` is not
+    /// there), so the console is captured the same way iOS captures it: by
+    /// injecting the SHARED [`console_shim`] at document start and registering the
+    /// [`CAPTURE_BRIDGE`] script-message channel it posts to. Desktop and iOS
+    /// therefore run the byte-for-byte SAME page-side shim from ONE place in
+    /// `werust-core`, while ANDROID uses its real native
+    /// `WebChromeClient.onConsoleMessage` callback (strictly better than a shim).
+    /// That deliberate per-platform difference is recorded in
+    /// `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`.
+    ///
+    /// The shim CHAINS to the original `console.*`, so the page's own console and
+    /// the WebKit Web Inspector's console are untouched.
+    ///
+    /// # NETWORK: the resource-load signals, which see https too
+    ///
+    /// `resource-load-started` fires for EVERY resource the page loads — including
+    /// the `https://`/`http://` ones the `ipfs://` scheme handler never sees (they
+    /// go direct through WebKit) — so this is the capture point with the widest
+    /// desktop reach. Each started resource gets `finished`/`failed` handlers that
+    /// read its [`URIResponse`](webkit6::URIResponse) for the status, MIME and
+    /// size, and push ONE [`NetworkEntry`] built through the core's
+    /// [`network_entry`] constructor (so the store's `MAX_TEXT_CHARS` bound cannot
+    /// be bypassed).
+    ///
+    /// # The honest per-request posture (ADR-0006)
+    ///
+    /// * A SUB-RESOURCE carries the posture of what that ONE request actually did:
+    ///   an `ipfs://` resource that FINISHED came back through the hash-verified
+    ///   scheme handler (a mismatch fails the request, which lands on `failed`
+    ///   instead), so it is `content-verified`; everything else — an `https://`
+    ///   subresource, a `werust://` internal page, an `ipfs://` request that failed
+    ///   — is `unverified-origin`. The rule itself is the core's shared
+    ///   [`request_trust_posture`], never re-derived here.
+    /// * The MAIN DOCUMENT instead takes the LOAD's OWN posture from the shared
+    ///   lifecycle (the same fact the chrome trust indicator paints), so the
+    ///   Network tab cannot show `content-verified` for the page row while the
+    ///   indicator shows the louder `name-via-trusted-rpc` on an ENS-named page
+    ///   (ADR-0006's two-axis rule; the store's DECISIONS.md Decision 4 assigns
+    ///   this obligation here).
+    ///
+    /// # Threading
+    ///
+    /// Both capture points run on the GTK loop the signal already fires on, doing
+    /// only a bounded push into a `Mutex`-guarded ring buffer — no retrieval, no
+    /// I/O, no lock held across a wait (`docs/adr/0008`'s discipline). The store is
+    /// a cheap `Arc` handle, so the wiring captures its OWN clone and never reaches
+    /// through the shell.
+    ///
+    /// Wired directly on the concrete backend (not through the `Renderer` seam) for
+    /// the same reason `install_provider`/`install_ipfs` are: the handlers capture
+    /// the `Rc`-shared, non-`Send` lifecycle and view, and run only on the single
+    /// GTK thread.
+    ///
+    /// [`DebugCapture`]: werust_core::debug::DebugCapture
+    /// [`console_shim`]: werust_core::debug::console_shim
+    /// [`CAPTURE_BRIDGE`]: werust_core::debug::CAPTURE_BRIDGE
+    /// [`network_entry`]: werust_core::debug::network_entry
+    /// [`request_trust_posture`]: werust_core::debug::request_trust_posture
+    pub fn install_debug_capture(&mut self, capture: werust_core::debug::DebugCapture) {
+        use werust_core::debug::{console_shim, route_capture_message, CAPTURE_BRIDGE};
+
+        // --- CONSOLE: the shared injected shim over its own capture channel ---
+        self.content_manager
+            .register_script_message_handler(CAPTURE_BRIDGE, None);
+        let console_capture = capture.clone();
+        self.content_manager.connect_script_message_received(
+            Some(CAPTURE_BRIDGE),
+            move |_cm, value| {
+                // One shared parse+push for both shim-fed platforms: an unreadable
+                // or hostile body is dropped, never fabricated into an entry.
+                route_capture_message(&console_capture, value.to_str().as_ref());
+            },
+        );
+        self.inject_script(&console_shim());
+
+        // --- NETWORK: the resource-load signals (https included) --------------
+        // NOTE: the page-side `fetch`/`XHR` shim iOS also injects is deliberately
+        // NOT injected here: these signals already report every resource,
+        // including the browser-internal subresource loads the page-side wrapper
+        // cannot see, so adding it would only double-record a subset.
+        let life_for_posture = self.life.clone();
+        self.view
+            .connect_resource_load_started(move |_view, resource, request| {
+                let method = request
+                    .http_method()
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "GET".to_string());
+                let url = request.uri().map(|u| u.to_string()).unwrap_or_default();
+                let started = std::time::Instant::now();
+
+                let finished_state = ResourceCaptureState {
+                    capture: capture.clone(),
+                    life: life_for_posture.clone(),
+                    method: method.clone(),
+                    url: url.clone(),
+                    started,
+                };
+                resource.connect_finished(move |resource| {
+                    // A FINISHED `ipfs://` resource came back through the
+                    // hash-verified scheme handler (a verify failure fails the
+                    // request, landing on `failed` below), so this is the ONE place
+                    // that may report the content-verified posture.
+                    finished_state.record(Some(resource), true);
+                });
+
+                let failed_state = ResourceCaptureState {
+                    capture: capture.clone(),
+                    life: life_for_posture.clone(),
+                    method,
+                    url,
+                    started,
+                };
+                resource.connect_failed(move |resource, _error| {
+                    // A FAILED request proved nothing: never verified.
+                    failed_state.record(Some(resource), false);
+                });
+            });
+    }
+
     /// Wire native `ipfs://` resolution into this webview, over the seam's
     /// custom-scheme / request-interception hook.
     ///
@@ -564,6 +698,158 @@ impl WebViewRenderer {
             inspector.show();
         }
     }
+}
+
+/// What one in-flight resource's capture handlers need to record it when it
+/// finishes or fails: the shared store, the lifecycle the main-document decision
+/// reads, and the request facts only the START signal carried.
+///
+/// `resource-load-started` is where the METHOD and the request URL are available;
+/// `finished`/`failed` are where the RESPONSE is. This carries the former across
+/// to the latter so exactly ONE [`NetworkEntry`] is pushed per resource, at the
+/// point its outcome is known.
+///
+/// It deliberately holds NO [`WebView`] clone: this value lives inside a signal
+/// closure on a `WebResource` the view itself owns, so retaining the view here
+/// would keep it alive from an object it owns for the life of every resource.
+/// The main-document decision reads the shared lifecycle instead, which is the
+/// SAME current-URL fact the chrome paints and is already shared into the view's
+/// own load signals.
+struct ResourceCaptureState {
+    capture: werust_core::debug::DebugCapture,
+    life: SharedLifecycle,
+    method: String,
+    url: String,
+    started: std::time::Instant,
+}
+
+impl ResourceCaptureState {
+    /// Push this resource's [`NetworkEntry`] into the shared store.
+    ///
+    /// `finished_ok` is whether the resource COMPLETED (a failed request proved
+    /// nothing, so it can never be reported verified). Runs on the GTK loop the
+    /// signal fires on and does only a bounded push; the decision itself is the
+    /// pure, display-free [`resource_network_entry`].
+    fn record(&self, resource: Option<&webkit6::WebResource>, finished_ok: bool) {
+        let response: Option<webkit6::URIResponse> =
+            resource.and_then(webkit6::WebResource::response);
+        let status = response.as_ref().map(webkit6::URIResponse::status_code);
+        let mime = response
+            .as_ref()
+            .and_then(|r| r.mime_type())
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        let size = response.as_ref().map(webkit6::URIResponse::content_length);
+
+        // The MAIN DOCUMENT takes the LOAD's own (two-axis) posture so the Network
+        // tab cannot contradict the chrome trust indicator on the same screen;
+        // every other row keeps its honest per-request posture. Identified by URL
+        // against the shared lifecycle's current load — the same fact the chrome
+        // paints, so the two surfaces agree by construction.
+        let life = self.life.borrow();
+        let load_posture = (life.current_url() == Some(self.url.as_str())).then(|| life.posture());
+        drop(life);
+
+        let entry = resource_network_entry(&ResourceLoadFacts {
+            method: &self.method,
+            url: &self.url,
+            status,
+            mime: &mime,
+            size,
+            finished_ok,
+            load_posture,
+            timestamp: epoch_millis(),
+            duration: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+        self.capture.push_network(entry);
+    }
+}
+
+/// Everything WebKitGTK's resource-load signals observed about ONE resource: the
+/// request facts from `resource-load-started` and the response facts from
+/// `finished`/`failed`, plus the outcome and the main-document decision.
+///
+/// A struct rather than a long argument list because the two signals contribute
+/// different halves of it, and because every field is the same shape of thing:
+/// an OBSERVATION, never an instruction (capture is read-only).
+pub(crate) struct ResourceLoadFacts<'a> {
+    /// The HTTP-style method the request carried (`GET` when it reported none).
+    pub method: &'a str,
+    /// The requested URL.
+    pub url: &'a str,
+    /// The response status, or `None`/`0` when there was no response (a
+    /// custom-scheme answer carries no HTTP status).
+    pub status: Option<u32>,
+    /// The response MIME type, empty when unknown.
+    pub mime: &'a str,
+    /// The response body size in bytes, or `None`/`0` when unknown.
+    pub size: Option<u64>,
+    /// Whether the resource COMPLETED. A failed request proved nothing, so it is
+    /// never reported verified.
+    pub finished_ok: bool,
+    /// `Some(posture)` ONLY for the MAIN-DOCUMENT resource, whose row takes the
+    /// LOAD's own two-axis posture (so the Network tab and the chrome trust
+    /// indicator cannot disagree, ADR-0006). `None` for a sub-resource, which
+    /// keeps the honest per-request posture the shared
+    /// [`request_trust_posture`](werust_core::debug::request_trust_posture)
+    /// derives.
+    pub load_posture: Option<renderer::TrustPosture>,
+    /// When it was captured, in milliseconds since the Unix epoch.
+    pub timestamp: u64,
+    /// How long the resource took, in milliseconds.
+    pub duration: u64,
+}
+
+/// Build the [`NetworkEntry`] for one desktop resource load: the pure,
+/// display-free half of [`ResourceCaptureState::record`], so the whole mapping
+/// (including the trust rule) is unit-testable with no GTK loop and no network.
+///
+/// A `0` status/size means WebKitGTK reported none, and the core constructor
+/// keeps it honestly ABSENT rather than a fabricated `0`.
+pub(crate) fn resource_network_entry(
+    facts: &ResourceLoadFacts<'_>,
+) -> werust_core::debug::NetworkEntry {
+    let &ResourceLoadFacts {
+        method,
+        url,
+        status,
+        mime,
+        size,
+        finished_ok,
+        load_posture,
+        timestamp,
+        duration,
+    } = facts;
+    // A verified request is a CONTENT-ADDRESSED one that actually completed:
+    // an `ipfs://` load that hash-verified is finished through the scheme handler,
+    // while a mismatch fails the request. The scheme test itself lives in the
+    // core's `request_trust_posture`, so this only supplies the honest
+    // "did it complete" half and never re-derives the trust rule.
+    let entry = werust_core::debug::network_entry(
+        method,
+        url,
+        status.and_then(|s| u16::try_from(s).ok()),
+        mime,
+        size,
+        finished_ok,
+        timestamp,
+    )
+    .with_duration(duration);
+    match load_posture {
+        // The MAIN DOCUMENT reports the LOAD's posture verbatim.
+        Some(posture) => entry.with_trust(posture),
+        None => entry,
+    }
+}
+
+/// Milliseconds since the Unix epoch, for a captured entry's timestamp (`0` if
+/// the clock is before the epoch). The core store takes a caller-supplied
+/// timestamp so it binds no clock; this is the desktop edge's supply.
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Whether the WebKit Web Inspector's `enable-developer-extras` is turned on for

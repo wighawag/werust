@@ -119,6 +119,35 @@ pub enum ConsoleLevel {
 }
 
 impl ConsoleLevel {
+    /// Map a PLATFORM's console level name onto werust's one console vocabulary.
+    ///
+    /// The three capture points report a level as text, and each platform spells
+    /// it its own way: the injected [`console_shim`] posts the `console.*` method
+    /// name (`log`/`info`/`warn`/`error`/`debug`), while Android's
+    /// `ConsoleMessage.MessageLevel` is `LOG`/`WARNING`/`ERROR`/`DEBUG`/`TIP`.
+    /// This is the ONE place that mapping lives, so a Console tab shows the same
+    /// level for the same page log whatever platform captured it.
+    ///
+    /// Case-insensitive, and deliberately TOTAL: an unrecognised level is
+    /// [`Log`](ConsoleLevel::Log) (the type's default) rather than a new level or
+    /// a dropped entry — a capture point never invents vocabulary and never
+    /// silently loses a message.
+    #[must_use]
+    pub fn from_platform(name: &str) -> Self {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "info" => ConsoleLevel::Info,
+            // Android spells `console.warn` `WARNING`.
+            "warn" | "warning" => ConsoleLevel::Warn,
+            "error" => ConsoleLevel::Error,
+            // Android's `VERBOSE`-ish `DEBUG`, and the `console.debug` method.
+            "debug" | "verbose" => ConsoleLevel::Debug,
+            // Android's `TIP` is an advisory hint the engine emits: closest to
+            // `console.info`, and definitely not a warning.
+            "tip" => ConsoleLevel::Info,
+            _ => ConsoleLevel::Log,
+        }
+    }
+
     /// The stable, lower-case wire name for the debug JSON, so every edge paints
     /// the SAME level from the SAME fact (mirroring the trust-posture and
     /// load-step wire names).
@@ -527,6 +556,432 @@ pub fn debug_json(capture: &DebugCapture) -> String {
     .to_string()
 }
 
+// ---------------------------------------------------------------------------
+// The SHARED half of the per-platform CAPTURE POINTS (task
+// `debug-console-network-capture-per-platform`).
+//
+// The store above is fed by six capture points across three platforms. Two of
+// them (desktop and iOS) have NO native console callback, so they capture the
+// console by INJECTING a page-side shim over the seam's script-message bridge —
+// and iOS additionally captures what network it can reach with a best-effort
+// `fetch`/`XHR` wrapper. Everything those points share (the injected JS, the
+// envelope they post, the parse, and the event -> entry mapping the NATIVE hooks
+// use too) lives HERE, in the toolkit-free core, so:
+//
+// * desktop and iOS inject the byte-for-byte SAME shim (one string, one channel
+//   name, one envelope shape) rather than two drifting copies;
+// * the mapping from a platform console/network event to a core entry is a pure
+//   function, unit-tested with no webview, no GTK loop and no network;
+// * every entry is built through `new()` + the `with_*` setters, so the
+//   `MAX_TEXT_CHARS` truncation that makes the store bounded can never be
+//   bypassed by a capture point assigning a field directly.
+//
+// It lives in THIS module (not a new one) because it is the same concept: the
+// debug capture. `DebugCapture` is the sink; this is the shared plumbing that
+// fills it.
+// ---------------------------------------------------------------------------
+
+/// The script-message bridge name the injected capture shim posts to.
+///
+/// Deliberately its OWN channel, NOT the EIP-1193
+/// [`PROVIDER_BRIDGE`](crate::provider::PROVIDER_BRIDGE): the provider channel is
+/// a trust surface with a request/response contract, and folding a debug
+/// observation stream into it would re-mean it. The page posts
+/// `window.webkit.messageHandlers.werustDebug.postMessage(<json>)`; nothing is
+/// ever pushed back down this channel (capture is one-way, READ-ONLY
+/// observation).
+pub const CAPTURE_BRIDGE: &str = "werustDebug";
+
+/// The page-side CONSOLE capture shim, injected at document start by the
+/// platforms with no native console callback (desktop WebKitGTK and iOS
+/// WKWebView).
+///
+/// It wraps `console.log/info/warn/error/debug`, posts a
+/// `{"kind":"console", …}` envelope up the [`CAPTURE_BRIDGE`], and then CHAINS
+/// to the original method, so the page's own console behaviour (and the native
+/// remote inspector's console) is unchanged — capture never swallows a message.
+/// It also guards against double-installation (`__werustConsoleCaptured`), takes
+/// the source/line best-effort from a synthetic stack (reporting line `0`, i.e.
+/// "unknown", rather than guessing when the frame is unreadable), and swallows
+/// its OWN errors: a debug surface must never be able to break a page.
+///
+/// Android does NOT use this: it has the REAL native callback
+/// (`WebChromeClient.onConsoleMessage`), which reports level/message/source/line
+/// directly and is strictly better than a shim. That deliberate per-platform
+/// difference is recorded in
+/// `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`.
+#[must_use]
+pub fn console_shim() -> String {
+    // The channel name is substituted rather than `format!`-templated so the JS
+    // below stays readable (a `format!` would need every brace doubled).
+    CONSOLE_SHIM_JS.replace(BRIDGE_PLACEHOLDER, CAPTURE_BRIDGE)
+}
+
+/// The page-side BEST-EFFORT network capture shim (`fetch` + `XMLHttpRequest`),
+/// injected at document start by iOS ONLY.
+///
+/// WKWebView exposes no per-resource load callback, so this is the pragmatic
+/// route to a non-empty Network tab on iOS. Its coverage is honestly PARTIAL: it
+/// sees only requests the PAGE makes through `fetch`/`XHR`, never the
+/// browser-internal subresource loads (`<img>`, `<script>`, CSS `url()`,
+/// navigation preloads). The limits are recorded in
+/// `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`.
+///
+/// Desktop does NOT use this: WebKitGTK's `resource-load-started` signal already
+/// reports EVERY resource (including the internal subresource loads this cannot
+/// see), so injecting this there would only double-record a subset.
+///
+/// It SKIPS `ipfs:`/`werust:` URLs, which the native scheme handler already
+/// records with their REAL (verified) posture: capturing them here as well would
+/// produce a second, contradicting row claiming the weaker
+/// [`UnverifiedOrigin`](TrustPosture::UnverifiedOrigin) posture for the same
+/// request. It observes on a SEPARATE promise chain and never rethrows, so it
+/// cannot alter the page's own request outcome (READ-ONLY).
+#[must_use]
+pub fn network_shim() -> String {
+    NETWORK_SHIM_JS.replace(BRIDGE_PLACEHOLDER, CAPTURE_BRIDGE)
+}
+
+/// The token the shim sources carry where [`CAPTURE_BRIDGE`] is substituted in.
+const BRIDGE_PLACEHOLDER: &str = "__WERUST_CAPTURE_BRIDGE__";
+
+const CONSOLE_SHIM_JS: &str = r#"(function () {
+  "use strict";
+  var BRIDGE = "__WERUST_CAPTURE_BRIDGE__";
+  // The shim is a document-start user script; guard so a re-injection (a second
+  // frame, an edge that also evaluates it on page-start) wraps console only once
+  // and cannot stack wrappers.
+  if (window.__werustConsoleCaptured) { return; }
+  window.__werustConsoleCaptured = true;
+
+  function post(envelope) {
+    // Page -> native, over the debug capture channel. Guarded and silent: a
+    // missing bridge (or a serialisation failure) must never throw into the page.
+    try {
+      var mh = window.webkit
+        && window.webkit.messageHandlers
+        && window.webkit.messageHandlers[BRIDGE];
+      if (mh && typeof mh.postMessage === "function") {
+        mh.postMessage(JSON.stringify(envelope));
+      }
+    } catch (e) {}
+  }
+
+  // Flatten console arguments to ONE text message (the shape every native
+  // console hook reports, and what the store's `message` field holds).
+  function flatten(args) {
+    var parts = [];
+    for (var i = 0; i < args.length; i++) {
+      var a = args[i];
+      if (typeof a === "string") { parts.push(a); continue; }
+      var text;
+      try { text = JSON.stringify(a); } catch (e) { text = null; }
+      // JSON.stringify yields undefined for undefined/functions/symbols.
+      parts.push(text === undefined || text === null ? String(a) : text);
+    }
+    return parts.join(" ");
+  }
+
+  // Best-effort source/line from a synthetic stack. Frame 0 is this function and
+  // frame 1 the console wrapper, so frame 2 is the page's own call site. If the
+  // stack is unreadable we report NO line (0), never a guessed one.
+  function callSite() {
+    var site = { source: "", line: 0 };
+    try {
+      var stack = (new Error()).stack;
+      if (!stack) { return site; }
+      var frames = String(stack).split("\n");
+      var frame = frames[2] || frames[frames.length - 1] || "";
+      var at = frame.indexOf("@");
+      var loc = (at === -1 ? frame : frame.slice(at + 1)).trim();
+      var m = /^(.*):(\d+):(\d+)$/.exec(loc);
+      if (m) {
+        site.source = m[1];
+        site.line = parseInt(m[2], 10) || 0;
+      } else {
+        site.source = loc;
+      }
+    } catch (e) {}
+    return site;
+  }
+
+  ["log", "info", "warn", "error", "debug"].forEach(function (level) {
+    var original = console[level];
+    console[level] = function () {
+      var site = callSite();
+      post({
+        kind: "console",
+        level: level,
+        message: flatten(arguments),
+        source: site.source,
+        line: site.line,
+        ts: Date.now()
+      });
+      // CHAIN to the original: capture observes, it never swallows. The page's
+      // own console (and the native remote inspector) behaves exactly as before.
+      if (typeof original === "function") { original.apply(console, arguments); }
+    };
+  });
+})();"#;
+
+const NETWORK_SHIM_JS: &str = r#"(function () {
+  "use strict";
+  var BRIDGE = "__WERUST_CAPTURE_BRIDGE__";
+  if (window.__werustNetworkCaptured) { return; }
+  window.__werustNetworkCaptured = true;
+
+  function post(envelope) {
+    try {
+      var mh = window.webkit
+        && window.webkit.messageHandlers
+        && window.webkit.messageHandlers[BRIDGE];
+      if (mh && typeof mh.postMessage === "function") {
+        mh.postMessage(JSON.stringify(envelope));
+      }
+    } catch (e) {}
+  }
+
+  // The NATIVE custom-scheme handler already records these with their REAL
+  // (hash-verified) trust posture; recording them here too would add a second,
+  // contradicting row claiming the weaker unverified posture for the same
+  // request.
+  function skip(url) {
+    var u = String(url || "").toLowerCase();
+    return u.indexOf("ipfs:") === 0 || u.indexOf("werust:") === 0;
+  }
+
+  function record(method, url, status, mime, size, started) {
+    post({
+      kind: "network",
+      method: String(method || "GET").toUpperCase(),
+      url: String(url || ""),
+      status: status || 0,
+      mime: String(mime || "").split(";")[0].trim(),
+      size: size || 0,
+      ts: Date.now(),
+      duration: Date.now() - started
+    });
+  }
+
+  var originalFetch = window.fetch;
+  if (typeof originalFetch === "function") {
+    window.fetch = function (input, init) {
+      var url = (typeof input === "string") ? input : ((input && input.url) || "");
+      var method = (init && init.method) || (input && input.method) || "GET";
+      var started = Date.now();
+      var promise = originalFetch.apply(this, arguments);
+      if (!skip(url)) {
+        // Observe on a SEPARATE chain with BOTH handlers supplied, so the page's
+        // own promise is returned untouched and this observation can neither
+        // alter the outcome nor raise an unhandled rejection.
+        try {
+          promise.then(function (response) {
+            var mime = "";
+            var size = 0;
+            try {
+              mime = (response.headers && response.headers.get("content-type")) || "";
+              size = parseInt((response.headers && response.headers.get("content-length")) || "0", 10) || 0;
+            } catch (e) {}
+            record(method, url, response.status, mime, size, started);
+          }, function () {
+            // A failed request has no status: report it as unknown, not a fake 0.
+            record(method, url, 0, "", 0, started);
+          });
+        } catch (e) {}
+      }
+      return promise;
+    };
+  }
+
+  var OriginalXHR = window.XMLHttpRequest;
+  if (typeof OriginalXHR === "function" && OriginalXHR.prototype) {
+    var open = OriginalXHR.prototype.open;
+    var send = OriginalXHR.prototype.send;
+    OriginalXHR.prototype.open = function (method, url) {
+      try {
+        this.__werustMethod = method;
+        this.__werustUrl = url;
+      } catch (e) {}
+      return open.apply(this, arguments);
+    };
+    OriginalXHR.prototype.send = function () {
+      var xhr = this;
+      var started = Date.now();
+      try {
+        if (!skip(xhr.__werustUrl)) {
+          xhr.addEventListener("loadend", function () {
+            var mime = "";
+            try { mime = xhr.getResponseHeader("content-type") || ""; } catch (e) {}
+            record(xhr.__werustMethod, xhr.__werustUrl, xhr.status, mime, 0, started);
+          });
+        }
+      } catch (e) {}
+      return send.apply(this, arguments);
+    };
+  }
+})();"#;
+
+/// One event a capture point observed: already mapped onto a core entry, ready
+/// to push.
+///
+/// The injected shim posts BOTH kinds over the one [`CAPTURE_BRIDGE`], so the
+/// parse must be able to answer either; the native hooks build their entry
+/// directly ([`console_entry`] / [`network_entry`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapturedEvent {
+    /// A `console.*` call the injected console shim reported.
+    Console(ConsoleEntry),
+    /// A `fetch`/`XHR` request the injected network shim reported.
+    Network(NetworkEntry),
+}
+
+/// Parse one envelope the injected shim posted up the [`CAPTURE_BRIDGE`] into a
+/// core entry, or [`None`] for anything unreadable.
+///
+/// Total and fail-quiet by design: a page can post ARBITRARY text on this channel
+/// (the shim is page-side JS a hostile page can call directly), so a malformed,
+/// hostile, or unknown-`kind` body yields `None` rather than an error, a panic, or
+/// a fabricated entry. Every field is bounded by the entry constructors, and an
+/// absent/zero optional (`line`, `status`, `size`, `duration`) stays honestly
+/// ABSENT rather than becoming a fake `0`.
+///
+/// A shim-reported NETWORK entry always carries the conservative
+/// [`UnverifiedOrigin`](TrustPosture::UnverifiedOrigin) posture
+/// ([`request_trust_posture`] with `verified: false`): page-side JS cannot prove
+/// anything about the load path, so it never claims verification. The shim skips
+/// the content-addressed schemes the NATIVE handler records with their real
+/// posture, so this can never contradict a verified row.
+#[must_use]
+pub fn parse_capture_message(body: &str) -> Option<CapturedEvent> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let timestamp = value.get("ts").and_then(Value::as_u64).unwrap_or_default();
+    match value.get("kind").and_then(Value::as_str)? {
+        "console" => {
+            let level = ConsoleLevel::from_platform(
+                value
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+            );
+            let message = value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let source = value
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let line = value
+                .get("line")
+                .and_then(Value::as_u64)
+                .and_then(|l| u32::try_from(l).ok())
+                .unwrap_or_default();
+            Some(CapturedEvent::Console(console_entry(
+                level, message, source, line, timestamp,
+            )))
+        }
+        "network" => {
+            let url = value.get("url").and_then(Value::as_str).unwrap_or_default();
+            let method = value.get("method").and_then(Value::as_str).unwrap_or("GET");
+            let status = value
+                .get("status")
+                .and_then(Value::as_u64)
+                .and_then(|s| u16::try_from(s).ok());
+            let mime = value
+                .get("mime")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let size = value.get("size").and_then(Value::as_u64);
+            let mut entry = network_entry(method, url, status, mime, size, false, timestamp);
+            if let Some(duration) = value.get("duration").and_then(Value::as_u64) {
+                entry = entry.with_duration(duration);
+            }
+            Some(CapturedEvent::Network(entry))
+        }
+        _ => None,
+    }
+}
+
+/// Parse an envelope the injected shim posted and PUSH it into `capture`.
+///
+/// The one line every shim-fed capture point runs (desktop's script-message
+/// handler, iOS's `WKScriptMessageHandler`), so the parse, the bound, and the
+/// posture rule cannot drift between the two platforms. Unreadable bodies are
+/// dropped silently ([`parse_capture_message`]).
+pub fn route_capture_message(capture: &DebugCapture, body: &str) {
+    match parse_capture_message(body) {
+        Some(CapturedEvent::Console(entry)) => capture.push_console(entry),
+        Some(CapturedEvent::Network(entry)) => capture.push_network(entry),
+        None => {}
+    }
+}
+
+/// Build a [`ConsoleEntry`] from what a console capture point reports, through
+/// the CONSTRUCTORS (so `MAX_TEXT_CHARS` truncation applies) and with an absent
+/// field left honestly absent.
+///
+/// `line` is 1-based; `0` means "the platform reported none" and yields
+/// [`None`], never a fabricated line 0. An empty `source` is left empty. Shared
+/// by the shim path and the native Android `onConsoleMessage` path (through its
+/// FFI), so all three platforms map onto the store identically.
+#[must_use]
+pub fn console_entry(
+    level: ConsoleLevel,
+    message: &str,
+    source: &str,
+    line: u32,
+    timestamp: u64,
+) -> ConsoleEntry {
+    let mut entry = ConsoleEntry::new(level, message).with_timestamp(timestamp);
+    if !source.is_empty() {
+        entry = entry.with_source(source);
+    }
+    if line > 0 {
+        entry = entry.with_line(line);
+    }
+    entry
+}
+
+/// Build a [`NetworkEntry`] from what a network capture point reports, through
+/// the CONSTRUCTORS (so `MAX_TEXT_CHARS` truncation applies) and with the HONEST
+/// per-request trust posture.
+///
+/// `verified` says whether THIS request's bytes actually came back through the
+/// hash-verified content-addressed path; the posture is derived from it by
+/// [`request_trust_posture`], never from the URL string, so a request that merely
+/// LOOKS content-addressed is never labelled verified. A `None`/`0` optional
+/// (`status`, `size`) stays honestly absent rather than becoming a fake `0`.
+///
+/// The MAIN-DOCUMENT entry is the one exception the store's DECISIONS.md hands to
+/// the capture points: its posture is overwritten with the LOAD's own posture
+/// (via [`NetworkEntry::with_trust`]) so the Network tab cannot show
+/// `content-verified` while the chrome trust indicator shows the louder
+/// `name-via-trusted-rpc` for the same page (ADR-0006's two-axis rule).
+#[must_use]
+pub fn network_entry(
+    method: &str,
+    url: &str,
+    status: Option<u16>,
+    mime: &str,
+    size: Option<u64>,
+    verified: bool,
+    timestamp: u64,
+) -> NetworkEntry {
+    let mut entry = NetworkEntry::new(method, url).with_timestamp(timestamp);
+    let trust = request_trust_posture(&entry.scheme, verified);
+    entry = entry.with_trust(trust);
+    if let Some(status) = status.filter(|s| *s > 0) {
+        entry = entry.with_status(status);
+    }
+    if !mime.is_empty() {
+        entry = entry.with_mime(mime);
+    }
+    if let Some(size) = size.filter(|s| *s > 0) {
+        entry = entry.with_size(size);
+    }
+    entry
+}
+
 /// The stable, lower-kebab wire name of a [`TrustPosture`]: the SAME names the
 /// mobile chrome JSON (`ffi_json`) and the desktop trust indicator use.
 ///
@@ -805,6 +1260,251 @@ mod tests {
             .expect("the capture point thread");
         assert_eq!(capture.network().len(), 1);
         assert_eq!(capture.network()[0].url, "ipfs://from-a-worker");
+    }
+
+    // -- the shared capture-point half (task
+    //    `debug-console-network-capture-per-platform`) ------------------------
+
+    #[test]
+    fn every_platform_console_level_spelling_maps_onto_the_one_vocabulary() {
+        // The three capture points spell a level differently (the shim posts the
+        // `console.*` method name, Android reports `ConsoleMessage.MessageLevel`),
+        // and this is the ONE place that mapping lives.
+        for (platform, expected) in [
+            ("log", ConsoleLevel::Log),
+            ("info", ConsoleLevel::Info),
+            ("warn", ConsoleLevel::Warn),
+            ("WARNING", ConsoleLevel::Warn), // Android spells console.warn WARNING
+            ("error", ConsoleLevel::Error),
+            ("ERROR", ConsoleLevel::Error),
+            ("debug", ConsoleLevel::Debug),
+            ("TIP", ConsoleLevel::Info), // Android's advisory hint
+        ] {
+            assert_eq!(
+                ConsoleLevel::from_platform(platform),
+                expected,
+                "platform level {platform}"
+            );
+        }
+        assert_eq!(
+            ConsoleLevel::from_platform("something-new"),
+            ConsoleLevel::Log,
+            "an unrecognised platform level falls back to log, never a new level"
+        );
+    }
+
+    #[test]
+    fn the_injected_shims_post_on_the_capture_channel_not_the_provider_channel() {
+        // The debug channel is its OWN bridge: folding a one-way observation
+        // stream into the EIP-1193 provider's request/response trust channel would
+        // re-mean it.
+        assert_ne!(CAPTURE_BRIDGE, crate::provider::PROVIDER_BRIDGE);
+        for shim in [console_shim(), network_shim()] {
+            assert!(shim.contains(CAPTURE_BRIDGE), "the shim names the channel");
+            assert!(
+                !shim.contains(BRIDGE_PLACEHOLDER),
+                "the placeholder is substituted, not shipped to the page"
+            );
+            assert!(
+                !shim.contains(crate::provider::PROVIDER_BRIDGE),
+                "capture never posts on the provider channel"
+            );
+        }
+    }
+
+    #[test]
+    fn the_console_shim_chains_to_the_original_and_wraps_every_level_once() {
+        let shim = console_shim();
+        for level in ["log", "info", "warn", "error", "debug"] {
+            assert!(
+                shim.contains(&format!("\"{level}\"")),
+                "console.{level} is wrapped"
+            );
+        }
+        assert!(
+            shim.contains("original.apply(console, arguments)"),
+            "capture CHAINS to the original console method, never swallows it"
+        );
+        assert!(
+            shim.contains("__werustConsoleCaptured"),
+            "a re-injection must not stack wrappers"
+        );
+    }
+
+    #[test]
+    fn the_network_shim_skips_the_schemes_the_native_handler_records_verified() {
+        // Recording an `ipfs://` request page-side too would add a SECOND row for
+        // the same request claiming the weaker unverified posture, contradicting
+        // the native handler's honest verified one.
+        let shim = network_shim();
+        assert!(shim.contains("ipfs:"), "the shim skips ipfs:");
+        assert!(shim.contains("werust:"), "the shim skips werust:");
+        assert!(
+            shim.contains("__werustNetworkCaptured"),
+            "a re-injection must not stack wrappers"
+        );
+    }
+
+    #[test]
+    fn a_shim_console_envelope_maps_onto_a_console_entry() {
+        let event = parse_capture_message(
+            r#"{"kind":"console","level":"warn","message":"deprecated",
+               "source":"https://x/app.js","line":42,"ts":1700000000123}"#,
+        )
+        .expect("a console envelope");
+        let CapturedEvent::Console(entry) = event else {
+            panic!("expected a console entry");
+        };
+        assert_eq!(entry.level, ConsoleLevel::Warn);
+        assert_eq!(entry.message, "deprecated");
+        assert_eq!(entry.source, "https://x/app.js");
+        assert_eq!(entry.line, Some(42));
+        assert_eq!(entry.timestamp, 1_700_000_000_123);
+    }
+
+    #[test]
+    fn a_shim_network_envelope_maps_onto_an_unverified_network_entry() {
+        // Page-side JS can prove NOTHING about the load path, so a shim-reported
+        // request never claims verification.
+        let event = parse_capture_message(
+            r#"{"kind":"network","method":"post","url":"https://api.example/x",
+               "status":201,"mime":"application/json","size":12,"ts":7,"duration":33}"#,
+        )
+        .expect("a network envelope");
+        let CapturedEvent::Network(entry) = event else {
+            panic!("expected a network entry");
+        };
+        assert_eq!(entry.method, "post");
+        assert_eq!(entry.url, "https://api.example/x");
+        assert_eq!(entry.status, Some(201));
+        assert_eq!(entry.mime, "application/json");
+        assert_eq!(entry.size, Some(12));
+        assert_eq!(entry.duration, Some(33));
+        assert_eq!(entry.scheme, "https");
+        assert_eq!(entry.trust, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn a_hostile_or_unreadable_capture_body_is_dropped_not_fabricated() {
+        // The capture channel is page-reachable JS: a hostile page can post
+        // anything. Every one of these must be dropped, never panic and never
+        // become a fabricated entry.
+        for body in [
+            "",
+            "not json",
+            "[]",
+            "null",
+            r#"{"kind":"unknown"}"#,
+            r#"{"message":"no kind"}"#,
+            r#"{"kind":"console","level":{"nested":true},"line":"nope"}"#,
+        ] {
+            let capture = DebugCapture::new();
+            route_capture_message(&capture, body);
+            let dropped = capture.console().is_empty() && capture.network().is_empty();
+            // A `console` envelope with junk FIELDS still yields an entry (the
+            // fields degrade to their honest defaults); only a body with no
+            // readable `kind` is dropped entirely.
+            if body.contains("\"kind\":\"console\"") {
+                assert_eq!(capture.console().len(), 1, "degraded, not dropped: {body}");
+                assert_eq!(capture.console()[0].level, ConsoleLevel::Log);
+                assert_eq!(capture.console()[0].line, None, "no fabricated line");
+            } else {
+                assert!(dropped, "unreadable body captured something: {body}");
+            }
+        }
+    }
+
+    #[test]
+    fn routing_a_capture_message_pushes_into_the_shared_store() {
+        let capture = DebugCapture::new();
+        route_capture_message(
+            &capture,
+            r#"{"kind":"console","level":"error","message":"boom"}"#,
+        );
+        route_capture_message(&capture, r#"{"kind":"network","url":"https://x/y"}"#);
+        assert_eq!(capture.console().len(), 1);
+        assert_eq!(capture.console()[0].level, ConsoleLevel::Error);
+        assert_eq!(capture.network().len(), 1);
+        assert_eq!(capture.network()[0].url, "https://x/y");
+    }
+
+    #[test]
+    fn a_capture_point_entry_leaves_an_absent_field_absent_not_a_fake_zero() {
+        let entry = console_entry(ConsoleLevel::Log, "m", "", 0, 0);
+        assert_eq!(entry.line, None, "line 0 means unknown, not line zero");
+        assert_eq!(entry.source, "");
+
+        let entry = network_entry("GET", "https://x/y", Some(0), "", Some(0), false, 0);
+        assert_eq!(entry.status, None, "status 0 means unknown");
+        assert_eq!(entry.size, None, "size 0 means unknown");
+        assert_eq!(entry.mime, "");
+    }
+
+    #[test]
+    fn a_capture_point_entry_is_bounded_because_it_goes_through_the_constructors() {
+        // The `MAX_TEXT_CHARS` truncation lives ONLY in `new()`/`with_*`, so a
+        // capture point that assigned a field directly would silently break the
+        // store's boundedness in exactly the pathological case it guards.
+        let huge = "x".repeat(MAX_TEXT_CHARS * 3);
+        let entry = console_entry(ConsoleLevel::Log, &huge, &huge, 1, 0);
+        assert_eq!(entry.message.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(entry.source.chars().count(), MAX_TEXT_CHARS);
+
+        let entry = network_entry("GET", &huge, None, &huge, None, false, 0);
+        assert_eq!(entry.url.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(entry.mime.chars().count(), MAX_TEXT_CHARS);
+
+        // …and through the SHIM path too (the parse must not bypass them).
+        let capture = DebugCapture::new();
+        let body =
+            serde_json::json!({"kind": "console", "level": "log", "message": huge}).to_string();
+        route_capture_message(&capture, &body);
+        assert_eq!(capture.console()[0].message.chars().count(), MAX_TEXT_CHARS);
+    }
+
+    #[test]
+    fn a_capture_point_never_labels_a_request_verified_from_its_url_alone() {
+        // The posture tracks the ACTUAL load path (ADR-0006 / the store's
+        // Decision 4): only a content-addressed request whose bytes really
+        // verified is content-verified.
+        assert_eq!(
+            network_entry("GET", "ipfs://cid/x", None, "", None, false, 0).trust,
+            TrustPosture::UnverifiedOrigin,
+            "an ipfs:// request that did not verify claims nothing"
+        );
+        assert_eq!(
+            network_entry("GET", "ipfs://cid/x", None, "", None, true, 0).trust,
+            TrustPosture::ContentVerified
+        );
+        assert_eq!(
+            network_entry("GET", "https://x/y", None, "", None, true, 0).trust,
+            TrustPosture::UnverifiedOrigin,
+            "no https request is ever content-verified, whatever a caller claims"
+        );
+    }
+
+    #[test]
+    fn the_main_document_entry_can_carry_the_loads_own_two_axis_posture() {
+        // The store's DECISIONS.md Decision 4 hands THIS obligation to the capture
+        // points: the main-document row takes the LOAD's posture, so the Network
+        // tab cannot show `content-verified` while the chrome trust indicator
+        // shows the louder `name-via-trusted-rpc` for the same page.
+        let entry = network_entry(
+            "GET",
+            "ipfs://cid/index.html",
+            Some(200),
+            "text/html",
+            None,
+            true,
+            0,
+        )
+        .with_trust(TrustPosture::NameViaTrustedRpc);
+        assert_eq!(entry.trust, TrustPosture::NameViaTrustedRpc);
+        assert_eq!(
+            trust_posture_wire_name(entry.trust),
+            "name-via-trusted-rpc",
+            "and it renders in the trust indicator's exact vocabulary"
+        );
     }
 
     #[test]

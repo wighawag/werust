@@ -471,3 +471,59 @@ description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "debug-capture-console-and-network"
+description = "CAPTURE the page's console messages and network requests into werust's ONE shared bounded store (`werust_core::debug::DebugCapture`), always-on, so the in-app debug menu's Console and Network tabs have real content on every platform. Each network entry carries the HONEST per-request trust posture (ADR-0006) and the main-document entry mirrors the load's own posture, so the Network tab can never contradict the chrome trust indicator. Capture is READ-ONLY observation: it does not alter the load path, the `ipfs://` verification, or the posture."
+# This row is for the CAPTURE POINTS, not for the tabbed debug VIEW that renders
+# them (the follow-on `debug-view-console-network-tabs-{desktop,mobile}`), and not
+# for the Phase-2 capture toggle. The store itself is shared, toolkit-free core
+# (`crates/werust-core/src/debug.rs`), which also owns the two INJECTED page-side
+# shims, the envelope parse, and the platform-event -> core-entry mapping — so the
+# vocabulary (`ConsoleLevel::from_platform`) and the trust rule
+# (`request_trust_posture`) are derived in ONE place and no edge forks them.
+#
+# What each edge adds is only its own platform hooks. The console MECHANISM
+# differs on purpose: desktop and iOS inject the SAME shared shim because neither
+# WebKitGTK 6 (no console signal on `WebView` in the pinned webkit6 binding) nor
+# WKWebView exposes a console callback, while Android uses its REAL native
+# `WebChromeClient.onConsoleMessage` — strictly better (exact level/source/line,
+# sees engine-emitted output, unwrappable by no page). Network reach likewise
+# differs by what each platform exposes, and this is the asymmetry the guard
+# exists to surface:
+#   * desktop  — `WebView::connect_resource_load_started` + per-resource
+#                finished/failed (`install_debug_capture` in
+#                crates/webview-renderer/src/backend.rs, wired from
+#                crates/werust/src/main.rs). Sees EVERY resource, https included,
+#                which the ipfs:// scheme handler never does.
+#   * android  — the existing `shouldInterceptRequest`, recording BOTH the
+#                intercepted (ipfs://) and the passed-through (return-null)
+#                requests (BrowserActivity.kt over WerustCore.kt ->
+#                crates/werust-android/rust). Widest reach: that hook sees every
+#                request.
+#   * ios      — the reachable points ONLY: both WKURLSchemeHandlers, the
+#                WKNavigationDelegate main-frame navigation, and a best-effort
+#                fetch/XHR shim (install_debug_capture in
+#                crates/werust-ios/rust/src/lib.rs; DebugCaptureHandler in
+#                WKWebViewShellController.swift). It does NOT see browser-internal
+#                subresource loads (<img>/<script>/CSS url()/preloads) — WKWebView
+#                exposes no per-resource callback. That coverage limit is ACCEPTED
+#                by the spec's Out of Scope and recorded honestly in
+#                docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md
+#                (Decision 3), so `implemented` here means "the capture points this
+#                platform CAN wire are wired", not "identical reach".
+# Capture runs where the platform event already runs and does only a bounded
+# ring-buffer insert; on Android it pushes through a CLONED DebugCapture handle
+# and NEVER the session lock, because `onConsoleMessage` is on the UI thread while
+# `resolve_ipfs` can hold that lock for seconds during a CAR retrieval — the ANR
+# shape docs/adr/0008 and the spec's user story 4 forbid.
+# The runtime-only Kotlin/Swift wiring (which the pure-Rust gate never compiles)
+# is guarded source-shape-wise by
+# crates/werust-core/tests/debug_capture_edge_wiring_shape.rs, and the live capture
+# carries recorded manual steps at
+# docs/spikes/debug-console-network-capture-per-platform/README.md.
+# Task `debug-console-network-capture-per-platform`, spec
+# `in-app-debug-menu-console-and-network`.
+desktop = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

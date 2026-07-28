@@ -368,6 +368,10 @@ pub fn menu_json() -> String {
 /// single dispatch thread would give.
 pub struct SyncSession {
     inner: Mutex<CoreSession>,
+    /// A CLONE of the session's [`DebugCapture`](werust_core::debug::DebugCapture),
+    /// held BESIDE the mutex so the debug capture points never touch the session
+    /// lock (see [`debug_capture`](SyncSession::debug_capture)).
+    debug: werust_core::debug::DebugCapture,
 }
 
 impl Default for SyncSession {
@@ -380,8 +384,14 @@ impl SyncSession {
     /// Build a fresh synchronized session over a new [`CoreSession`].
     #[must_use]
     pub fn new() -> Self {
+        let session = CoreSession::new();
+        // Clone the shared capture handle OUT once, at construction, so every
+        // later capture push reaches the store WITHOUT taking the session lock
+        // (see `debug_capture`). Both clones are the same store.
+        let debug = session.debug_capture().clone();
         Self {
-            inner: Mutex::new(CoreSession::new()),
+            inner: Mutex::new(session),
+            debug,
         }
     }
 
@@ -485,32 +495,155 @@ impl SyncSession {
         self.with(|s| s.chrome_json())
     }
 
-    /// The debug capture store as a JSON document, under the lock. See
-    /// [`CoreSession::debug_json`].
+    /// The debug capture store as a JSON document, read OFF the session lock.
+    ///
+    /// The debug VIEW polls this on its refresh cadence from the UI thread, and
+    /// the store is the same `Arc`-shared handle the capture points push into (see
+    /// [`debug_capture`](SyncSession::debug_capture)), so encoding it needs no
+    /// session at all. Reading it through the session lock would put a UI-thread
+    /// poll behind an in-flight `resolve_ipfs` retrieval — the ANR shape user
+    /// story 4 forbids.
     #[must_use]
     pub fn debug_json(&self) -> String {
-        self.with(|s| s.debug_json())
+        werust_core::debug::debug_json(&self.debug)
     }
 
-    /// Capture one CONSOLE entry, under the lock. This is called from the WebView
-    /// UI/worker thread (`WebChromeClient.onConsoleMessage`), so it goes through
-    /// the SAME boundary `resolve_ipfs` does. See
-    /// [`werust_core::debug::DebugCapture::push_console`].
+    /// The shared capture store, reachable WITHOUT the session lock.
+    ///
+    /// # Why this is not `self.with(|s| s.debug_capture())` (the ANR guard)
+    ///
+    /// Every other method here funnels through the session lock, which is exactly
+    /// right for a call that DRIVES the session. A debug capture push is not that
+    /// call. `WebChromeClient.onConsoleMessage` runs on the Android **UI thread**,
+    /// while `resolve_ipfs` can hold this same lock for SECONDS on a WebView
+    /// worker thread during a CAR retrieval (`docs/adr/0008`). Pushing a console
+    /// entry through the session boundary would therefore block the UI thread
+    /// behind a content retrieval — precisely the ANR shape the spec's user story
+    /// 4 exists to prevent, and precisely what the off-main-thread work fixed.
+    ///
+    /// [`DebugCapture`](werust_core::debug::DebugCapture) is an `Arc<Mutex<_>>`
+    /// handle for this reason: a capture point needs no `&mut` session at all. So
+    /// a clone is taken ONCE at construction and held beside the mutex; a push
+    /// contends only on the store's own short-lived lock (a bounded ring-buffer
+    /// insert, no I/O), never on the session.
+    #[must_use]
+    pub fn debug_capture(&self) -> &werust_core::debug::DebugCapture {
+        &self.debug
+    }
+
+    /// Capture one CONSOLE entry, OFF the session lock. Called from the WebView UI
+    /// thread (`WebChromeClient.onConsoleMessage`); see
+    /// [`debug_capture`](SyncSession::debug_capture) for why it must not go
+    /// through the session boundary.
     pub fn push_console_entry(&self, entry: werust_core::debug::ConsoleEntry) {
-        self.with(|s| s.debug_capture().push_console(entry));
+        self.debug.push_console(entry);
     }
 
-    /// Capture one NETWORK entry, under the lock. Called from the WebView WORKER
-    /// thread (`shouldInterceptRequest`), exactly like `resolve_ipfs`. See
-    /// [`werust_core::debug::DebugCapture::push_network`].
+    /// Capture one NETWORK entry, OFF the session lock. Called from the WebView
+    /// WORKER thread (`shouldInterceptRequest`) for BOTH the intercepted and the
+    /// passed-through requests, so it must never serialize behind an in-flight
+    /// retrieval.
     pub fn push_network_entry(&self, entry: werust_core::debug::NetworkEntry) {
-        self.with(|s| s.debug_capture().push_network(entry));
+        self.debug.push_network(entry);
     }
 
-    /// Empty the capture store (the debug view's Clear action), under the lock.
+    /// Empty the capture store (the debug view's Clear action), off the session
+    /// lock like the pushes.
     pub fn clear_debug_capture(&self) {
-        self.with(|s| s.debug_capture().clear());
+        self.debug.clear();
     }
+
+    /// Capture one console message Kotlin's `WebChromeClient.onConsoleMessage`
+    /// reported, mapping the platform's `ConsoleMessage` fields onto a core
+    /// [`ConsoleEntry`](werust_core::debug::ConsoleEntry).
+    ///
+    /// Android is the ONE platform with a REAL native console callback, so it does
+    /// NOT use the injected shim desktop and iOS share: `onConsoleMessage` hands
+    /// over message / `messageLevel` / `sourceId` / `lineNumber` directly, which is
+    /// strictly better (it sees engine-emitted messages a page-side wrapper never
+    /// could, and cannot be un-wrapped by the page). The level name is mapped
+    /// through the ONE shared
+    /// [`ConsoleLevel::from_platform`](werust_core::debug::ConsoleLevel::from_platform),
+    /// so Android's `WARNING`/`TIP` land in the same vocabulary the shim's
+    /// `warn`/`info` do. Recorded in
+    /// `docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`.
+    ///
+    /// Runs on the UI thread, so it goes through the lock-free
+    /// [`debug_capture`](SyncSession::debug_capture) path.
+    pub fn capture_console(&self, level: &str, message: &str, source: &str, line: u32) {
+        use werust_core::debug::{console_entry, ConsoleLevel};
+        self.push_console_entry(console_entry(
+            ConsoleLevel::from_platform(level),
+            message,
+            source,
+            line,
+            epoch_millis(),
+        ));
+    }
+
+    /// Capture one request Kotlin's `WebViewClient.shouldInterceptRequest`
+    /// observed, for BOTH the intercepted (`ipfs://`, answered from the core) and
+    /// the passed-through (`return null`) requests — which is why Android has the
+    /// widest network reach of the three platforms: that hook sees EVERY request.
+    ///
+    /// `verified` must say whether THIS request's bytes really came back through
+    /// the hash-verified content-addressed path (i.e. the core's resolution
+    /// succeeded for an `ipfs://` request), never whether the URL looks
+    /// content-addressed: the shared
+    /// [`network_entry`](werust_core::debug::network_entry) derives the honest
+    /// posture from it (ADR-0006).
+    ///
+    /// `main_frame` marks the MAIN-DOCUMENT row, which additionally takes the
+    /// LOAD's own two-axis posture so the Network tab cannot contradict the chrome
+    /// trust indicator on the same screen. That is the ONE case that reads the
+    /// session (under the lock), and it runs on the WebView WORKER thread that
+    /// already locks for `resolve_ipfs` — never on the UI thread. Every other row
+    /// (every sub-resource, the whole hot path) stays entirely off the lock.
+    ///
+    /// Capture is READ-ONLY: it does not decide, alter or delay what
+    /// `shouldInterceptRequest` returns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_network(
+        &self,
+        method: &str,
+        url: &str,
+        status: u16,
+        mime: &str,
+        size: u64,
+        verified: bool,
+        main_frame: bool,
+    ) {
+        let mut entry = werust_core::debug::network_entry(
+            method,
+            url,
+            Some(status),
+            mime,
+            Some(size),
+            verified,
+            epoch_millis(),
+        );
+        if main_frame {
+            // The two-axis reconciliation (the store's DECISIONS.md Decision 4):
+            // on an ENS-named page the indicator shows `name-via-trusted-rpc`, so
+            // the main-document row must show that too rather than the plainer
+            // per-request `content-verified`.
+            entry = entry.with_trust(self.with(|s| s.chrome().trust_posture));
+        }
+        self.push_network_entry(entry);
+    }
+}
+
+/// Milliseconds since the Unix epoch, for a captured debug entry's timestamp
+/// (`0` if the clock is before the epoch).
+///
+/// The core store takes a caller-supplied timestamp so it binds no clock (the
+/// store's DECISIONS.md Decision 6); this is the Android edge's supply, taken
+/// here rather than in Kotlin so all three edges stamp entries the same way.
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
 }
 
 /// Install the native `ipfs://` scheme handler on `backend`, the twin of the
@@ -619,7 +752,7 @@ fn install_provider(backend: &mut AndroidBackend) {
 mod jni_exports {
     use super::SyncSession;
     use jni::objects::{JClass, JString};
-    use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
+    use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
 
     /// Reconstruct a `&SyncSession` from the opaque handle Kotlin threads back.
@@ -986,6 +1119,73 @@ mod jni_exports {
         handle: jlong,
     ) {
         unsafe { session(handle) }.clear_debug_capture();
+    }
+
+    /// Capture one console message from Kotlin's REAL native
+    /// `WebChromeClient.onConsoleMessage` callback (task
+    /// `debug-console-network-capture-per-platform`).
+    ///
+    /// Android needs no injected console shim: this callback reports
+    /// message/level/source/line directly. `line` is 1-based; `0` means the
+    /// platform reported none. Runs on the UI THREAD and pushes OFF the session
+    /// lock (`SyncSession::debug_capture`), so it can never block behind an
+    /// in-flight `resolve_ipfs` retrieval (the ANR guard).
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeCaptureConsole(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        level: JString,
+        message: JString,
+        source: JString,
+        line: jint,
+    ) {
+        let level = read(&mut env, &level);
+        let message = read(&mut env, &message);
+        let source = read(&mut env, &source);
+        unsafe { session(handle) }.capture_console(
+            &level,
+            &message,
+            &source,
+            u32::try_from(line).unwrap_or(0),
+        );
+    }
+
+    /// Capture one request from Kotlin's `WebViewClient.shouldInterceptRequest`,
+    /// for BOTH the intercepted (`ipfs://`) and the passed-through requests.
+    ///
+    /// `verified` must reflect what the request ACTUALLY did (the core resolution
+    /// succeeded for an `ipfs://` request), never what the URL looks like;
+    /// `main_frame` marks the main-document row, which takes the load's own
+    /// two-axis posture. A `0` status/size means unknown and stays honestly absent
+    /// in the store. Runs on the WebView WORKER thread and (except for the
+    /// main-frame posture read) pushes off the session lock.
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeCaptureNetwork(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        method: JString,
+        url: JString,
+        status: jint,
+        mime: JString,
+        size: jlong,
+        verified: jboolean,
+        main_frame: jboolean,
+    ) {
+        let method = read(&mut env, &method);
+        let url = read(&mut env, &url);
+        let mime = read(&mut env, &mime);
+        unsafe { session(handle) }.capture_network(
+            &method,
+            &url,
+            u16::try_from(status).unwrap_or(0),
+            &mime,
+            u64::try_from(size).unwrap_or(0),
+            verified != JNI_FALSE,
+            main_frame != JNI_FALSE,
+        );
     }
 
     /// werust's version string, for the Kotlin browser menu's version line. Takes
@@ -1658,6 +1858,172 @@ mod tests {
         // state is. Calling them with no `CoreSession` in existence is the test.
         assert!(super::menu_json().contains("\"items\""));
         assert!(!super::version().is_empty());
+    }
+
+    // --- The ANDROID CAPTURE POINTS (task ---------------------------------
+    // `debug-console-network-capture-per-platform`)
+
+    #[test]
+    fn the_native_console_callback_maps_onto_a_core_console_entry() {
+        // Acceptance: Android captures console via its REAL native callback
+        // (`WebChromeClient.onConsoleMessage`), whose `MessageLevel` names
+        // (`WARNING`, `TIP`, …) must land in werust's ONE console vocabulary — the
+        // same vocabulary the desktop/iOS shim's `warn`/`info` map onto, so the
+        // Console tab reads identically on all three.
+        use werust_core::debug::ConsoleLevel;
+        let s = SyncSession::new();
+        s.capture_console("WARNING", "deprecated API", "https://x/app.js", 42);
+        s.capture_console("TIP", "a hint", "", 0);
+
+        let entries = s.debug_capture().console();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].level, ConsoleLevel::Warn);
+        assert_eq!(entries[0].message, "deprecated API");
+        assert_eq!(entries[0].source, "https://x/app.js");
+        assert_eq!(entries[0].line, Some(42));
+        assert_eq!(entries[1].level, ConsoleLevel::Info);
+        assert_eq!(
+            entries[1].line, None,
+            "line 0 means unknown, never a fabricated line zero"
+        );
+        assert_eq!(entries[1].source, "");
+    }
+
+    #[test]
+    fn should_intercept_request_records_both_the_intercepted_and_passed_through_requests() {
+        // Acceptance: `shouldInterceptRequest` sees EVERY request, so Android
+        // records the passed-through (`return null`) ones too — that is what makes
+        // the Network tab the whole request stream and not just the
+        // content-addressed slice.
+        let s = SyncSession::new();
+        // The intercepted, hash-verified `ipfs://` sub-resource.
+        s.capture_network(
+            "GET",
+            "ipfs://bafy/pic.png",
+            200,
+            "image/png",
+            99,
+            true,
+            false,
+        );
+        // The passed-through `https://` sub-resource: the response never crosses
+        // werust, so status/mime/size are unknown here.
+        s.capture_network("GET", "https://cdn.example/a.js", 0, "", 0, false, false);
+
+        let entries = s.debug_capture().network();
+        assert_eq!(entries.len(), 2, "both branches record");
+        assert_eq!(entries[0].url, "ipfs://bafy/pic.png");
+        assert_eq!(entries[0].status, Some(200));
+        assert_eq!(entries[0].size, Some(99));
+        assert_eq!(entries[0].trust, renderer::TrustPosture::ContentVerified);
+        assert_eq!(entries[1].url, "https://cdn.example/a.js");
+        assert_eq!(
+            entries[1].status, None,
+            "an unknown status stays unknown, never a fake 200"
+        );
+        assert_eq!(entries[1].size, None);
+        assert_eq!(entries[1].trust, renderer::TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn android_capture_never_labels_a_request_verified_from_its_url_alone() {
+        // ADR-0006: the posture tracks the ACTUAL load path. A `werust://settings`
+        // page is served by the core but is NOT hash-verified content, and a
+        // FAILED `ipfs://` resolution proved nothing.
+        let s = SyncSession::new();
+        s.capture_network(
+            "GET",
+            "werust://settings",
+            200,
+            "text/html",
+            10,
+            true,
+            false,
+        );
+        s.capture_network(
+            "GET",
+            "ipfs://bafy/gone",
+            502,
+            "text/plain",
+            0,
+            false,
+            false,
+        );
+
+        let entries = s.debug_capture().network();
+        assert_eq!(
+            entries[0].trust,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "an internal werust:// page is not content-verified"
+        );
+        assert_eq!(
+            entries[1].trust,
+            renderer::TrustPosture::UnverifiedOrigin,
+            "a failed ipfs:// request claims nothing"
+        );
+    }
+
+    #[test]
+    fn the_android_main_document_row_takes_the_loads_own_posture() {
+        // The store's DECISIONS.md Decision 4: the main-document row must show the
+        // SAME posture the chrome trust indicator shows, so the Network tab and the
+        // indicator cannot disagree on the same screen.
+        let s = SyncSession::new();
+        s.capture_network(
+            "GET",
+            "ipfs://bafy/index.html",
+            200,
+            "text/html",
+            12,
+            true,
+            true,
+        );
+        let entries = s.debug_capture().network();
+        assert_eq!(
+            entries[0].trust,
+            s.with(|c| c.chrome().trust_posture),
+            "the main-document row mirrors the chrome's posture exactly"
+        );
+    }
+
+    #[test]
+    fn a_capture_push_never_waits_on_the_session_lock_so_the_ui_thread_cannot_anr() {
+        // THE ANR GUARD (spec user story 4). `onConsoleMessage` runs on the UI
+        // THREAD while `resolve_ipfs` can hold the session lock for SECONDS on a
+        // worker thread during a CAR retrieval. If a capture push went through the
+        // session boundary, the UI thread would block behind that retrieval —
+        // exactly the ANR the off-main-thread work fixed.
+        //
+        // This test HOLDS the session lock and then captures from another thread
+        // (crossing the raw pointer exactly as the JNI edge does): it can only
+        // complete if the push does not need the session.
+        let session: Box<SyncSession> = Box::default();
+        let raw: *mut SyncSession = Box::into_raw(session);
+        let held = unsafe { &*raw }
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let ptr = SessionPtr(raw);
+        let captured = std::thread::spawn(move || {
+            let ptr = ptr;
+            let s: &SyncSession = unsafe { &*ptr.0 };
+            // Both capture kinds, plus the debug view's read + clear, must be
+            // reachable while the session is locked.
+            s.capture_console("ERROR", "boom", "", 0);
+            s.push_network_entry(werust_core::debug::NetworkEntry::new("GET", "https://x/y"));
+            let json = s.debug_json();
+            s.clear_debug_capture();
+            json
+        })
+        .join()
+        .expect("the capture thread must not block on the session lock");
+
+        assert!(captured.contains("boom"), "{captured}");
+        assert!(captured.contains("https://x/y"), "{captured}");
+        drop(held);
+        let session = unsafe { Box::from_raw(raw) };
+        assert!(session.debug_json().contains("\"console\":[]"));
     }
 
     #[test]

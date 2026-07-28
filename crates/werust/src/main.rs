@@ -545,6 +545,24 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // forcing dark or overriding a page's own declared `color-scheme` (task
     // `webview-follow-os-color-scheme`, `docs/adr/0009`).
     backend.follow_os_color_scheme();
+    // Wire the DESKTOP console + network CAPTURE POINTS that feed the in-app debug
+    // menu's Console and Network tabs: an injected `console.*` shim over the
+    // script-message bridge (WebKitGTK 6 exposes no console signal, so desktop
+    // uses the SAME shared shim iOS does) plus the webview's resource-load signals
+    // (which see `https://` too, not just the `ipfs://` the scheme handler
+    // intercepts). Capture is READ-ONLY observation: it never answers a request,
+    // alters a load, or changes a trust posture — each entry merely REPORTS the
+    // honest per-request posture (ADR-0006), with the main-document row taking the
+    // load's own posture so the Network tab cannot contradict the trust indicator
+    // (task `debug-console-network-capture-per-platform`).
+    //
+    // The store is created HERE and handed to BOTH sides: a clone into the capture
+    // hooks (installed before the backend is boxed behind the seam) and the other
+    // into the shell via `with_debug_capture`, exactly as the redirect sink is
+    // shared — both clones are the SAME store, so the debug view renders what the
+    // hooks captured.
+    let debug_capture = werust_core::debug::DebugCapture::new();
+    backend.install_debug_capture(debug_capture.clone());
     // Capture the live WebKitGTK view BEFORE the backend is boxed behind the
     // `Renderer` seam, so the shell can open the WEB inspector (F12) on it. The
     // web inspector is a WebKitGTK-specific surface (not part of the cross-backend
@@ -555,7 +573,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // `enable-web-inspector-devtools-all-platforms`).
     let inspector_view = backend.web_view().clone();
     let shell = Rc::new(RefCell::new(
-        BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects),
+        BrowserShell::new(Box::new(backend))
+            .with_redirect_sink(redirects)
+            .with_debug_capture(debug_capture),
     ));
 
     // Make the two trust-indicator states VISUALLY DISTINCT: a green verified

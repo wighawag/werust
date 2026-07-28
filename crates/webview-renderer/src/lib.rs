@@ -1511,4 +1511,171 @@ mod tests {
             vec![TrustHook::ProviderInjection, TrustHook::IpfsScheme]
         );
     }
+
+    // -- desktop console + network CAPTURE (task
+    //    `debug-console-network-capture-per-platform`) --------------------------
+
+    #[test]
+    fn a_desktop_resource_load_maps_onto_a_network_entry_with_its_response_facts() {
+        // Acceptance (desktop network capture, headless): the resource-load signals
+        // report a request's method/url at START and its response at FINISH; the
+        // capture point folds them into ONE core `NetworkEntry`. This pins that
+        // mapping display-free — the live signal wiring is
+        // `WebViewRenderer::install_debug_capture` (backend.rs), whose real-webview
+        // half is the ignored `real_webview_installs_the_debug_capture` below plus
+        // the recorded manual steps.
+        let entry = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "https://cdn.example/app.js",
+            status: Some(200),
+            mime: "application/javascript",
+            size: Some(4096),
+            finished_ok: true,
+            load_posture: None,
+            timestamp: 1_700_000_000_000,
+            duration: 17,
+        });
+        assert_eq!(entry.method, "GET");
+        assert_eq!(entry.url, "https://cdn.example/app.js");
+        assert_eq!(entry.status, Some(200));
+        assert_eq!(entry.mime, "application/javascript");
+        assert_eq!(entry.size, Some(4096));
+        assert_eq!(entry.scheme, "https");
+        assert_eq!(entry.duration, Some(17));
+        assert_eq!(
+            entry.trust,
+            TrustPosture::UnverifiedOrigin,
+            "an https subresource is never content-verified"
+        );
+    }
+
+    #[test]
+    fn desktop_capture_reports_the_honest_per_request_posture_never_the_url_alone() {
+        // ADR-0006 per-request: an `ipfs://` sub-resource that FINISHED came back
+        // through the hash-verified scheme handler, so it is content-verified; one
+        // that FAILED (a hash mismatch fails the request) proved nothing.
+        let verified = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "ipfs://bafy/pic.png",
+            status: Some(200),
+            mime: "image/png",
+            size: Some(9),
+            finished_ok: true,
+            load_posture: None,
+            timestamp: 0,
+            duration: 0,
+        });
+        assert_eq!(verified.trust, TrustPosture::ContentVerified);
+
+        let failed = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "ipfs://bafy/pic.png",
+            status: None,
+            mime: "",
+            size: None,
+            finished_ok: false,
+            load_posture: None,
+            timestamp: 0,
+            duration: 0,
+        });
+        assert_eq!(
+            failed.trust,
+            TrustPosture::UnverifiedOrigin,
+            "a failed ipfs:// request claims nothing"
+        );
+        assert_eq!(
+            failed.status, None,
+            "no response means no fabricated status"
+        );
+        assert_eq!(failed.size, None);
+    }
+
+    #[test]
+    fn the_desktop_main_document_row_takes_the_loads_own_two_axis_posture() {
+        // The store's DECISIONS.md Decision 4, honoured here: on an ENS-named page
+        // the chrome trust indicator shows `name-via-trusted-rpc`, so the Network
+        // tab's MAIN-DOCUMENT row must show the same thing rather than the plain
+        // per-request `content-verified` — the two surfaces cannot disagree on the
+        // same screen. Sub-resources keep their own honest per-request posture (the
+        // test above).
+        let main = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "ipfs://bafy/index.html",
+            status: Some(200),
+            mime: "text/html",
+            size: Some(120),
+            finished_ok: true,
+            load_posture: Some(TrustPosture::NameViaTrustedRpc),
+            timestamp: 0,
+            duration: 0,
+        });
+        assert_eq!(main.trust, TrustPosture::NameViaTrustedRpc);
+
+        let mutable = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "ipfs://bafy/index.html",
+            status: Some(200),
+            mime: "text/html",
+            size: None,
+            finished_ok: true,
+            load_posture: Some(TrustPosture::MutableName),
+            timestamp: 0,
+            duration: 0,
+        });
+        assert_eq!(mutable.trust, TrustPosture::MutableName);
+    }
+
+    #[test]
+    fn desktop_console_capture_uses_the_one_shared_shim_and_its_own_channel() {
+        // Desktop and iOS have no native console callback, so both inject the SAME
+        // core shim over the SAME dedicated capture channel (never the EIP-1193
+        // provider's trust channel). Pinning the source here is what stops the two
+        // platforms drifting into two copies.
+        let backend = include_str!("backend.rs");
+        assert!(
+            backend.contains("console_shim()"),
+            "desktop injects the SHARED core console shim, not a local copy"
+        );
+        assert!(
+            backend.contains("CAPTURE_BRIDGE"),
+            "desktop registers the dedicated capture channel"
+        );
+        assert!(
+            backend.contains("route_capture_message"),
+            "desktop routes through the ONE shared parse+push"
+        );
+        assert!(
+            !backend.contains("network_shim()"),
+            "desktop does NOT inject the page-side fetch/XHR shim: its resource-load \
+             signals already see every resource, so it would double-record a subset"
+        );
+    }
+
+    /// End-to-end install of the console + network capture points on the REAL
+    /// WebKitGTK backend. Ignored by default (constructing a `WebViewRenderer`
+    /// initializes GTK, which needs a display). Run on a desktop session with
+    /// `cargo test -p webview-renderer -- --ignored`. The MAPPING is pinned
+    /// display-free by the tests above; here we only pin that installing the hooks
+    /// on the real backend wires the signals without panicking, and that capture
+    /// leaves the backend's trust posture untouched (it is READ-ONLY observation).
+    /// The live end-to-end capture carries recorded manual steps at
+    /// `docs/spikes/debug-console-network-capture-per-platform/README.md`.
+    #[test]
+    #[ignore = "needs a display: constructs a real WebViewRenderer (GTK init)"]
+    fn real_webview_installs_the_debug_capture() {
+        let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
+        let capture = werust_core::debug::DebugCapture::new();
+        let before = r.trust_posture();
+        r.install_debug_capture(capture.clone());
+        assert_eq!(
+            r.trust_posture(),
+            before,
+            "capture is READ-ONLY observation: it does not touch the trust posture"
+        );
+        assert!(
+            capture.console().is_empty(),
+            "nothing captured before a load"
+        );
+        assert!(capture.network().is_empty());
+    }
 }

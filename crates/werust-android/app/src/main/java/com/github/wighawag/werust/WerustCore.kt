@@ -116,6 +116,69 @@ class WerustCore : AutoCloseable {
     fun chrome(): Chrome = Chrome.fromJson(nativeChromeJson(handle))
 
     /**
+     * The bounded console + network CAPTURE STORE as its own JSON document, the
+     * wire form the in-app debug view renders (a DEDICATED accessor beside
+     * [chrome], so the chrome JSON — re-encoded on every refresh — stays lean).
+     * Read OFF the native session lock, so polling it never waits on an in-flight
+     * `ipfs://` retrieval.
+     */
+    fun debugJson(): String = nativeDebugJson(handle)
+
+    /** Empty the capture store: the debug view's Clear action. */
+    fun debugClear() = nativeDebugClear(handle)
+
+    /**
+     * Capture one CONSOLE message from the platform's REAL native callback
+     * ([android.webkit.WebChromeClient.onConsoleMessage]) into the shared core
+     * store, for the in-app debug menu's Console tab (task
+     * `debug-console-network-capture-per-platform`).
+     *
+     * Android needs NO injected console shim (which is what desktop and iOS must
+     * use, since neither WebKitGTK 6 nor WKWebView exposes a console callback):
+     * this hook reports message/level/source/line directly, sees engine-emitted
+     * messages a page-side wrapper never could, and cannot be un-wrapped by the
+     * page. [level] is the platform's `ConsoleMessage.MessageLevel` name; the core
+     * maps it onto werust's one console vocabulary. [line] is 1-based, `0` for
+     * unknown.
+     *
+     * Runs on the UI THREAD, and the native side pushes OFF the session lock, so
+     * capture can never block the UI behind an in-flight `ipfs://` retrieval (the
+     * ANR guard). Capture is READ-ONLY observation: the page's own console is
+     * untouched.
+     */
+    fun captureConsole(level: String, message: String, source: String, line: Int) =
+        nativeCaptureConsole(handle, level, message, source, line)
+
+    /**
+     * Capture one NETWORK request from
+     * [android.webkit.WebViewClient.shouldInterceptRequest] into the shared core
+     * store, for the in-app debug menu's Network tab.
+     *
+     * That hook sees EVERY request the WebView makes (Android has the widest
+     * network reach of the three platforms), so it records BOTH the intercepted
+     * (`ipfs://`, answered from the core) and the passed-through (`return null`)
+     * requests. [verified] must say whether THIS request's bytes really came back
+     * hash-verified through the content-addressed path — never whether the URL
+     * merely looks content-addressed — so the Network tab can never imply a
+     * request was trusted that was not (ADR-0006). [mainFrame] marks the
+     * main-document row, which takes the LOAD's own posture so the tab cannot
+     * contradict the trust indicator. A `0` [status]/[size] means unknown.
+     *
+     * Runs on the WebView WORKER thread and pushes off the session lock, so it
+     * neither blocks nor is blocked by an in-flight retrieval. Capture is
+     * READ-ONLY: it does not decide or delay what the hook returns.
+     */
+    fun captureNetwork(
+        method: String,
+        url: String,
+        status: Int,
+        mime: String,
+        size: Long,
+        verified: Boolean,
+        mainFrame: Boolean,
+    ) = nativeCaptureNetwork(handle, method, url, status, mime, size, verified, mainFrame)
+
+    /**
      * The GENERAL browser menu (the ⋮ menu) the Activity builds its native
      * `PopupMenu` from: the werust VERSION line + a Debug entry that opens the
      * in-app debug view, decoded from the core's JSON wire form.
@@ -382,6 +445,25 @@ class WerustCore : AutoCloseable {
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)
     private external fun nativeOnUrlChanged(handle: Long, url: String)
     private external fun nativeChromeJson(handle: Long): String
+    private external fun nativeDebugJson(handle: Long): String
+    private external fun nativeDebugClear(handle: Long)
+    private external fun nativeCaptureConsole(
+        handle: Long,
+        level: String,
+        message: String,
+        source: String,
+        line: Int,
+    )
+    private external fun nativeCaptureNetwork(
+        handle: Long,
+        method: String,
+        url: String,
+        status: Int,
+        mime: String,
+        size: Long,
+        verified: Boolean,
+        mainFrame: Boolean,
+    )
 
     // The browser-menu accessors thread NO session handle: the version and the
     // menu are properties of the BUILD, so the menu is available whatever the

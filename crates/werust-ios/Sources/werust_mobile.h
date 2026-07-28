@@ -165,6 +165,37 @@ char *werust_ios_debug_json(WerustCoreSession *session);
 /* Empty the debug capture store: the debug view's Clear action. */
 void werust_ios_debug_clear(WerustCoreSession *session);
 
+/* THE iOS CAPTURE POINTS that FEED the store above (task
+ * debug-console-network-capture-per-platform).
+ *
+ * WKWebView has NO console callback and NO per-resource load callback, so iOS
+ * captures through injected page-side shims (the console shim is the SAME shared
+ * string desktop injects; the network one is a best-effort fetch/XHR wrapper)
+ * plus the two native points below. Coverage limits are recorded honestly in
+ * docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md.
+ *
+ * Capture one envelope a shim posted, from Swift's WKScriptMessageHandler for
+ * the capture channel ("werustDebug"). The body is PAGE-CONTROLLED text, so the
+ * core parse is total and fail-quiet: an unreadable or hostile body is dropped,
+ * never fabricated into an entry, and a shim-reported request never claims to
+ * have been verified. `name` / `body` are borrowed C strings. */
+void werust_ios_capture_script_message(WerustCoreSession *session,
+                                       const char *name, const char *body);
+
+/* Capture one NETWORK request from an iOS point that sees it NATIVELY: the
+ * WKURLSchemeHandler custom-scheme tasks and the WKNavigationDelegate main-frame
+ * navigations. `verified` must reflect what the request ACTUALLY did (a
+ * successful ipfs:// resolution through the hash-verified path), never what the
+ * URL looks like (ADR-0006); `main_frame` marks the main-document row, which
+ * takes the load's own two-axis posture so the Network tab cannot contradict the
+ * trust indicator. A 0 status/size means unknown (kept honestly absent, never a
+ * fabricated 0). `method` / `url` / `mime` are borrowed C strings. */
+void werust_ios_capture_network(WerustCoreSession *session, const char *method,
+                                const char *url, uint16_t status,
+                                const char *mime, uint64_t size, bool verified,
+                                bool main_frame);
+
+
 /* werust's version string as a heap C string, for the browser menu's version
  * line (free with werust_ios_string_free). Takes NO session: the version is a
  * property of the BUILD, and it is the ONE shared source all three platforms'

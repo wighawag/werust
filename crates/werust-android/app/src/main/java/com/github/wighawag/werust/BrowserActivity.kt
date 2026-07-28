@@ -12,6 +12,7 @@ import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.inputmethod.EditorInfo
+import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -562,6 +563,44 @@ class BrowserActivity : ComponentActivity() {
      * docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.
      */
     private inner class CoreWebChromeClient : WebChromeClient() {
+        /**
+         * The ANDROID CONSOLE CAPTURE POINT: every `console.*` the page logs, into
+         * the shared core store the in-app debug menu's Console tab renders (task
+         * `debug-console-network-capture-per-platform`).
+         *
+         * Android is the ONE platform that uses its REAL native console callback
+         * rather than an injected shim (desktop and iOS must inject one, since
+         * neither WebKitGTK 6 nor WKWebView exposes a console callback). This hook
+         * hands over the message, the level, the source id and the line number
+         * directly, sees engine-emitted console output a page-side `console.*`
+         * wrapper never could, and cannot be un-wrapped by the page. The recorded
+         * decision is at
+         * docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md.
+         *
+         * READ-ONLY observation: returning `false` lets the WebView keep its
+         * default handling (the message still goes to logcat and to a tethered
+         * chrome://inspect console), so capture ADDS a surface rather than
+         * replacing one.
+         *
+         * THREADING: this runs on the UI thread, so the native push deliberately
+         * does NOT go through the session lock (`SyncSession::debug_capture`) —
+         * `resolve_ipfs` can hold that lock for seconds on a worker thread during a
+         * CAR retrieval, and waiting on it here would be exactly the ANR the
+         * off-main-thread work fixed. The push itself is a bounded ring-buffer
+         * insert.
+         */
+        override fun onConsoleMessage(message: ConsoleMessage): Boolean {
+            core.captureConsole(
+                message.messageLevel().name,
+                message.message() ?: "",
+                message.sourceId() ?: "",
+                message.lineNumber(),
+            )
+            // Do NOT claim to have handled it: the platform's own console handling
+            // (logcat, the remote inspector) stays exactly as it was.
+            return false
+        }
+
         override fun onCreateWindow(
             view: WebView,
             isDialog: Boolean,
@@ -645,9 +684,40 @@ class BrowserActivity : ComponentActivity() {
             request: WebResourceRequest,
         ): WebResourceResponse? {
             val url = request.url.toString()
+            val method = request.method ?: "GET"
+            val mainFrame = request.isForMainFrame
             return when (val resolution = core.resolveIpfs(url)) {
-                null -> null // not an intercepted scheme: let the WebView handle it
-                is WerustCore.Resolution.Ok ->
+                null -> {
+                    // THE PASSED-THROUGH BRANCH — and the reason Android has the
+                    // widest network reach of the three platforms: this hook sees
+                    // EVERY request the WebView makes, including the `https://`
+                    // ones werust does not intercept at all. Record it before
+                    // returning null so the Network tab is the whole request
+                    // stream, not just the content-addressed slice. It is honestly
+                    // UNVERIFIED (werust did not fetch or verify these bytes; the
+                    // WebView did), and its status/mime are unknown here because
+                    // the response never passes through us — recorded as 0/"", which
+                    // the core keeps as an honest "unknown", never a fake 200.
+                    core.captureNetwork(method, url, 0, "", 0L, false, mainFrame)
+                    null // not an intercepted scheme: let the WebView handle it
+                }
+                is WerustCore.Resolution.Ok -> {
+                    // THE INTERCEPTED BRANCH: werust resolved these bytes itself, so
+                    // the real status + MIME are known here. `verified` is true ONLY
+                    // for a successful `ipfs://` resolution — the core decides what
+                    // that earns (an `ipfs://` resolution that hash-verified is
+                    // content-verified; a `werust://settings` page is not), so the
+                    // trust posture tracks the ACTUAL load path and never the URL
+                    // string (ADR-0006).
+                    core.captureNetwork(
+                        method,
+                        url,
+                        resolution.status,
+                        resolution.mimeType,
+                        resolution.body.size.toLong(),
+                        true,
+                        mainFrame,
+                    )
                     if (resolution.status == 200) {
                         WebResourceResponse(
                             resolution.mimeType,
@@ -671,7 +741,13 @@ class BrowserActivity : ComponentActivity() {
                             ByteArrayInputStream(resolution.body),
                         )
                     }
-                is WerustCore.Resolution.Error ->
+                }
+                is WerustCore.Resolution.Error -> {
+                    // A FAILED resolution proved nothing, so it is recorded honestly
+                    // UNVERIFIED with the fail-closed 502 the WebView is about to
+                    // see. Capturing the failure is the point: the Network tab is
+                    // where a user diagnoses why a page did not render.
+                    core.captureNetwork(method, url, 502, "text/plain", 0L, false, mainFrame)
                     // Fail closed: an HTTP error status with no body, so unverified
                     // bytes never render and the failure is honest. The reason is
                     // carried in the reason phrase; the `WebView` surfaces the
@@ -692,6 +768,7 @@ class BrowserActivity : ComponentActivity() {
                         emptyMap<String, String>(),
                         ByteArrayInputStream(ByteArray(0)),
                     )
+                }
             }
         }
 

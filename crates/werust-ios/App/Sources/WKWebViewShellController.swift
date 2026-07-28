@@ -176,6 +176,24 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
             configuration.userContentController.addUserScript(
                 WKUserScript(source: shim, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
+        // Wire the iOS CONSOLE + best-effort NETWORK capture that feeds the in-app
+        // debug menu (task `debug-console-network-capture-per-platform`). WKWebView
+        // has NO native console callback and NO per-resource load callback, so the
+        // page-wide reach is INJECTED JS on a DEDICATED capture channel (never the
+        // provider's trust channel): the console shim is the byte-for-byte SAME
+        // string desktop injects (one place in `werust-core`), and the network one
+        // is a best-effort `fetch`/`XHR` wrapper. What that wrapper cannot see (the
+        // browser-internal subresource loads) is covered as far as iOS allows by
+        // the NATIVE points below — the `WKURLSchemeHandler` tasks and the
+        // main-frame navigations — and the residual gap is recorded honestly in
+        // docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md.
+        //
+        // The scripts come from the core (which registered the channel handler), so
+        // Swift adds no shim of its own: `documentStartScript()` returns EVERY
+        // registered document-start script in injection order, which is why the
+        // provider shim and both capture shims arrive through the one call above.
+        let captureHandler = DebugCaptureHandler(core: core)
+        configuration.userContentController.add(captureHandler, name: Self.captureChannel)
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
         // SAME-DOCUMENT URL tracking (task
@@ -462,6 +480,25 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     }
 
     func webView(_ wv: WKWebView, didFinish navigation: WKNavigation!) {
+        // THE MAIN-FRAME NETWORK capture point (task
+        // `debug-console-network-capture-per-platform`): WKWebView gives no
+        // per-resource callback, so a finished navigation is the one native signal
+        // that a MAIN DOCUMENT was loaded — including the `https://` pages neither
+        // the scheme handler nor the page-side fetch/XHR shim ever sees.
+        //
+        // It SKIPS the custom schemes the scheme handlers already recorded (with
+        // the real status/MIME and, for `ipfs://`, the real verified posture),
+        // exactly as the page-side shim does: one request must produce ONE row, and
+        // the handler is the point that actually knows the outcome. Recorded as
+        // `verified: false` because `didFinish` proves a page LOADED, not that its
+        // bytes were hash-verified — but as the MAIN-FRAME row it then takes the
+        // LOAD's own posture, so it reports exactly what the chrome trust indicator
+        // shows rather than contradicting it.
+        if let url = wv.url?.absoluteString, !url.isEmpty, !Self.isCoreServedScheme(url) {
+            core.captureNetwork(
+                method: "GET", url: url, status: 0, mime: "", size: 0,
+                verified: false, mainFrame: true)
+        }
         core.onPageFinished(wv.url?.absoluteString ?? "")
         // `afterCoreAction` (not a bare `refreshChrome`) because driving the core
         // here may produce a PENDING LOAD the WKWebView must perform: a site's
@@ -497,6 +534,56 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
     /// The EIP-1193 provider script-message channel (matches `werust-core`).
     fileprivate static let providerChannel = "werustProvider"
+
+    /// Whether `url` uses a scheme werust SERVES itself through a
+    /// `WKURLSchemeHandler` (`ipfs://`, `werust://`), and which is therefore
+    /// already captured at that handler with its real status/MIME and its real
+    /// trust posture.
+    ///
+    /// The other capture points skip these so one request produces ONE Network-tab
+    /// row: a second row from a point that does NOT know the outcome would claim
+    /// the weaker unverified posture and contradict the handler's honest one. The
+    /// page-side `fetch`/`XHR` shim applies the same rule in JS.
+    fileprivate static func isCoreServedScheme(_ url: String) -> Bool {
+        let lower = url.lowercased()
+        return lower.hasPrefix("ipfs:") || lower.hasPrefix("werust:")
+    }
+
+    /// The DEBUG CAPTURE script-message channel the injected console + fetch/XHR
+    /// shims post on (matches `werust_core::debug::CAPTURE_BRIDGE`).
+    ///
+    /// Deliberately its OWN channel, not the provider's: the provider channel is a
+    /// trust surface with a request/response contract, while capture is one-way,
+    /// READ-ONLY observation. Nothing is ever pushed back down this one.
+    fileprivate static let captureChannel = "werustDebug"
+}
+
+/// The `WKScriptMessageHandler` for the DEBUG CAPTURE channel: the iOS edge that
+/// receives what the injected console / fetch-XHR shims observed and hands it to
+/// the shared `werust-core` capture store the debug view renders (task
+/// `debug-console-network-capture-per-platform`).
+///
+/// One-way by construction: it returns nothing to the page and evaluates no JS
+/// back into it (contrast [ProviderBridgeHandler], which must answer). The body
+/// is PAGE-CONTROLLED text — a hostile page can post on this channel directly —
+/// so it is handed straight to the core's total, fail-quiet parse, which drops an
+/// unreadable body rather than fabricating an entry, and never lets a
+/// shim-reported request claim to have been verified.
+final class DebugCaptureHandler: NSObject, WKScriptMessageHandler {
+    private let core: WerustCore
+
+    init(core: WerustCore) {
+        self.core = core
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage
+    ) {
+        // The shims post their envelope as a JSON string.
+        core.captureScriptMessage(
+            WKWebViewShellController.captureChannel, message.body as? String ?? "")
+    }
 }
 
 /// The `WKScriptMessageHandler` for the EIP-1193 provider channel: the iOS edge
@@ -548,8 +635,23 @@ final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
                 NSError(domain: "werust.ipfs", code: -1, userInfo: nil))
             return
         }
+        // The iOS NETWORK capture point with the REAL outcome: this handler knows
+        // whether the bytes actually came back hash-verified, which the page-side
+        // fetch/XHR shim never could (and which is why that shim deliberately
+        // SKIPS `ipfs:`/`werust:` — it would otherwise add a second, contradicting
+        // row claiming the weaker unverified posture). A custom-scheme request is
+        // always a sub-resource or the main document; `mainFrame` is decided by
+        // whether it is the URL the core currently has in flight (the same fact the
+        // chrome paints), so the main-document row can take the load's own posture.
+        // Capture is READ-ONLY: it does not change what is served below.
+        let method = urlSchemeTask.request.httpMethod ?? "GET"
+        let mainFrame = core.chrome().url == url.absoluteString
         switch core.resolveIpfs(url.absoluteString) {
         case .some(.success(let mimeType, let body, let status)):
+            core.captureNetwork(
+                method: method, url: url.absoluteString, status: UInt16(status),
+                mime: mimeType, size: UInt64(body.count), verified: true,
+                mainFrame: mainFrame)
             // A NON-OK status WITH a body is the site's own error page, named by
             // its `_redirects` (IPIP-0002) for a path that is not in its DAG: it
             // must RENDER, but as the not-found it honestly is (what a gateway
@@ -578,6 +680,12 @@ final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
             urlSchemeTask.didReceive(body)
             urlSchemeTask.didFinish()
         case .some(.failure(let reason)):
+            // A FAILED resolution proved nothing, so it is captured honestly
+            // UNVERIFIED. Capturing the failure is the point: the Network tab is
+            // where a user diagnoses why a page did not render.
+            core.captureNetwork(
+                method: method, url: url.absoluteString, status: 0, mime: "", size: 0,
+                verified: false, mainFrame: mainFrame)
             // Fail closed: never render unverified bytes; surface the honest reason.
             urlSchemeTask.didFailWithError(
                 NSError(
@@ -622,8 +730,17 @@ final class WerustSchemeHandler: NSObject, WKURLSchemeHandler {
                 NSError(domain: "werust.settings", code: -1, userInfo: nil))
             return
         }
+        // Capture the internal-page request too, so the Network tab is the whole
+        // reachable stream. It is honestly UNVERIFIED: `werust://settings` is an
+        // internal chrome page, NOT hash-verified content (the same distinction the
+        // trust indicator makes).
+        let method = urlSchemeTask.request.httpMethod ?? "GET"
+        let mainFrame = core.chrome().url == url.absoluteString
         switch core.applySettings(url.absoluteString) {
         case .some(.success(let mimeType, let body, _)):
+            core.captureNetwork(
+                method: method, url: url.absoluteString, status: 200, mime: mimeType,
+                size: UInt64(body.count), verified: false, mainFrame: mainFrame)
             let response = URLResponse(
                 url: url, mimeType: mimeType,
                 expectedContentLength: body.count, textEncodingName: "utf-8")

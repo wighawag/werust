@@ -215,6 +215,63 @@ final class WerustCore {
         return Chrome.fromJSON(String(cString: c))
     }
 
+    /// The bounded console + network CAPTURE STORE as its own JSON document, the
+    /// wire form the in-app debug view renders (a DEDICATED accessor beside
+    /// [chrome], so the chrome JSON — re-encoded on every refresh — stays lean).
+    func debugJSON() -> String {
+        guard let c = werust_ios_debug_json(handle) else { return "" }
+        defer { werust_ios_string_free(c) }
+        return String(cString: c)
+    }
+
+    /// Empty the capture store: the debug view's Clear action.
+    func debugClear() { werust_ios_debug_clear(handle) }
+
+    /// Capture one envelope the injected debug shim posted on the capture channel,
+    /// from the `WKScriptMessageHandler` (task
+    /// `debug-console-network-capture-per-platform`).
+    ///
+    /// WKWebView has NO native console callback, so iOS captures the console with
+    /// the SAME injected shim desktop uses (one shared string in `werust-core`),
+    /// and captures what network it can reach with a best-effort `fetch`/`XHR`
+    /// wrapper on the same channel. The body is page-controlled text; the core's
+    /// parse is total and fail-quiet, so a hostile or unreadable body is dropped
+    /// rather than fabricated into an entry.
+    func captureScriptMessage(_ name: String, _ body: String) {
+        name.withCString { n in
+            body.withCString { b in werust_ios_capture_script_message(handle, n, b) }
+        }
+    }
+
+    /// Capture one NETWORK request from an iOS point that sees it NATIVELY: the
+    /// `WKURLSchemeHandler` custom-scheme tasks and the `WKNavigationDelegate`
+    /// main-frame navigations.
+    ///
+    /// [verified] must say whether THIS request's bytes really came back through
+    /// the hash-verified content-addressed path — never whether the URL merely
+    /// looks content-addressed — so the Network tab can never imply a request was
+    /// trusted that was not (ADR-0006). [mainFrame] marks the main-document row,
+    /// which takes the LOAD's own posture so the tab cannot contradict the trust
+    /// indicator. A `0` [status]/[size] means unknown.
+    func captureNetwork(
+        method: String,
+        url: String,
+        status: UInt16,
+        mime: String,
+        size: UInt64,
+        verified: Bool,
+        mainFrame: Bool
+    ) {
+        method.withCString { m in
+            url.withCString { u in
+                mime.withCString { mi in
+                    werust_ios_capture_network(
+                        handle, m, u, status, mi, size, verified, mainFrame)
+                }
+            }
+        }
+    }
+
     /// werust's version string, from the ONE shared source (`werust_core::version`,
     /// the Rust workspace version) over the C-ABI — never a Swift literal and never
     /// the bundle's `CFBundleShortVersionString`, so the iOS menu can never disagree

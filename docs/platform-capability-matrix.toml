@@ -553,11 +553,23 @@ description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug
 # crates/werust-core/tests/debug_view_desktop_wiring_shape.rs; the window
 # itself carries recorded manual steps at
 # docs/spikes/debug-view-console-network-tabs-desktop/README.md.
-# The MOBILE cells are stubbed onto the one mobile follow-on task (an Android +
-# iOS full-screen tabbed view, per the spec's task breakdown); until then both
-# mobile Debug hooks state honestly that the view is not built yet.
-# Task `debug-view-console-network-tabs-desktop`, spec
+# The MOBILE cells (task `debug-view-console-network-tabs-mobile`): the
+# Android (`BrowserActivity.kt` + `DebugView.kt`) and iOS
+# (`WKWebViewShellController.swift`'s `DebugViewController`) Debug hooks now
+# open a FULL-SCREEN tabbed screen over the FFI `debug_json` document: two
+# toggled lists (Android two toggle buttons over one ListView, iOS a
+# UISegmentedControl over one UITableView), no new UI dependency, with the
+# Network rows speaking the mobile trust indicator's exact glyph + wire-name
+# vocabulary and the refresh event-driven on the EXISTING chrome-refresh
+# points (plus the console capture event, already on the UI/main thread): NO
+# new timer, NO busy poll, so the Android ANR fix is respected. iOS network
+# coverage stays honestly partial (the `debug-capture-console-and-network`
+# row names what iOS can see). The wiring is guarded source-shape-wise by
+# crates/werust-core/tests/debug_view_mobile_wiring_shape.rs; manual device
+# steps are recorded at
+# docs/spikes/debug-view-console-network-tabs-mobile/README.md.
+# Tasks `debug-view-console-network-tabs-{desktop,mobile}`, spec
 # `in-app-debug-menu-console-and-network`.
 desktop = { state = "implemented" }
-ios = { state = "stubbed", task = "debug-view-console-network-tabs-mobile" }
-android = { state = "stubbed", task = "debug-view-console-network-tabs-mobile" }
+ios = { state = "implemented" }
+android = { state = "implemented" }

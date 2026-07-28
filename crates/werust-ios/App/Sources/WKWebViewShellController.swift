@@ -61,6 +61,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// `pushState`/`replaceState`) is reported into the core. Held for the
     /// controller's lifetime; released on deinit.
     private var urlObservation: NSKeyValueObservation?
+    /// The presented IN-APP DEBUG VIEW, if any (weak: the presentation retains it;
+    /// after dismissal it deallocs and this nils). Refreshed from the shell's
+    /// EXISTING chrome-refresh points (`refreshChrome`) and from the capture
+    /// channel's message event (already on the main thread), so it tracks the
+    /// store with NO timer and NO poll.
+    private weak var debugViewController: DebugViewController?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -193,6 +199,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // registered document-start script in injection order, which is why the
         // provider shim and both capture shims arrive through the one call above.
         let captureHandler = DebugCaptureHandler(core: core)
+        // The open debug view refreshes from the capture event itself (the
+        // script-message handler is already on the main thread): event-driven,
+        // never a timer/poll.
+        captureHandler.onCapture = { [weak self] in
+            self?.debugViewController?.refresh()
+        }
         configuration.userContentController.add(captureHandler, name: Self.captureChannel)
         webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = self
@@ -366,6 +378,11 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         errorBanner.backgroundColor = chrome.errorIsRetryable()
             ? UIColor(red: 0.71, green: 0.51, blue: 0.04, alpha: 1.0)
             : UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
+        // The open IN-APP DEBUG VIEW refreshes on this SAME existing
+        // chrome-refresh point: the mobile cadence is event-driven (after each
+        // core action / navigation signal), so the view tracks the store with NO
+        // new timer and NO busy poll.
+        debugViewController?.refresh()
     }
 
     // --- the general browser menu ---------------------------------------------
@@ -397,22 +414,18 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         if id == WerustCore.Menu.itemDebug { openDebugView() }
     }
 
-    /// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
-    ///
-    /// THIS is the one method `debug-view-console-network-tabs-mobile` replaces: it
-    /// will present the full-screen tabbed Console/Network view over the core's
-    /// capture store (`werust_ios_debug_json`). Until then it states honestly that
-    /// the view is not built yet, so activating the entry has a visible effect
-    /// rather than reading as a broken menu item. The version comes from the ONE
-    /// shared source over the FFI, like the menu's version line.
+    /// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls: presents
+    /// the FULL-SCREEN tabbed Console + Network debug view over the core's shared
+    /// capture store (`WerustCore.debugJSON()`). The menu task
+    /// (`general-browser-menu-with-version-and-debug-entry`) left this hook an
+    /// honest "not built yet" placeholder; THIS is the real view that fills it
+    /// (task `debug-view-console-network-tabs-mobile`). The view's Done button
+    /// dismisses it (the way back to the page).
     private func openDebugView() {
-        let alert = UIAlertController(
-            title: "Debug",
-            message:
-                "werust \(WerustCore.version()) — the in-app debug view (Console + Network) is not built yet.",
-            preferredStyle: .alert)
-        alert.addAction(UIAlertAction(title: "OK", style: .default))
-        present(alert, animated: true)
+        let controller = DebugViewController(core: core)
+        controller.modalPresentationStyle = .fullScreen
+        debugViewController = controller
+        present(controller, animated: true)
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------
@@ -558,6 +571,354 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     fileprivate static let captureChannel = "werustDebug"
 }
 
+/// The iOS IN-APP DEBUG VIEW: a full-screen tabbed screen (Console + Network)
+/// presented from the browser menu's Debug entry, rendering the ONE shared
+/// capture store over the FFI (`WerustCore.debugJSON()`) (task
+/// `debug-view-console-network-tabs-mobile`, spec
+/// `in-app-debug-menu-console-and-network`). The twin of the Android `DebugView`.
+///
+/// This is the no-tether debug surface: a phone user with no desktop opens the
+/// ⋮ menu -> Debug and sees the page's console log and network requests IN-APP.
+/// The native remote inspector (Safari Web Inspector over USB) stays as the deep
+/// devtools; this is the standalone console+network subset, and it is READ-ONLY
+/// by construction (rows are table cells; no `UITextField`/`UITextView` exists
+/// here; a typeable REPL is the remote inspector's job, spec Out of Scope).
+///
+/// The recorded decisions this bakes in live in
+/// `docs/spikes/debug-view-console-network-tabs-mobile/DECISIONS.md`; the short
+/// form:
+///
+/// * TABS AS TWO TOGGLED LISTS: a `UISegmentedControl` switching ONE table
+///   between the Console and Network tabs (the "two toggled lists" the task
+///   allows), mirroring Android's two toggle buttons over one list; no new UI
+///   framework (SwiftUI) is pulled into a UIKit-programmatic shell.
+/// * REFRESH IS EVENT-DRIVEN, ON THE EXISTING CADENCE: the shell calls
+///   `refresh()` from its own `refreshChrome` (the existing chrome-refresh
+///   point) and from the capture channel's message event (already on the main
+///   thread). NO new timer, NO poll. Each refresh re-renders from the whole
+///   snapshot: the store is bounded (300 entries x 2000 chars) and the cadence
+///   is per page event, not per frame, so the incremental sequence-anchor the
+///   DESKTOP view needs on its 50ms pump is not needed here (the FFI document
+///   carries no sequence).
+/// * iOS NETWORK COVERAGE IS PARTIAL, BY PLATFORM: the capture task records
+///   exactly what iOS can see (custom-scheme tasks, main-frame navigations,
+///   page-issued fetch/XHR via the shim, never the browser-internal
+///   subresource loads WKWebView exposes no callback for); this view renders
+///   whatever is captured and improves as capture does
+///   (`docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md`,
+///   Decision 3).
+/// * THE NETWORK TAB SPEAKS THE TRUST INDICATOR'S EXACT VOCABULARY (ADR-0006):
+///   each row's trust is the indicator's glyph for the posture plus the core's
+///   wire name the debug JSON already carries, in the same hues the desktop
+///   stylesheet gives the `trust-*` classes, never a new label.
+final class DebugViewController: UIViewController, UITableViewDataSource {
+    /// Which tab is showing: the CONSOLE log (segment 0) or the NETWORK requests
+    /// (segment 1).
+    private enum Tab: Int {
+        case console = 0
+        case network = 1
+    }
+
+    /// One rendered row: the main line, an optional detail line (the network
+    /// URL, unbounded, on its own line so a phone-width screen keeps the
+    /// columns legible), its colour (nil = the theme default), and whether the
+    /// main line is bold (console errors/warnings).
+    private struct Row {
+        let text: String
+        let detail: String?
+        let color: UIColor?
+        let bold: Bool
+    }
+
+    private let core: WerustCore
+    private let tabControl = UISegmentedControl(items: ["Console", "Network"])
+    private let tableView = UITableView()
+    private let emptyLabel = UILabel()
+    private var rows: [Row] = []
+
+    init(core: WerustCore) {
+        self.core = core
+        super.init(nibName: nil, bundle: nil)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is not used; the shell builds this controller in code")
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .systemBackground
+
+        // The header row: the title, the CLEAR action (empties BOTH buffers of
+        // the shared store over the FFI), and Done (the way back to the page).
+        let titleLabel = UILabel()
+        titleLabel.text = "Console + Network capture"
+        titleLabel.font = .boldSystemFont(ofSize: 15)
+        titleLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        let clearButton = UIButton(type: .system)
+        clearButton.setTitle("Clear", for: .normal)
+        clearButton.addTarget(self, action: #selector(onClear), for: .touchUpInside)
+        let doneButton = UIButton(type: .system)
+        doneButton.setTitle("Done", for: .normal)
+        doneButton.addTarget(self, action: #selector(onDone), for: .touchUpInside)
+        let header = UIStackView(arrangedSubviews: [titleLabel, clearButton, doneButton])
+        header.axis = .horizontal
+        header.spacing = 8
+        header.alignment = .center
+        header.translatesAutoresizingMaskIntoConstraints = false
+
+        // The tab strip: a segmented control switching the ONE table between the
+        // Console and Network tabs.
+        tabControl.selectedSegmentIndex = Tab.console.rawValue
+        tabControl.addTarget(self, action: #selector(onTabChanged), for: .valueChanged)
+        tabControl.translatesAutoresizingMaskIntoConstraints = false
+
+        emptyLabel.text = "Nothing captured yet"
+        emptyLabel.textAlignment = .center
+        emptyLabel.textColor = .secondaryLabel
+        emptyLabel.isHidden = true
+        emptyLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        tableView.dataSource = self
+        tableView.allowsSelection = false
+        tableView.rowHeight = UITableView.automaticDimension
+        tableView.estimatedRowHeight = 44
+        tableView.translatesAutoresizingMaskIntoConstraints = false
+
+        view.addSubview(header)
+        view.addSubview(tabControl)
+        view.addSubview(tableView)
+        view.addSubview(emptyLabel)
+
+        let g = view.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: g.topAnchor, constant: 8),
+            header.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 8),
+            header.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
+
+            tabControl.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 8),
+            tabControl.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 8),
+            tabControl.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
+
+            tableView.topAnchor.constraint(equalTo: tabControl.bottomAnchor, constant: 8),
+            tableView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            tableView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            tableView.bottomAnchor.constraint(equalTo: g.bottomAnchor),
+
+            emptyLabel.centerXAnchor.constraint(equalTo: tableView.centerXAnchor),
+            emptyLabel.centerYAnchor.constraint(equalTo: tableView.centerYAnchor),
+        ])
+
+        // Paint the store captured so far on open, so the view never opens
+        // visibly empty when there are already entries.
+        refresh()
+    }
+
+    /// The CLEAR action: empty BOTH buffers of the shared store over the FFI,
+    /// then repaint.
+    @objc private func onClear() {
+        core.debugClear()
+        refresh()
+    }
+
+    /// Done: the way back to the page.
+    @objc private func onDone() {
+        dismiss(animated: true)
+    }
+
+    @objc private func onTabChanged() {
+        refresh()
+        // A tab switch starts at the BOTTOM (the newest entries).
+        scrollToBottom()
+    }
+
+    /// Catch the view up with the store: re-read the FFI debug document and
+    /// re-render the active tab. Called on open, on the shell's EXISTING
+    /// chrome-refresh points, and from the capture channel's message event
+    /// (already on the main thread): event-driven, never a timer/poll. Newest
+    /// stays at the bottom; the scroll sticks to the bottom only when the user
+    /// is already there (a user scrolled up reading an earlier entry is never
+    /// yanked back down).
+    func refresh() {
+        // Before the view is loaded there is nothing to paint (viewDidLoad
+        // paints on open); the shell may call this any time after presentation.
+        guard isViewLoaded else { return }
+        let wasAtBottom = isAtBottom()
+        rows = currentRows()
+        emptyLabel.isHidden = !rows.isEmpty
+        tableView.reloadData()
+        if wasAtBottom {
+            scrollToBottom()
+        }
+    }
+
+    /// Scroll to the newest row (the BOTTOM; rows are oldest-first, the
+    /// devtools-console idiom).
+    private func scrollToBottom() {
+        guard !rows.isEmpty else { return }
+        tableView.layoutIfNeeded()
+        tableView.scrollToRow(
+            at: IndexPath(row: rows.count - 1, section: 0), at: .bottom, animated: false)
+    }
+
+    /// Whether the table is showing its newest row.
+    private func isAtBottom() -> Bool {
+        if rows.isEmpty { return true }
+        return tableView.contentOffset.y + tableView.bounds.height
+            >= tableView.contentSize.height - 1
+    }
+
+    /// The rows of the active tab, parsed from the FFI debug document.
+    private func currentRows() -> [Row] {
+        guard let data = core.debugJSON().data(using: .utf8),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [] }
+        if tabControl.selectedSegmentIndex == Tab.network.rawValue {
+            let entries = document["network"] as? [[String: Any]] ?? []
+            return entries.map(Self.networkRow)
+        }
+        let entries = document["console"] as? [[String: Any]] ?? []
+        return entries.map(Self.consoleRow)
+    }
+
+    /// One CONSOLE row of the FFI debug document, coloured by its level. An
+    /// unknown line is JSON `null`, kept honestly absent.
+    private static func consoleRow(_ entry: [String: Any]) -> Row {
+        let level = entry["level"] as? String ?? "log"
+        return Row(
+            text: consoleRowText(
+                level: level,
+                message: entry["message"] as? String ?? "",
+                source: entry["source"] as? String ?? "",
+                line: entry["line"] as? Int),
+            detail: nil,
+            color: consoleLevelColor(level),
+            bold: level == "error" || level == "warn")
+    }
+
+    /// One NETWORK row of the FFI debug document, coloured by its trust
+    /// posture. Unknown status/size is JSON `null`, kept honestly absent.
+    private static func networkRow(_ entry: [String: Any]) -> Row {
+        let trust = entry["trust"] as? String ?? "unverified-origin"
+        return Row(
+            text: networkSummaryText(
+                method: entry["method"] as? String ?? "GET",
+                status: entry["status"] as? Int,
+                mime: entry["mime"] as? String ?? "",
+                size: entry["size"] as? Int,
+                trust: trust),
+            detail: entry["url"] as? String ?? "",
+            color: trustColor(trust),
+            bold: false)
+    }
+
+    // --- the render-from-store mapping (pure; the twin of the Android mapping) -
+
+    /// The full text of one console row: `[<level>] <message>` plus the
+    /// `<source>:<line>` tail in parentheses when there is one. The level tag is
+    /// the store's OWN wire name, and an absent source/line stays honestly
+    /// absent (never a fabricated `:0`). The SAME mapping the desktop
+    /// `console_row_text` applies.
+    static func consoleRowText(level: String, message: String, source: String, line: Int?) -> String {
+        if source.isEmpty { return "[\(level)] \(message)" }
+        if let line = line { return "[\(level)] \(message) (\(source):\(line))" }
+        return "[\(level)] \(message) (\(source))"
+    }
+
+    /// The colour of one console row by its level (the desktop stylesheet's
+    /// hues: info blue, warn amber, error red, debug grey), nil = the theme
+    /// default for log.
+    static func consoleLevelColor(_ level: String) -> UIColor? {
+        switch level {
+        case "info": return UIColor(red: 0x1A / 255, green: 0x5F / 255, blue: 0xB4 / 255, alpha: 1)
+        case "warn": return UIColor(red: 0x9A / 255, green: 0x6A / 255, blue: 0x00 / 255, alpha: 1)
+        case "error": return UIColor(red: 0xC0 / 255, green: 0x1C / 255, blue: 0x28 / 255, alpha: 1)
+        case "debug": return UIColor(red: 0x5C / 255, green: 0x5C / 255, blue: 0x5C / 255, alpha: 1)
+        default: return nil
+        }
+    }
+
+    /// The per-request trust label of a network row: the mobile trust
+    /// indicator's glyph for the posture (`✓` / `◈` / `◇` / `⚠`, the SAME four
+    /// `Chrome.trustIndicator()` paints) plus the core's wire name the debug
+    /// JSON carries, never a new label minted for the debug view (ADR-0006).
+    /// TOTAL and fail-closed: an unrecognised posture renders as the unverified
+    /// one, never verbatim (a verbatim render could smuggle a minted label into
+    /// the one surface whose job is honest trust).
+    static func networkTrustLabel(_ trust: String) -> String {
+        switch trust {
+        case "content-verified": return "✓ content-verified"
+        case "name-via-trusted-rpc": return "◈ name-via-trusted-rpc"
+        case "mutable-name": return "◇ mutable-name"
+        default: return "⚠ unverified-origin"
+        }
+    }
+
+    /// The colour of a network row by its trust posture (the indicator's hues:
+    /// the desktop stylesheet's `trust-*` colours).
+    static func trustColor(_ trust: String) -> UIColor {
+        switch trust {
+        case "content-verified":
+            return UIColor(red: 0x0A / 255, green: 0x7D / 255, blue: 0x28 / 255, alpha: 1)
+        case "name-via-trusted-rpc":
+            return UIColor(red: 0x1A / 255, green: 0x5F / 255, blue: 0xB4 / 255, alpha: 1)
+        case "mutable-name":
+            return UIColor(red: 0x6C / 255, green: 0x3F / 255, blue: 0xB4 / 255, alpha: 1)
+        default:
+            return UIColor(red: 0x9A / 255, green: 0x6A / 255, blue: 0x00 / 255, alpha: 1)
+        }
+    }
+
+    /// The summary line of one network row: method, status, MIME, size and the
+    /// honest per-request trust label. An unknown field renders as `?`, never a
+    /// fabricated `0` (the store's own honesty rule).
+    static func networkSummaryText(
+        method: String, status: Int?, mime: String, size: Int?, trust: String
+    ) -> String {
+        [
+            method,
+            status.map { String($0) } ?? "?",
+            mime.isEmpty ? "?" : mime,
+            sizeText(size),
+            networkTrustLabel(trust),
+        ].joined(separator: "  ")
+    }
+
+    /// A human byte count (`512 B`, `1.5 KB`, `2.0 MB`), or `?` when unknown.
+    static func sizeText(_ size: Int?) -> String {
+        guard let size = size else { return "?" }
+        if size < 1024 { return "\(size) B" }
+        if size < 1024 * 1024 { return String(format: "%.1f KB", Double(size) / 1024.0) }
+        return String(format: "%.1f MB", Double(size) / (1024.0 * 1024.0))
+    }
+
+    // --- UITableViewDataSource (READ-ONLY rows) -------------------------------
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
+        rows.count
+    }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let row = rows[indexPath.row]
+        // Two reuse pools: a plain one for console rows, a subtitle one for
+        // network rows (the URL rides the detail line).
+        let identifier = row.detail == nil ? "debugConsoleRow" : "debugNetworkRow"
+        let cell = tableView.dequeueReusableCell(withIdentifier: identifier)
+            ?? UITableViewCell(
+                style: row.detail == nil ? .default : .subtitle, reuseIdentifier: identifier)
+        cell.textLabel?.text = row.text
+        cell.textLabel?.numberOfLines = 0
+        cell.textLabel?.font = row.bold ? .boldSystemFont(ofSize: 13) : .systemFont(ofSize: 13)
+        cell.textLabel?.textColor = row.color ?? .label
+        cell.detailTextLabel?.text = row.detail
+        cell.detailTextLabel?.numberOfLines = 0
+        cell.detailTextLabel?.font = .systemFont(ofSize: 12)
+        cell.detailTextLabel?.textColor = .secondaryLabel
+        return cell
+    }
+}
+
 /// The `WKScriptMessageHandler` for the DEBUG CAPTURE channel: the iOS edge that
 /// receives what the injected console / fetch-XHR shims observed and hands it to
 /// the shared `werust-core` capture store the debug view renders (task
@@ -572,6 +933,11 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 final class DebugCaptureHandler: NSObject, WKScriptMessageHandler {
     private let core: WerustCore
 
+    /// Called after each captured envelope has been handed to the store, so an
+    /// OPEN debug view can refresh from the SAME event (this handler is already
+    /// on the main thread) instead of polling.
+    var onCapture: (() -> Void)?
+
     init(core: WerustCore) {
         self.core = core
     }
@@ -583,6 +949,7 @@ final class DebugCaptureHandler: NSObject, WKScriptMessageHandler {
         // The shims post their envelope as a JSON string.
         core.captureScriptMessage(
             WKWebViewShellController.captureChannel, message.body as? String ?? "")
+        onCapture?()
     }
 }
 

@@ -23,10 +23,10 @@ import android.webkit.WebViewClient
 import java.io.ByteArrayInputStream
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
 import android.widget.TextView
-import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import java.util.concurrent.ExecutorService
@@ -106,6 +106,19 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var webView: WebView
 
     /**
+     * The IN-APP DEBUG VIEW: the full-screen tabbed Console + Network screen the
+     * browser menu's Debug entry opens (task
+     * `debug-view-console-network-tabs-mobile`). Built once, laid out MATCH_PARENT
+     * OVER the whole browser chrome (an overlay on the root container), and hidden
+     * until [openDebugView] shows it. It renders the ONE shared capture store over
+     * the FFI ([WerustCore.debugJson]), so it needs this Activity's session: an
+     * overlay, not a separate Activity (a session cannot cross an Activity
+     * boundary, and an overlay needs no manifest entry). The SYSTEM Back button
+     * closes it ([debugBackCallback]).
+     */
+    private lateinit var debugView: DebugView
+
+    /**
      * The URL bar's DEFAULT text colour, captured once at creation so the
      * invalid-entry red can be reverted to it (rather than hard-coding a colour
      * that would fight the OS light/dark theme). Restored whenever the entry is
@@ -160,11 +173,27 @@ class BrowserActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * The SYSTEM/hardware Back handler for the IN-APP DEBUG VIEW: while the debug
+     * view is open, Back CLOSES it (the way back to the page) instead of
+     * navigating page history or exiting. Registered AFTER [systemBackCallback],
+     * and the dispatcher consults the most recently registered enabled callback
+     * first, so an enabled [debugBackCallback] always wins over the history one
+     * while the view is open. Enabled only while the debug view is open
+     * ([openDebugView] / [closeDebugView]); disabled it falls through to the
+     * history callback exactly as before.
+     */
+    private val debugBackCallback = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            closeDebugView()
+        }
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val browserChrome = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         // The toolbar row is at least a touch-target tall (48dp), so even though the
         // nav buttons render as a small square glyph they stay comfortably tappable.
         val toolbar = LinearLayout(this).apply {
@@ -304,10 +333,20 @@ class BrowserActivity : ComponentActivity() {
             visibility = View.GONE
         }
 
-        root.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(errorBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        root.addView(webView)
-        root.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        browserChrome.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        browserChrome.addView(errorBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        browserChrome.addView(webView)
+        browserChrome.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+
+        // The IN-APP DEBUG VIEW: a full-screen overlay ABOVE the browser chrome
+        // (added last so it draws on top), hidden until the menu's Debug entry
+        // opens it. The root is a FrameLayout so the overlay can cover the whole
+        // screen (toolbar included) without disturbing the chrome's own layout.
+        debugView = DebugView(this, core) { closeDebugView() }
+        debugView.visibility = View.GONE
+        val root = FrameLayout(this)
+        root.addView(browserChrome, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+        root.addView(debugView, FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         setContentView(root)
 
         // Handle the SYSTEM/hardware Back button: while the core has back history
@@ -316,6 +355,9 @@ class BrowserActivity : ComponentActivity() {
         // the platform default exits the Activity. Registered with this Activity
         // as the lifecycle owner so it is removed on destroy.
         onBackPressedDispatcher.addCallback(this, systemBackCallback)
+        // Registered after the history callback so that, while the debug view is
+        // open (and only then), system Back closes the view first.
+        onBackPressedDispatcher.addCallback(this, debugBackCallback)
 
         // Launch a browsing surface: drive the core to the start URL OFF the UI
         // thread (a `.eth`/ENS start URL would otherwise block onCreate on the
@@ -417,21 +459,23 @@ class BrowserActivity : ComponentActivity() {
     }
 
     /**
-     * The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
-     *
-     * THIS is the one method `debug-view-console-network-tabs-mobile` replaces: it
-     * will open the full-screen tabbed Console/Network view over the core's
-     * capture store (`WerustCore.debugJson`). Until then it states honestly that
-     * the view is not built yet, so activating the entry has a visible effect
-     * rather than reading as a broken menu item. The version comes from the ONE
-     * shared source over the FFI, like the menu's version line.
+     * The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls: opens the
+     * full-screen tabbed Console + Network debug view over the core's shared
+     * capture store ([WerustCore.debugJson]). The menu task
+     * (`general-browser-menu-with-version-and-debug-entry`) left this hook an
+     * honest "not built yet" placeholder; THIS is the real view that fills it
+     * (task `debug-view-console-network-tabs-mobile`). System Back while it is
+     * open closes it ([debugBackCallback]); the ✕ affordance is the view's own.
      */
     private fun openDebugView() {
-        Toast.makeText(
-            this,
-            "werust ${core.version()} — the in-app debug view (Console + Network) is not built yet.",
-            Toast.LENGTH_LONG,
-        ).show()
+        debugView.open()
+        debugBackCallback.isEnabled = true
+    }
+
+    /** Close the debug view (the ✕ affordance and the system Back button). */
+    private fun closeDebugView() {
+        debugView.close()
+        debugBackCallback.isEnabled = false
     }
 
     /** After driving the core, apply any pending load to the WebView and repaint. */
@@ -494,6 +538,13 @@ class BrowserActivity : ComponentActivity() {
         } else {
             errorBanner.visibility = View.GONE
         }
+        // The open IN-APP DEBUG VIEW refreshes on this SAME existing
+        // chrome-refresh point: the mobile cadence is event-driven (after each
+        // core action / page lifecycle signal), so the view tracks the store with
+        // NO new timer and NO busy poll; the ANR fix is respected, and the FFI
+        // debug document reads OFF the native session lock, so this refresh can
+        // never block the UI thread behind an in-flight `ipfs://` retrieval.
+        if (::debugView.isInitialized && debugView.isOpen()) debugView.refresh()
     }
 
     /**
@@ -596,6 +647,11 @@ class BrowserActivity : ComponentActivity() {
                 message.sourceId() ?: "",
                 message.lineNumber(),
             )
+            // The open debug view refreshes from this SAME event (this callback
+            // is already on the UI thread, and the refresh reads the FFI debug
+            // document off the session lock), so the Console tab tracks new log
+            // entries with no timer or poll.
+            if (::debugView.isInitialized && debugView.isOpen()) debugView.refresh()
             // Do NOT claim to have handled it: the platform's own console handling
             // (logcat, the remote inspector) stays exactly as it was.
             return false

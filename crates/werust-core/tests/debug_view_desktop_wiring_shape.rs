@@ -38,9 +38,11 @@
 //! 4. The view is READ-ONLY (no typeable input in the debug view) and the F12
 //!    inspector is unaffected
 //!    (`the_view_is_read_only_and_the_f12_inspector_is_untouched`).
-//! 5. Desktop-scoped + parity-tracked: the mobile hooks stay placeholders, and
-//!    the matrix row links the mobile follow-on
-//!    (`the_mobile_hooks_remain_placeholders_for_the_mobile_view_task`).
+//! 5. Desktop-scoped + parity-tracked: the matrix row's desktop cell is
+//!    implemented (the mobile cells have since been implemented by
+//!    `debug-view-console-network-tabs-mobile`, guarded by the sibling
+//!    `debug_view_mobile_wiring_shape.rs`)
+//!    (`the_desktop_cell_is_implemented_and_the_mobile_cells_are_the_sibling_guards_job`).
 //! 6. Tests cover the mapping where testable (the `main.rs` unit tests); the
 //!    window itself carries recorded manual steps at
 //!    `docs/spikes/debug-view-console-network-tabs-desktop/README.md`.
@@ -224,13 +226,14 @@ fn the_view_is_read_only_and_the_f12_inspector_is_untouched() {
 }
 
 #[test]
-fn the_mobile_hooks_remain_placeholders_for_the_mobile_view_task() {
-    // Criterion 5: this task is DESKTOP-scoped. The Android and iOS Debug hooks
-    // keep their honest placeholder until `debug-view-console-network-tabs-mobile`
-    // fills them (the sibling `browser_menu_edge_wiring_shape.rs` pins the
-    // placeholder wording per hook body), and the parity matrix tracks the mobile
-    // gap (the `debug-view-console-network` row, enforced by
-    // `platform_capability_parity.rs`).
+fn the_desktop_cell_is_implemented_and_the_mobile_cells_are_the_sibling_guards_job() {
+    // Criterion 5: this task was DESKTOP-scoped. The parity matrix row
+    // (`debug-view-console-network`, enforced by `platform_capability_parity.rs`)
+    // marks the desktop cell implemented. The mobile cells were stubbed onto
+    // `debug-view-console-network-tabs-mobile` when this landed; that task has
+    // since filled them, so the mobile half of the row (and the mobile hooks,
+    // whose honest placeholder is GONE) is now asserted by the sibling
+    // `debug_view_mobile_wiring_shape.rs`.
     let matrix = source("docs/platform-capability-matrix.toml");
     // The row is the LAST capability in the matrix, so slice to the end of the
     // file rather than to a following `[[capability]]` header.
@@ -241,11 +244,5 @@ fn the_mobile_hooks_remain_placeholders_for_the_mobile_view_task() {
     assert!(
         row.contains("desktop = { state = \"implemented\" }"),
         "the desktop debug view must be marked implemented: {row:?}"
-    );
-    assert!(
-        row.matches("debug-view-console-network-tabs-mobile")
-            .count()
-            >= 2,
-        "both mobile cells must be stubbed onto the mobile view task: {row:?}"
     );
 }

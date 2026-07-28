@@ -19,6 +19,11 @@ android {
         versionName = "0.0.0"
         // The floor ABIs: arm64-v8a for real devices, x86_64 for the emulator.
         ndk { abiFilters += listOf("arm64-v8a", "x86_64") }
+
+        // The on-device instrumentation probe (`src/androidTest`): the strongest
+        // automatable harness for the real System WebView's behaviour (task
+        // `mobile-ronan-eth-buttons-no-navigation`).
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     // Unsigned debug APK only — signing/store is out of scope for this task.
@@ -57,6 +62,12 @@ dependencies {
     // platform `WebView` + widgets + framework themes, so the Rust core remains
     // the only linked "library" that matters.
     implementation("androidx.activity:activity:1.9.3")
+
+    // ON-DEVICE TEST ONLY (never shipped in the app APK): the JUnit4 runner +
+    // rule support for the `androidTest` System-WebView probe. The app itself
+    // stays framework-only (the single androidx dependency above).
+    androidTestImplementation("androidx.test:runner:1.6.2")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
 }
 
 // ---------------------------------------------------------------------------

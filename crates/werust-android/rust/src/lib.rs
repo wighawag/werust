@@ -37,6 +37,7 @@
 
 mod backend;
 mod ffi_json;
+mod origin_map;
 
 pub use backend::{AndroidBackend, AndroidHandle};
 
@@ -185,32 +186,43 @@ impl CoreSession {
         // `resolve_scheme` dispatches `ipfs` AND `werust`), so a `werust://settings`
         // page must NOT be marked content-verified — it is an internal chrome page,
         // not hash-verified content. Scope the mark to the `ipfs` scheme.
+        //
+        // The check runs on the MAPPED-BACK form
+        // ([`origin_map::from_webview_url`], identity for anything off the
+        // internal origin): a page served on the internal `https://<cid>.ipfs
+        // .werust.invalid` origin has its requests intercepted as `https://…`
+        // URLs, but they ARE `ipfs://` requests and their verified resolution
+        // must earn the content-verified mark exactly as a direct `ipfs://`
+        // request does.
+        let uri = origin_map::from_webview_url(uri);
         let is_ipfs = uri
             .split_once("://")
             .is_some_and(|(scheme, _)| scheme == werust_core::ipfs::IPFS_SCHEME);
-        self.backend.resolve_scheme(uri).map(|result| match result {
-            Ok(response) => {
-                if is_ipfs {
-                    // The bytes verified against their CID on the shared core path:
-                    // mark the current load content-verified so the chrome's trust
-                    // indicator reflects the REAL (hash-verified) load path — the
-                    // same thing the desktop `install_ipfs` scheme handler does on
-                    // success. A fail-closed error (below) never reaches this, so an
-                    // unverified load is never marked verified. The two-axis flags
-                    // (`mark_ens_origin`/`mark_mutable_name`) set by the ENS/IPNS
-                    // front door then decide the honest posture surfaced.
-                    self.backend.mark_content_verified();
+        self.backend
+            .resolve_scheme(&uri)
+            .map(|result| match result {
+                Ok(response) => {
+                    if is_ipfs {
+                        // The bytes verified against their CID on the shared core path:
+                        // mark the current load content-verified so the chrome's trust
+                        // indicator reflects the REAL (hash-verified) load path — the
+                        // same thing the desktop `install_ipfs` scheme handler does on
+                        // success. A fail-closed error (below) never reaches this, so an
+                        // unverified load is never marked verified. The two-axis flags
+                        // (`mark_ens_origin`/`mark_mutable_name`) set by the ENS/IPNS
+                        // front door then decide the honest posture surfaced.
+                        self.backend.mark_content_verified();
+                    }
+                    SchemeResolution::Ok {
+                        mime_type: response.mime_type,
+                        body: response.body,
+                        status: response.status,
+                    }
                 }
-                SchemeResolution::Ok {
-                    mime_type: response.mime_type,
-                    body: response.body,
-                    status: response.status,
-                }
-            }
-            Err(e) => SchemeResolution::Err {
-                reason: e.to_string(),
-            },
-        })
+                Err(e) => SchemeResolution::Err {
+                    reason: e.to_string(),
+                },
+            })
     }
 
     /// The scripts to inject at document start (the EIP-1193 provider shim), so
@@ -298,6 +310,23 @@ impl CoreSession {
     pub fn debug_json(&self) -> String {
         self.shell.debug_json()
     }
+}
+
+/// Map a core URL to the URL the platform `WebView` should load
+/// ([`origin_map::to_webview_url`]): `ipfs://<cid>[/path]` -> the internal
+/// `https://<cid>.ipfs.werust.invalid[/path]` origin, anything else unchanged.
+///
+/// SESSION-FREE (a pure function), for the ONE Kotlin call site that loads a
+/// URL the core did not surface as a pending load: the `_blank`/`window.open`
+/// transport in `BrowserActivity.onCreateWindow`, which hands its target to
+/// `WebView.loadUrl` directly. Mapping there too keeps an `ipfs://` new-window
+/// target on the SAME internal-origin path as every other load (an unmapped
+/// `ipfs://` main-frame load would land the page on the opaque origin again —
+/// the root cause of the mobile no-navigation, task
+/// `mobile-ronan-eth-buttons-no-navigation`).
+#[must_use]
+pub fn to_webview_url(url: &str) -> String {
+    origin_map::to_webview_url(url)
 }
 
 /// werust's version string for the Kotlin edge's browser MENU: the ONE shared
@@ -613,9 +642,17 @@ impl SyncSession {
         verified: bool,
         main_frame: bool,
     ) {
+        // Record the MAPPED-BACK URL ([`origin_map::from_webview_url`],
+        // identity off the internal origin): a page served on the internal
+        // `https://<cid>.ipfs.werust.invalid` origin makes its requests as
+        // `https://…` URLs, but the Network tab is the USER's diagnosis
+        // surface and must speak the real `ipfs://` URLs the core everywhere
+        // else reports — the internal origin is an edge detail, never a fact
+        // the user should have to decode.
+        let url = origin_map::from_webview_url(url);
         let mut entry = werust_core::debug::network_entry(
             method,
-            url,
+            &url,
             Some(status),
             mime,
             Some(size),
@@ -1076,6 +1113,21 @@ mod jni_exports {
         let url = read(&mut env, &url);
         let reason = read(&mut env, &reason);
         unsafe { session(handle) }.on_page_failed(&url, &reason);
+    }
+
+    /// The session-free core->WebView URL map ([`super::to_webview_url`]),
+    /// for the `_blank`/`window.open` transport's direct `WebView.loadUrl`.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeToWebViewUrl(
+        mut env: JNIEnv,
+        _class: JClass,
+        url: JString,
+    ) -> jstring {
+        let url = read(&mut env, &url);
+        let mapped = super::to_webview_url(&url);
+        env.new_string(mapped)
+            .map(|js| js.into_raw())
+            .unwrap_or(std::ptr::null_mut())
     }
 
     #[no_mangle]

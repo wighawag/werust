@@ -674,8 +674,13 @@ class BrowserActivity : ComponentActivity() {
                 ): Boolean {
                     // Load the `_blank`/`window.open` target IN THE CURRENT view
                     // through the normal load path (verification preserved), then
-                    // tear down the throwaway transport WebView.
-                    webView.loadUrl(request.url.toString())
+                    // tear down the throwaway transport WebView. The URL is mapped
+                    // through the core's toWebViewUrl first: an `ipfs://` target
+                    // must load on the internal https origin like every other
+                    // load — a direct `ipfs://` main-frame load would land the
+                    // page on the opaque origin where SvelteKit client nav dies
+                    // (task mobile-ronan-eth-buttons-no-navigation).
+                    webView.loadUrl(core.toWebViewUrl(request.url.toString()))
                     v.stopLoading()
                     v.destroy()
                     return true
@@ -720,11 +725,22 @@ class BrowserActivity : ComponentActivity() {
          * with no `https://`/gateway URL shown to the user. A non-`ipfs://`
          * request returns `null` so the `WebView` handles it normally.
          *
-         * INTERCEPTION MECHANISM (Android): the NATIVE custom scheme via
-         * `shouldInterceptRequest`. See the recorded decision at
-         * work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md
-         * for the internal-`https://appassets` fallback if a device build shows a
-         * top-level `ipfs://` navigation does not reach this hook.
+         * INTERCEPTION MECHANISM (Android): `shouldInterceptRequest` answering
+         * from the core, with the page served on the INTERNAL `https://<cid>
+         * .ipfs.werust.invalid` origin — the fallback recorded in
+         * work/notes/observations/mobile-ipfs-interception-mechanism-2026-07-23.md,
+         * promoted to THE mechanism by task
+         * `mobile-ronan-eth-buttons-no-navigation`: an `ipfs://` document served
+         * through this hook gets an OPAQUE origin in the System WebView (Blink
+         * refuses `fetch(ipfs://…)` and dynamic `import()` before the network
+         * stack and `localStorage` is null), which killed every SvelteKit
+         * client-side navigation. The WebView therefore loads the internal
+         * `https://` origin (a normal fetchable, `pushState`-able secure
+         * context); every URL is translated between that origin and the core's
+         * real `ipfs://` URLs by the Rust edge (`origin_map.rs`), so this hook
+         * still receives real `ipfs://` requests and the core's history/URL bar
+         * never see the internal origin. Diagnosis + on-device evidence:
+         * docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md.
          *
          * THREADING: this hook runs on a WebView WORKER thread, NOT the UI thread
          * that drives `navigate` / `onPageStarted` / `onPageFinished`. Both touch

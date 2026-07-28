@@ -42,6 +42,8 @@ use renderer::{
     ViewHandle,
 };
 
+use crate::origin_map::{from_webview_url, to_webview_url};
+
 /// Validate a URL for [`Renderer::navigate`], rejecting unusable ones.
 ///
 /// The same rule the WebKitGTK backend uses: an absolute URL with a non-empty
@@ -247,8 +249,22 @@ impl AndroidHandle {
     /// Take the URL the core has committed to but Kotlin has not yet loaded onto
     /// the platform `WebView`, if any. Kotlin calls this after driving the core
     /// (navigate/back/forward/reload) and calls `WebView.loadUrl` with the result.
+    ///
+    /// An `ipfs://<cid>` pending load is surfaced ON THE INTERNAL `https://`
+    /// origin ([`to_webview_url`]): a `shouldInterceptRequest`-served `ipfs://`
+    /// document gets an OPAQUE origin in the System WebView (Blink refuses
+    /// `fetch(ipfs://…)` before the network stack and throws `SecurityError` on
+    /// `pushState`), which is what killed SvelteKit client-side navigation on
+    /// Android (task `mobile-ronan-eth-buttons-no-navigation`). The WebView
+    /// loads the internal origin; every URL it reports back is mapped to the
+    /// real `ipfs://` form by [`from_webview_url`], so the core's history and
+    /// the URL bar never see the internal origin.
     pub fn take_pending_load(&self) -> Option<String> {
-        self.inner.borrow_mut().pending_load.take()
+        self.inner
+            .borrow_mut()
+            .pending_load
+            .take()
+            .map(|url| to_webview_url(&url))
     }
 
     /// Resolve an intercepted `<scheme>://…` request through the handler the
@@ -266,12 +282,18 @@ impl AndroidHandle {
     /// `WebView` handle the URL normally); `Some(Err(..))` is a real, honest
     /// resolution failure that must FAIL the load, never render unverified bytes.
     pub fn resolve_scheme(&self, uri: &str) -> Option<Result<SchemeResponse, RendererError>> {
+        // Map an internal-`https`-origin URL back to its real `ipfs://` form
+        // FIRST ([`from_webview_url`]; identity for anything else), so a page
+        // living on the internal origin has its subresource + client-router
+        // data fetches dispatched to the `ipfs` handler as real `ipfs://`
+        // requests — and the `_redirects` 3xx main-frame inference (which
+        // compares the intercepted URI against the shell's top-level URL, both
+        // `ipfs://`) stays consistent.
+        let uri = from_webview_url(uri);
         let scheme = uri.split_once("://").map(|(s, _)| s.to_string())?;
         let mut b = self.inner.borrow_mut();
         let handler = b.scheme_handlers.get_mut(&scheme)?;
-        Some(handler(SchemeRequest {
-            uri: uri.to_string(),
-        }))
+        Some(handler(SchemeRequest { uri }))
     }
 
     /// Mark the CURRENT load content-verified from the OS edge: its bytes came
@@ -371,8 +393,12 @@ impl AndroidHandle {
     /// `doUpdateVisitedHistory` that merely echoes the current load's URL (a real
     /// load, not an SPA nav) emits nothing.
     pub fn on_url_changed(&self, url: &str) {
+        // The WebView reports the URL IT is on (the internal `https://` origin
+        // for a content-addressed page); map it back so the core's history and
+        // the URL bar track the real `ipfs://` location.
+        let url = from_webview_url(url);
         let mut b = self.inner.borrow_mut();
-        if b.current().map(String::as_str) == Some(url) {
+        if b.current().map(String::as_str) == Some(url.as_str()) {
             return;
         }
         // A same-document history push adds a forward entry from mid-history,
@@ -380,43 +406,40 @@ impl AndroidHandle {
         // lifecycle reset (state/posture/flags keep the current document's values).
         let next = b.cursor.map_or(0, |c| c + 1);
         b.history.truncate(next);
-        b.history.push(url.to_string());
+        b.history.push(url.clone());
         b.cursor = Some(b.history.len() - 1);
-        b.events.push_back(LoadEvent::UrlChanged {
-            url: url.to_string(),
-        });
+        b.events.push_back(LoadEvent::UrlChanged { url });
     }
 
     /// Report that the platform `WebView` committed the load on `url` (the
     /// effective URL after any redirects): advance to [`LoadState::Committed`] and
     /// emit [`LoadEvent::Committed`]. Called from Kotlin's `onPageCommitVisible`.
     pub fn on_page_committed(&self, url: &str) {
+        let url = from_webview_url(url);
         let mut b = self.inner.borrow_mut();
         b.state = LoadState::Committed;
-        b.events.push_back(LoadEvent::Committed {
-            url: url.to_string(),
-        });
+        b.events.push_back(LoadEvent::Committed { url });
     }
 
     /// Report that the platform `WebView` finished loading `url`: advance to
     /// [`LoadState::Finished`] and emit [`LoadEvent::Finished`]. Called from
     /// Kotlin's `onPageFinished`.
     pub fn on_page_finished(&self, url: &str) {
+        let url = from_webview_url(url);
         let mut b = self.inner.borrow_mut();
         b.state = LoadState::Finished;
-        b.events.push_back(LoadEvent::Finished {
-            url: url.to_string(),
-        });
+        b.events.push_back(LoadEvent::Finished { url });
     }
 
     /// Report that the platform `WebView` failed to load `url`: advance to
     /// [`LoadState::Failed`] and emit [`LoadEvent::Failed`]. Called from Kotlin's
     /// `onReceivedError`.
     pub fn on_page_failed(&self, url: &str, reason: &str) {
+        let url = from_webview_url(url);
         let mut b = self.inner.borrow_mut();
         b.state = LoadState::Failed;
         b.events.push_back(LoadEvent::Failed {
-            url: url.to_string(),
+            url,
             reason: reason.to_string(),
         });
     }
@@ -825,6 +848,156 @@ mod tests {
         // A change that merely echoes the current URL emits nothing.
         h.on_url_changed("ipfs://bafyroot/portfolio");
         assert_eq!(b.poll_event(), None, "an unchanged URL emits no event");
+    }
+
+    /// The ronan.eth fixture root's canonical base32 CIDv1 (the form the ENS
+    /// contenthash decoder produces and the internal origin carries).
+    const CID_V1: &str = "bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq";
+
+    /// The internal-origin form of an `ipfs://` fixture URL, as the platform
+    /// WebView loads + reports it.
+    fn internal(path: &str) -> String {
+        format!("https://{CID_V1}.ipfs.werust.invalid{path}")
+    }
+
+    #[test]
+    fn the_pending_load_is_served_on_the_internal_https_origin() {
+        // The opaque-origin fix (task mobile-ronan-eth-buttons-no-navigation):
+        // the platform WebView must NOT load `ipfs://` directly (a
+        // `shouldInterceptRequest`-served `ipfs://` document gets an OPAQUE
+        // origin in the System WebView, which kills SvelteKit client-side nav:
+        // Blink refuses `fetch(ipfs://...)` before the network stack and throws
+        // `SecurityError` on `pushState`). The pending load the edge hands to
+        // `WebView.loadUrl` is therefore the internal `https://` origin, while
+        // the core's own truth (history, the URL bar) stays the real `ipfs://`
+        // URL.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.navigate(&format!("ipfs://{CID_V1}/")).unwrap();
+        assert_eq!(
+            h.take_pending_load().as_deref(),
+            Some(internal("/").as_str()),
+            "the WebView loads the internal https origin"
+        );
+        assert_eq!(
+            b.current_url().as_deref(),
+            Some(format!("ipfs://{CID_V1}/").as_str()),
+            "the core's truth stays the real ipfs:// URL"
+        );
+        // A non-ipfs pending load passes through unchanged.
+        b.navigate("https://example.com/").unwrap();
+        assert_eq!(
+            h.take_pending_load().as_deref(),
+            Some("https://example.com/")
+        );
+    }
+
+    #[test]
+    fn webview_signals_on_the_internal_origin_report_back_as_ipfs() {
+        // The WebView reports its load signals with the URL IT loaded (the
+        // internal origin); the edge maps them back so the core's lifecycle
+        // events + history never see the internal origin.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.navigate(&format!("ipfs://{CID_V1}/")).unwrap();
+        let _ = b.poll_event(); // Started
+        let loaded = h.take_pending_load().expect("a pending load");
+        assert!(loaded.starts_with("https://"), "loaded: {loaded}");
+
+        h.on_page_committed(&loaded);
+        assert_eq!(
+            b.poll_event(),
+            Some(LoadEvent::Committed {
+                url: format!("ipfs://{CID_V1}/")
+            }),
+            "the commit signal reports the real ipfs:// URL"
+        );
+        h.on_page_finished(&loaded);
+        assert_eq!(
+            b.poll_event(),
+            Some(LoadEvent::Finished {
+                url: format!("ipfs://{CID_V1}/")
+            })
+        );
+        assert_eq!(
+            b.current_url().as_deref(),
+            Some(format!("ipfs://{CID_V1}/").as_str())
+        );
+    }
+
+    #[test]
+    fn a_spa_client_side_nav_on_the_internal_origin_completes_end_to_end() {
+        // THE acceptance regression guard (the mobile half of field finding D):
+        // a SvelteKit `pushState` client nav, reported by the WebView as a
+        // same-document history change ON THE INTERNAL ORIGIN, must complete as
+        // a real navigation in the core: a `UrlChanged` event carrying the real
+        // `ipfs://` URL, the history entry + Back availability updated, the
+        // document's verified posture untouched, and Back returning to the
+        // site's root (surfaced again on the internal origin for the WebView).
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.navigate(&format!("ipfs://{CID_V1}/")).unwrap();
+        h.mark_content_verified();
+        settle(&mut b, &h);
+        assert_eq!(b.trust_posture(), TrustPosture::ContentVerified);
+
+        // The SvelteKit router's pushState to `/blog/` fires
+        // `doUpdateVisitedHistory` with the internal-origin URL.
+        h.on_url_changed(&internal("/blog/"));
+        assert_eq!(
+            b.poll_event(),
+            Some(LoadEvent::UrlChanged {
+                url: format!("ipfs://{CID_V1}/blog/")
+            }),
+            "the SPA nav reports the real ipfs:// URL, never the internal origin"
+        );
+        assert_eq!(
+            b.current_url().as_deref(),
+            Some(format!("ipfs://{CID_V1}/blog/").as_str())
+        );
+        assert_eq!(
+            b.trust_posture(),
+            TrustPosture::ContentVerified,
+            "a same-document nav keeps the document's established posture"
+        );
+        assert!(b.can_go_back(), "the SPA nav pushed a history entry");
+
+        // Back returns to the site root, surfaced to the WebView on the
+        // internal origin again.
+        b.go_back();
+        assert_eq!(
+            h.take_pending_load().as_deref(),
+            Some(internal("/").as_str())
+        );
+    }
+
+    #[test]
+    fn an_internal_origin_request_routes_to_the_ipfs_scheme_handler() {
+        // A page on the internal origin requests its subresources (and the
+        // client router fetches `__data.json`) as `https://<cid>.ipfs.werust
+        // .invalid/...`; `shouldInterceptRequest` routes every request through
+        // `resolve_scheme`, which must map the URL back and dispatch it to the
+        // `ipfs` handler as the real `ipfs://<cid>/...` request.
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        b.register_scheme_handler(
+            "ipfs",
+            Box::new(|request: SchemeRequest| {
+                Ok(SchemeResponse::ok("text/html", request.uri.into_bytes()))
+            }),
+        );
+
+        let resolved = h
+            .resolve_scheme(&internal("/blog/__data.json?x-sveltekit-invalidated=01"))
+            .expect("the internal origin routes to the ipfs handler")
+            .expect("the canned handler resolves");
+        assert_eq!(
+            resolved.body,
+            format!("ipfs://{CID_V1}/blog/__data.json?x-sveltekit-invalidated=01").into_bytes(),
+            "the handler sees the real ipfs:// request"
+        );
+        // A plain https request is still not intercepted.
+        assert!(h.resolve_scheme("https://example.com/x").is_none());
     }
 
     #[test]

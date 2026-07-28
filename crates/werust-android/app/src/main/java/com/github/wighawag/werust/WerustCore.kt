@@ -112,6 +112,20 @@ class WerustCore : AutoCloseable {
      */
     fun onUrlChanged(url: String) = nativeOnUrlChanged(handle, url)
 
+    /**
+     * Map a core URL to the URL the platform `WebView` should load:
+     * `ipfs://<cid>[/path]` -> the internal `https://<cid>.ipfs.werust.invalid`
+     * origin, anything else unchanged. SESSION-FREE (a pure native function),
+     * for the ONE call site that loads a URL the core did not surface as a
+     * pending load: the `_blank`/`window.open` transport in `onCreateWindow`,
+     * which hands its target to `WebView.loadUrl` directly. An unmapped
+     * `ipfs://` main-frame load would land the page on the System WebView's
+     * OPAQUE `ipfs://` origin, where Blink refuses `fetch(ipfs://…)` and
+     * `pushState` throws — the mobile no-navigation root cause (task
+     * `mobile-ronan-eth-buttons-no-navigation`).
+     */
+    fun toWebViewUrl(url: String): String = nativeToWebViewUrl(url)
+
     /** The current chrome the Activity paints (URL bar, nav enablement, status). */
     fun chrome(): Chrome = Chrome.fromJson(nativeChromeJson(handle))
 
@@ -444,6 +458,7 @@ class WerustCore : AutoCloseable {
     private external fun nativeOnPageFinished(handle: Long, url: String)
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)
     private external fun nativeOnUrlChanged(handle: Long, url: String)
+    private external fun nativeToWebViewUrl(url: String): String
     private external fun nativeChromeJson(handle: Long): String
     private external fun nativeDebugJson(handle: Long): String
     private external fun nativeDebugClear(handle: Long)

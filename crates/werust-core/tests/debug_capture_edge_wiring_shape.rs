@@ -168,6 +168,78 @@ fn every_platform_captures_network_at_the_points_it_can_reach() {
 }
 
 #[test]
+fn the_main_frame_reconciliation_uses_the_one_shared_core_predicate() {
+    // Criterion 5 (verification/trust honest) + the store's DECISIONS.md Decision
+    // 4, as corrected by this task's Decision 5. The MAIN-DOCUMENT row takes the
+    // LOAD's own two-axis posture so the Network tab cannot contradict the trust
+    // indicator — which only works if each edge agrees on WHICH row that is.
+    //
+    // There is exactly ONE main-frame predicate in the codebase
+    // (`RedirectSink::is_main_frame`, re-exported as `BrowserShell::is_main_frame`),
+    // driven by the top-level URL the shell reports on every navigation and
+    // normalised through `frame_key`. Android is the one platform with a NATIVE
+    // answer (`isForMainFrame`) and uses it. Desktop and iOS have none, and must
+    // ASK the core rather than compare URL strings: the naive compares are all
+    // wrong (the chrome's url_text is the pinned ENS DISPLAY name, WebKit
+    // re-reports `ipfs://<cid>` authority-less, and a redirected main document
+    // keeps its pre-redirect URL).
+    assert!(
+        desktop_backend().contains("is_main_frame(&self.url)"),
+        "the desktop capture must ask the SHARED core main-frame predicate"
+    );
+    assert!(
+        !desktop_backend().contains("life.current_url() == Some(self.url"),
+        "no local URL compare may stand in for the shared predicate on desktop"
+    );
+
+    assert!(
+        ios_core().contains("self.shell.is_main_frame(url)"),
+        "the iOS core must reconcile the main-document row with the SHARED core \
+         predicate, since a WKURLSchemeTask carries no main-frame flag"
+    );
+    assert!(
+        !ios_controller().contains("core.chrome().url == url.absoluteString"),
+        "Swift must NOT decide main-frame by comparing against the chrome's \
+         DISPLAYED url: on an ENS load that is the pinned name (ronan.eth) while \
+         the request is ipfs://<cid>/…, so it never fires on exactly the page the \
+         reconciliation exists for"
+    );
+
+    assert!(
+        android_activity().contains("val mainFrame = request.isForMainFrame"),
+        "Android has the platform's OWN main-frame answer and must use it"
+    );
+}
+
+#[test]
+fn a_desktop_resource_is_recorded_once_from_finished_never_also_from_failed() {
+    // Criterion 5 again, from the other side. WebKit emits a failed resource's
+    // `failed` signal and then ALSO emits `finished` for it
+    // (`webkitWebResourceFailed` ends by calling `webkitWebResourceFinished`), so
+    // pushing from both recorded every failed load TWICE and the second row
+    // claimed the success the first disproved — stamping a failed, possibly
+    // hash-MISMATCHED `ipfs://` subresource `content-verified`.
+    let desktop = desktop_backend();
+    assert_eq!(
+        desktop.matches(".record(").count(),
+        1,
+        "exactly ONE push site per resource: the finished handler"
+    );
+    let failed_handler = desktop
+        .split_once("resource.connect_failed(")
+        .expect("the desktop capture connects a failed handler")
+        .1
+        .split_once("resource.connect_finished(")
+        .expect("the failed handler precedes the single finished push")
+        .0;
+    assert!(
+        !failed_handler.contains(".record(") && failed_handler.contains("failed.set(true)"),
+        "connect_failed must only FLAG the failure for the single finished push \
+         to read, never push a row of its own"
+    );
+}
+
+#[test]
 fn android_capture_never_goes_through_the_session_lock() {
     // Criterion 3, THE ANR GUARD (spec user story 4). `onConsoleMessage` runs on
     // the Android UI THREAD, while `resolve_ipfs` can hold the session lock for

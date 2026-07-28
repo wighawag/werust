@@ -260,18 +260,35 @@ impl WebViewRenderer {
     /// # The honest per-request posture (ADR-0006)
     ///
     /// * A SUB-RESOURCE carries the posture of what that ONE request actually did:
-    ///   an `ipfs://` resource that FINISHED came back through the hash-verified
-    ///   scheme handler (a mismatch fails the request, which lands on `failed`
-    ///   instead), so it is `content-verified`; everything else — an `https://`
-    ///   subresource, a `werust://` internal page, an `ipfs://` request that failed
-    ///   — is `unverified-origin`. The rule itself is the core's shared
+    ///   an `ipfs://` resource that came back WITHOUT failing went through the
+    ///   hash-verified scheme handler, so it is `content-verified`; everything
+    ///   else — an `https://` subresource, a `werust://` internal page, an
+    ///   `ipfs://` request that FAILED (a hash mismatch fails the request) — is
+    ///   `unverified-origin`. The rule itself is the core's shared
     ///   [`request_trust_posture`], never re-derived here.
     /// * The MAIN DOCUMENT instead takes the LOAD's OWN posture from the shared
     ///   lifecycle (the same fact the chrome trust indicator paints), so the
     ///   Network tab cannot show `content-verified` for the page row while the
     ///   indicator shows the louder `name-via-trusted-rpc` on an ENS-named page
     ///   (ADR-0006's two-axis rule; the store's DECISIONS.md Decision 4 assigns
-    ///   this obligation here).
+    ///   this obligation here). WHICH resource is the main document is answered by
+    ///   the core's ONE shared main-frame predicate (the `_redirects`
+    ///   [`RedirectSink`](werust_core::ipfs::RedirectSink) the shell already drives
+    ///   with every top-level navigation), never by a raw URL compare here — the
+    ///   naive compares miss the WebKit authority-less `ipfs:///<cid>` form and a
+    ///   post-redirect URL, and comparing against the chrome's DISPLAYED url would
+    ///   never fire at all on an ENS page (the name is pinned there).
+    ///
+    /// # ONE request, ONE row
+    ///
+    /// WebKit emits a resource's `failed` signal and then ALSO emits `finished`
+    /// (`webkitWebResourceFailed` ends by calling `webkitWebResourceFinished`), so
+    /// pushing from both would record every failed load TWICE, and the second row
+    /// would claim the success the first just disproved — stamping a failed,
+    /// possibly hash-MISMATCHED `ipfs://` subresource `content-verified`. `failed`
+    /// therefore only FLAGS the failure on the shared per-resource state;
+    /// `finished` is the single push, and it reads that flag for the honest
+    /// outcome.
     ///
     /// # Threading
     ///
@@ -291,7 +308,11 @@ impl WebViewRenderer {
     /// [`CAPTURE_BRIDGE`]: werust_core::debug::CAPTURE_BRIDGE
     /// [`network_entry`]: werust_core::debug::network_entry
     /// [`request_trust_posture`]: werust_core::debug::request_trust_posture
-    pub fn install_debug_capture(&mut self, capture: werust_core::debug::DebugCapture) {
+    pub fn install_debug_capture(
+        &mut self,
+        capture: werust_core::debug::DebugCapture,
+        redirects: werust_core::ipfs::RedirectSink,
+    ) {
         use werust_core::debug::{console_shim, route_capture_message, CAPTURE_BRIDGE};
 
         // --- CONSOLE: the shared injected shim over its own capture channel ---
@@ -321,33 +342,35 @@ impl WebViewRenderer {
                     .map(|m| m.to_string())
                     .unwrap_or_else(|| "GET".to_string());
                 let url = request.uri().map(|u| u.to_string()).unwrap_or_default();
-                let started = std::time::Instant::now();
 
-                let finished_state = ResourceCaptureState {
+                // ONE state per resource, SHARED by both signals: `failed` only
+                // FLAGS the failure, `finished` performs the single push. (`Rc` +
+                // `Cell` rather than an `Arc`/atomic: both signals fire on the one
+                // GTK thread this whole wiring lives on.)
+                let state = std::rc::Rc::new(ResourceCaptureState {
                     capture: capture.clone(),
                     life: life_for_posture.clone(),
-                    method: method.clone(),
-                    url: url.clone(),
-                    started,
-                };
-                resource.connect_finished(move |resource| {
-                    // A FINISHED `ipfs://` resource came back through the
-                    // hash-verified scheme handler (a verify failure fails the
-                    // request, landing on `failed` below), so this is the ONE place
-                    // that may report the content-verified posture.
-                    finished_state.record(Some(resource), true);
-                });
-
-                let failed_state = ResourceCaptureState {
-                    capture: capture.clone(),
-                    life: life_for_posture.clone(),
+                    redirects: redirects.clone(),
                     method,
                     url,
-                    started,
-                };
-                resource.connect_failed(move |resource, _error| {
-                    // A FAILED request proved nothing: never verified.
-                    failed_state.record(Some(resource), false);
+                    started: std::time::Instant::now(),
+                    failed: std::cell::Cell::new(false),
+                });
+
+                let failed_state = state.clone();
+                resource.connect_failed(move |_resource, _error| {
+                    // FLAG ONLY, never a push: WebKit emits `failed` and then ALSO
+                    // emits `finished` for the same resource, so pushing here would
+                    // record the request twice and the second row would claim the
+                    // success this one just disproved.
+                    failed_state.failed.set(true);
+                });
+
+                resource.connect_finished(move |resource| {
+                    // The SINGLE push for this resource, at the point WebKit is done
+                    // with it either way. A request that failed proved nothing, so
+                    // it is never reported content-verified.
+                    state.record(Some(resource));
                 });
             });
     }
@@ -712,25 +735,42 @@ impl WebViewRenderer {
 /// It deliberately holds NO [`WebView`] clone: this value lives inside a signal
 /// closure on a `WebResource` the view itself owns, so retaining the view here
 /// would keep it alive from an object it owns for the life of every resource.
-/// The main-document decision reads the shared lifecycle instead, which is the
-/// SAME current-URL fact the chrome paints and is already shared into the view's
-/// own load signals.
+/// The posture comes from the shared lifecycle instead (the SAME fact the chrome
+/// paints, already shared into the view's own load signals), and WHICH resource
+/// is the main document comes from the core's one shared main-frame predicate on
+/// the `_redirects` sink.
+///
+/// ONE of these is shared (via an `Rc`) by BOTH the `failed` and the `finished`
+/// handler, because WebKit emits both for a failed resource: `failed` sets
+/// [`failed`](ResourceCaptureState::failed) and `finished` performs the single
+/// push, so one request produces exactly one honest row.
 struct ResourceCaptureState {
     capture: werust_core::debug::DebugCapture,
     life: SharedLifecycle,
+    /// The `_redirects` sink the shell drives with every top-level navigation:
+    /// the codebase's ONE main-frame predicate, reused here rather than
+    /// re-derived (see [`WebViewRenderer::install_debug_capture`]).
+    redirects: werust_core::ipfs::RedirectSink,
     method: String,
     url: String,
     started: std::time::Instant,
+    /// Set by the `failed` handler; READ by the `finished` handler, which is the
+    /// only pusher. A `Cell` (not an atomic) because both signals fire on the one
+    /// GTK thread.
+    failed: std::cell::Cell<bool>,
 }
 
 impl ResourceCaptureState {
-    /// Push this resource's [`NetworkEntry`] into the shared store.
+    /// Push this resource's ONE [`NetworkEntry`] into the shared store.
     ///
-    /// `finished_ok` is whether the resource COMPLETED (a failed request proved
-    /// nothing, so it can never be reported verified). Runs on the GTK loop the
+    /// Called only from the `finished` handler, which WebKit emits for every
+    /// resource including a failed one; the honest outcome is read from
+    /// [`failed`](ResourceCaptureState::failed), because a request that failed
+    /// proved nothing and can never be reported verified. Runs on the GTK loop the
     /// signal fires on and does only a bounded push; the decision itself is the
     /// pure, display-free [`resource_network_entry`].
-    fn record(&self, resource: Option<&webkit6::WebResource>, finished_ok: bool) {
+    fn record(&self, resource: Option<&webkit6::WebResource>) {
+        let finished_ok = !self.failed.get();
         let response: Option<webkit6::URIResponse> =
             resource.and_then(webkit6::WebResource::response);
         let status = response.as_ref().map(webkit6::URIResponse::status_code);
@@ -743,12 +783,15 @@ impl ResourceCaptureState {
 
         // The MAIN DOCUMENT takes the LOAD's own (two-axis) posture so the Network
         // tab cannot contradict the chrome trust indicator on the same screen;
-        // every other row keeps its honest per-request posture. Identified by URL
-        // against the shared lifecycle's current load — the same fact the chrome
-        // paints, so the two surfaces agree by construction.
-        let life = self.life.borrow();
-        let load_posture = (life.current_url() == Some(self.url.as_str())).then(|| life.posture());
-        drop(life);
+        // every other row keeps its honest per-request posture. WHICH resource is
+        // the main document is the core's ONE shared predicate (the `_redirects`
+        // sink the shell drives with every top-level navigation), normalized so it
+        // survives the WebKit authority-less `ipfs:///<cid>` form and a
+        // query/fragment — never a raw URL compare here.
+        let load_posture = self
+            .redirects
+            .is_main_frame(&self.url)
+            .then(|| self.life.borrow().posture());
 
         let entry = resource_network_entry(&ResourceLoadFacts {
             method: &self.method,

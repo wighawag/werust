@@ -639,13 +639,18 @@ final class IpfsSchemeHandler: NSObject, WKURLSchemeHandler {
         // whether the bytes actually came back hash-verified, which the page-side
         // fetch/XHR shim never could (and which is why that shim deliberately
         // SKIPS `ipfs:`/`werust:` — it would otherwise add a second, contradicting
-        // row claiming the weaker unverified posture). A custom-scheme request is
-        // always a sub-resource or the main document; `mainFrame` is decided by
-        // whether it is the URL the core currently has in flight (the same fact the
-        // chrome paints), so the main-document row can take the load's own posture.
+        // row claiming the weaker unverified posture).
+        //
+        // `mainFrame: false` because a `WKURLSchemeTask` carries NO main-frame
+        // flag: the core decides, with the ONE shared main-frame predicate driven
+        // by the top-level URL the shell reports on every navigation. Swift must
+        // NOT compare here — the obvious compare against `chrome().url` is against
+        // the DISPLAY identity, which on an ENS load is the pinned `ronan.eth`
+        // while this task's URL is `ipfs://<cid>/…`, so it would never fire on
+        // exactly the page the reconciliation exists for.
         // Capture is READ-ONLY: it does not change what is served below.
         let method = urlSchemeTask.request.httpMethod ?? "GET"
-        let mainFrame = core.chrome().url == url.absoluteString
+        let mainFrame = false
         switch core.resolveIpfs(url.absoluteString) {
         case .some(.success(let mimeType, let body, let status)):
             core.captureNetwork(
@@ -734,8 +739,12 @@ final class WerustSchemeHandler: NSObject, WKURLSchemeHandler {
         // reachable stream. It is honestly UNVERIFIED: `werust://settings` is an
         // internal chrome page, NOT hash-verified content (the same distinction the
         // trust indicator makes).
+        //
+        // `mainFrame: false` for the same reason as [IpfsSchemeHandler]: a scheme
+        // task carries no main-frame flag, so the CORE decides with its one shared
+        // predicate rather than Swift comparing against the display identity.
         let method = urlSchemeTask.request.httpMethod ?? "GET"
-        let mainFrame = core.chrome().url == url.absoluteString
+        let mainFrame = false
         switch core.applySettings(url.absoluteString) {
         case .some(.success(let mimeType, let body, _)):
             core.captureNetwork(

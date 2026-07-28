@@ -561,8 +561,16 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // into the shell via `with_debug_capture`, exactly as the redirect sink is
     // shared — both clones are the SAME store, so the debug view renders what the
     // hooks captured.
+    //
+    // The `_redirects` sink is handed in too: it is the codebase's ONE main-frame
+    // predicate (the shell reports every top-level navigation into it), which the
+    // network capture reads to decide which row is the main-document row. A raw
+    // URL compare would miss the WebKit authority-less `ipfs:///<cid>` form, and
+    // comparing against the chrome's DISPLAYED url would never fire on an ENS page
+    // at all (the name is pinned there) — exactly the page the reconciliation
+    // exists for.
     let debug_capture = werust_core::debug::DebugCapture::new();
-    backend.install_debug_capture(debug_capture.clone());
+    backend.install_debug_capture(debug_capture.clone(), redirects.clone());
     // Capture the live WebKitGTK view BEFORE the backend is boxed behind the
     // `Renderer` seam, so the shell can open the WEB inspector (F12) on it. The
     // web inspector is a WebKitGTK-specific surface (not part of the cross-backend

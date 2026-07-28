@@ -491,8 +491,10 @@ description = "CAPTURE the page's console messages and network requests into wer
 # sees engine-emitted output, unwrappable by no page). Network reach likewise
 # differs by what each platform exposes, and this is the asymmetry the guard
 # exists to surface:
-#   * desktop  — `WebView::connect_resource_load_started` + per-resource
-#                finished/failed (`install_debug_capture` in
+#   * desktop  — `WebView::connect_resource_load_started`, pushing ONE row per
+#                resource from `finished` (its `failed` handler only FLAGS the
+#                outcome, because WebKit emits failed AND THEN finished for the
+#                same resource) (`install_debug_capture` in
 #                crates/webview-renderer/src/backend.rs, wired from
 #                crates/werust/src/main.rs). Sees EVERY resource, https included,
 #                which the ipfs:// scheme handler never does.
@@ -512,6 +514,12 @@ description = "CAPTURE the page's console messages and network requests into wer
 #                docs/spikes/debug-console-network-capture-per-platform/DECISIONS.md
 #                (Decision 3), so `implemented` here means "the capture points this
 #                platform CAN wire are wired", not "identical reach".
+# WHICH row is the main document (the one that takes the load's own two-axis
+# posture) comes from the codebase's ONE main-frame predicate on desktop and iOS
+# — `BrowserShell::is_main_frame` over the `_redirects` sink, driven by the
+# top-level URL the shell reports on every navigation — never a per-edge URL
+# compare. Android is the one platform with a NATIVE answer
+# (`WebResourceRequest.isForMainFrame`) and uses it. See DECISIONS.md Decision 5.
 # Capture runs where the platform event already runs and does only a bounded
 # ring-buffer insert; on Android it pushes through a CLONED DebugCapture handle
 # and NEVER the session lock, because `onConsoleMessage` is on the UI thread while

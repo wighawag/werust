@@ -43,17 +43,26 @@ Where two capture points could see the same request, the one that knows its real
 - The page-side `fetch`/`XHR` shim SKIPS `ipfs:` / `werust:` URLs (in JS).
 - The iOS `didFinish` main-frame capture skips the same schemes (`isCoreServedScheme`).
 - Desktop does NOT inject the `fetch`/`XHR` shim at all: its resource-load signals already see every resource, including the internal loads the shim cannot, so the shim would only double-record a subset.
+- **Desktop pushes from `finished` ONLY, never from `failed`.** WebKit emits a failed resource's `failed` signal and then ALSO emits `finished` for the same resource (`webkitWebResourceFailed` ends by calling `webkitWebResourceFinished`; the GTK docs state `failed` is emitted *before* `finished`). Connecting a push to both recorded every failed load twice, and the second row passed "finished OK" — which stamped a FAILED, possibly hash-MISMATCHED `ipfs://` subresource `content-verified`. So `failed` now only sets a failure flag on the shared per-resource state, and `finished` performs the single push, reading that flag for the honest outcome.
 
-- **Why.** A second row from a point that does not know the outcome would claim the weaker `unverified-origin` posture for a request the handler honestly recorded as `content-verified` — two contradicting rows for one request, in the surface whose whole job is being honest about trust.
-- **What it touches.** Any future capture point must ask "does a point that knows more already record this?" before adding a row.
+- **Why.** A second row from a point that does not know the outcome would claim the weaker `unverified-origin` posture for a request the handler honestly recorded as `content-verified` — two contradicting rows for one request, in the surface whose whole job is being honest about trust. The desktop `failed`+`finished` case was the same defect pointing the other, worse way: the duplicate claimed MORE trust than the truth.
+- **What it touches.** Any future capture point must ask "does a point that knows more already record this?" before adding a row, and "can this signal fire twice for one request?" before pushing from it.
+- **Pinned by** `a_failed_desktop_resource_pushes_exactly_one_row_and_it_is_never_verified` (webview-renderer).
 
 ## Decision 5: the MAIN-DOCUMENT row takes the LOAD's own posture; sub-resources keep their own
 
 Every capture point flags the main-document request, and that row's posture is overwritten from the load's posture (the same fact the chrome trust indicator paints). Sub-resource rows keep the per-request posture `request_trust_posture` derives.
 
 - **Why.** This is the obligation the store's DECISIONS.md Decision 4 explicitly handed to this task (ADR-0006's two-axis rule): `request_trust_posture` returns a plain per-request posture and does not apply the loudest-warning rule, so on an ENS-named page the Network tab would show `content-verified` for the page row while the indicator shows `name-via-trusted-rpc` — two surfaces contradicting each other on one screen.
-- **How each platform identifies it.** Desktop: `WebView::main_resource()`, falling back to the lifecycle's current URL. Android: `WebResourceRequest.isForMainFrame` (the platform's own answer). iOS: the URL matching the core's current chrome URL, plus the `didFinish` navigation which is main-frame by definition.
-- **What it touches.** The debug-VIEW tasks may rely on "the main-document row and the trust indicator always agree".
+- **How each platform identifies it — ONE shared predicate, not three.** Where the platform gives a native answer, that answer is used; where it does not, the capture asks the core's single main-frame predicate rather than comparing URL strings itself.
+  - **Android**: `WebResourceRequest.isForMainFrame`, the platform's own answer (`shouldInterceptRequest` is handed it directly). Nothing to infer.
+  - **Desktop and iOS**: `RedirectSink::is_main_frame`, re-exported as `BrowserShell::is_main_frame`. It is driven by the top-level URL the shell already reports on every navigation (`note_navigation`, for the `_redirects` 3xx gate) and normalised through `frame_key`. Desktop's resource-load capture calls it with the resource URL; iOS's scheme handlers pass `main_frame: false` (a `WKURLSchemeTask` carries no such flag) and the core applies the predicate. iOS's `WKNavigationDelegate` `didFinish` still passes `main_frame: true`, because a main-frame navigation IS the platform's native answer.
+- **Why one shared predicate** (this replaced two per-edge string compares, and is the fix for a Gate-2 defect):
+  - Comparing against the chrome's **displayed** URL (`ChromeState.url_text`) is comparing against the DISPLAY IDENTITY. On an ENS load the shell pins the name, so `url_text` is `ronan.eth` while the request is `ipfs://<cid>/index.html`: the compare never fired on exactly the page the reconciliation was mandated for, and the Network tab showed `content-verified` beside a `name-via-trusted-rpc` indicator on the same screen.
+  - Comparing against a raw URL string misses WebKit's authority-less `ipfs:///<cid>` re-report and a request's query/fragment; `frame_key` normalises both away (that is why it exists).
+  - Comparing against the lifecycle's current URL also drifts for a redirected main document, whose request URL is the pre-redirect one while the lifecycle already holds the final one.
+- **What it touches.** Any future surface needing "is this the main frame?" must call the shared predicate, not mint a fourth answer. The debug-VIEW tasks may rely on "the main-document row and the trust indicator always agree".
+- **Pinned by** `the_desktop_main_frame_check_is_the_shared_core_predicate_not_a_local_compare` (webview-renderer) and `the_ios_scheme_handler_row_is_reconciled_by_the_shared_core_main_frame_predicate` (werust-ios-core).
 
 ## Decision 6: Android capture pushes OFF the session lock (the ANR guard)
 

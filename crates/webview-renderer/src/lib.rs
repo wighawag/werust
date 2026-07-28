@@ -1626,6 +1626,87 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_desktop_resource_pushes_exactly_one_row_and_it_is_never_verified() {
+        // WebKit emits a failed resource's `failed` signal AND THEN its `finished`
+        // signal (`webkitWebResourceFailed` ends by calling
+        // `webkitWebResourceFinished`). Pushing from both recorded every failed
+        // load TWICE, and the `finished` row passed `finished_ok = true` — which
+        // stamped a FAILED, possibly hash-MISMATCHED `ipfs://` subresource
+        // `content-verified` in the very surface whose job is trust honesty.
+        //
+        // So `failed` must only FLAG, and `finished` must be the single push that
+        // reads the flag. Pinned on the source because the double-push lives in the
+        // signal wiring, which needs a display to run.
+        let backend = include_str!("backend.rs");
+        let failed_handler = backend
+            .split_once("resource.connect_failed(")
+            .expect("the resource-load capture connects a failed handler")
+            .1;
+        let failed_body = failed_handler
+            .split_once("resource.connect_finished(")
+            .expect("the failed handler precedes the single finished push")
+            .0;
+        assert!(
+            !failed_body.contains(".record("),
+            "connect_failed must NEVER push a row: WebKit emits finished for a \
+             failed resource too, so the request would be recorded twice"
+        );
+        assert!(
+            failed_body.contains("failed.set(true)"),
+            "connect_failed FLAGS the failure for the single finished push to read"
+        );
+        assert_eq!(
+            backend.matches(".record(").count(),
+            1,
+            "exactly ONE push site for a resource: the finished handler"
+        );
+        // And the honest outcome that single push then reports for a failed
+        // resource is UNVERIFIED, whatever its scheme looked like.
+        let entry = crate::backend::resource_network_entry(&crate::backend::ResourceLoadFacts {
+            method: "GET",
+            url: "ipfs://bafy/tampered.png",
+            status: None,
+            mime: "",
+            size: None,
+            finished_ok: false,
+            load_posture: None,
+            timestamp: 0,
+            duration: 0,
+        });
+        assert_eq!(entry.trust, TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn the_desktop_main_frame_check_is_the_shared_core_predicate_not_a_local_compare() {
+        // ONE main-frame concept in the codebase. The desktop capture reuses the
+        // core's `RedirectSink::is_main_frame` (driven by the top-level URL the
+        // shell reports via `note_navigation`, normalized through `frame_key`)
+        // rather than comparing URL strings itself. The naive compares are all
+        // subtly wrong: the lifecycle's current URL misses a redirected main
+        // document and the WebKit authority-less `ipfs:///<cid>` form, and the
+        // chrome's DISPLAYED url is the pinned ENS name on exactly the page the
+        // reconciliation exists for.
+        let backend = include_str!("backend.rs");
+        assert!(
+            backend.contains("redirects\n            .is_main_frame(&self.url)")
+                || backend.contains("redirects.is_main_frame(&self.url)"),
+            "the desktop capture asks the SHARED core main-frame predicate"
+        );
+        assert!(
+            !backend.contains("life.current_url() == Some(self.url"),
+            "no local URL compare stands in for the shared predicate"
+        );
+        // And the predicate itself survives the forms desktop actually sees.
+        let sink = werust_core::ipfs::RedirectSink::new();
+        sink.note_navigation("ipfs://bafypage/index.html");
+        assert!(
+            sink.is_main_frame("ipfs:///bafypage/index.html"),
+            "the WebKit authority-less form is the SAME document"
+        );
+        assert!(!sink.is_main_frame("ipfs://bafypage/app.css"));
+    }
+
+    #[test]
     fn desktop_console_capture_uses_the_one_shared_shim_and_its_own_channel() {
         // Desktop and iOS have no native console callback, so both inject the SAME
         // core shim over the SAME dedicated capture channel (never the EIP-1193
@@ -1666,7 +1747,7 @@ mod tests {
         let mut r = WebViewRenderer::new().expect("gtk init on a desktop session");
         let capture = werust_core::debug::DebugCapture::new();
         let before = r.trust_posture();
-        r.install_debug_capture(capture.clone());
+        r.install_debug_capture(capture.clone(), werust_core::ipfs::RedirectSink::new());
         assert_eq!(
             r.trust_posture(),
             before,

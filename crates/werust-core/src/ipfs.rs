@@ -225,7 +225,29 @@ impl RedirectSink {
     /// (nothing reported yet) is answered `false`: a sink nobody drives cannot
     /// navigate anything, which is the pre-3xx fail-closed behaviour rather than a
     /// guess.
-    pub(crate) fn is_main_frame(&self, uri: &str) -> bool {
+    ///
+    /// # The ONE main-frame concept in the codebase
+    ///
+    /// Public (and re-exported through
+    /// [`BrowserShell::is_main_frame`](crate::BrowserShell::is_main_frame)) because
+    /// the 3xx redirect gate is NOT the only place that has to answer "is this
+    /// request the top-level document?": the debug Network capture
+    /// (`debug-console-network-capture-per-platform`) needs exactly the same
+    /// answer to decide which row takes the LOAD's own two-axis posture (ADR-0006)
+    /// instead of a plain per-request one.
+    ///
+    /// Every such caller MUST come here rather than compare URL strings itself,
+    /// because the naive compares are all subtly wrong:
+    ///
+    /// * against the CHROME's displayed URL: on an ENS load the shell PINS the
+    ///   name (`url_override`), so the display identity is `ronan.eth` while the
+    ///   intercepted request is `ipfs://<cid>/…` — the compare never matches and
+    ///   the page row silently degrades to a sub-resource posture;
+    /// * against a raw string: WebKit re-reports `ipfs://<cid>` as the
+    ///   authority-LESS `ipfs:///<cid>`, and a request may carry a query/fragment;
+    ///   [`frame_key`] normalizes both away.
+    #[must_use]
+    pub fn is_main_frame(&self, uri: &str) -> bool {
         let key = frame_key(uri);
         self.chain
             .lock()

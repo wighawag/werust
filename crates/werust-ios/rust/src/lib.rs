@@ -272,9 +272,27 @@ impl CoreSession {
     /// ones that may report a verified posture: `verified` must say whether THIS
     /// request's bytes actually came back through the hash-verified
     /// content-addressed path (a successful `ipfs://` resolution), never whether
-    /// the URL looks content-addressed (ADR-0006). `main_frame` marks the
-    /// main-document row, which additionally takes the LOAD's own two-axis posture
-    /// so the Network tab cannot contradict the chrome trust indicator.
+    /// the URL looks content-addressed (ADR-0006).
+    ///
+    /// # Which row is the main document
+    ///
+    /// The main-document row additionally takes the LOAD's own two-axis posture,
+    /// so the Network tab cannot contradict the chrome trust indicator on the same
+    /// screen. `main_frame` says only that the CALLER natively knows this is the
+    /// main document (the `WKNavigationDelegate`, which is handed the main frame's
+    /// own URL); a `WKURLSchemeHandler` task carries no such flag, so it passes
+    /// `false` and the decision is made HERE, by the core's ONE shared main-frame
+    /// predicate ([`BrowserShell::is_main_frame`], driven by the top-level URL the
+    /// shell reports into the `_redirects` sink on every navigation).
+    ///
+    /// Swift MUST NOT compare URLs itself. The obvious compare — the scheme-handler
+    /// URL against `chrome().url` — is against the DISPLAY identity: on an ENS load
+    /// the shell pins the name, so `url_text` is `ronan.eth` while the request is
+    /// `ipfs://<cid>/…` and the compare never fires on exactly the page the
+    /// reconciliation was mandated for (the tab would show `content-verified`
+    /// beside a `name-via-trusted-rpc` indicator). The shared predicate normalizes
+    /// through `frame_key`, so it also survives the authority-less `ipfs:///<cid>`
+    /// form and a query/fragment.
     ///
     /// A `0` status/size means unknown and stays honestly absent in the store.
     // The flat argument list MIRRORS the C-ABI export Swift calls
@@ -300,7 +318,7 @@ impl CoreSession {
             verified,
             epoch_millis(),
         );
-        if main_frame {
+        if main_frame || self.shell.is_main_frame(url) {
             entry = entry.with_trust(self.shell.chrome().trust_posture);
         }
         self.shell.debug_capture().push_network(entry);
@@ -1088,8 +1106,11 @@ mod ffi {
     ///
     /// `verified` must reflect what the request ACTUALLY did (a successful
     /// `ipfs://` resolution through the hash-verified path), never what the URL
-    /// looks like; `main_frame` marks the main-document row, which takes the
-    /// load's own two-axis posture. A `0` status/size means unknown.
+    /// looks like; `main_frame` says only that the CALLER natively knows this is
+    /// the main document (the nav delegate) — a scheme task passes `false` and the
+    /// core decides with its shared main-frame predicate. Either way the
+    /// main-document row takes the load's own two-axis posture. A `0` status/size
+    /// means unknown.
     ///
     /// # Safety
     /// `session` is a live handle; `method`, `url` and `mime` are valid
@@ -1695,6 +1716,72 @@ mod tests {
             s.debug_capture().network()[0].trust,
             s.chrome().trust_posture,
             "the main-document row mirrors the chrome's posture exactly"
+        );
+    }
+
+    #[test]
+    fn the_ios_scheme_handler_row_is_reconciled_by_the_shared_core_main_frame_predicate() {
+        // The requeue's Gate-2 fix. A `WKURLSchemeTask` carries NO main-frame flag,
+        // so Swift used to compute one by comparing the task URL against
+        // `chrome().url` — the DISPLAY identity. That compare is wrong in exactly
+        // the cases it was mandated for: on an ENS load the shell pins the name
+        // there (`ronan.eth`) while the task URL is `ipfs://<cid>/…`, and WebKit
+        // re-reports the same document in the authority-LESS `ipfs:///<cid>` form.
+        // Either way the compare never fires, and the Network tab would show a
+        // plain `content-verified` page row beside a louder indicator.
+        //
+        // So Swift passes `main_frame: false` and the CORE decides, with the ONE
+        // shared predicate driven by the top-level URL the shell already reports on
+        // every navigation (normalized through `frame_key`).
+        let mut s = CoreSession::new();
+        assert!(s.navigate("ipfs://bafypage/index.html"));
+        s.backend.mark_content_verified();
+        let url = s.take_pending_load().expect("the ipfs load is pending");
+        s.on_page_committed(&url);
+        s.on_page_finished(&url);
+
+        assert_ne!(
+            s.chrome().url_text,
+            "ipfs:///bafypage/index.html",
+            "the display identity is NOT the form a scheme task sees, which is \
+             exactly why Swift may not compare against it"
+        );
+
+        // The AUTHORITY-LESS form of the very same document, as a scheme task sees
+        // it — with `main_frame: false`, exactly as Swift now calls it, and with
+        // `verified: false` so the per-request posture alone would be the weaker
+        // `unverified-origin`: only the reconciliation can lift it.
+        s.capture_network(
+            "GET",
+            "ipfs:///bafypage/index.html",
+            200,
+            "text/html",
+            12,
+            false,
+            false,
+        );
+        // …and a genuine sub-resource of it, which must NOT be reconciled.
+        s.capture_network(
+            "GET",
+            "ipfs://bafypage/app.css",
+            200,
+            "text/css",
+            4,
+            true,
+            false,
+        );
+
+        let entries = s.debug_capture().network();
+        assert_eq!(
+            entries[0].trust,
+            s.chrome().trust_posture,
+            "the main-document row takes the LOAD's posture even though Swift \
+             passed main_frame: false and the URL form differs from the display one"
+        );
+        assert_eq!(
+            entries[1].trust,
+            renderer::TrustPosture::ContentVerified,
+            "a sub-resource keeps its own honest per-request posture"
         );
     }
 

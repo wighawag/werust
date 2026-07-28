@@ -906,6 +906,27 @@ impl BrowserShell {
         &self.debug
     }
 
+    /// Whether a request for `uri` is the MAIN FRAME (the top-level document this
+    /// shell is loading) rather than a sub-resource of it.
+    ///
+    /// The ONE main-frame predicate in the codebase, re-exported from the
+    /// [`RedirectSink`](crate::ipfs::RedirectSink::is_main_frame) the 3xx gate
+    /// already drives: the shell reports every top-level navigation into the sink
+    /// (`note_navigation`), so the sink holds the authoritative top-level URL,
+    /// normalized through `frame_key` so the WebKit authority-less `ipfs:///<cid>`
+    /// form and a query/fragment still match.
+    ///
+    /// The debug NETWORK capture calls this to decide which row is the
+    /// main-document row (which takes the LOAD's own two-axis posture so the
+    /// Network tab cannot contradict the trust indicator, ADR-0006). It must NOT
+    /// compare against [`ChromeState::url_text`], which is the DISPLAY identity:
+    /// on an ENS load the shell pins the name there, so the compare would never
+    /// fire on exactly the page it was mandated for.
+    #[must_use]
+    pub fn is_main_frame(&self, uri: &str) -> bool {
+        self.redirects.is_main_frame(uri)
+    }
+
     /// The capture store as the debug JSON document each edge's debug view
     /// renders ([`crate::debug::debug_json`]).
     ///

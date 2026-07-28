@@ -250,9 +250,18 @@ final class WerustCore {
     /// [verified] must say whether THIS request's bytes really came back through
     /// the hash-verified content-addressed path — never whether the URL merely
     /// looks content-addressed — so the Network tab can never imply a request was
-    /// trusted that was not (ADR-0006). [mainFrame] marks the main-document row,
-    /// which takes the LOAD's own posture so the tab cannot contradict the trust
-    /// indicator. A `0` [status]/[size] means unknown.
+    /// trusted that was not (ADR-0006).
+    ///
+    /// [mainFrame] says only that the CALLER natively knows this is the main
+    /// document (the `WKNavigationDelegate`, handed the main frame's own URL). A
+    /// `WKURLSchemeTask` carries no such flag and passes `false`: the CORE then
+    /// decides with its ONE shared main-frame predicate. Do NOT compare URLs in
+    /// Swift — the obvious compare against `chrome().url` is against the DISPLAY
+    /// identity, which on an ENS load is the pinned name while the request is
+    /// `ipfs://<cid>/…`, so it never fires on the page the reconciliation exists
+    /// for. Either way the main-document row takes the LOAD's own posture, so the
+    /// tab cannot contradict the trust indicator. A `0` [status]/[size] means
+    /// unknown.
     func captureNetwork(
         method: String,
         url: String,

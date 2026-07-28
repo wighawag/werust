@@ -186,10 +186,14 @@ void werust_ios_capture_script_message(WerustCoreSession *session,
  * WKURLSchemeHandler custom-scheme tasks and the WKNavigationDelegate main-frame
  * navigations. `verified` must reflect what the request ACTUALLY did (a
  * successful ipfs:// resolution through the hash-verified path), never what the
- * URL looks like (ADR-0006); `main_frame` marks the main-document row, which
- * takes the load's own two-axis posture so the Network tab cannot contradict the
- * trust indicator. A 0 status/size means unknown (kept honestly absent, never a
- * fabricated 0). `method` / `url` / `mime` are borrowed C strings. */
+ * URL looks like (ADR-0006); `main_frame` says only that the CALLER natively
+ * knows this is the main document (the nav delegate) — a scheme task carries no
+ * such flag and passes false, and the core then decides with its ONE shared
+ * main-frame predicate rather than Swift comparing against the pinned display
+ * URL. Either way the main-document row takes the load's own two-axis posture so
+ * the Network tab cannot contradict the trust indicator. A 0 status/size means
+ * unknown (kept honestly absent, never a fabricated 0). `method` / `url` /
+ * `mime` are borrowed C strings. */
 void werust_ios_capture_network(WerustCoreSession *session, const char *method,
                                 const char *url, uint16_t status,
                                 const char *mime, uint64_t size, bool verified,

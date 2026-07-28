@@ -69,3 +69,13 @@
 <!-- q7 fields: id=q7 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q8
+
+**'task:debug-console-network-capture-per-platform' was bounced — how should we proceed?**
+
+> transient infra: 429 {"type":"error","error":{"type":"rate_limit_error","message":"This request would exceed your account's rate limit. Please try again later."},"request_id":"req_011CdU5orU6qpth8Np1qF6Uf"}
+
+<!-- q8 fields: id=q8 kind=stuck -->
+
+**Your answer** (write below this line):

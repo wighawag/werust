@@ -4,6 +4,7 @@ slug: debug-view-console-network-tabs-desktop
 spec: in-app-debug-menu-console-and-network
 blockedBy: [debug-capture-store-console-and-network-in-core, general-browser-menu-with-version-and-debug-entry]
 covers: [1, 3]
+needsAnswers: true
 ---
 
 ## What to build

@@ -4,7 +4,6 @@ slug: debug-console-network-capture-per-platform
 spec: in-app-debug-menu-console-and-network
 blockedBy: [debug-capture-store-console-and-network-in-core]
 covers: [4, 5]
-needsAnswers: true
 ---
 
 ## What to build

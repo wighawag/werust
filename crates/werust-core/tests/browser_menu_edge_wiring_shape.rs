@@ -84,7 +84,7 @@ fn every_edge_has_a_menu_affordance_opening_a_native_menu_surface() {
         "desktop must open the menu in a GTK MenuButton + Popover"
     );
     assert!(
-        desktop.contains("toolbar.append(&build_menu_button(&window));"),
+        desktop.contains("toolbar.append(&build_menu_button(&window, &debug_view));"),
         "the desktop menu button must be in the toolbar"
     );
 
@@ -215,13 +215,16 @@ fn no_edge_hardcodes_a_version_string() {
 #[test]
 fn every_edge_routes_the_debug_item_to_an_open_debug_view_hook() {
     // Criterion 3: the Debug entry OPENS the debug view, wired to an
-    // open-debug-view HOOK the debug-view tasks fill (this menu task lands FIRST —
-    // those tasks are blockedBy it). Each edge must therefore have exactly one
-    // named hook, dispatched from the item's STABLE core id (never its label, which
-    // is display text).
+    // open-debug-view HOOK the debug-view tasks fill (this menu task landed FIRST —
+    // those tasks were blockedBy it; the desktop one has since filled its hook
+    // with the real tabbed view, guarded by the sibling
+    // `debug_view_desktop_wiring_shape.rs`). Each edge must therefore have exactly
+    // one named hook, dispatched from the item's STABLE core id (never its label,
+    // which is display text).
     let desktop = desktop_shell();
     assert!(
-        desktop.contains("fn open_debug_view(") && desktop.contains("open_debug_view(&window)"),
+        desktop.contains("fn open_debug_view(")
+            && desktop.contains("open_debug_view(&window, &debug_view)"),
         "desktop must route the Debug item to a named open_debug_view hook"
     );
     assert!(
@@ -250,20 +253,17 @@ fn every_edge_routes_the_debug_item_to_an_open_debug_view_hook() {
     );
 
     // The hook is a hook, not a silent no-op: until the view exists each edge says
-    // so, so the entry has an honest visible effect. (The desktop wording itself is
-    // pinned by the desktop unit test
-    // `the_debug_entry_hook_states_the_view_is_not_built_yet_rather_than_doing_nothing`.)
+    // so, so the entry has an honest visible effect. The DESKTOP hook is no longer
+    // exercised here: `debug-view-console-network-tabs-desktop` filled it with the
+    // real tabbed view (its wiring is guarded by the sibling
+    // `debug_view_desktop_wiring_shape.rs`), so only the two MOBILE hooks still
+    // carry the placeholder (their view is `debug-view-console-network-tabs-mobile`).
     //
     // Bounded to each hook's OWN body (brace-matched, so it stops at the hook's
     // closing brace and EXCLUDES the doc comment above it), or emptying the hook
     // would still pass on the doc comment's copy of the phrase — the vacuity the
     // sibling system-Back guard learned to avoid.
     for (name, src, signature) in [
-        (
-            "desktop",
-            desktop.as_str(),
-            "fn debug_view_placeholder_message() -> String",
-        ),
         ("Android", android.as_str(), "private fun openDebugView()"),
         ("iOS", ios.as_str(), "private func openDebugView()"),
     ] {

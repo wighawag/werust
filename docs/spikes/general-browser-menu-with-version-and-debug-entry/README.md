@@ -36,6 +36,8 @@ This menu task lands BEFORE the tabbed debug view (`debug-view-console-network-t
 
 Each currently states, honestly, that the view is not built yet (naming the version and that it will show Console + Network) rather than being a silent no-op that reads as a broken menu item. Replacing that ONE function per edge is the whole edge-side job of the debug-view tasks.
 
+> Superseded on DESKTOP (2026-07-28): `debug-view-console-network-tabs-desktop` filled the desktop hook with the real tabbed view, so `open_debug_view` on desktop no longer shows the placeholder (see `docs/spikes/debug-view-console-network-tabs-desktop/README.md`). The two MOBILE hooks still carry the placeholder until `debug-view-console-network-tabs-mobile`. The manual steps below describe the menu as this task landed it; desktop step 5 now opens the real debug view.
+
 ## What the automated gate covers, and what it cannot
 
 In the pure-Rust `verify` gate (`cargo fmt && clippy && build && test` — no Android SDK, no Xcode):

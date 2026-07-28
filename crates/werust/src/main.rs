@@ -19,14 +19,19 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use gtk4::pango::EllipsizeMode;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
-    MenuButton, Orientation, Popover, Widget,
+    ListBox, MenuButton, Notebook, Orientation, Popover, ScrolledWindow, Widget, Window,
 };
 
+use renderer::TrustPosture;
 use webkit6::prelude::WebViewExt;
 use webview_renderer::WebViewRenderer;
+use werust_core::debug::{
+    trust_posture_wire_name, ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry,
+};
 use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::{BrowserShell, ChromeState};
 
@@ -76,36 +81,357 @@ fn banner() -> String {
     )
 }
 
-/// The message the DEBUG menu entry shows until the debug VIEW exists.
-///
-/// The menu (this task) lands BEFORE the tabbed debug view (the follow-on tasks
-/// `debug-view-console-network-tabs-desktop` / `-mobile`, which are blocked on
-/// this menu plus the capture store). So the Debug entry is wired to an
-/// open-debug-view HOOK — [`open_debug_view`] — that today states honestly that
-/// the view is not built yet rather than silently doing nothing. Pure, so the
-/// wording is pinned without a display; the recorded decision is in
-/// `docs/spikes/general-browser-menu-with-version-and-debug-entry/DECISIONS.md`.
-fn debug_view_placeholder_message() -> String {
-    format!(
-        "werust {} — the in-app debug view (Console + Network) is not built yet.",
-        werust_core::version()
-    )
+/// The state the menu's Debug entry and the refresh pump share about the DEBUG
+/// VIEW: the capture store the view renders, and the currently-open view, if
+/// any. Grouped so the one [`open_debug_view`] hook and the pump see the SAME
+/// fact (both clones of the store are the one `Arc` store the capture points
+/// feed).
+struct DebugViewState {
+    capture: DebugCapture,
+    open: RefCell<Option<Rc<RefCell<DebugView>>>>,
 }
 
-/// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls.
+/// The OPEN-DEBUG-VIEW hook the browser menu's Debug entry calls: opens the
+/// tabbed Console + Network debug view over the shared capture store. The menu
+/// task (`general-browser-menu-with-version-and-debug-entry`) left this hook a
+/// placeholder; THIS is the real view that fills it (task
+/// `debug-view-console-network-tabs-desktop`).
 ///
-/// THIS is the one function `debug-view-console-network-tabs-desktop` replaces:
-/// it will open the tabbed Console/Network panel over the capture store
-/// ([`BrowserShell::debug_capture`]). Until then it states the placeholder
-/// ([`debug_view_placeholder_message`]) so activating the entry has an honest,
-/// visible effect. Keeping the hook a named function (rather than an inline
-/// closure) is what makes the swap a one-site change.
-fn open_debug_view(parent: &ApplicationWindow) {
-    gtk4::AlertDialog::builder()
-        .message("Debug")
-        .detail(debug_view_placeholder_message())
+/// The view is a SEPARATE window, transient for the browser window: an
+/// in-window panel would crowd the page view on every open, and a window closes
+/// with its own close button, so "toggled closed again" is the platform's own
+/// affordance (recorded in
+/// `docs/spikes/debug-view-console-network-tabs-desktop/DECISIONS.md`).
+/// Re-activating Debug while the view is open PRESENTS (raises) it rather than
+/// opening a second copy; closing the window drops the slot so the next
+/// activation opens a fresh one.
+fn open_debug_view(parent: &ApplicationWindow, state: &Rc<DebugViewState>) {
+    if let Some(view) = state.open.borrow().as_ref() {
+        view.borrow().window.present();
+        return;
+    }
+    let view = DebugView::new(parent, state.capture.clone());
+    view.borrow().window.connect_close_request({
+        let state = state.clone();
+        move |_| {
+            // The view is gone: drop the slot so the next Debug activation
+            // opens a fresh window rather than presenting a destroyed one.
+            *state.open.borrow_mut() = None;
+            glib::Propagation::Proceed
+        }
+    });
+    // Paint the store captured so far BEFORE presenting, so the window never
+    // opens visibly empty when there are already entries.
+    view.borrow_mut().refresh();
+    let window = view.borrow().window.clone();
+    *state.open.borrow_mut() = Some(view);
+    window.present();
+}
+
+/// The debug view itself: a separate window with a CLEAR action over a
+/// `Notebook` of the CONSOLE and NETWORK tabs, each a scrollable list rendered
+/// from the shared capture store ([`DebugCapture`]). READ-ONLY by construction:
+/// every row is a non-editable label (a typeable REPL is the native F12 WebKit
+/// inspector's job, out of scope here).
+///
+/// The view is refreshed on the EXISTING chrome pump cadence (the 50ms timeout
+/// in [`open_window`]), never a busy loop: the refresh is INCREMENTAL, appending
+/// only the rows captured since the last tick (and resetting on a `clear`), so
+/// an idle tick is a length check. Rows are newest-at-BOTTOM with auto-scroll
+/// that sticks only when the user is already at the bottom (the devtools
+/// idiom; recorded in the task's DECISIONS.md).
+struct DebugView {
+    window: Window,
+    capture: DebugCapture,
+    console_list: ListBox,
+    network_list: ListBox,
+    console_scrolled: ScrolledWindow,
+    network_scrolled: ScrolledWindow,
+    /// How many store entries are already rendered per tab, so a refresh appends
+    /// only the tail instead of rebuilding the list every tick.
+    rendered_console: usize,
+    rendered_network: usize,
+}
+
+impl DebugView {
+    /// Build the debug-view window: a header row (a title + the CLEAR action)
+    /// over the two-tab `Notebook`. The parent is any window (the browser's
+    /// `ApplicationWindow` in production), so the display-requiring end-to-end
+    /// test can parent it on a plain `Window`.
+    fn new(parent: &impl IsA<Window>, capture: DebugCapture) -> Rc<RefCell<Self>> {
+        let console_list = ListBox::new();
+        console_list.set_selection_mode(gtk4::SelectionMode::None);
+        let console_scrolled = ScrolledWindow::builder()
+            .child(&console_list)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+
+        let network_list = ListBox::new();
+        network_list.set_selection_mode(gtk4::SelectionMode::None);
+        let network_scrolled = ScrolledWindow::builder()
+            .child(&network_list)
+            .vexpand(true)
+            .hexpand(true)
+            .build();
+
+        let notebook = Notebook::new();
+        notebook.append_page(&console_scrolled, Some(&Label::new(Some("Console"))));
+        notebook.append_page(&network_scrolled, Some(&Label::new(Some("Network"))));
+        notebook.set_vexpand(true);
+
+        // The CLEAR action empties the shared store (`DebugCapture::clear`, BOTH
+        // buffers); the refresh below then resets both lists.
+        let clear = Button::with_label("Clear");
+        clear.set_tooltip_text(Some("Clear the captured console + network entries"));
+        let title = Label::builder()
+            .label("Console + Network capture")
+            .xalign(0.0)
+            .hexpand(true)
+            .build();
+        let header = GtkBox::new(Orientation::Horizontal, 6);
+        header.append(&title);
+        header.append(&clear);
+
+        let root = GtkBox::new(Orientation::Vertical, 6);
+        root.set_margin_top(8);
+        root.set_margin_bottom(8);
+        root.set_margin_start(8);
+        root.set_margin_end(8);
+        root.append(&header);
+        root.append(&notebook);
+
+        let window = Window::builder()
+            .transient_for(parent)
+            .title("werust Debug")
+            .default_width(760)
+            .default_height(480)
+            .child(&root)
+            .build();
+
+        let view = Rc::new(RefCell::new(Self {
+            window,
+            capture,
+            console_list,
+            network_list,
+            console_scrolled,
+            network_scrolled,
+            rendered_console: 0,
+            rendered_network: 0,
+        }));
+
+        clear.connect_clicked({
+            let view = view.clone();
+            move |_| {
+                let mut view = view.borrow_mut();
+                view.capture.clear();
+                view.refresh();
+            }
+        });
+
+        view
+    }
+
+    /// Catch the view up with the store: append the rows captured since the last
+    /// refresh, or RESET both lists when the store shrank (the Clear action).
+    /// Called on the existing pump cadence while the view is open.
+    fn refresh(&mut self) {
+        let console = self.capture.console();
+        if console.len() < self.rendered_console {
+            clear_list_box(&self.console_list);
+            self.rendered_console = 0;
+        }
+        if console.len() > self.rendered_console {
+            let stick = is_at_bottom(&self.console_scrolled);
+            for entry in &console[self.rendered_console..] {
+                self.console_list.append(&console_row(entry));
+            }
+            self.rendered_console = console.len();
+            stick_to_bottom(&self.console_scrolled, stick);
+        }
+
+        let network = self.capture.network();
+        if network.len() < self.rendered_network {
+            clear_list_box(&self.network_list);
+            self.rendered_network = 0;
+        }
+        if network.len() > self.rendered_network {
+            let stick = is_at_bottom(&self.network_scrolled);
+            for entry in &network[self.rendered_network..] {
+                self.network_list.append(&network_row(entry));
+            }
+            self.rendered_network = network.len();
+            stick_to_bottom(&self.network_scrolled, stick);
+        }
+    }
+}
+
+/// Remove every row of a [`ListBox`] (after the store's `clear()` shrank it).
+fn clear_list_box(list: &ListBox) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+}
+
+/// Whether the scrolled list is already at the bottom (so newly appended rows
+/// should auto-scroll into view, the devtools-console idiom).
+fn is_at_bottom(scrolled: &ScrolledWindow) -> bool {
+    let adj = scrolled.vadjustment();
+    adj.value() >= adj.upper() - adj.page_size() - 1.0
+}
+
+/// Auto-scroll a list to the bottom after new rows were appended, but ONLY when
+/// it was already at the bottom (`stick`): a user scrolled up reading an earlier
+/// entry is never yanked back down. Deferred to idle, because the adjustment's
+/// upper bound updates only after the new rows are laid out.
+fn stick_to_bottom(scrolled: &ScrolledWindow, stick: bool) {
+    if stick {
+        let scrolled = scrolled.clone();
+        glib::idle_add_local_once(move || {
+            let adj = scrolled.vadjustment();
+            adj.set_value(adj.upper() - adj.page_size());
+        });
+    }
+}
+
+/// One CONSOLE row: a single-line label `[<level>] <message> (<source>:<line>)`,
+/// carrying the `debug-console-<level>` class ([`APP_CSS`]) so an error reads
+/// red and a warning amber at a glance.
+fn console_row(entry: &ConsoleEntry) -> Label {
+    let label = single_line(&console_row_text(entry));
+    label.add_css_class(console_level_css_class(entry.level));
+    label
+}
+
+/// One NETWORK row: a horizontal strip of single-line columns (method, status,
+/// MIME, size, the honest per-request trust posture, the URL) so the columns
+/// stay legible as the list grows. The trust column carries the SAME glyph,
+/// wire name and CSS class the chrome trust indicator uses (ADR-0006).
+fn network_row(entry: &NetworkEntry) -> GtkBox {
+    let row = GtkBox::new(Orientation::Horizontal, 10);
+    for text in [
+        entry.method.clone(),
+        network_status_text(entry.status),
+        network_mime_text(&entry.mime),
+        network_size_text(entry.size),
+    ] {
+        row.append(&single_line(&text));
+    }
+    let trust = single_line(&network_trust_label(entry.trust));
+    trust.add_css_class(network_trust_css_class(entry.trust));
+    row.append(&trust);
+    // The URL is the long, unbounded column: it takes the slack and ellipsizes
+    // in the MIDDLE so both the scheme and the tail stay visible.
+    let url = single_line(&entry.url);
+    url.set_hexpand(true);
+    url.set_ellipsize(EllipsizeMode::Middle);
+    row.append(&url);
+    row
+}
+
+/// A single-line, selectable, end-ellipsized label aligned left: the building
+/// block of every debug-view row (READ-ONLY: labels, never entries).
+fn single_line(text: &str) -> Label {
+    Label::builder()
+        .label(text)
+        .xalign(0.0)
+        .single_line_mode(true)
+        .ellipsize(EllipsizeMode::End)
+        .selectable(true)
         .build()
-        .show(Some(parent));
+}
+
+/// The CSS class colouring one console row by its level: error red, warn amber,
+/// info blue, debug grey, log neutral. Pure, so the level-to-class mapping is
+/// pinned without a display.
+fn console_level_css_class(level: ConsoleLevel) -> &'static str {
+    match level {
+        ConsoleLevel::Log => "debug-console-log",
+        ConsoleLevel::Info => "debug-console-info",
+        ConsoleLevel::Warn => "debug-console-warn",
+        ConsoleLevel::Error => "debug-console-error",
+        ConsoleLevel::Debug => "debug-console-debug",
+    }
+}
+
+/// The `<source>:<line>` tail of a console row: empty when the platform
+/// reported no source (the injected shim reports none for an unreadable stack
+/// frame), source-only when it reported no line. An absent field stays honestly
+/// absent rather than rendering a fabricated `:0`. Pure, for display-free tests.
+fn console_source_line(entry: &ConsoleEntry) -> String {
+    match (entry.source.is_empty(), entry.line) {
+        (true, _) => String::new(),
+        (false, Some(line)) => format!("{}:{line}", entry.source),
+        (false, None) => entry.source.clone(),
+    }
+}
+
+/// The full text of one console row: `[<level>] <message>` plus the source tail
+/// in parentheses when there is one. The level tag is the store's OWN wire name
+/// (`log`/`info`/`warn`/`error`/`debug`), so the Console tab speaks the capture
+/// store's vocabulary exactly. Pure, for display-free tests.
+fn console_row_text(entry: &ConsoleEntry) -> String {
+    let source = console_source_line(entry);
+    if source.is_empty() {
+        format!("[{}] {}", entry.level.wire_name(), entry.message)
+    } else {
+        format!("[{}] {} ({source})", entry.level.wire_name(), entry.message)
+    }
+}
+
+/// The status column of a network row: the response code, or `?` when the
+/// request has no status (a custom scheme answered without one, or the request
+/// failed before a response): an unknown stays honestly unknown.
+fn network_status_text(status: Option<u16>) -> String {
+    status.map_or_else(|| "?".to_string(), |s| s.to_string())
+}
+
+/// The MIME column of a network row, or `?` when unknown.
+fn network_mime_text(mime: &str) -> String {
+    if mime.is_empty() {
+        "?".to_string()
+    } else {
+        mime.to_string()
+    }
+}
+
+/// The size column of a network row: a human byte count (`512 B`, `1.5 KB`,
+/// `2.0 MB`), or `?` when unknown.
+fn network_size_text(size: Option<u64>) -> String {
+    match size {
+        None => "?".to_string(),
+        Some(bytes) if bytes < 1024 => format!("{bytes} B"),
+        Some(bytes) if bytes < 1024 * 1024 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        Some(bytes) => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// The per-request trust label of a network row: the SAME posture vocabulary
+/// the chrome trust indicator speaks (ADR-0006) — the indicator's glyph for the
+/// posture plus the core's wire name (`content-verified`, `unverified-origin`,
+/// `name-via-trusted-rpc`, `mutable-name`), never a new label minted for the
+/// debug view. Pure, for display-free tests.
+fn network_trust_label(posture: TrustPosture) -> String {
+    let glyph = match posture {
+        TrustPosture::ContentVerified => "✓",
+        TrustPosture::NameViaTrustedRpc => "◈",
+        TrustPosture::MutableName => "◇",
+        TrustPosture::UnverifiedOrigin => "⚠",
+    };
+    format!("{glyph} {}", trust_posture_wire_name(posture))
+}
+
+/// The CSS class colouring a network row's trust column: one of the SAME
+/// `trust-*` classes the chrome trust indicator toggles, so a content-verified
+/// request is the same green the indicator's verified badge is. Pure, for
+/// display-free tests.
+fn network_trust_css_class(posture: TrustPosture) -> &'static str {
+    match posture {
+        TrustPosture::ContentVerified => "trust-verified",
+        TrustPosture::NameViaTrustedRpc => "trust-name-trusted-rpc",
+        TrustPosture::MutableName => "trust-mutable-name",
+        TrustPosture::UnverifiedOrigin => "trust-unverified",
+    }
 }
 
 /// Build the general browser MENU button: the ⋮ affordance every browser has,
@@ -120,7 +446,7 @@ fn open_debug_view(parent: &ApplicationWindow) {
 /// dispatched by its stable id. A FUTURE menu item therefore needs no change
 /// here at all unless it is an action with new behaviour — that is the
 /// "structured to grow" property, expressed in code.
-fn build_menu_button(window: &ApplicationWindow) -> MenuButton {
+fn build_menu_button(window: &ApplicationWindow, debug_view: &Rc<DebugViewState>) -> MenuButton {
     let menu = BrowserMenu::new();
     let list = GtkBox::new(Orientation::Vertical, 2);
     for item in menu.items() {
@@ -140,6 +466,7 @@ fn build_menu_button(window: &ApplicationWindow) -> MenuButton {
                 // Dispatch on the STABLE id, never the display label.
                 let id = item.id.clone();
                 let window = window.clone();
+                let debug_view = debug_view.clone();
                 button.connect_clicked(move |button| {
                     // Close the popover first, so the menu does not sit over
                     // whatever the entry opens.
@@ -149,7 +476,7 @@ fn build_menu_button(window: &ApplicationWindow) -> MenuButton {
                         }
                     }
                     if id == MENU_ITEM_DEBUG {
-                        open_debug_view(&window);
+                        open_debug_view(&window, &debug_view);
                     }
                 });
                 list.append(&button);
@@ -463,14 +790,18 @@ fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
     }
 }
 
-/// The stylesheet that makes the trust-indicator states visually distinct: a
-/// NEUTRAL grey loading badge (no trust claim, shown while a load is in flight),
-/// a green content-verified badge, a blue name-via-trusted-RPC badge (an honest
-/// middle state), a purple mutable-name badge, and an amber unverified-origin
-/// one. Kept as one constant next to the classes the chrome toggles
-/// (`trust-loading` / `trust-verified` / `trust-name-trusted-rpc` /
-/// `trust-mutable-name` / `trust-unverified`).
-const TRUST_INDICATOR_CSS: &str = "\
+/// The app stylesheet: the classes that make the trust-indicator states
+/// visually distinct (a NEUTRAL grey loading badge shown while a load is in
+/// flight, a green content-verified badge, a blue name-via-trusted-RPC badge, a
+/// purple mutable-name badge, an amber unverified-origin one), plus the error
+/// banner, the invalid-URL badge, the menu info item, and the debug view's
+/// level-coloured console rows. Kept as one constant next to the classes the
+/// chrome and the debug view toggle (`trust-loading` / `trust-verified` /
+/// `trust-name-trusted-rpc` / `trust-mutable-name` / `trust-unverified`,
+/// `debug-console-*`). The debug view's Network tab REUSES the `trust-*`
+/// classes for its per-request trust column, so a content-verified request is
+/// the same green the indicator's verified badge is (ADR-0006, one vocabulary).
+const APP_CSS: &str = "\
 .trust-loading { color: #5c5c5c; font-weight: bold; padding: 0 6px; }\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
@@ -480,15 +811,19 @@ const TRUST_INDICATOR_CSS: &str = "\
 .error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .invalid-url-badge { color: #c01c28; font-weight: bold; padding: 0 6px; }\
 .menu-info-item { padding: 4px 8px; }\
-.url-invalid { color: #c01c28; text-decoration: underline; text-decoration-color: #c01c28; }";
+.url-invalid { color: #c01c28; text-decoration: underline; text-decoration-color: #c01c28; }\
+.debug-console-log { padding: 2px 6px; }\
+.debug-console-info { color: #1a5fb4; padding: 2px 6px; }\
+.debug-console-warn { color: #9a6a00; font-weight: bold; padding: 2px 6px; }\
+.debug-console-error { color: #c01c28; font-weight: bold; padding: 2px 6px; }\
+.debug-console-debug { color: #5c5c5c; padding: 2px 6px; }";
 
-/// Load the trust-indicator stylesheet onto the default display, so the
-/// `trust-verified` / `trust-name-trusted-rpc` / `trust-unverified` classes the
-/// chrome toggles render as visually distinct badges. A no-op if there is no
-/// display.
-fn install_trust_indicator_css() {
+/// Load the app stylesheet onto the default display, so the `trust-*` classes
+/// the chrome toggles and the `debug-console-*` classes the debug view toggles
+/// render as visually distinct states. A no-op if there is no display.
+fn install_app_css() {
     let provider = CssProvider::new();
-    provider.load_from_string(TRUST_INDICATOR_CSS);
+    provider.load_from_string(APP_CSS);
     if let Some(display) = gdk::Display::default() {
         gtk4::style_context_add_provider_for_display(
             &display,
@@ -583,13 +918,23 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let shell = Rc::new(RefCell::new(
         BrowserShell::new(Box::new(backend))
             .with_redirect_sink(redirects)
-            .with_debug_capture(debug_capture),
+            .with_debug_capture(debug_capture.clone()),
     ));
 
-    // Make the two trust-indicator states VISUALLY DISTINCT: a green verified
-    // badge vs an amber unverified-origin one. Loaded once for the display so the
-    // `trust-verified` / `trust-unverified` classes the chrome toggles are styled.
-    install_trust_indicator_css();
+    // The DEBUG-VIEW state the menu's Debug entry (which opens the view) and the
+    // refresh pump (which keeps it live) share: the SAME capture store the
+    // capture hooks feed (another clone of the one `Arc` handle), and the slot
+    // for the currently-open debug view, if any (task
+    // `debug-view-console-network-tabs-desktop`).
+    let debug_view = Rc::new(DebugViewState {
+        capture: debug_capture,
+        open: RefCell::new(None),
+    });
+
+    // Load the app stylesheet once for the display so the `trust-*` classes the
+    // chrome toggles and the `debug-console-*` classes the debug view toggles
+    // are styled.
+    install_app_css();
 
     // Embed the live, interactive view. The seam hands the shell an opaque
     // pointer to the backend's native view; the shell reconstructs it as a plain
@@ -684,7 +1029,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // available (never debug-build-gated), and built to grow: a new core menu item
     // shows up here with no layout change (task
     // `general-browser-menu-with-version-and-debug-entry`).
-    toolbar.append(&build_menu_button(&window));
+    toolbar.append(&build_menu_button(&window, &debug_view));
 
     // Wire each control to drive the shell THROUGH the seam, then repaint chrome.
     // Shared as an `Rc<dyn Fn()>` so every handler (and the pump) can hold it.
@@ -768,9 +1113,19 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     glib::timeout_add_local(Duration::from_millis(50), {
         let shell = shell.clone();
         let refresh = refresh.clone();
+        let debug_view = debug_view.clone();
         move || {
             if shell.borrow_mut().pump() {
                 refresh();
+            }
+            // Refresh the OPEN debug view on the SAME existing cadence (no new
+            // timer, no busy loop): the capture store changes off the seam's
+            // load events (console messages, resource loads), so `pump()`
+            // returning false does not mean the store is unchanged. The refresh
+            // is incremental (it appends only the rows captured since the last
+            // tick), so an idle tick over an open view is a length check.
+            if let Some(view) = debug_view.open.borrow().as_ref() {
+                view.borrow_mut().refresh();
             }
             glib::ControlFlow::Continue
         }
@@ -783,13 +1138,20 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, debug_view_placeholder_message, error_banner_css_class, error_banner_text,
-        error_banner_visible, invalid_entry_badge_text, invalid_entry_badge_visible,
-        should_open_web_inspector, status_line, trust_indicator, trust_indicator_css_class,
-        trust_indicator_detail, DEFAULT_URL,
+        banner, console_level_css_class, console_row_text, console_source_line,
+        error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
+        invalid_entry_badge_visible, network_mime_text, network_size_text, network_status_text,
+        network_trust_css_class, network_trust_label, should_open_web_inspector, status_line,
+        trust_indicator, trust_indicator_css_class, trust_indicator_detail, DEFAULT_URL,
     };
-    use gtk4::gdk;
+    use gtk4::prelude::*;
+    use gtk4::{gdk, gio};
     use renderer::{LoadState, TrustPosture};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use werust_core::debug::{
+        trust_posture_wire_name, ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry,
+    };
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
     use werust_core::{ChromeState, LoadStep};
 
@@ -977,31 +1339,261 @@ mod tests {
     }
 
     #[test]
-    fn the_debug_entry_hook_states_the_view_is_not_built_yet_rather_than_doing_nothing() {
-        // Acceptance: the Debug entry opens the debug view via an
-        // OPEN-DEBUG-VIEW HOOK the debug-view task fills. This task lands the menu
-        // FIRST (the view tasks are blocked on it), so the hook must have an
-        // HONEST visible effect meanwhile — not a silent no-op that reads as a
-        // broken menu item. The wording names the version and the view's real
-        // content (Console + Network) so the user knows what is coming.
-        let message = debug_view_placeholder_message();
-        assert!(
-            message.contains(werust_core::version()),
-            "the placeholder names the running version: {message}"
+    fn console_rows_carry_the_level_message_and_source_line_coloured_by_level() {
+        // Acceptance (Console tab): a captured console entry renders level +
+        // message + source:line, level-distinguished. The level tag is the
+        // store's own wire name, and the row's CSS class is distinct per level
+        // (error red, warn amber via `debug-console-*` in APP_CSS).
+        let entry = ConsoleEntry::new(ConsoleLevel::Warn, "deprecated API")
+            .with_source("https://x/app.js")
+            .with_line(42);
+        assert_eq!(
+            console_row_text(&entry),
+            "[warn] deprecated API (https://x/app.js:42)"
         );
-        assert!(
-            message.contains("Console") && message.contains("Network"),
-            "the placeholder names what the debug view will show: {message}"
+        assert_eq!(console_level_css_class(entry.level), "debug-console-warn");
+
+        // Every level has its OWN class, so the levels are visually distinct.
+        let classes: Vec<&str> = [
+            ConsoleLevel::Log,
+            ConsoleLevel::Info,
+            ConsoleLevel::Warn,
+            ConsoleLevel::Error,
+            ConsoleLevel::Debug,
+        ]
+        .into_iter()
+        .map(console_level_css_class)
+        .collect();
+        for (i, class) in classes.iter().enumerate() {
+            assert!(class.starts_with("debug-console-"));
+            assert!(
+                !classes[..i].contains(class),
+                "every level is coloured distinctly: {classes:?}"
+            );
+        }
+
+        // An absent source/line stays honestly absent: no fabricated `:0`, no
+        // dangling parentheses.
+        let no_source = ConsoleEntry::new(ConsoleLevel::Error, "boom");
+        assert_eq!(console_source_line(&no_source), "");
+        assert_eq!(console_row_text(&no_source), "[error] boom");
+        let source_no_line =
+            ConsoleEntry::new(ConsoleLevel::Log, "hi").with_source("ipfs://cid/a.js");
+        assert_eq!(
+            console_row_text(&source_no_line),
+            "[log] hi (ipfs://cid/a.js)"
         );
-        assert!(
-            message.contains("not built yet"),
-            "the placeholder is honest that the view does not exist yet: {message}"
+    }
+
+    #[test]
+    fn network_rows_carry_method_status_mime_and_size_with_unknowns_honest() {
+        // Acceptance (Network tab): the row columns render the entry's method,
+        // status, mime and size, and an UNKNOWN field renders as `?`, never a
+        // fabricated `0` (a failed request has no status; a shim-reported
+        // request may have no size).
+        let entry = NetworkEntry::new("GET", "ipfs://bafy/pic.png")
+            .with_status(200)
+            .with_mime("image/png")
+            .with_size(1536);
+        assert_eq!(entry.method, "GET");
+        assert_eq!(network_status_text(entry.status), "200");
+        assert_eq!(network_mime_text(&entry.mime), "image/png");
+        assert_eq!(network_size_text(entry.size), "1.5 KB");
+
+        let unknown = NetworkEntry::new("GET", "https://x/y");
+        assert_eq!(network_status_text(unknown.status), "?");
+        assert_eq!(network_mime_text(&unknown.mime), "?");
+        assert_eq!(network_size_text(unknown.size), "?");
+
+        // The size column is human-scaled at the unit boundaries.
+        assert_eq!(network_size_text(Some(0)), "0 B");
+        assert_eq!(network_size_text(Some(512)), "512 B");
+        assert_eq!(network_size_text(Some(1024)), "1.0 KB");
+        assert_eq!(network_size_text(Some(1024 * 1024)), "1.0 MB");
+    }
+
+    #[test]
+    fn the_network_trust_column_speaks_the_chrome_trust_indicators_exact_vocabulary() {
+        // Acceptance (Network tab trust): each request renders werust's HONEST
+        // per-request trust posture using the SAME vocabulary as the trust
+        // indicator (ADR-0006), never a new label: the indicator's glyph, the
+        // core's wire name, and one of the SAME `trust-*` CSS classes the
+        // indicator toggles.
+        let indicator_classes = [
+            "trust-verified",
+            "trust-name-trusted-rpc",
+            "trust-mutable-name",
+            "trust-unverified",
+        ];
+        let mut labels = Vec::new();
+        for (posture, glyph) in [
+            (TrustPosture::ContentVerified, "✓"),
+            (TrustPosture::NameViaTrustedRpc, "◈"),
+            (TrustPosture::MutableName, "◇"),
+            (TrustPosture::UnverifiedOrigin, "⚠"),
+        ] {
+            let label = network_trust_label(posture);
+            // The label is the indicator's glyph plus the core's wire name, so an
+            // ipfs:// row reads `✓ content-verified` and an https:// row
+            // `⚠ unverified-origin`: the SAME words the chrome JSON carries.
+            assert_eq!(
+                label,
+                format!("{glyph} {}", trust_posture_wire_name(posture)),
+                "the Network tab speaks the trust indicator's vocabulary: {label}"
+            );
+            assert!(
+                indicator_classes.contains(&network_trust_css_class(posture)),
+                "the trust column reuses the indicator's own CSS classes"
+            );
+            assert!(
+                !labels.contains(&label),
+                "each posture is labelled distinctly: {label}"
+            );
+            labels.push(label);
+        }
+
+        // The honest split the spec names: an ipfs:// request content-verified,
+        // an https:// subresource unverified-origin.
+        assert_eq!(
+            network_trust_label(TrustPosture::ContentVerified),
+            "✓ content-verified"
+        );
+        assert_eq!(
+            network_trust_label(TrustPosture::UnverifiedOrigin),
+            "⚠ unverified-origin"
+        );
+        assert_eq!(
+            network_trust_css_class(TrustPosture::ContentVerified),
+            "trust-verified"
+        );
+        assert_eq!(
+            network_trust_css_class(TrustPosture::UnverifiedOrigin),
+            "trust-unverified"
         );
     }
 
     #[test]
     fn default_url_is_an_https_url() {
         assert!(DEFAULT_URL.starts_with("https://"));
+    }
+
+    /// The number of row widgets currently in a debug-view list, walking the
+    /// widget siblings (the rows are appended as plain children of the
+    /// `ListBox`). Test-only.
+    fn row_count(list: &gtk4::ListBox) -> usize {
+        let mut count = 0;
+        let mut child = list.first_child();
+        while let Some(widget) = child {
+            count += 1;
+            child = widget.next_sibling();
+        }
+        count
+    }
+
+    /// End-to-end, on the REAL widgets: the menu's Debug entry opens the real
+    /// debug-view window (a `Notebook` of the two tabs), the window renders a
+    /// real capture store and refreshes incrementally, Clear empties it, and
+    /// closing the window drops the slot so a later activation opens a fresh
+    /// one. Ignored by default because it initializes GTK, which needs a display
+    /// the `verify` gate may not have; run explicitly on a desktop session with
+    /// `cargo test -p werust -- --ignored`. It is ONE test on purpose: GTK can
+    /// only be initialized on one thread, so the display-requiring steps share
+    /// this one test thread. The render-from-store MAPPING itself is pinned
+    /// display-free by the pure-function tests above.
+    #[test]
+    #[ignore = "needs a display: constructs the real menu + debug-view window (GTK init)"]
+    fn real_debug_view_end_to_end_on_a_display() {
+        use super::{build_menu_button, DebugView, DebugViewState};
+        use gtk4::{Application, ApplicationWindow};
+
+        gtk4::init().expect("gtk init on a desktop session");
+        let app = Application::builder()
+            .application_id("com.github.wighawag.werust.test")
+            .build();
+        app.register(gio::Cancellable::NONE)
+            .expect("register the test application");
+        let window = ApplicationWindow::builder().application(&app).build();
+
+        let capture = DebugCapture::new();
+        let state = Rc::new(DebugViewState {
+            capture: capture.clone(),
+            open: RefCell::new(None),
+        });
+        let menu_button = build_menu_button(&window, &state);
+
+        // Find the Debug ACTION button inside the popover's item list (the menu
+        // is built by iterating the core's items; the Debug entry is the only
+        // Action today) and activate it, exactly as a click does.
+        let popover = menu_button.popover().expect("the menu has a popover");
+        let list = popover.child().expect("the popover has the item list");
+        let mut child = list.first_child();
+        let mut debug_button = None;
+        while let Some(widget) = child {
+            if let Ok(button) = widget.clone().downcast::<gtk4::Button>() {
+                if button.label().as_deref() == Some("Debug") {
+                    debug_button = Some(button);
+                }
+            }
+            child = widget.next_sibling();
+        }
+        let debug_button = debug_button.expect("the menu lists a Debug action");
+
+        debug_button.emit_clicked();
+        assert!(
+            state.open.borrow().is_some(),
+            "activating the Debug entry opens the debug view"
+        );
+
+        // The OPEN view renders the store, and refreshes INCREMENTALLY: a tick
+        // with one more captured entry appends only the tail, never rebuilds.
+        let view = state
+            .open
+            .borrow()
+            .as_ref()
+            .expect("the view is open")
+            .clone();
+        capture.push_console(
+            ConsoleEntry::new(ConsoleLevel::Error, "boom")
+                .with_source("https://x/app.js")
+                .with_line(7),
+        );
+        capture.push_network(
+            NetworkEntry::new("GET", "ipfs://bafy/pic.png")
+                .with_status(200)
+                .with_mime("image/png")
+                .with_size(1536)
+                .with_trust(TrustPosture::ContentVerified),
+        );
+        view.borrow_mut().refresh();
+        assert_eq!(row_count(&view.borrow().console_list), 1);
+        assert_eq!(row_count(&view.borrow().network_list), 1);
+        capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, "later"));
+        view.borrow_mut().refresh();
+        assert_eq!(row_count(&view.borrow().console_list), 2);
+        assert_eq!(row_count(&view.borrow().network_list), 1);
+
+        // Clear: emptying the shared store resets both lists on the next tick
+        // (the store shrank below the rendered counts).
+        capture.clear();
+        view.borrow_mut().refresh();
+        assert_eq!(row_count(&view.borrow().console_list), 0);
+        assert_eq!(row_count(&view.borrow().network_list), 0);
+
+        // Activating Debug again PRESENTS the same window rather than opening a
+        // second copy (the slot still holds it, so no new view is built).
+        let built = Rc::strong_count(&view);
+        debug_button.emit_clicked();
+        assert_eq!(Rc::strong_count(&view), built, "no second view is built");
+
+        // Closing the debug window drops the slot, so the next activation opens
+        // a fresh one.
+        view.borrow().window.close();
+        assert!(
+            state.open.borrow().is_none(),
+            "closing the debug window clears the slot"
+        );
+
+        window.close();
     }
 
     #[test]

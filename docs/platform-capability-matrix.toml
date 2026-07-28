@@ -535,3 +535,29 @@ description = "CAPTURE the page's console messages and network requests into wer
 desktop = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "debug-view-console-network"
+description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug entry: a Console tab (level-distinguished rows: level + message + source:line) and a Network tab (method / url / status / mime / size rows, each carrying werust's HONEST per-request trust posture in the trust indicator's SAME vocabulary, ADR-0006), a Clear action driving the shared store's `clear()`, live updates on the existing refresh cadence (no busy loop), READ-ONLY (a typeable REPL stays the native inspector's job). Renders the ONE shared capture store (`debug-capture-console-and-network`); the native F12/remote inspector (`web-inspector`) coexists as the deep devtools."
+# Desktop fills the open-debug-view HOOK the menu task left (`open_debug_view`
+# in crates/werust/src/main.rs): a separate window, transient for the browser
+# window, with a GTK `Notebook` of the two tabs rendered from the shared
+# `DebugCapture` store (another clone of the one `Arc` handle the capture
+# points feed). Rows are newest-at-bottom with stick-to-bottom auto-scroll;
+# the refresh is INCREMENTAL (append-only tail reads, reset on `clear()`),
+# driven from the ONE existing 50ms chrome pump, so no timer or busy loop is
+# added. The trust column reuses the indicator's glyphs, the core's wire names
+# (`trust_posture_wire_name`) and the SAME `trust-*` CSS classes (no new
+# label). The render-from-store mapping is unit-tested in main.rs and the
+# wiring is guarded source-shape-wise by
+# crates/werust-core/tests/debug_view_desktop_wiring_shape.rs; the window
+# itself carries recorded manual steps at
+# docs/spikes/debug-view-console-network-tabs-desktop/README.md.
+# The MOBILE cells are stubbed onto the one mobile follow-on task (an Android +
+# iOS full-screen tabbed view, per the spec's task breakdown); until then both
+# mobile Debug hooks state honestly that the view is not built yet.
+# Task `debug-view-console-network-tabs-desktop`, spec
+# `in-app-debug-menu-console-and-network`.
+desktop = { state = "implemented" }
+ios = { state = "stubbed", task = "debug-view-console-network-tabs-mobile" }
+android = { state = "stubbed", task = "debug-view-console-network-tabs-mobile" }

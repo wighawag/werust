@@ -524,6 +524,54 @@ fn every_rust_compiling_leg_injects_the_tag_version_into_the_build() {
     }
 }
 
+#[test]
+fn every_rust_compiling_leg_passes_the_rpc_endpoint_secret_through() {
+    // Task `configurable-rpc-endpoint-via-env`: each leg that compiles Rust also
+    // exports `WERUST_RPC_URL` from the OPTIONAL repository secret of the same
+    // name, so a release pipeline CAN supply a private ENS-resolution endpoint
+    // without its URL ever entering the repo. BOTH secret states are covered:
+    //
+    //   * WITH the secret configured, Actions substitutes its value into the
+    //     build env.
+    //   * WITHOUT it (the secret is optional — a fork, or simply unconfigured),
+    //     the expression substitutes the EMPTY string and `rpc_endpoint()` in
+    //     `ethereum.rs` falls back to the public `DEFAULT_RPC_ENDPOINT`, whose
+    //     empty-falls-back rule exists precisely for this case.
+    //
+    // This test parses the workflow FILE (never the secret's value), so it
+    // passes identically on either path. What it pins: the injection
+    // EXPRESSION references the secret, and no leg hardcodes a literal
+    // endpoint URL (a private RPC URL must never be committed).
+    for leg in ["goreleaser", "android-apk", "ios-simulator-app"] {
+        let j = job(leg);
+        let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
+            panic!(
+                "the `{leg}` leg compiles Rust, so it must declare an `env:` block (WERUST_VERSION \
+                 and WERUST_RPC_URL live there)"
+            )
+        });
+        let injected = env
+            .get(Value::String("WERUST_RPC_URL".into()))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the `{leg}` leg's `env:` must pass WERUST_RPC_URL through from the optional \
+                     repository secret (empty when unconfigured -> public default)"
+                )
+            });
+        assert!(
+            injected.contains("secrets.WERUST_RPC_URL"),
+            "the `{leg}` leg must source WERUST_RPC_URL from `secrets.WERUST_RPC_URL` (the SAME \
+             secret-name pattern as WERUST_VERSION); got {injected:?}"
+        );
+        assert!(
+            !injected.contains("http"),
+            "the `{leg}` leg must NOT hardcode a literal RPC URL (private endpoints are never \
+             committed; the default lives in `DEFAULT_RPC_ENDPOINT`); got {injected:?}"
+        );
+    }
+}
+
 /// The `fetch-depth` the job's `actions/checkout` step requests, or [`None`] when
 /// the job has no checkout step or sets no depth (cargo's default shallow
 /// checkout, which carries no tags).

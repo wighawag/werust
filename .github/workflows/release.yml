@@ -36,6 +36,16 @@ name: release
 # menu reading `werust 0.0.0`. On the dispatch dry-run the variable is simply
 # empty (there is no tag), and the build script falls through to `git describe`.
 # Pinned by `crates/werust-core/tests/release_plumbing_shape.rs`.
+#
+# THE RPC ENDPOINT IS AN OPTIONAL SECRET, NEVER A COMMITTED URL. Every leg that
+# compiles Rust ALSO exports `WERUST_RPC_URL` from the OPTIONAL repository
+# secret of the same name, so a release can point ENS resolution at a private
+# endpoint (e.g. a self-hosted node) without its URL ever entering the repo.
+# `WERUST_RPC_URL` is read ONCE at session construction by
+# `crates/werust-core/src/ethereum.rs` (`rpc_endpoint`); when the secret is
+# absent the expression substitutes the EMPTY string and the compiled code
+# falls back to the public `DEFAULT_RPC_ENDPOINT` (`https://1rpc.io/eth`), so
+# the workflow works identically with or without the secret configured.
 
 on:
   push:
@@ -100,6 +110,10 @@ jobs:
       # and the ⋮ menu read. On the dispatch dry-run there is no tag, so it is
       # empty and the build script falls through to `git describe`.
       WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      # Optional private RPC endpoint for ENS resolution, exported to the build
+      # env. Empty when the secret is not configured -> the public
+      # `DEFAULT_RPC_ENDPOINT` is used (see the header comment).
+      WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -176,6 +190,9 @@ jobs:
       # so the Android ⋮ menu reports the SAME version as desktop and iOS. Same
       # tag-or-empty rule as the desktop leg above.
       WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      # Optional private RPC endpoint (same secret pass-through as the desktop
+      # leg; empty -> public default).
+      WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -250,6 +267,9 @@ jobs:
       # so the iOS ⋮ menu reports the SAME version as desktop and Android. Same
       # tag-or-empty rule as the desktop leg above.
       WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      # Optional private RPC endpoint (same secret pass-through as the desktop
+      # leg; empty -> public default).
+      WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
     steps:
       - uses: actions/checkout@v4
         with:

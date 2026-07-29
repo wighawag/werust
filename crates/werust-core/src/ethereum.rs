@@ -74,12 +74,53 @@ use serde_json::{json, Value};
 ///
 /// This is a TRUSTED origin: the `eth_call` result is taken on this endpoint's
 /// word (Phase 1 has no light client — the trustless backend is the Phase-2
-/// swap). `https://ethereum-rpc.publicnode.com` is a public, keyless mainnet RPC
-/// used as a sensible default; the durable endpoint policy (which RPC, or a
-/// local node) is not this task's concern and is overridden by constructing with
-/// [`RpcProvider::with_endpoint`] — mirroring the `GatewayContentSource::new` /
-/// `with_gateway` pair, so there is NO config subsystem to chase.
-pub const DEFAULT_RPC_ENDPOINT: &str = "https://ethereum-rpc.publicnode.com";
+/// swap). `https://1rpc.io/eth` is a public, keyless mainnet RPC used as the
+/// labelled default (the previous default, `ethereum-rpc.publicnode.com`, was
+/// observed DNS-blocked by home routers and TLS-broken behind captive portals);
+/// the durable endpoint policy (which RPC, or a local node) is not this task's
+/// concern and is overridden by constructing with
+/// [`RpcProvider::with_endpoint`], and the `WERUST_RPC_URL` environment
+/// variable (when set and non-empty) takes precedence over this default at
+/// session construction — see [`rpc_endpoint`]. Mirrors the
+/// `GatewayContentSource::new` / `with_gateway` pair, so there is NO config
+/// subsystem to chase.
+pub const DEFAULT_RPC_ENDPOINT: &str = "https://1rpc.io/eth";
+
+/// The environment variable that overrides [`DEFAULT_RPC_ENDPOINT`] for a
+/// session: the opt-in lever for pointing ENS resolution at a private endpoint
+/// (e.g. a local node) without committing its URL. Fits the `WERUST_*` lever
+/// namespace established by `WERUST_VERSION` (build.rs) and
+/// `WERUST_SETTINGS_DIR` (retrieval.rs).
+const RPC_URL_ENV: &str = "WERUST_RPC_URL";
+
+/// The endpoint [`RpcProvider::new`] points at: the `WERUST_RPC_URL` env lever
+/// when set and non-empty (whitespace-trimmed), else [`DEFAULT_RPC_ENDPOINT`].
+///
+/// Returns an owned `String` because `std::env::var` owns its data;
+/// [`RpcProvider::with_endpoint`] takes `&str`, so this composes without a
+/// leak. The env is read ONCE per session — `RpcProvider::new` is called once
+/// at session construction (the same one-shot boundary at which
+/// `WERUST_VERSION` is resolved at build time), never per request — so a live
+/// change requires a relaunch, the same constraint as the existing in-app
+/// settings. The precedence decision itself is pure and env-free
+/// ([`resolve_rpc_endpoint`]) so tests exercise it WITHOUT mutating the
+/// process-global env (which would race under parallel `cargo test`).
+fn rpc_endpoint() -> String {
+    resolve_rpc_endpoint(std::env::var(RPC_URL_ENV).ok().as_deref())
+}
+
+/// The pure precedence core behind [`rpc_endpoint`]: a non-empty
+/// (whitespace-trimmed) env value wins, trimmed; an unset, empty, or
+/// whitespace-only value falls back to [`DEFAULT_RPC_ENDPOINT`]. The
+/// empty-falls-back rule is load-bearing for CI: the release workflow always
+/// exports `WERUST_RPC_URL` from the OPTIONAL repository secret, which
+/// substitutes an empty string when unconfigured.
+fn resolve_rpc_endpoint(env_value: Option<&str>) -> String {
+    match env_value {
+        Some(value) if !value.trim().is_empty() => value.trim().to_string(),
+        _ => DEFAULT_RPC_ENDPOINT.to_string(),
+    }
+}
 
 /// The default block tag an [`eth_call`](EthereumProvider::eth_call) uses when
 /// the caller passes [`BlockTag::Latest`].
@@ -340,9 +381,10 @@ impl RpcTransport for UreqRpcTransport {
 /// behind the same [`EthereumProvider`] seam.
 ///
 /// The endpoint is user-overridable with a labelled default: [`new`](RpcProvider::new)
-/// uses [`DEFAULT_RPC_ENDPOINT`]; [`with_endpoint`](RpcProvider::with_endpoint)
-/// overrides it — mirroring `GatewayContentSource::new` / `with_gateway`, with NO
-/// config subsystem.
+/// resolves it via [`rpc_endpoint`] (the `WERUST_RPC_URL` env lever when set and
+/// non-empty, else [`DEFAULT_RPC_ENDPOINT`]); [`with_endpoint`](RpcProvider::with_endpoint)
+/// overrides it outright — mirroring `GatewayContentSource::new` / `with_gateway`,
+/// with NO config subsystem.
 ///
 /// It is generic over the [`RpcTransport`] so tests drive it against an
 /// in-process transport double (capturing the request body, off the live
@@ -352,11 +394,13 @@ pub struct RpcProvider<T: RpcTransport = UreqRpcTransport> {
 }
 
 impl RpcProvider<UreqRpcTransport> {
-    /// An RPC provider over the bound transport, pointed at the labelled
-    /// [`DEFAULT_RPC_ENDPOINT`] (a trusted origin).
+    /// An RPC provider over the bound transport, pointed at the endpoint
+    /// [`rpc_endpoint`] resolves for this session: the `WERUST_RPC_URL` env
+    /// lever when set and non-empty, else the labelled [`DEFAULT_RPC_ENDPOINT`]
+    /// (a trusted origin).
     #[must_use]
     pub fn new() -> Self {
-        Self::with_endpoint(DEFAULT_RPC_ENDPOINT)
+        Self::with_endpoint(&rpc_endpoint())
     }
 
     /// An RPC provider over the bound transport, pointed at a specific `endpoint`
@@ -540,6 +584,67 @@ mod tests {
         json!({ "jsonrpc": "2.0", "id": 1, "result": result_hex })
             .to_string()
             .into_bytes()
+    }
+
+    // -----------------------------------------------------------------------
+    // The `WERUST_RPC_URL` endpoint precedence (task
+    // `configurable-rpc-endpoint-via-env`). Network-isolated and env-mutation-
+    // free: the precedence decision lives in the PURE `resolve_rpc_endpoint`
+    // core, so no test touches `std::env::set_var` (an unsafe setter in Rust
+    // 2024 that would race under parallel `cargo test`).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_labelled_default_endpoint_is_1rpc() {
+        // The human-triggered default swap: the labelled default is now the
+        // public, keyless `1rpc.io/eth` (publicnode.com was observed DNS- and
+        // TLS-blocked on home networks).
+        assert_eq!(DEFAULT_RPC_ENDPOINT, "https://1rpc.io/eth");
+    }
+
+    #[test]
+    fn rpc_endpoint_falls_back_to_the_default_when_the_env_is_unset() {
+        // No `WERUST_RPC_URL`: a fresh, unconfigured build resolves through the
+        // labelled public default.
+        assert_eq!(resolve_rpc_endpoint(None), DEFAULT_RPC_ENDPOINT);
+    }
+
+    #[test]
+    fn rpc_endpoint_prefers_a_non_empty_env_value_whitespace_trimmed() {
+        // A set, non-empty `WERUST_RPC_URL` wins over the default, trimmed.
+        assert_eq!(
+            resolve_rpc_endpoint(Some("https://example.test/rpc")),
+            "https://example.test/rpc"
+        );
+        assert_eq!(
+            resolve_rpc_endpoint(Some("  https://example.test/rpc  ")),
+            "https://example.test/rpc",
+            "the env value is whitespace-trimmed"
+        );
+    }
+
+    #[test]
+    fn rpc_endpoint_falls_back_to_the_default_when_the_env_is_empty() {
+        // An EMPTY `WERUST_RPC_URL` (e.g. the CI secret is not configured, so
+        // the workflow exports an empty string) must NOT override the default.
+        assert_eq!(resolve_rpc_endpoint(Some("")), DEFAULT_RPC_ENDPOINT);
+        assert_eq!(
+            resolve_rpc_endpoint(Some("   ")),
+            DEFAULT_RPC_ENDPOINT,
+            "a whitespace-only value counts as empty"
+        );
+    }
+
+    #[test]
+    fn rpc_provider_new_resolves_its_endpoint_through_the_env_lever() {
+        // The wiring assertion: `RpcProvider::new` / `default` point at whatever
+        // `rpc_endpoint()` resolves for THIS process env (no env mutation — the
+        // precedence itself is pinned by the pure-core tests above, and their
+        // composition gives "unset env -> DEFAULT_RPC_ENDPOINT"). Reading back
+        // the bound transport's endpoint proves `new` went through the
+        // resolver, not a hardcoded constant.
+        assert_eq!(RpcProvider::new().transport.endpoint, rpc_endpoint());
+        assert_eq!(RpcProvider::default().transport.endpoint, rpc_endpoint());
     }
 
     #[test]

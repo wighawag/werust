@@ -20,3 +20,10 @@ crates/werust-android/**/*.iml
 crates/werust-ios/build/
 crates/werust-ios/App/**/xcuserdata/
 crates/werust-ios/App/**/*.xcworkspace/xcuserdata/
+
+# Local-only env files (dev secrets, private RPC endpoints). NEVER commit a
+# real RPC URL, a private key, or any other secret into any tracked file.
+# `.env.example` (committed) documents the shape; real `.env*` files are not.
+.env
+.env.local
+.env.*.local

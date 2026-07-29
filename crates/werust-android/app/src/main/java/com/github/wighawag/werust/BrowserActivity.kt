@@ -102,6 +102,20 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var status: TextView
     private lateinit var trust: TextView
     private lateinit var errorBanner: TextView
+    /**
+     * The NON-BLOCKING loading banner: a bar directly under the toolbar and ABOVE
+     * the WebView, shown ONLY while a load is in flight, naming the current
+     * pipeline phase (one of the existing `LoadStep` values, verbatim) and offering
+     * a Cancel that calls the SAME `core.stop()` the toolbar Stop button uses. The
+     * field-test v0.2.7 fix — on a long retrieval the user stared at a frozen page
+     * with no signal anything was happening; this banner says "working: fetching
+     * content…" with a way out. Driven by the existing chrome-refresh pump (no new
+     * timer / poll / tight loop), so the Android ANR guard is not regressed. Hidden
+     * on a settled/failed chrome (the [errorBanner] takes the slot then). Task
+     * `loading-banner-with-phase-and-cancel`.
+     */
+    private lateinit var loadingBanner: LinearLayout
+    private lateinit var loadingBannerText: TextView
     private lateinit var invalidBadge: TextView
     private lateinit var webView: WebView
 
@@ -333,7 +347,48 @@ class BrowserActivity : ComponentActivity() {
             visibility = View.GONE
         }
 
+        // The NON-BLOCKING loading banner: a bar directly under the toolbar and
+        // ABOVE the WebView, shown ONLY while a load is in flight, naming the
+        // current pipeline phase (one of the existing `LoadStep` values, verbatim)
+        // and offering a Cancel that calls the SAME `core.stop()` the toolbar Stop
+        // button uses (task `loading-banner-with-phase-and-cancel`). A horizontal
+        // row: a weighted phase label (hexpand) + a Cancel button at the END.
+        // Starts hidden. Driven by the existing chrome-refresh pump (no new timer /
+        // poll / tight loop), so the Android ANR guard is not regressed.
+        loadingBannerText = TextView(this).apply {
+            setTextColor(0xFFFFFFFF.toInt())
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
+        }
+        val loadingBannerCancel = Button(this).apply {
+            text = "Cancel"
+            minWidth = 0
+            minimumWidth = 0
+            setPadding(dp(12), 0, dp(12), 0)
+            setTextColor(0xFFFFFFFF.toInt())
+            setBackgroundColor(0x00000000)
+            // Cancel calls the SAME `core.stop()` the toolbar Stop button uses — a
+            // cheap non-blocking core call (no resolve/network), so it runs inline
+            // on the UI thread; still refresh the chrome afterwards. No new
+            // mechanic, just a second affordance surfaced in the banner.
+            setOnClickListener { core.stop(); afterCoreAction() }
+        }
+        loadingBanner = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setBackgroundColor(0xFF1A5FB4.toInt())
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            addView(loadingBannerText)
+            addView(loadingBannerCancel)
+        }
+
         browserChrome.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        // The loading banner and the error banner share the slot directly under
+        // the toolbar and ABOVE the WebView. They are mutually exclusive (a load
+        // is either in flight or has settled as finished/failed/idle), so only one
+        // is visible at a time; both surface a load state the user cannot miss.
+        browserChrome.addView(loadingBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         browserChrome.addView(errorBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         browserChrome.addView(webView)
         browserChrome.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -521,6 +576,20 @@ class BrowserActivity : ComponentActivity() {
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone.
         trust.text = chrome.trustIndicator()
+        // The NON-BLOCKING loading banner: shown ONLY while a load is in flight,
+        // naming the current pipeline phase (one of the existing `LoadStep` values,
+        // verbatim). Its CANCEL calls the SAME `core.stop()` the toolbar Stop button
+        // uses (wired once at construction). Hidden on a settled/failed chrome (the
+        // error banner takes the slot on a failure) — the two are mutually
+        // exclusive, since a load is either in flight or has settled. Driven by this
+        // existing refresh, so no new timer / poll / tight loop (the Android ANR
+        // guard is not regressed). Task `loading-banner-with-phase-and-cancel`.
+        if (chrome.loadingBannerVisible()) {
+            loadingBannerText.text = chrome.loadingBannerText()
+            loadingBanner.visibility = View.VISIBLE
+        } else {
+            loadingBanner.visibility = View.GONE
+        }
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden

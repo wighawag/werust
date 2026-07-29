@@ -434,6 +434,33 @@ final class WerustCore {
         /// SAME rule desktop/Android apply, from the SAME chrome-JSON fact.
         func errorBannerVisible() -> Bool { error != nil }
 
+        /// Whether the NON-BLOCKING loading banner should be shown: exactly while
+        /// a load is in flight (`loading`). A passive view update driven by the
+        /// existing chrome-refresh pump (NOT a new timer / poll / tight loop), so
+        /// the Android ANR guard is not regressed. The IN-FLIGHT counterpart of
+        /// `errorBannerVisible()` (which fires on a FAILED load); the two are
+        /// mutually exclusive. The SAME rule desktop/Android apply, from the SAME
+        /// chrome-JSON `loading` fact (task `loading-banner-with-phase-and-cancel`).
+        func loadingBannerVisible() -> Bool { loading }
+
+        /// The loading-banner text: names the current pipeline phase (one of the
+        /// existing `LoadStep` wire values, verbatim) so a slow load reads as
+        /// working, not frozen — the field-test v0.2.7 finding this task answers.
+        /// The phase names are the `LoadStep` vocabulary verbatim (capitalised +
+        /// ellipsised for the banner), so the banner and the debug Network tab
+        /// cannot disagree. A generic "Loading…" is shown when a load is in flight
+        /// but no step is known yet (`loadStep` idle), so the banner never lies
+        /// about a frozen phase. The SAME mapping desktop/Android apply.
+        func loadingBannerText() -> String {
+            switch loadStep {
+            case "resolving-name": return "Resolving name…"
+            case "fetching-record": return "Fetching record…"
+            case "fetching-content": return "Fetching content…"
+            case "rendering": return "Rendering…"
+            default: return "Loading…"
+            }
+        }
+
         /// The PROMINENT error-banner text for a failed load: the accurate,
         /// protocol-named reason drawn straight from `error` (the resolver/decoder
         /// taxonomy — e.g. "IPNS record did not verify: …"), never a generic

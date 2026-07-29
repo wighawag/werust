@@ -56,6 +56,19 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// the footer status was "not easily seen"). Hidden otherwise. The SAME
     /// surfacing desktop/Android show.
     private let errorBanner = UILabel()
+    /// The NON-BLOCKING loading banner: a bar under the toolbar and ABOVE the web
+    /// view, shown ONLY while a load is in flight, naming the current pipeline
+    /// phase (one of the existing `LoadStep` values, verbatim) and offering a
+    /// Cancel that calls the SAME `core.stop()` the toolbar Stop button uses. The
+    /// field-test v0.2.7 fix — on a long retrieval the user stared at a frozen page
+    /// with no signal anything was happening; this banner says "working: fetching
+    /// content…" with a way out. Driven by the existing chrome-refresh pump (no new
+    /// timer / poll / tight loop), so the Android ANR guard is not regressed.
+    /// Hidden on a settled/failed chrome (the `errorBanner` takes the slot then).
+    /// Task `loading-banner-with-phase-and-cancel`.
+    private let loadingBanner = UIView()
+    private let loadingBannerLabel = UILabel()
+    private let loadingBannerCancel = UIButton(type: .system)
     private var webView: WKWebView!
     /// KVO token for observing `webView.url` so a SAME-DOCUMENT URL change (an SPA
     /// `pushState`/`replaceState`) is reported into the core. Held for the
@@ -283,7 +296,31 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         errorBanner.isHidden = true
         errorBanner.translatesAutoresizingMaskIntoConstraints = false
 
+        // The NON-BLOCKING loading banner: white-on-blue, naming the current
+        // pipeline phase with a Cancel that calls the SAME `core.stop()` the
+        // toolbar Stop button uses (task `loading-banner-with-phase-and-cancel`).
+        // A horizontal row: a wrapping phase label + a Cancel button at the END.
+        // Starts hidden; driven by the existing chrome-refresh pump (no new timer
+        // / poll / tight loop), so the Android ANR guard is not regressed.
+        loadingBanner.backgroundColor = UIColor(red: 0.10, green: 0.37, blue: 0.71, alpha: 1.0)
+        loadingBanner.isHidden = true
+        loadingBanner.translatesAutoresizingMaskIntoConstraints = false
+
+        loadingBannerLabel.font = .boldSystemFont(ofSize: 14)
+        loadingBannerLabel.textColor = .white
+        loadingBannerLabel.numberOfLines = 0
+        loadingBannerLabel.translatesAutoresizingMaskIntoConstraints = false
+        loadingBanner.addSubview(loadingBannerLabel)
+
+        loadingBannerCancel.setTitle("Cancel", for: .normal)
+        loadingBannerCancel.setTitleColor(.white, for: .normal)
+        loadingBannerCancel.titleLabel?.font = .boldSystemFont(ofSize: 14)
+        loadingBannerCancel.addTarget(self, action: #selector(onStop), for: .touchUpInside)
+        loadingBannerCancel.translatesAutoresizingMaskIntoConstraints = false
+        loadingBanner.addSubview(loadingBannerCancel)
+
         view.addSubview(toolbar)
+        view.addSubview(loadingBanner)
         view.addSubview(errorBanner)
         view.addSubview(webView)
         view.addSubview(statusLabel)
@@ -294,6 +331,23 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
             toolbar.topAnchor.constraint(equalTo: g.topAnchor, constant: 8),
             toolbar.leadingAnchor.constraint(equalTo: g.leadingAnchor, constant: 8),
             toolbar.trailingAnchor.constraint(equalTo: g.trailingAnchor, constant: -8),
+
+            // The loading banner and the error banner share the slot directly
+            // under the toolbar and ABOVE the web view. They are mutually
+            // exclusive (a load is either in flight or has settled as
+            // finished/failed/idle), so only one is visible at a time; both
+            // surface a load state the user cannot miss in the content area.
+            loadingBanner.topAnchor.constraint(equalTo: toolbar.bottomAnchor, constant: 8),
+            loadingBanner.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            loadingBanner.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+
+            loadingBannerLabel.topAnchor.constraint(equalTo: loadingBanner.topAnchor, constant: 10),
+            loadingBannerLabel.leadingAnchor.constraint(equalTo: loadingBanner.leadingAnchor, constant: 12),
+            loadingBannerLabel.bottomAnchor.constraint(equalTo: loadingBanner.bottomAnchor, constant: -10),
+            loadingBannerLabel.trailingAnchor.constraint(equalTo: loadingBannerCancel.leadingAnchor, constant: -8),
+
+            loadingBannerCancel.centerYAnchor.constraint(equalTo: loadingBanner.centerYAnchor),
+            loadingBannerCancel.trailingAnchor.constraint(equalTo: loadingBanner.trailingAnchor, constant: -12),
 
             // Directly under the toolbar and ABOVE the web view, so a failed load's
             // reason is unmissable in the content area, not buried in the footer.
@@ -365,6 +419,18 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone.
         trustLabel.text = chrome.trustIndicator()
+        // The NON-BLOCKING loading banner: shown ONLY while a load is in flight,
+        // naming the current pipeline phase (one of the existing `LoadStep` values,
+        // verbatim). Its CANCEL calls the SAME `core.stop()` the toolbar Stop button
+        // uses (wired once in `layoutChrome`). Hidden on a settled/failed chrome
+        // (the error banner takes the slot on a failure) — the two are mutually
+        // exclusive, since a load is either in flight or has settled. Driven by this
+        // existing refresh, so no new timer / poll / tight loop (the Android ANR
+        // guard is not regressed). Task `loading-banner-with-phase-and-cancel`.
+        loadingBanner.isHidden = !chrome.loadingBannerVisible()
+        if chrome.loadingBannerVisible() {
+            loadingBannerLabel.text = chrome.loadingBannerText()
+        }
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden

@@ -84,7 +84,8 @@ use serde_json::{json, Value};
 /// session construction — see [`rpc_endpoint`]. Mirrors the
 /// `GatewayContentSource::new` / `with_gateway` pair, so there is NO config
 /// subsystem to chase.
-pub const DEFAULT_RPC_ENDPOINT: &str = "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
+pub const DEFAULT_RPC_ENDPOINT: &str =
+    "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
 
 /// The environment variable that overrides [`DEFAULT_RPC_ENDPOINT`] for a
 /// session: the opt-in lever for pointing ENS resolution at a private endpoint
@@ -599,7 +600,10 @@ mod tests {
         // The human-triggered default swap: the labelled default is now the
         // public, keyless `1rpc.io/eth` (publicnode.com was observed DNS- and
         // TLS-blocked on home networks).
-        assert_eq!(DEFAULT_RPC_ENDPOINT, "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161");
+        assert_eq!(
+            DEFAULT_RPC_ENDPOINT,
+            "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161"
+        );
     }
 
     #[test]

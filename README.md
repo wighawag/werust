@@ -8,7 +8,7 @@ Standard cargo workflow: `cargo build`, `cargo test` (the `verify` gate addition
 
 ### Private Ethereum RPC endpoint (`WERUST_RPC_URL`)
 
-ENS resolution (`ronan.eth` -> IPFS) goes through a trusted JSON-RPC endpoint whose public, keyless default is `https://1rpc.io/eth`. To use a private endpoint (your own node, e.g. the `https://your-private-rpc.example.com/` shape) WITHOUT committing its URL:
+ENS resolution (`ronan.eth` -> IPFS) goes through a trusted JSON-RPC endpoint whose public, keyless default is `https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161`. To use a private endpoint (your own node, e.g. the `https://your-private-rpc.example.com/` shape) WITHOUT committing its URL:
 
 1. Copy `.env.example` to `.env` (git-ignored) and set `WERUST_RPC_URL`.
 2. Run via `source .env && cargo run` (or a `direnv`-style loader — your choice; werust deliberately ships NO runtime `.env` loader).

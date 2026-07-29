@@ -74,8 +74,8 @@ use serde_json::{json, Value};
 ///
 /// This is a TRUSTED origin: the `eth_call` result is taken on this endpoint's
 /// word (Phase 1 has no light client — the trustless backend is the Phase-2
-/// swap). `https://1rpc.io/eth` is a public, keyless mainnet RPC used as the
-/// labelled default (the previous default, `ethereum-rpc.publicnode.com`, was
+/// swap). `https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161` is a public, keyless mainnet RPC used as the
+/// labelled default (the previous default, `ethereum-rpc.publicnode.com`, then `https://1rpc.io/eth`, were
 /// observed DNS-blocked by home routers and TLS-broken behind captive portals);
 /// the durable endpoint policy (which RPC, or a local node) is not this task's
 /// concern and is overridden by constructing with
@@ -84,7 +84,7 @@ use serde_json::{json, Value};
 /// session construction — see [`rpc_endpoint`]. Mirrors the
 /// `GatewayContentSource::new` / `with_gateway` pair, so there is NO config
 /// subsystem to chase.
-pub const DEFAULT_RPC_ENDPOINT: &str = "https://1rpc.io/eth";
+pub const DEFAULT_RPC_ENDPOINT: &str = "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
 
 /// The environment variable that overrides [`DEFAULT_RPC_ENDPOINT`] for a
 /// session: the opt-in lever for pointing ENS resolution at a private endpoint
@@ -599,7 +599,7 @@ mod tests {
         // The human-triggered default swap: the labelled default is now the
         // public, keyless `1rpc.io/eth` (publicnode.com was observed DNS- and
         // TLS-blocked on home networks).
-        assert_eq!(DEFAULT_RPC_ENDPOINT, "https://1rpc.io/eth");
+        assert_eq!(DEFAULT_RPC_ENDPOINT, "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161");
     }
 
     #[test]

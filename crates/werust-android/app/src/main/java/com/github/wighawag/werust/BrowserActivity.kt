@@ -745,11 +745,16 @@ class BrowserActivity : ComponentActivity() {
          * THREADING: this hook runs on a WebView WORKER thread, NOT the UI thread
          * that drives `navigate` / `onPageStarted` / `onPageFinished`. Both touch
          * the SAME native session, so the Rust edge wraps it in a `SyncSession`
-         * (a `Mutex` around the single-threaded `CoreSession`): every native call
-         * — including this [WerustCore.resolveIpfs] — locks first, so the two
-         * threads are serialized and the core's shared `RefCell` is never borrowed
-         * concurrently. That is what makes calling into the core from this
-         * off-UI-thread hook sound.
+         * (a `Mutex` around the single-threaded `CoreSession`): every WORKER-thread
+         * native call — including this [WerustCore.resolveIpfs] — locks first, so
+         * the two threads are serialized. The UI thread's page-signal callbacks
+         * ([WerustCore.onPageCommitted] / [WerustCore.onPageFinished] /
+         * [WerustCore.onPageFailed] / [WerustCore.onUrlChanged]) are the one
+         * exception: they record through the backend's thread-safe clone handle
+         * OFF the session lock, so a multi-second retrieval holding the lock here
+         * can never freeze the UI thread (the ANR guard, task
+         * `mobile-page-signal-callbacks-off-session-lock`). That is what makes
+         * calling into the core from this off-UI-thread hook sound.
          */
         override fun shouldInterceptRequest(
             view: WebView,

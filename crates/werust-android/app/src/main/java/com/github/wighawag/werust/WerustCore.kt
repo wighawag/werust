@@ -94,13 +94,26 @@ class WerustCore : AutoCloseable {
     fun handleProviderMessage(name: String, body: String): String =
         nativeHandleProviderMessage(handle, name, body)
 
-    /** Report the platform `WebView`'s commit signal into the core. */
+    /**
+     * Report the platform `WebView`'s commit signal into the core. Runs on the
+     * UI thread and returns OFF the native session lock (it records through the
+     * backend's thread-safe clone handle), so it never waits on an in-flight
+     * `ipfs://` retrieval — the ANR guard (task
+     * `mobile-page-signal-callbacks-off-session-lock`). The chrome fold is
+     * deferred to the next [chrome] / [takePendingLoad] read, which repaints it.
+     */
     fun onPageCommitted(url: String) = nativeOnPageCommitted(handle, url)
 
-    /** Report the platform `WebView`'s finished signal into the core. */
+    /**
+     * Report the platform `WebView`'s finished signal into the core. Off the
+     * native session lock, like [onPageCommitted].
+     */
     fun onPageFinished(url: String) = nativeOnPageFinished(handle, url)
 
-    /** Report the platform `WebView`'s error signal into the core. */
+    /**
+     * Report the platform `WebView`'s error signal into the core. Off the
+     * native session lock, like [onPageCommitted].
+     */
     fun onPageFailed(url: String, reason: String) = nativeOnPageFailed(handle, url, reason)
 
     /**
@@ -109,6 +122,9 @@ class WerustCore : AutoCloseable {
      * location instead of freezing. Reported from
      * [android.webkit.WebViewClient.doUpdateVisitedHistory], which fires on
      * same-document history changes (no `onPageStarted`/`onPageFinished`).
+     * Off the native session lock, like [onPageCommitted] — this is the signal
+     * the v0.2.7 SPA-nav freeze pinned, so it must return in microseconds even
+     * while the router's `__data.json` retrieval holds the worker-side lock.
      */
     fun onUrlChanged(url: String) = nativeOnUrlChanged(handle, url)
 

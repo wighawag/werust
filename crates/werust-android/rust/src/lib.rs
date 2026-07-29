@@ -162,6 +162,33 @@ impl CoreSession {
         self.shell.stop();
     }
 
+    /// Drain every pending load event off the backend and fold it into the
+    /// chrome ([`BrowserShell::pump`](werust_core::BrowserShell::pump)).
+    ///
+    /// The single-threaded signal callbacks below
+    /// ([`on_page_committed`](CoreSession::on_page_committed) & co.) run this
+    /// INLINE. The [`SyncSession`] page-signal path instead RECORDS the signals
+    /// off the session lock and runs the pump on the next locked read (the
+    /// deferred pump — see [`SyncSession::on_page_committed`]).
+    pub fn pump(&mut self) {
+        self.shell.pump();
+    }
+
+    /// A CLONE of the session's backend handle: the same shared inner the
+    /// shell's backend drives, reachable WITHOUT borrowing the session.
+    ///
+    /// This is the clone-boundary the [`SyncSession`] page-signal path is built
+    /// on (task `mobile-page-signal-callbacks-off-session-lock`): the handle's
+    /// inner is an `Arc<Mutex<_>>` whose holds are microsecond field accesses,
+    /// so the UI thread's page-signal callbacks can RECORD through it while a
+    /// worker thread holds the session lock for a retrieval — the debug-capture
+    /// clone-out precedent ([`debug_capture`](CoreSession::debug_capture))
+    /// applied to the WebView load signals.
+    #[must_use]
+    pub fn backend_handle(&self) -> AndroidHandle {
+        self.backend.clone()
+    }
+
     /// The URL (if any) the core has committed to but the platform `WebView` has
     /// not yet loaded. Kotlin drains this after driving the session and calls
     /// `WebView.loadUrl` with it.
@@ -361,46 +388,97 @@ pub fn menu_json() -> String {
 ///
 /// # Why this exists (the Android-only data race)
 ///
-/// The [`CoreSession`] is single-threaded by construction: its
-/// [`AndroidBackend`] shares its state through an [`Rc<RefCell>`](std::rc::Rc)
-/// (`!Sync`, the same interior-mutability shape `webview-renderer` uses), so
-/// every method assumes it is the ONLY thing touching the session. Desktop and
-/// iOS honour that: their scheme handlers dispatch on the single main/GTK thread,
-/// so the whole session is only ever driven from one thread.
+/// The [`CoreSession`] is single-threaded by construction: its shell owns the
+/// backend as a `Box<dyn Renderer>` and every shell method assumes it is the
+/// ONLY thing touching the session. Desktop and iOS honour that: their scheme
+/// handlers dispatch on the single main/GTK thread, so the whole session is
+/// only ever driven from one thread.
 ///
 /// Android is the exception. The platform `WebView` runs
 /// `WebViewClient.shouldInterceptRequest` on a WebView WORKER thread, while the
 /// UI thread independently drives the SAME session during an in-flight load
 /// (`navigate`/`onPageStarted`/`onPageFinished` + sub-resource interception).
 /// Without a boundary, the worker thread's [`resolve_ipfs`](CoreSession::resolve_ipfs)
-/// (`RefCell::borrow_mut` on the shared inner) races the UI thread's navigate /
-/// load-signal calls (also `borrow_mut`): two `&mut CoreSession` live across
-/// threads plus a non-atomic `RefCell` borrow = a data race / UB / a `RefCell`
-/// already-borrowed panic.
+/// races the UI thread's navigate / load-signal calls on the backend's shared
+/// state: two live accesses across threads = a data race / UB.
 ///
 /// `SyncSession` closes that gap: it wraps the session in a [`Mutex`] and every
-/// edge call goes through it, so no two threads ever borrow the `RefCell`
-/// concurrently — the worker-thread resolve and the UI-thread drive are
-/// serialized. The lock is the SAME single-thread invariant desktop/iOS get for
-/// free from their single-threaded dispatch, made explicit on the one edge that
-/// needs it.
+/// SESSION-DRIVING or SHELL-READING call goes through it, so the worker-thread
+/// resolve and the UI-thread drive are serialized. The lock is the SAME
+/// single-thread invariant desktop/iOS get for free from their single-threaded
+/// dispatch, made explicit on the one edge that needs it.
+///
+/// # The TWO lock-free paths (clone-handle boundaries)
+///
+/// Not every call goes through the mutex. Two kinds of state are reachable
+/// through a CLONE of thread-safe shared state held BESIDE the mutex, so their
+/// callers never queue behind a lock a worker thread can hold for SECONDS (a
+/// CAR retrieval inside `resolve_ipfs` — the ANR shape of the v0.2.7 field
+/// finding, where a same-document URL update from a SvelteKit `pushState`
+/// froze the UI thread long enough to raise Android's "kill app / wait?"
+/// dialog):
+///
+/// * The DEBUG CAPTURE store (`Arc<Mutex<_>>` clone — see
+///   [`debug_capture`](SyncSession::debug_capture)), the precedent.
+/// * The BACKEND's shared inner (`Arc<Mutex<_>>` via the cloned
+///   [`AndroidHandle`]) for the four UI-thread PAGE-SIGNAL callbacks
+///   ([`on_page_committed`](SyncSession::on_page_committed) /
+///   [`on_page_finished`](SyncSession::on_page_finished) /
+///   [`on_page_failed`](SyncSession::on_page_failed) /
+///   [`on_url_changed`](SyncSession::on_url_changed), task
+///   `mobile-page-signal-callbacks-off-session-lock`). No inner lock is ever
+///   held across I/O (see [`AndroidHandle::resolve_scheme`]), so these contend
+///   for microseconds at worst.
+///
+/// Every WORKER-thread caller stays ON the mutex: `resolve_ipfs` AND
+/// `handle_provider_message` (the two long-lived lockers), plus the
+/// shorter-lived `document_start_scripts`. They serialize against the
+/// UI/executor thread's session drive exactly as before; only the page-signal
+/// callbacks moved off, and taking a worker caller off would silently lose
+/// that serialisation during a long provider call.
+///
+/// # The deferred pump
+///
+/// The lock-free page-signal callbacks RECORD the signal (load state + event +
+/// history) but do NOT pump the shell — the pump needs the session, which is
+/// exactly what is locked. The fold into the chrome happens in the pump-first
+/// locked reads ([`take_pending_load`](SyncSession::take_pending_load) and
+/// [`chrome_json`](SyncSession::chrome_json)), which the Kotlin edge calls
+/// immediately after every signal (`afterCoreAction`), so the chrome — and the
+/// `_redirects` 3xx pending-load hand-off — behave exactly as when the
+/// callbacks pumped inline.
+///
+/// RESIDUAL (recorded, per the task's "only lock-free path" prescription): the
+/// two pump-first READS still take the mutex, so the UI thread can still wait
+/// out the REMAINDER of one in-flight retrieval on a read (bounded, and
+/// unchanged from before — the callbacks, the cumulative multi-retrieval
+/// freeze, are what moved off). If the on-device verification still reproduces
+/// the dialog, a chrome snapshot / clone-handle read path is the documented
+/// follow-up (`docs/spikes/mobile-page-signal-callbacks-off-session-lock/MANUAL-VERIFICATION.md`).
 ///
 /// # Soundness of a `Mutex` over a `!Send` session
 ///
-/// [`CoreSession`] is `!Send` (it owns `Rc`s), so `SyncSession` is itself
-/// `!Send`/`!Sync` at the type level and the JNI layer crosses only a raw
-/// pointer (never a typed `Send` reference). The `Mutex` provides the actual
-/// mutual exclusion + happens-before: the `Rc` refcounts are only ever touched
-/// while the lock is held (the `Rc`s never escape the guarded `CoreSession`), so
-/// there is no concurrent refcount mutation. One thread accesses the session at
-/// a time, with a release/acquire edge between them — the same guarantee a
-/// single dispatch thread would give.
+/// [`CoreSession`] is `!Send` (its shell owns a `Box<dyn Renderer>`), so
+/// `SyncSession` is itself `!Send`/`!Sync` at the type level and the JNI layer
+/// crosses only a raw pointer (never a typed `Send` reference). The `Mutex`
+/// provides the actual mutual exclusion + happens-before for the session: one
+/// thread drives the shell at a time, with a release/acquire edge between
+/// them — the same guarantee a single dispatch thread would give. The cloned
+/// [`AndroidHandle`] needs no such discipline: its `Arc<Mutex<_>>` inner is
+/// `Send + Sync` in its own right, so the lock-free paths above are sound
+/// without the session lock.
 pub struct SyncSession {
     inner: Mutex<CoreSession>,
     /// A CLONE of the session's [`DebugCapture`](werust_core::debug::DebugCapture),
     /// held BESIDE the mutex so the debug capture points never touch the session
     /// lock (see [`debug_capture`](SyncSession::debug_capture)).
     debug: werust_core::debug::DebugCapture,
+    /// A CLONE of the session's [`AndroidHandle`], held BESIDE the mutex so the
+    /// UI thread's page-signal callbacks record through the backend's
+    /// `Arc<Mutex<_>>` inner WITHOUT the session lock (see the struct doc's
+    /// "lock-free paths" section). Both clones are the same shared inner the
+    /// shell's backend drives.
+    backend: AndroidHandle,
 }
 
 impl Default for SyncSession {
@@ -418,9 +496,14 @@ impl SyncSession {
         // later capture push reaches the store WITHOUT taking the session lock
         // (see `debug_capture`). Both clones are the same store.
         let debug = session.debug_capture().clone();
+        // Clone the backend handle OUT once too, at construction, so the
+        // page-signal callbacks record through the shared inner WITHOUT taking
+        // the session lock (see the struct doc's "lock-free paths" section).
+        let backend = session.backend_handle();
         Self {
             inner: Mutex::new(session),
             debug,
+            backend,
         }
     }
 
@@ -462,10 +545,20 @@ impl SyncSession {
         self.with(CoreSession::stop);
     }
 
-    /// Drain the pending load, under the lock. See
+    /// Drain the pending load, under the lock, PUMPING first. See
     /// [`CoreSession::take_pending_load`].
+    ///
+    /// The pump-first fold is where a page signal RECORDED off the session lock
+    /// (the lock-free path — see [`on_page_committed`](SyncSession::on_page_committed))
+    /// lands in the chrome, and it must happen in the SAME locked call as the
+    /// drain: the pump is what turns a `_redirects` 3xx into the queued pending
+    /// load (task `ipfs-redirects-3xx-navigation-support`), so draining before
+    /// the fold would miss the redirect.
     pub fn take_pending_load(&self) -> Option<String> {
-        self.with(CoreSession::take_pending_load)
+        self.with(|s| {
+            s.pump();
+            s.take_pending_load()
+        })
     }
 
     /// Resolve an intercepted `ipfs://` request, under the lock. This is the
@@ -493,35 +586,69 @@ impl SyncSession {
         self.with(|s| s.handle_provider_message(name, body))
     }
 
-    /// Report the commit signal, under the lock. See
-    /// [`CoreSession::on_page_committed`].
+    /// Report the commit signal, OFF the session lock. The semantics are
+    /// [`CoreSession::on_page_committed`]'s; the difference at this layer is
+    /// the PATH and the PUMP:
+    ///
+    /// * PATH: the signal is recorded through the cloned [`AndroidHandle`] (the
+    ///   backend's `Arc<Mutex<_>>` inner), never `self.with(...)`. Called from
+    ///   the Android UI thread, so it must NEVER queue behind the session lock
+    ///   a WebView worker thread holds for a multi-second CAR retrieval inside
+    ///   `resolve_ipfs` — the ANR shape of the v0.2.7 field finding (the
+    ///   ronan.eth "kill app / wait?" dialog, task
+    ///   `mobile-page-signal-callbacks-off-session-lock`).
+    /// * PUMP: DEFERRED, unlike [`CoreSession::on_page_committed`]'s inline
+    ///   pump — the pump needs the session, which is exactly what is locked.
+    ///   The fold into the chrome happens in the pump-first locked reads
+    ///   ([`take_pending_load`](SyncSession::take_pending_load) /
+    ///   [`chrome_json`](SyncSession::chrome_json)), which the Kotlin edge
+    ///   calls immediately after every signal (`afterCoreAction`), so the
+    ///   chrome behaves exactly as when the callbacks pumped inline.
     pub fn on_page_committed(&self, url: &str) {
-        self.with(|s| s.on_page_committed(url));
+        self.backend.on_page_committed(url);
     }
 
-    /// Report the finished signal, under the lock. See
-    /// [`CoreSession::on_page_finished`].
+    /// Report the finished signal, OFF the session lock. See
+    /// [`CoreSession::on_page_finished`] for the semantics and
+    /// [`on_page_committed`](SyncSession::on_page_committed) for why this
+    /// records through the clone-handle boundary with the pump deferred.
     pub fn on_page_finished(&self, url: &str) {
-        self.with(|s| s.on_page_finished(url));
+        self.backend.on_page_finished(url);
     }
 
-    /// Report the error signal, under the lock. See
-    /// [`CoreSession::on_page_failed`].
+    /// Report the error signal, OFF the session lock. See
+    /// [`CoreSession::on_page_failed`] for the semantics and
+    /// [`on_page_committed`](SyncSession::on_page_committed) for why this
+    /// records through the clone-handle boundary with the pump deferred.
     pub fn on_page_failed(&self, url: &str, reason: &str) {
-        self.with(|s| s.on_page_failed(url, reason));
+        self.backend.on_page_failed(url, reason);
     }
 
-    /// Report a same-document URL change, under the lock. See
-    /// [`CoreSession::on_url_changed`].
+    /// Report a same-document URL change, OFF the session lock. See
+    /// [`CoreSession::on_url_changed`] for the semantics and
+    /// [`on_page_committed`](SyncSession::on_page_committed) for the path.
+    ///
+    /// This is THE callback the v0.2.7 freeze pinned: an SPA `pushState` fires
+    /// `doUpdateVisitedHistory` on the UI thread WHILE the client router's
+    /// `__data.json` round-trip keeps the worker thread holding the session
+    /// lock — the URL-bar update now records in microseconds and the fold
+    /// follows on the next chrome read, instead of the UI thread freezing
+    /// behind the retrieval.
     pub fn on_url_changed(&self, url: &str) {
-        self.with(|s| s.on_url_changed(url));
+        self.backend.on_url_changed(url);
     }
 
-    /// The current chrome as a JSON object, under the lock. See
+    /// The current chrome as a JSON object, under the lock, PUMPING first so a
+    /// page signal RECORDED off the session lock is folded into the chrome
+    /// before the encode (the deferred pump — see
+    /// [`on_page_committed`](SyncSession::on_page_committed)). See
     /// [`CoreSession::chrome_json`].
     #[must_use]
     pub fn chrome_json(&self) -> String {
-        self.with(|s| s.chrome_json())
+        self.with(|s| {
+            s.pump();
+            s.chrome_json()
+        })
     }
 
     /// The debug capture store as a JSON document, read OFF the session lock.
@@ -801,12 +928,14 @@ mod jni_exports {
     /// Reconstruct a `&SyncSession` from the opaque handle Kotlin threads back.
     ///
     /// The handle points at a [`SyncSession`], not a bare `CoreSession`, so a
-    /// shared `&` is enough: every session method locks the inner `Mutex` before
-    /// touching the `CoreSession`. This is what makes the two Kotlin threads
+    /// shared `&` is enough: every session-DRIVING method locks the inner
+    /// `Mutex` before touching the `CoreSession`, and the two lock-free paths
+    /// (the page-signal callbacks and the debug capture) go through their own
+    /// thread-safe clone handles. This is what makes the two Kotlin threads
     /// safe — the UI thread's navigate / load-signal calls and the WebView
     /// worker thread's `shouldInterceptRequest` -> `nativeResolveIpfs` can hold
-    /// this `&` at the same time, but the `Mutex` serializes the actual session
-    /// access so the shared `RefCell` is never borrowed by two threads at once.
+    /// this `&` at the same time, with the `Mutex` serializing the actual
+    /// session access and the clone handles serializing their own shared state.
     ///
     /// # Safety
     /// `handle` must be a pointer returned by `nativeNew` and not yet freed by
@@ -1578,21 +1707,29 @@ mod tests {
 
     #[test]
     fn the_sync_session_serializes_the_ui_thread_and_the_webview_worker_thread() {
-        // The requeue's Gate-2 data race, reproduced and closed: on Android the
-        // WebView WORKER thread runs `shouldInterceptRequest` -> `resolve_ipfs`
-        // (a `RefCell::borrow_mut` on the shared inner) WHILE the UI thread drives
-        // the SAME session (navigate / onPageStarted / onPageFinished, also
-        // `borrow_mut`). Against a bare `CoreSession` that is two `&mut` across
-        // threads + a non-atomic `RefCell` borrow = UB / a `RefCell`
-        // already-borrowed panic. `SyncSession` wraps the session in a `Mutex`, so
-        // the two threads are serialized and neither the resolve nor the drive can
-        // observe a mid-borrow session.
+        // The requeue's Gate-2 data race, reproduced and closed on the WORKER
+        // side. The WebView worker side has TWO session-lock callers, not one:
+        // `shouldInterceptRequest` -> `resolve_ipfs` AND the provider
+        // JS-interface -> `handle_provider_message` (and `document_start_scripts`
+        // / `debug_json` for shorter-lived reads), each serialized by
+        // `self.with(...)` against every other session access. This drives BOTH
+        // long-lived worker callers concurrently many times over: if the
+        // boundary were missing, their accesses on the backend's shared inner
+        // and the shell would collide mid-call.
         //
-        // This drives BOTH edges concurrently many times over: if the boundary
-        // were missing (a bare `Rc<RefCell>` shared unsynchronized), the
-        // `borrow_mut` collisions would panic the worker or the UI thread. It
-        // stays network-isolated: the `ipfs://` CID is malformed, so `resolve_ipfs`
-        // fails closed in `Cid::try_from` BEFORE any fetch.
+        // The UI thread is deliberately NOT part of this concurrent pair any
+        // more: since the page-signal callbacks moved onto the clone-handle
+        // boundary (the backend's `Arc<Mutex>` inner cloned out of the session,
+        // the debug-capture precedent — task
+        // `mobile-page-signal-callbacks-off-session-lock`), the UI thread now
+        // reads the chrome through the clone-handle boundary and is NOT
+        // serialised by this test; the worker side still is. The UI side's
+        // guarantee is pinned by the sibling ANR guard
+        // (`the_page_signal_callbacks_never_wait_on_the_session_lock_so_a_spa_nav_cannot_anr`).
+        //
+        // It stays network-isolated: the `ipfs://` CID is malformed, so
+        // `resolve_ipfs` fails closed in `Cid::try_from` BEFORE any fetch, and
+        // the provider bridge's read-only stub answers `eth_chainId` keylessly.
         use std::thread;
 
         // Own the session in a `Box` on the main thread and cross ONLY the raw
@@ -1605,28 +1742,9 @@ mod tests {
         let raw: *mut SyncSession = Box::into_raw(session);
         let iterations = 500;
 
-        // The UI thread: the in-flight-load drive the Activity does on the main
-        // thread (navigate + the WebView's real load signals + chrome reads).
-        let ui = {
-            let ptr = SessionPtr(raw);
-            thread::spawn(move || {
-                let ptr = ptr;
-                let s: &SyncSession = unsafe { &*ptr.0 };
-                for i in 0..iterations {
-                    let url = format!("https://example.com/{i}");
-                    s.navigate(&url);
-                    if let Some(pending) = s.take_pending_load() {
-                        s.on_page_committed(&pending);
-                        s.on_page_finished(&pending);
-                    }
-                    let _ = s.chrome_json();
-                }
-            })
-        };
-
-        // The WebView worker thread: `shouldInterceptRequest` resolving `ipfs://`
-        // through the shared core path concurrently with the UI-thread drive.
-        let worker = {
+        // WebView worker thread A: `shouldInterceptRequest` resolving `ipfs://`
+        // through the shared core path, under the session lock.
+        let resolver = {
             let ptr = SessionPtr(raw);
             thread::spawn(move || {
                 let ptr = ptr;
@@ -1634,7 +1752,7 @@ mod tests {
                 for _ in 0..iterations {
                     // Intercepted + routed to the core; a malformed CID fails
                     // closed (network-isolated) but STILL exercises the same
-                    // `borrow_mut` on the shared inner that races the UI thread.
+                    // locked session access that races the provider worker.
                     match s.resolve_ipfs("ipfs://not-a-valid-cid/index.html") {
                         Some(SchemeResolution::Err { .. }) => {}
                         other => panic!("expected a fail-closed resolution, got {other:?}"),
@@ -1643,19 +1761,44 @@ mod tests {
             })
         };
 
-        // If the boundary were missing this join would surface a panic (a
-        // `RefCell` already-borrowed) from either thread; with it, both complete.
-        ui.join()
-            .expect("the UI-thread drive must not panic under the lock");
-        worker
+        // WebView worker thread B: the provider JS-interface dispatching
+        // EIP-1193 envelopes through the shared core path, under the SAME
+        // session lock — the second long-lived locker, serialised against the
+        // first exactly as both are serialised against the UI-thread drive.
+        let provider = {
+            let ptr = SessionPtr(raw);
+            thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                for i in 0..iterations {
+                    let pushed = s.handle_provider_message(
+                        "werustProvider",
+                        &format!(r#"{{"id":{i},"method":"eth_chainId","params":[]}}"#),
+                    );
+                    assert_eq!(
+                        pushed.len(),
+                        1,
+                        "the provider round-trips under the contended lock"
+                    );
+                }
+            })
+        };
+
+        // If the boundary were missing these joins would surface a panic from a
+        // mid-call collision; with it, both worker sides complete serialized.
+        resolver
             .join()
             .expect("the WebView-worker resolve must not panic under the lock");
+        provider
+            .join()
+            .expect("the provider worker must not panic under the lock");
 
         // Reclaim ownership on the main thread now both workers have joined.
         let session: Box<SyncSession> = unsafe { Box::from_raw(raw) };
 
-        // The session survived the concurrent drive and is still coherent: a
-        // final navigate + settle through the same boundary still works.
+        // The session survived the concurrent worker drive and is still
+        // coherent: a final navigate + settle through the same boundary (the
+        // page signals recording OFF the lock, the reads folding them) works.
         session.navigate("https://after.example/");
         if let Some(pending) = session.take_pending_load() {
             session.on_page_committed(&pending);
@@ -1665,6 +1808,96 @@ mod tests {
         assert!(
             json.contains("\"url\":\"https://after.example/\""),
             "the session is still coherent after the concurrent drive: {json}"
+        );
+    }
+
+    #[test]
+    fn the_page_signal_callbacks_never_wait_on_the_session_lock_so_a_spa_nav_cannot_anr() {
+        // THE ANR REGRESSION GUARD (task
+        // `mobile-page-signal-callbacks-off-session-lock`, the v0.2.7 field
+        // finding): a `shouldInterceptRequest` mid-`resolve_ipfs` holds the
+        // session lock for SECONDS on the WebView WORKER thread during a CAR
+        // retrieval, and the UI thread's page-signal callbacks used to queue
+        // behind it through `self.with(...)` — a same-document `onUrlChanged`
+        // from a SvelteKit `pushState` then froze the UI thread long enough to
+        // raise Android's "kill app / wait?" dialog.
+        //
+        // This test HOLDS the session lock (the worker's mid-retrieval stand-in)
+        // and then drives the FOUR UI-thread page-signal callbacks from another
+        // thread (crossing the raw pointer exactly as the JNI edge does): each
+        // must return within 10ms. The receive timeout is the deadlock trip: if
+        // a callback ever goes back through the session lock, it blocks behind
+        // the held guard and this fails cleanly instead of hanging the gate.
+        use std::sync::{mpsc, Arc, Barrier};
+        use std::time::{Duration, Instant};
+
+        let session: Box<SyncSession> = Box::default();
+        let raw: *mut SyncSession = Box::into_raw(session);
+
+        // Establish a current entry so the four signals have a load to report
+        // against (the SPA nav rewrites it below).
+        {
+            let s: &SyncSession = unsafe { &*raw };
+            s.navigate("https://example.com/");
+            let _ = s.take_pending_load();
+        }
+
+        // The gate: the UI thread starts signalling only once this thread HOLDS
+        // the session lock (so thread-spawn latency never pollutes the 10ms).
+        let gate = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel::<(&'static str, Duration)>();
+        let ui = {
+            let ptr = SessionPtr(raw);
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let ptr = ptr;
+                let s: &SyncSession = unsafe { &*ptr.0 };
+                gate.wait();
+                let start = Instant::now();
+                s.on_page_committed("https://example.com/");
+                tx.send(("on_page_committed", start.elapsed())).unwrap();
+                let start = Instant::now();
+                s.on_page_finished("https://example.com/");
+                tx.send(("on_page_finished", start.elapsed())).unwrap();
+                let start = Instant::now();
+                s.on_page_failed("https://example.com/dead", "boom");
+                tx.send(("on_page_failed", start.elapsed())).unwrap();
+                let start = Instant::now();
+                s.on_url_changed("https://example.com/other");
+                tx.send(("on_url_changed", start.elapsed())).unwrap();
+            })
+        };
+
+        // The WebView WORKER thread: hold the session lock exactly as a
+        // multi-second CAR retrieval inside `resolve_ipfs` does, then release
+        // the UI thread onto its callbacks.
+        let held = unsafe { &*raw }
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        gate.wait();
+
+        for _ in 0..4 {
+            let (call, elapsed) = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a page-signal callback blocked behind the worker-held session lock");
+            assert!(
+                elapsed < Duration::from_millis(10),
+                "{call} took {elapsed:?} while the worker held the session lock \
+                 (the ANR shape: the UI thread must return in milliseconds)"
+            );
+        }
+        ui.join().expect("the UI-thread signalling must not panic");
+        drop(held);
+
+        // The signals were RECORDED, not dropped: the next locked read folds
+        // them into the chrome (the deferred pump), so the URL bar still
+        // follows the SPA nav once it is read.
+        let session: Box<SyncSession> = unsafe { Box::from_raw(raw) };
+        let json = session.chrome_json();
+        assert!(
+            json.contains("\"url\":\"https://example.com/other\""),
+            "the deferred pump folds the recorded signals into the chrome: {json}"
         );
     }
 

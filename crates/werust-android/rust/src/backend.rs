@@ -10,10 +10,22 @@
 //! Unlike the WebKitGTK backend, `AndroidBackend` does not OWN a native view: the
 //! Kotlin `Activity` owns the platform `WebView`. So this backend is *edge-driven*
 //! from both sides across the JNI boundary, and it shares its state behind an
-//! [`Rc<RefCell>`](std::rc::Rc) — the SAME interior-mutability shape
-//! `webview-renderer` uses to share a `LoadLifecycle` with the webview's signal
-//! closures — so the core owns a `Box<dyn Renderer>` while the session keeps an
-//! [`AndroidHandle`] to the same state for the platform-`WebView` protocol:
+//! [`Arc<Mutex>`](std::sync::Mutex) — the THREAD-SAFE analogue of the
+//! `Rc<RefCell>` interior-mutability shape `webview-renderer` uses to share a
+//! `LoadLifecycle` with the webview's signal closures — so the core owns a
+//! `Box<dyn Renderer>` while the session keeps an [`AndroidHandle`] to the same
+//! state for the platform-`WebView` protocol:
+//!
+//! Why not the desktop `Rc<RefCell>` shape: Android is the one edge where the
+//! shared state is touched from TWO threads at once (the WebView WORKER thread's
+//! `shouldInterceptRequest` and the UI thread's page-signal callbacks), and the
+//! UI-thread callbacks deliberately go through a CLONED handle OFF the session
+//! lock (task `mobile-page-signal-callbacks-off-session-lock` — a worker-held
+//! session lock during a multi-second CAR retrieval must never delay them, the
+//! ANR shape). Only a thread-safe shared cell makes that clone-boundary sound;
+//! every lock hold here is a microsecond field access (no call holds the lock
+//! across I/O — see [`AndroidHandle::resolve_scheme`]), so the two paths contend
+//! for nanoseconds, never for the length of a retrieval.
 //!
 //! * The core drives navigation INTO the backend
 //!   ([`navigate`](Renderer::navigate)/[`go_back`](Renderer::go_back)/…); the
@@ -31,10 +43,8 @@
 //! own, so "Kotlin confined to the OS edge" holds: history logic lives here, in
 //! Rust, behind the seam.
 
-use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use renderer::{
     KeyEvent, LoadEvent, LoadState, PointerEvent, Renderer, RendererError, SchemeHandler,
@@ -43,6 +53,20 @@ use renderer::{
 };
 
 use crate::origin_map::{from_webview_url, to_webview_url};
+
+/// Lock the shared inner, recovering a poisoned lock into the guard rather than
+/// propagating: the edge must stay responsive, and the inner is plain data whose
+/// mutations are individually consistent (a panic mid-call is a bug we would
+/// rather surface as a degraded-but-live session than a crash on every later
+/// call). The same posture `SyncSession::with` takes for the session lock.
+///
+/// Every hold of this lock is a microsecond field access or map/queue operation
+/// — NEVER held across a scheme/script handler call or any I/O (see
+/// [`AndroidHandle::resolve_scheme`]) — so the UI thread's lock-free page-signal
+/// path can never queue behind a worker thread's retrieval.
+fn lock(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
+    inner.lock().unwrap_or_else(|p| p.into_inner())
+}
 
 /// Validate a URL for [`Renderer::navigate`], rejecting unusable ones.
 ///
@@ -110,13 +134,14 @@ struct Inner {
     /// [`AndroidHandle::take_pending_eval`] for Kotlin to run via
     /// `WebView.evaluateJavascript`.
     ///
-    /// Held behind an [`Arc<Mutex<_>>`](std::sync::Arc) (not the surrounding
-    /// `Rc<RefCell>`) so the provider bridge handler can own a `Send` clone of
-    /// JUST this queue: the seam's [`ScriptMessageHandler`] is `Send`, but the
-    /// backend's shared `Inner` is `!Send` (it holds `Rc`s), so the provider
-    /// closure captures this `Send` eval sink alone rather than the whole handle —
-    /// the mobile twin of how the desktop `install_provider` closure captures a
-    /// cloneable view handle for its response push.
+    /// Held behind its OWN [`Arc<Mutex<_>>`](std::sync::Arc) (not just the
+    /// surrounding shared cell) so the provider bridge handler can own a clone
+    /// of JUST this queue and push without locking the whole inner: the seam's
+    /// [`ScriptMessageHandler`] runs with the inner lock OUT (see
+    /// [`AndroidHandle::handle_script_message`]), so the provider closure
+    /// captures this eval sink alone rather than the whole handle — the mobile
+    /// twin of how the desktop `install_provider` closure captures a cloneable
+    /// view handle for its response push.
     pending_eval: Arc<Mutex<Vec<String>>>,
     /// The [`TrustPosture`] of the CURRENT load: the same shared-`LoadLifecycle`
     /// posture the desktop backend surfaces, made real on the Android edge (the
@@ -217,7 +242,7 @@ impl Inner {
 /// platform-`WebView` protocol (pending-load + signals).
 #[derive(Debug, Default, Clone)]
 pub struct AndroidBackend {
-    inner: Rc<RefCell<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl AndroidBackend {
@@ -240,9 +265,15 @@ impl AndroidBackend {
 /// A handle to an [`AndroidBackend`]'s shared state, held by the session for the
 /// platform-`WebView` protocol: the URL to load onto the `WebView`, and the
 /// `WebView`'s real load signals reported back into the core.
+///
+/// The shared state is an `Arc<Mutex<_>>`, so a CLONE of this handle is the
+/// lock-free boundary the `SyncSession` serves the UI thread's page-signal
+/// callbacks through (task `mobile-page-signal-callbacks-off-session-lock`):
+/// the clone contends only on the inner's own microsecond holds, never on the
+/// session lock a worker thread can hold for the length of a CAR retrieval.
 #[derive(Debug, Clone)]
 pub struct AndroidHandle {
-    inner: Rc<RefCell<Inner>>,
+    inner: Arc<Mutex<Inner>>,
 }
 
 impl AndroidHandle {
@@ -260,8 +291,7 @@ impl AndroidHandle {
     /// real `ipfs://` form by [`from_webview_url`], so the core's history and
     /// the URL bar never see the internal origin.
     pub fn take_pending_load(&self) -> Option<String> {
-        self.inner
-            .borrow_mut()
+        lock(&self.inner)
             .pending_load
             .take()
             .map(|url| to_webview_url(&url))
@@ -291,9 +321,24 @@ impl AndroidHandle {
         // `ipfs://`) stays consistent.
         let uri = from_webview_url(uri);
         let scheme = uri.split_once("://").map(|(s, _)| s.to_string())?;
-        let mut b = self.inner.borrow_mut();
-        let handler = b.scheme_handlers.get_mut(&scheme)?;
-        Some(handler(SchemeRequest { uri }))
+        // Take the handler OUT of the map for the duration of the call so the
+        // inner lock is NOT held across it (the same shape
+        // [`handle_script_message`](AndroidHandle::handle_script_message) uses):
+        // a handler can run a multi-second CAR retrieval on the WebView WORKER
+        // thread, and the UI thread's page-signal callbacks borrow this SAME
+        // inner OFF the session lock — holding the lock across the call would
+        // block the UI thread behind the retrieval, exactly the ANR shape the
+        // clone-handle boundary (task
+        // `mobile-page-signal-callbacks-off-session-lock`) exists to remove.
+        // Concurrent `resolve_scheme` calls for the same scheme are serialised
+        // by the session lock above this (`SyncSession::resolve_ipfs` stays on
+        // `self.with`), so the remove/call/reinsert cannot observe a missing
+        // handler in production.
+        let taken = lock(&self.inner).scheme_handlers.remove(&scheme);
+        let mut handler = taken?;
+        let result = handler(SchemeRequest { uri });
+        lock(&self.inner).scheme_handlers.insert(scheme, handler);
+        Some(result)
     }
 
     /// Mark the CURRENT load content-verified from the OS edge: its bytes came
@@ -305,7 +350,7 @@ impl AndroidHandle {
     /// surfaces the honest two-axis posture (`NameViaTrustedRpc` / `MutableName` /
     /// `ContentVerified`) for THIS load instead of the served default.
     pub fn mark_content_verified(&self) {
-        self.inner.borrow_mut().mark_content_verified();
+        lock(&self.inner).mark_content_verified();
     }
 
     /// The scripts to inject at document start (the EIP-1193 provider shim), in
@@ -315,7 +360,7 @@ impl AndroidHandle {
     /// bridge, which used to be an empty no-op.
     #[must_use]
     pub fn document_start_scripts(&self) -> Vec<String> {
-        self.inner.borrow().injected_scripts.clone()
+        lock(&self.inner).injected_scripts.clone()
     }
 
     /// Dispatch a page-posted script-message envelope on channel `name` to the
@@ -334,18 +379,17 @@ impl AndroidHandle {
     #[must_use]
     pub fn handle_script_message(&self, name: &str, body: &str) -> Vec<String> {
         // Take the handler OUT of the map for the duration of the call so the
-        // `RefCell` is not borrowed across the handler body: the handler is a
+        // inner lock is not held across the handler body: the handler is a
         // `FnMut` capturing its own response sink (`evaluate_javascript`, which
-        // borrows the same `Inner` to queue into `pending_eval`), so holding the
-        // borrow here would be a re-entrant `borrow_mut` panic. Re-insert it after.
-        let taken = self.inner.borrow_mut().script_handlers.remove(name);
+        // locks the same inner to queue into `pending_eval`), so holding the
+        // lock here would be a re-entrant deadlock. Re-insert it after.
+        let taken = lock(&self.inner).script_handlers.remove(name);
         if let Some(mut handler) = taken {
             handler(ScriptMessage {
                 handler: name.to_string(),
                 body: body.to_string(),
             });
-            self.inner
-                .borrow_mut()
+            lock(&self.inner)
                 .script_handlers
                 .insert(name.to_string(), handler);
         }
@@ -359,7 +403,7 @@ impl AndroidHandle {
     /// `WebView.evaluateJavascript`.
     #[must_use]
     pub fn take_pending_eval(&self) -> Vec<String> {
-        let queue = self.inner.borrow().pending_eval.clone();
+        let queue = lock(&self.inner).pending_eval.clone();
         let mut q = queue.lock().unwrap_or_else(|p| p.into_inner());
         std::mem::take(&mut *q)
     }
@@ -375,7 +419,7 @@ impl AndroidHandle {
     /// `install_provider` closure capturing a cloneable view handle.
     #[must_use]
     pub fn eval_sink(&self) -> Arc<Mutex<Vec<String>>> {
-        self.inner.borrow().pending_eval.clone()
+        lock(&self.inner).pending_eval.clone()
     }
 
     /// Report a SAME-DOCUMENT URL change: an SPA `pushState`/`replaceState`
@@ -397,7 +441,7 @@ impl AndroidHandle {
         // for a content-addressed page); map it back so the core's history and
         // the URL bar track the real `ipfs://` location.
         let url = from_webview_url(url);
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         if b.current().map(String::as_str) == Some(url.as_str()) {
             return;
         }
@@ -416,7 +460,7 @@ impl AndroidHandle {
     /// emit [`LoadEvent::Committed`]. Called from Kotlin's `onPageCommitVisible`.
     pub fn on_page_committed(&self, url: &str) {
         let url = from_webview_url(url);
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         b.state = LoadState::Committed;
         b.events.push_back(LoadEvent::Committed { url });
     }
@@ -426,7 +470,7 @@ impl AndroidHandle {
     /// Kotlin's `onPageFinished`.
     pub fn on_page_finished(&self, url: &str) {
         let url = from_webview_url(url);
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         b.state = LoadState::Finished;
         b.events.push_back(LoadEvent::Finished { url });
     }
@@ -436,7 +480,7 @@ impl AndroidHandle {
     /// `onReceivedError`.
     pub fn on_page_failed(&self, url: &str, reason: &str) {
         let url = from_webview_url(url);
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         b.state = LoadState::Failed;
         b.events.push_back(LoadEvent::Failed {
             url,
@@ -448,7 +492,7 @@ impl AndroidHandle {
 impl Renderer for AndroidBackend {
     fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
         validate_url(url)?;
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         // A fresh navigation from mid-history drops the forward entries.
         let next = b.cursor.map_or(0, |c| c + 1);
         b.history.truncate(next);
@@ -459,7 +503,7 @@ impl Renderer for AndroidBackend {
     }
 
     fn reload(&mut self) -> Result<(), RendererError> {
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         let url = b
             .current()
             .ok_or_else(|| RendererError::Backend("nothing to reload".into()))?
@@ -469,14 +513,14 @@ impl Renderer for AndroidBackend {
     }
 
     fn stop(&mut self) {
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         if b.state.is_loading() {
             b.state = LoadState::Idle;
         }
     }
 
     fn go_back(&mut self) {
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         if let Some(c) = b.cursor {
             if c > 0 {
                 b.cursor = Some(c - 1);
@@ -487,7 +531,7 @@ impl Renderer for AndroidBackend {
     }
 
     fn go_forward(&mut self) {
-        let mut b = self.inner.borrow_mut();
+        let mut b = lock(&self.inner);
         if let Some(c) = b.cursor {
             if c + 1 < b.history.len() {
                 b.cursor = Some(c + 1);
@@ -498,24 +542,24 @@ impl Renderer for AndroidBackend {
     }
 
     fn can_go_back(&self) -> bool {
-        matches!(self.inner.borrow().cursor, Some(c) if c > 0)
+        matches!(lock(&self.inner).cursor, Some(c) if c > 0)
     }
 
     fn can_go_forward(&self) -> bool {
-        let b = self.inner.borrow();
+        let b = lock(&self.inner);
         matches!(b.cursor, Some(c) if c + 1 < b.history.len())
     }
 
     fn load_state(&self) -> LoadState {
-        self.inner.borrow().state
+        lock(&self.inner).state
     }
 
     fn current_url(&self) -> Option<String> {
-        self.inner.borrow().current().cloned()
+        lock(&self.inner).current().cloned()
     }
 
     fn poll_event(&mut self) -> Option<LoadEvent> {
-        self.inner.borrow_mut().events.pop_front()
+        lock(&self.inner).events.pop_front()
     }
 
     fn view_handle(&self) -> ViewHandle {
@@ -536,8 +580,7 @@ impl Renderer for AndroidBackend {
         // used to be a silent no-op — the exact gap the platform-capability parity
         // guard exists to forbid; it is now real. It is the channel the EIP-1193
         // provider is injected over (`install_provider`).
-        self.inner
-            .borrow_mut()
+        lock(&self.inner)
             .script_handlers
             .insert(name.to_string(), handler);
     }
@@ -547,10 +590,7 @@ impl Renderer for AndroidBackend {
         // Android edge can install it onto the platform `WebView` as a page-start
         // user script via [`AndroidHandle::document_start_scripts`]. The seam
         // method that used to be a silent no-op is now real.
-        self.inner
-            .borrow_mut()
-            .injected_scripts
-            .push(script.to_string());
+        lock(&self.inner).injected_scripts.push(script.to_string());
     }
 
     fn evaluate_javascript(&self, script: &str) {
@@ -560,7 +600,7 @@ impl Renderer for AndroidBackend {
         // GTK loop) the JS is queued and drained by
         // [`AndroidHandle::take_pending_eval`]. This is the RESPONSE half of the
         // provider round-trip that settles a page's pending Promise.
-        if let Ok(mut queue) = self.inner.borrow().pending_eval.lock() {
+        if let Ok(mut queue) = lock(&self.inner).pending_eval.lock() {
             queue.push(script.to_string());
         }
     }
@@ -584,7 +624,7 @@ impl Renderer for AndroidBackend {
         // `mark_content_verified`), else the served-origin default. This is what
         // makes the mobile trust indicator reflect the real load posture rather
         // than the inherited seam default.
-        self.inner.borrow().posture
+        lock(&self.inner).posture
     }
 
     fn mark_ens_origin(&mut self) {
@@ -592,7 +632,7 @@ impl Renderer for AndroidBackend {
         // over the trusted RPC), so when the `ipfs` handler later verifies the
         // bytes the posture surfaces `NameViaTrustedRpc`. A fresh `begin` clears
         // the flag. The twin of the desktop backend's `mark_ens_origin`.
-        self.inner.borrow_mut().ens_origin = true;
+        lock(&self.inner).ens_origin = true;
     }
 
     fn mark_mutable_name(&mut self) {
@@ -600,7 +640,7 @@ impl Renderer for AndroidBackend {
         // load surfaces at most `MutableName` (or the louder `NameViaTrustedRpc` if
         // also ENS-originated), never immutable `ContentVerified`. A fresh `begin`
         // clears the flag. The twin of the desktop backend's `mark_mutable_name`.
-        self.inner.borrow_mut().mutable_name = true;
+        lock(&self.inner).mutable_name = true;
     }
 
     fn register_scheme_handler(&mut self, scheme: &str, handler: SchemeHandler) {
@@ -608,8 +648,7 @@ impl Renderer for AndroidBackend {
         // `shouldInterceptRequest` via [`AndroidHandle::resolve_scheme`]. This is
         // the seam method that used to be a silent no-op — the exact gap the
         // platform-capability parity guard exists to forbid; it is now real.
-        self.inner
-            .borrow_mut()
+        lock(&self.inner)
             .scheme_handlers
             .insert(scheme.to_string(), handler);
     }
@@ -767,6 +806,52 @@ mod tests {
             .expect("the canned handler resolves successfully");
         assert_eq!(resolved.mime_type, "text/html");
         assert_eq!(resolved.body, b"ipfs://bafycid/index.html");
+    }
+
+    #[test]
+    fn the_shared_state_is_send_and_sync_so_the_clone_boundary_is_sound() {
+        // The clone-handle boundary's type-level pin (task
+        // `mobile-page-signal-callbacks-off-session-lock`): the UI thread serves
+        // the page-signal callbacks through a CLONED handle OFF the session
+        // lock, which is only sound because the shared inner is an
+        // `Arc<Mutex<_>>` — never the desktop `Rc<RefCell>` shape. If the shared
+        // cell ever regresses to a single-threaded one, this stops compiling.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AndroidHandle>();
+        assert_send_sync::<AndroidBackend>();
+    }
+
+    #[test]
+    fn a_scheme_handler_runs_without_the_inner_lock_held() {
+        // The ANR-guard half of the clone-handle boundary (task
+        // `mobile-page-signal-callbacks-off-session-lock`): the UI thread's
+        // page-signal callbacks borrow the SAME shared inner OFF the session
+        // lock, so `resolve_scheme` must NOT hold the inner lock across the
+        // handler call — a handler can run a multi-second CAR retrieval, and
+        // holding the lock across it would block the UI thread's lock-free path
+        // behind the retrieval (exactly the freeze shape the task removes).
+        //
+        // A canned handler that RE-ENTERS the inner through a cloned handle can
+        // only complete if the lock is not held across the call: held, the
+        // re-entry deadlocks (or panics, under the old `RefCell` shape).
+        let mut b = AndroidBackend::new();
+        let h = b.handle();
+        let reentrant = h.clone();
+        b.register_scheme_handler(
+            "ipfs",
+            Box::new(move |_request: SchemeRequest| {
+                // Re-enter the shared inner mid-handler, the same access the
+                // UI-thread page-signal path performs during a retrieval.
+                reentrant.on_page_finished("https://example.com/");
+                Ok(SchemeResponse::ok("text/html", b"ok".to_vec()))
+            }),
+        );
+        let resolved = h
+            .resolve_scheme("ipfs://bafycid/")
+            .expect("registered, so it routes to the handler")
+            .expect("the re-entrant handler completes");
+        assert_eq!(resolved.body, b"ok");
+        assert_eq!(b.load_state(), LoadState::Finished, "the re-entry landed");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 {
-	"dorflCmd": "npx dorfl@0.8.1",
+	"dorflCmd": "npx dorfl@0.11.1",
 	"verify": "cargo fmt --check && cargo clippy && cargo build && cargo test",
 	"harness": "pi",
 	"autoBuild": false,

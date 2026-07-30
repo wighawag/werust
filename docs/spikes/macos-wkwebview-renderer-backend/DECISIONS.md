@@ -34,6 +34,8 @@ The choices in `macos-wkwebview-renderer-backend` that another task, a user or a
 
 **Why:** the Windows probe's case B was the internal `https://<cid>.ipfs.werust.invalid` origin — the fallback if case A failed. On WebKit that fallback cannot be built at all: WebKit refuses to give a natively-handled scheme to a `WKURLSchemeHandler`. Rather than assert that from Apple's documentation (the exact habit that cost this repo a field bug on Android), the probe measures it and puts the boolean in the report. The consequence is recorded in the verdict rule: a case-A failure on WebKit is a genuine BLOCKER, not a mechanism choice, and `verdict_from` says so instead of picking an unmeasured mechanism.
 
+**MEASURED 2026-07-30** ([run 30563185521](https://github.com/wighawag/werust/actions/runs/30563185521)): `+[WKWebView handlesURLScheme:@"https"]` came back **true**, so the reason there is no case B is now a recorded fact rather than a reading of Apple's documentation, and it is in the committed report.
+
 **What it touches:** the `Mechanism` enum deliberately keeps BOTH variants and their exact wire spellings from `crates/windows-origin-probe` (`registered-ipfs-scheme` / `internal-https-origin`), so the same cross-platform question is not named twice — a second name for one concept is the debt every later artifact would inherit. `InternalHttpsOrigin` can never be returned on macOS; it exists so the failing outcome has a name.
 
 ## 5. The negative control is "the same bytes with no handler-served origin", not a flipped flag
@@ -65,3 +67,13 @@ The choices in `macos-wkwebview-renderer-backend` that another task, a user or a
 **Why not a workspace member:** the stand-ins are deliberately FAKE. A crate in the workspace named `werust-core` that is not `werust-core` would be a trap; keeping the whole thing in a temp directory the script recreates each run makes it impossible to accidentally build against.
 
 **What it touches:** nothing in the product. It is a development loop, and the README says plainly that it is not a build and does not replace the `macos-14` job.
+
+**Outcome:** the first real `macos-14` run compiled `macos-renderer` and `macos-origin-probe` against the SDK with no source changes, so the harness did the job it was committed for. It still is not a build: the run, not the script, is the verdict.
+
+## 9. The measured `secure_context` is accepted and RE-RECORDED with its reason, not quietly overwritten
+
+**Chosen:** case A's `secure_context` in `expected.json` moves from the predicted `false` to the measured `true`, and the `recorded` provenance says WHY it moved, names the run it was measured on, and points at the verbatim report committed beside it.
+
+**Why:** the probe's contract (README, and `src/lib.rs`) is that a red run means the verdict is "re-decided and re-recorded WITH the reason, not silently overwritten". This is the first exercise of that contract, so how it is honoured sets the precedent. The field does not decide the mechanism (only origin + fetch + handler-fired + `pushState` do), it is the field the prediction itself flagged as least confident, and it moved in the SAFER direction: WebKit grants a handler-served origin a secure context with no `TreatAsSecure` equivalent needed. The alternatives were worse: leaving the prediction in place would keep the job permanently red on a field nobody disputes and would train readers to ignore it; deleting the field from the pinned set would shrink what a future WebKit regression is caught on, to avoid an inconvenience.
+
+**What it touches:** the sibling `macos-appkit-window-and-chrome` and any later WebKit-shell work, which now start from a MEASURED baseline rather than a prediction; and `crates/macos-origin-probe/tests/recorded_verdict.rs`, added here, which makes the re-stamp checkable on the Ubuntu gate by pinning `expected.json` to the committed run and requiring the provenance to name the OS build, the WebKit build and the CI run. That guard is a NEW obligation for whoever re-records this verdict next: re-stamp FROM a committed report, or the gate reds. It is deliberately not exported to `crates/windows-origin-probe` in this task (that probe already landed as a recording); if a third probe appears, the guard is the thing to share.

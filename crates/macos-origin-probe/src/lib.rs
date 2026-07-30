@@ -14,16 +14,24 @@
 //! `https://<cid>.ipfs.werust.invalid` origin map
 //! (`crates/werust-android/rust/src/origin_map.rs`).
 //!
-//! WebKit is EXPECTED to behave differently: a `WKURLSchemeHandler`-served
-//! document is expected to get a real `scheme://host` tuple origin, which is the
+//! WebKit was EXPECTED to behave differently: a `WKURLSchemeHandler`-served
+//! document was expected to get a real `scheme://host` tuple origin, which is the
 //! whole serving model of Capacitor/Ionic apps. That expectation is why
 //! `docs/adr/0011-webview2-for-windows.md` says macOS is the better-placed
-//! platform. But in this repo it is, to date, a **MECHANISM ANALYSIS**: the iOS
-//! shell ships on that mechanism and its runtime confirmation still awaits a Mac
+//! platform. In this repo it WAS only a **MECHANISM ANALYSIS**: the iOS shell
+//! ships on that mechanism and its runtime confirmation awaited a Mac
 //! (`docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md`, "iOS
-//! parity"). This probe is what turns the analysis into a measurement, for BOTH
-//! WebKit ports -- because the mechanism under test (`WKURLSchemeHandler`) is the
-//! same class on macOS and iOS.
+//! parity").
+//!
+//! **It is now MEASURED.** This probe ran on a `macos-14` runner on 2026-07-30
+//! (macOS 14.8.7 Build 23J520, AppleWebKit/605.1.15) and recorded a real
+//! `ipfs://<cid>` tuple origin, a same-origin `fetch` that resolved AND fired the
+//! handler, and a `pushState` that did not throw, with the negative control
+//! failing in the same run. That holds for BOTH WebKit ports, because the
+//! mechanism under test (`WKURLSchemeHandler`) is the same class on macOS and
+//! iOS. Verdict, evidence and the honest CI-versus-hardware split:
+//! `docs/spikes/macos-wkwebview-renderer-backend/README.md`; verbatim run:
+//! `docs/spikes/macos-wkwebview-renderer-backend/probe-report-2026-07-30.json`.
 //!
 //! This repo has already paid once for settling a platform-origin question from
 //! documents instead of a device. Not repeating that is the whole point.

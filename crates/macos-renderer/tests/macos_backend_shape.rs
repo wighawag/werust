@@ -628,12 +628,26 @@ fn the_verification_honesty_is_recorded() {
     // Criterion 7: what CI PROVED versus what still awaits a Mac, written down
     // at the task's stable spike path (ADR-0011 Amendment 1's requirement).
     let readme = source("docs/spikes/macos-wkwebview-renderer-backend/README.md");
-    for section in ["What CI proves", "What still awaits"] {
+    for section in ["What CI proved", "What still awaits"] {
         assert!(
             readme.contains(section),
             "the spike README must state `{section}`"
         );
     }
+    // Criterion 5: the origin behaviour is CONFIRMED AT RUNTIME, so the spike
+    // must carry the verbatim run the verdict was stamped from -- the same shape
+    // `windows-ipfs-origin-probe-on-ci` landed in. Prose alone cannot tell a
+    // measurement from a prediction, which is exactly how a prediction once got
+    // committed in the verdict's slot; `macos-origin-probe`'s
+    // `tests/recorded_verdict.rs` then holds the two to each other.
+    assert!(
+        exists("docs/spikes/macos-wkwebview-renderer-backend/probe-report-2026-07-30.json"),
+        "the measured verdict must ship with the verbatim run report it was stamped from"
+    );
+    assert!(
+        readme.contains("actions/runs/"),
+        "the README must link the CI run its measured claims come from"
+    );
     // And the iOS mechanism-analysis caveat this work exists to retire must have
     // been updated to say what is now measured.
     let ios_caveat = source("docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md");

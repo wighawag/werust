@@ -43,7 +43,10 @@
 //!   `window.ethereum` back over the bridge), and runs the sibling
 //!   `crates/macos-origin-probe`.
 //!
-//! What CI proves versus what still awaits a Mac is stated explicitly in
+//! That job has RUN (run 30563185521, macOS 14.8.7, AppleWebKit/605.1.15): both
+//! trust hooks and the fail-closed control passed on a live `WKWebView`, and the
+//! `WKURLSchemeHandler` origin behaviour is measured rather than reasoned about.
+//! What CI proved versus what still awaits a Mac is stated step by step in
 //! `docs/spikes/macos-wkwebview-renderer-backend/README.md`.
 
 pub mod pure;

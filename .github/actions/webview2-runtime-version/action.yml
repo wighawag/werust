@@ -1,0 +1,41 @@
+name: Record the runner's WebView2 Runtime version
+description: >
+  Read the WebView2 Runtime version off a Windows runner's EdgeUpdate registry
+  key and print it to the log. The ONE implementation of that read, shared by
+  every Windows leg (`windows-origin-probe.yml`, `windows-renderer.yml`).
+
+# WHY AN ACTION AND NOT A COPIED STEP. A result without its runtime version is
+# not a result, and the WebView2 Runtime is EVERGREEN: it cannot be pinned, and
+# this exact corner regressed in stable 144 in January 2026 (WebView2Feedback
+# #5495). So EVERY Windows leg records the version it measured on. Two hand-copied
+# pwsh blocks would be two implementations free to drift to different keys, at
+# which point two legs' logs would no longer be comparable — the very thing the
+# version is recorded for. This was extracted verbatim out of
+# `.github/workflows/windows-origin-probe.yml` by task `windows-renderer-ci-leg`;
+# it is a lift, not a rewrite.
+#
+# It is a repo-LOCAL composite action, so a workflow must `actions/checkout` before
+# it can `uses: ./.github/actions/webview2-runtime-version`.
+#
+# It never fails: an absent runtime is REPORTED here (a legible one-line
+# diagnosis) rather than surfacing later as a confusing probe or build failure.
+
+runs:
+  using: composite
+  steps:
+    - name: Record the runner's WebView2 Runtime version
+      shell: pwsh
+      run: |
+        $keys = @(
+          'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+          'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+        )
+        $found = $false
+        foreach ($key in $keys) {
+          if (Test-Path $key) {
+            $version = (Get-ItemProperty $key).pv
+            Write-Host "WebView2 Runtime (registry $key): $version"
+            $found = $true
+          }
+        }
+        if (-not $found) { Write-Host 'No WebView2 Runtime registry entry found.' }

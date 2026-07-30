@@ -1,0 +1,130 @@
+name: windows-renderer
+
+# The Windows leg (task `windows-renderer-ci-leg`, sub-task 1 of
+# `docs/adr/0011-webview2-for-windows.md`'s Windows split). It lands BEFORE any
+# Windows shell code, on purpose and for a MECHANICAL reason:
+#
+#   `gh workflow run <wf> --ref <branch>` is only legal once `<wf>` exists on the
+#   DEFAULT branch. A build agent therefore cannot dispatch a leg it is itself
+#   inventing, which is exactly why both macOS tasks shipped a PREDICTION where
+#   an acceptance criterion demanded a MEASUREMENT. With this file on `main`, the
+#   two Windows code tasks (`windows-webview2-renderer-backend`,
+#   `windows-win32-window-and-chrome`) can be dispatched against a real
+#   `windows-latest` runner by ref, exactly as `macos-renderer.yml` made the
+#   AppKit window provable (run 30572253620).
+#
+# WHAT IT PROVES TODAY. There is no Windows shell yet, so it proves the thing
+# that IS provable and is genuinely worth proving: that the repo's TOOLKIT-FREE
+# half compiles and passes its tests on `x86_64-pc-windows-msvc`. `webview-shared`
+# leads that set — it holds `LoadLifecycle`/`SharedLifecycle`, the `navigate` URL
+# rule and the ADR-0008 off-thread `ipfs://` boundary the WebView2 backend will
+# reuse VERBATIM, so proving it on Windows is proving the backend's own
+# foundation. The set was determined by MEASUREMENT (a `cargo xwin check
+# --target x86_64-pc-windows-msvc --tests` sweep over every workspace member),
+# not by assumption; the method, the results and the named exclusions are
+# recorded in `docs/spikes/windows-renderer-ci-leg/README.md`.
+#
+# EXCLUDED, with reasons: `werust` and `webview-renderer` bind gtk4/webkit6
+# through pkg-config and are measured RED for this target (nothing on a Windows
+# runner can satisfy those `.pc` files) — they are the Linux desktop's, and the
+# Ubuntu `verify` gate builds them. `macos-renderer`, `werust-macos`,
+# `macos-origin-probe`, `werust-android-core` and `werust-ios-core` are measured
+# GREEN here only because their platform halves are `cfg`-gated away to nearly
+# nothing on Windows, so building them here would assert nothing their own legs
+# do not already assert. `native-renderer` and `script-engine` are measured GREEN
+# for real, but sit outside the Windows-shell reuse path (they are the future
+# native stack, fully covered by the Ubuntu gate) and carry the heaviest
+# dependency trees in the workspace, so they are left out on COST, not on
+# redness; a later task may add them.
+#
+# A SEPARATE leg from the pure-Rust Ubuntu `verify` gate, exactly like
+# `mobile-ios.yml`, `macos-renderer.yml` and `windows-origin-probe.yml`. It is
+# also distinct from `windows-origin-probe.yml`, which MEASURES WebView2 origin
+# behaviour against a recorded verdict; this leg compiles and tests Rust.
+#
+# WHY THE `pull_request` FILTER IS NARROW (the deliberate trade-off). The sibling
+# `macos-renderer.yml` triggers on PRs touching `crates/werust-core/**`, so most
+# core work now spends `macos-14` minutes and can be gated by a red cross-platform
+# leg — a cost currently under review. This leg does NOT copy that filter. Its PR
+# trigger carries only what is genuinely Windows-shaped: `webview-shared` (the
+# half the Windows backend reuses verbatim), `windows-origin-probe` (the only
+# Windows-specific code in the tree), the shared version action and this file.
+# The wider dependency surface it builds — `werust-core`, `fetcher`, `renderer` —
+# is caught on `push` to `main` instead: early detection WITHOUT gating every
+# core PR on a cross-platform runner, plus `workflow_dispatch` for the deliberate
+# case (which is this leg's whole purpose anyway). The cost of the trade is
+# honest and bounded: a core change that breaks the Windows build is found
+# minutes after it merges rather than before, on a leg that gates nothing.
+# `crates/werust-core/tests/windows_renderer_leg_shape.rs` pins this choice, so
+# broadening it has to be a decision rather than a reflex.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/webview-shared/**"
+      - "crates/renderer/**"
+      - "crates/werust-core/**"
+      - "crates/fetcher/**"
+      - "crates/windows-origin-probe/**"
+      - ".github/actions/webview2-runtime-version/**"
+      - ".github/workflows/windows-renderer.yml"
+  pull_request:
+    paths:
+      - "crates/webview-shared/**"
+      - "crates/windows-origin-probe/**"
+      - ".github/actions/webview2-runtime-version/**"
+      - ".github/workflows/windows-renderer.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-crates:
+    runs-on: windows-latest
+    steps:
+      - name: Check the tree out byte-identically (no CRLF rewrite)
+        # Git for Windows defaults to `core.autocrlf=true`, so a Windows checkout
+        # would rewrite every LF to CRLF. Several tests in this repo PARSE
+        # committed source text and match multi-line patterns
+        # (`crates/werust-core/tests/*_shape.rs`), so a rewritten tree would fail
+        # them for a reason that has nothing to do with Windows. Disabling the
+        # conversion makes the runner test the repo's actual BYTES, identically
+        # to the Ubuntu gate. Must run BEFORE the checkout.
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record what this run measured on
+        # The ONE registry read, shared with `windows-origin-probe.yml`. The
+        # WebView2 Runtime is evergreen: a Windows result without its runtime
+        # version is not a result. (Nothing in THIS leg drives WebView2 yet — it
+        # is recorded so the log dates the run for the backend task that will.)
+        uses: ./.github/actions/webview2-runtime-version
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-windows-renderer-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-windows-renderer-cargo-
+
+      - name: Build the toolkit-free crates on x86_64-pc-windows-msvc
+        # Package-SCOPED, never a bare workspace build: the workspace contains
+        # GTK/WebKitGTK-bound crates that cannot build on a Windows runner.
+        # `windows-origin-probe` builds its `cfg(windows)` WebView2 half here,
+        # which the Ubuntu gate can only parse.
+        run: cargo build -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+
+      - name: Test the toolkit-free crates on x86_64-pc-windows-msvc
+        # The half the Windows backend will reuse verbatim, exercised on the
+        # platform that will reuse it: `webview-shared`'s load lifecycle, navigate
+        # URL rule and off-thread `ipfs://` boundary; `werust-core`'s chrome
+        # derivation, ENS/IPNS and debug capture; `fetcher`'s hash-verify
+        # boundary; and the origin probe's decision rules, which no leg runs on
+        # Windows today. All offline.
+        run: cargo test -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe

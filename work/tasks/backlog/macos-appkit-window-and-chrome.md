@@ -9,6 +9,19 @@ covers: []
 
 The PRODUCT half of the macOS desktop shell, split from the engine so the chrome can be reviewed on its own. `macos-wkwebview-renderer-backend` proved the seam; this task makes it a browser a person can use.
 
+### What the engine task actually landed (read this before planning)
+
+- **`crates/macos-renderer`** — `MacosRenderer`, a `Renderer` impl over WKWebView via `objc2`, with no widening of the trait. It already carries a BARE OFF-SCREEN host window purely so the engine can be run headlessly; **this task replaces that host with the real `NSWindow`**, it does not add a second one.
+- **`crates/webview-shared`** — the toolkit-free half moved out of `crates/webview-renderer` (`LoadLifecycle`/`SharedLifecycle`, the `navigate` URL rule, and the ADR-0008 off-thread `ipfs://` boundary). Reuse it; do not re-implement any of it in the window.
+- **`crates/macos-origin-probe`** plus `.github/workflows/macos-renderer.yml` on the `macos-14` runner. The leg BUILDS the macOS crates, runs their tests, exercises both trust hooks on a live WKWebView with a negative control, and re-measures the origin verdict.
+- **The origin question is SETTLED and measured:** `registered-ipfs-scheme` on macOS 14.8.7 / AppleWebKit 605.1.15, real `ipfs://<cid>` tuple origin, secure context, same-origin `fetch` that fires the handler, working `pushState`. Do not re-litigate it, and do not add an origin workaround.
+
+### You CAN get a real macOS run mid-task, so do not ship a prediction
+
+The engine task was blocked at Gate 2 for recording a PREDICTION rather than a measurement, and that trap is now avoidable: `.github/workflows/macos-renderer.yml` is on `main`, so `gh workflow run macos-renderer.yml --ref <your work branch>` is legal and runs the leg against your branch's code. If this task adds a crate or an example, EXTEND that workflow's path filters and its steps so the new surface is actually exercised, then dispatch a run and record what it proved. Anything not exercised must be listed honestly as awaiting hardware, not implied to be green.
+
+**Naming, recorded but NOT this task's job:** `crates/macos-renderer` is platform-named while `crates/webview-renderer` is now only the WebKitGTK backend and `crates/webview-shared` is the generic home. That trio reads wrong with a third backend coming, but renaming it here would bury the chrome work in a refactor. Leave it.
+
 A native `Werust.app` window: an `NSWindow` with a desktop-shaped toolbar (URL bar, back/forward/reload/stop, the trust indicator, the invalid-entry badge, the ⋮ menu), the error and load-progress surfaces, and the tabbed debug view, hosting the WKWebView from the backend task and driven by the shared `BrowserShell`. No browsing DECISION lives in Swift/ObjC: the edge paints and forwards.
 
 **This task PAINTS, it does not derive.** `desktop-chrome-presentation-into-core` moved the display rules into the toolkit-free core (`status_line`, `trust_indicator` / `_detail` / `_css_class`, `error_banner_*`, `invalid_entry_badge_*`, `load_progress_*`, plus the exported `TRUST_INDICATOR_CSS_CLASSES` / `ERROR_BANNER_CSS_CLASSES` sets). Consume them. Do not re-implement a single one in Swift, and do not hand-roll a class list: that duplication is exactly what the Kotlin and Swift twins already cost this project (the trust EXPLANATION shipped desktop-only for months because of it).

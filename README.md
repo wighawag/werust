@@ -2,6 +2,19 @@
 
 A from-scratch, general-purpose web browser in **Rust** for a "post-trusted-server" web: native `ipfs://` resolution, a native Ethereum (EIP-1193) provider and ENS-name resolution, privacy-protecting, local-first, with full compatibility for the normal server web. The domain language, conventions, and architecture entry point live in [CONTEXT.md](CONTEXT.md); decisions in `docs/adr/`; the work system in `work/`.
 
+## Command line
+
+`werust` with no argument (or `werust <url>`) opens the browser window, as always. A few verb-first subcommands run HEADLESSLY instead — no GTK window, no display needed — so a resolution can be scripted or debugged over ssh:
+
+```
+werust resolve <ens-name>   # print the contenthash reference the name points at (ipfs://<cid> or ipns://<name>)
+werust resolve --json <n>   # the same facts as one JSON object: {"name":…,"kind":…,"reference":…}
+werust version              # print the version banner (also --version, -V)
+werust --help               # the usage message (also -h)
+```
+
+`resolve` prints the reference on stdout and exits 0; a resolution failure prints the reason on stderr and exits 1. It performs the ENS read only: a mutable `ipns-ns` name is reported as the `ipns://<name>` pointer it is, NOT followed to its current CID (`docs/spikes/headless-cli-mode/DECISIONS.md`). Any other first argument is still treated as a URL to open in the GUI, so nothing that launched the browser before does anything different now.
+
 ## Development
 
 Standard cargo workflow: `cargo build`, `cargo test` (the `verify` gate additionally runs `cargo fmt --check` and `cargo clippy`). Desktop builds need the WebKitGTK 6.0 system dev packages; see `.github/workflows/release.yml` for the exact list.

@@ -38,8 +38,58 @@ use werust_core::{BrowserShell, ChromeState, LoadStep};
 /// The URL werust opens when none is given on the command line.
 const DEFAULT_URL: &str = "https://example.com/";
 
-/// The GTK application id for the shell window.
-const APP_ID: &str = "com.github.wighawag.werust";
+/// The reverse-DNS stem of the GTK application id: werust's name, WITHOUT the
+/// version element [`app_id`] appends.
+const APP_ID_STEM: &str = "com.github.wighawag.werust";
+
+/// The GTK application id for the shell window, VERSIONED with werust's own
+/// version so two different releases never share one process.
+///
+/// A GTK [`Application`] with a fixed id is single-instance over D-Bus:
+/// launching a second binary ACTIVATES the registered instance and hands the
+/// session to it. With an unversioned id that hand-off crosses RELEASES, and the
+/// old process answers with its OWN compiled-in behaviour: a different RPC
+/// endpoint, older feature flags, every compile-time constant. That is a real
+/// field failure: a user launched v0.2.9 (Infura), the running v0.2.8
+/// (`1rpc.io/eth`, which blocks `eth_call`) took the window, and every `.eth`
+/// site failed while the console said "werust 0.2.9" (task
+/// `versioned-gtk-app-id-and-stale-process-detection`). Putting the version IN
+/// the id means the two releases simply cannot address each other, so no IPC,
+/// version handshake or auto-kill of the old process is needed.
+///
+/// The version is [`werust_core::version`], the SAME single, build-time-resolved
+/// source the startup [`banner`] and the browser menu read, so the bus name can
+/// never disagree with the version the user is shown.
+///
+/// Within ONE release the id is unchanged, so a second copy of the same binary
+/// still activates the running window (the expected single-window behaviour).
+///
+/// # Why the version is not spliced in verbatim
+///
+/// An application id is a D-Bus well-known bus name: dot-separated elements of
+/// `[A-Za-z0-9_-]`, none of which may begin with a digit. So the version's dots
+/// become underscores (`0.2.9` -> `0_2_9`, which would otherwise add elements
+/// like `2` that start with a digit) and the element is prefixed with `v`
+/// (`0_2_9` starts with a digit too). Anything ELSE outside the allowed set is
+/// folded to `_` as well, because the resolved version is not always a release
+/// triple: a dev build is `git describe` output and an operator can inject an
+/// arbitrary `WERUST_VERSION`. An invalid id is not a loud failure (GLib
+/// rejects it and the application ends up non-unique), so the id is made valid
+/// by construction rather than trusted to be well-shaped (that widening beyond
+/// the dots, and the measured before/after D-Bus behaviour, are recorded in
+/// `docs/spikes/versioned-gtk-app-id-and-stale-process-detection/README.md`).
+fn app_id(version: &str) -> String {
+    let mut element = String::with_capacity(version.len() + 1);
+    element.push('v');
+    element.extend(version.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '-' {
+            c
+        } else {
+            '_'
+        }
+    }));
+    format!("{APP_ID_STEM}.{element}")
+}
 
 /// Whether a key press should open the WebKit Web Inspector (the in-window
 /// devtools: a console REPL + network + DOM for the page), given the pressed
@@ -609,7 +659,11 @@ fn main() -> glib::ExitCode {
         .nth(1)
         .unwrap_or_else(|| DEFAULT_URL.into());
 
-    let app = Application::builder().application_id(APP_ID).build();
+    // Versioned (see `app_id`): a NEW release must open its own window with its
+    // own compiled code, never be handed off to a still-running OLD release.
+    let app = Application::builder()
+        .application_id(app_id(werust_core::version()))
+        .build();
     app.connect_activate(move |app| {
         if let Err(e) = open_window(app, &url) {
             eprintln!("werust: {e}");
@@ -1361,7 +1415,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        banner, console_level_css_class, console_row_text, console_source_line,
+        app_id, banner, console_level_css_class, console_row_text, console_source_line,
         error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
         invalid_entry_badge_visible, load_progress_fraction, load_progress_hint,
         load_progress_visible, network_mime_text, network_size_text, network_status_text,
@@ -1632,6 +1686,74 @@ mod tests {
     #[test]
     fn banner_names_werust() {
         assert!(banner().starts_with("werust "));
+    }
+
+    #[test]
+    fn the_application_id_carries_the_version_so_two_releases_never_share_a_process() {
+        // Acceptance (task `versioned-gtk-app-id-and-stale-process-detection`):
+        // the GTK application id embeds the MARKETING version, dots replaced by
+        // underscores under a `v` element. A v0.2.9 binary launched while v0.2.8
+        // is running therefore addresses a DIFFERENT bus name, so GTK cannot
+        // hand the new session to the old process (which carries the old
+        // compile-time RPC endpoint and every other stale constant).
+        assert_eq!(app_id("0.2.9"), "com.github.wighawag.werust.v0_2_9");
+        assert_eq!(app_id("0.2.8"), "com.github.wighawag.werust.v0_2_8");
+        assert_ne!(
+            app_id("0.2.9"),
+            app_id("0.2.8"),
+            "different releases must not share a bus name"
+        );
+        // Intra-version single-instance is PRESERVED: the id is a pure function
+        // of the version, so a second copy of the SAME release still activates
+        // the running window rather than opening a second one.
+        assert_eq!(app_id("0.2.9"), app_id("0.2.9"));
+        // Every release stays under werust's one reverse-DNS name, so the ids
+        // remain recognisable (and `pkill -f werust.v0_2_8` still finds one).
+        assert!(app_id("0.2.9").starts_with("com.github.wighawag.werust."));
+    }
+
+    #[test]
+    fn the_application_id_is_built_from_the_one_shared_version_and_is_always_valid() {
+        // Acceptance: the id uses the SAME `werust_core::version()` the banner
+        // and the menu read (no second version source to drift), and whatever
+        // shape that build-time-resolved version takes, the result is a VALID
+        // GTK/D-Bus application id. An invalid id would make GTK reject it and
+        // silently drop uniqueness, which is exactly the failure this task fixes.
+        let running = app_id(werust_core::version());
+        assert!(
+            banner().contains(werust_core::version()),
+            "the id and the banner read the same version source: {running}"
+        );
+        assert!(
+            gio::Application::id_is_valid(&running),
+            "the id this binary registers must be valid: {running}"
+        );
+
+        // Teeth for that check: the NAIVE splice (the version dropped in as-is,
+        // with its dots and its leading digit) is rejected by GLib, so the
+        // underscore + `v` transformation is doing real work.
+        assert!(
+            !gio::Application::id_is_valid("com.github.wighawag.werust.0.2.9"),
+            "a digit-initial element is an invalid application id"
+        );
+
+        // The version is resolved at build time and is NOT always a release
+        // triple: a dev build is `git describe` output (`0.2.6-3-gabc1234`, or a
+        // bare short hash with no reachable tag), and an operator can inject an
+        // arbitrary `WERUST_VERSION`. All of them must still produce a valid id.
+        for version in [
+            "0.2.9",
+            "0.2.6-3-gabc1234",
+            "abc1234",
+            "vendor-build",
+            "1.0.0+build meta",
+        ] {
+            let id = app_id(version);
+            assert!(
+                gio::Application::id_is_valid(&id),
+                "version {version:?} must yield a valid application id, got {id}"
+            );
+        }
     }
 
     #[test]

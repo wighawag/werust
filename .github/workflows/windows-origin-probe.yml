@@ -29,6 +29,7 @@ on:
     paths:
       - "crates/windows-origin-probe/**"
       - "docs/spikes/windows-ipfs-origin-probe-on-ci/**"
+      - ".github/actions/webview2-runtime-version/**"
       - ".github/workflows/windows-origin-probe.yml"
 
 permissions:
@@ -47,21 +48,12 @@ jobs:
         # `GetAvailableCoreWebView2BrowserVersionString` and puts it in the
         # report; this step reads the same fact out of the registry so a missing
         # runtime is diagnosed HERE rather than as a confusing probe failure.
-        shell: pwsh
-        run: |
-          $keys = @(
-            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
-            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
-          )
-          $found = $false
-          foreach ($key in $keys) {
-            if (Test-Path $key) {
-              $version = (Get-ItemProperty $key).pv
-              Write-Host "WebView2 Runtime (registry $key): $version"
-              $found = $true
-            }
-          }
-          if (-not $found) { Write-Host 'No WebView2 Runtime registry entry found.' }
+        #
+        # The read itself was LIFTED verbatim out of this file into a shared
+        # composite action by task `windows-renderer-ci-leg`, so the second
+        # Windows leg (`windows-renderer.yml`) reuses it instead of minting a
+        # copy that could drift to a different registry key.
+        uses: ./.github/actions/webview2-runtime-version
 
       - name: Cache cargo
         uses: actions/cache@v4

@@ -26,10 +26,49 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
-    // Unsigned debug APK only — signing/store is out of scope for this task.
+    // ---- Release signing (task `android-apk-signing`) --------------------
+    //
+    // The keystore and its credentials are supplied ONLY through the
+    // environment, by CI, from four repository secrets (`ANDROID_KEYSTORE_B64`
+    // decoded to a file that `ANDROID_KEYSTORE_PATH` points at, plus
+    // `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`);
+    // see the `android-apk` job in `.github/workflows/release.yml`. NOTHING about
+    // the signing identity is committed — a release key cannot be regenerated,
+    // so it lives outside the repo.
+    //
+    // Gated on env PRESENCE, which is what keeps LOCAL dev builds untouched: with
+    // no `ANDROID_KEYSTORE_PATH` the `release` signing config is never created,
+    // and the `release` build type below then gets a null `signingConfig` — AGP
+    // leaves the build unsigned and names its output `app-release-unsigned.apk`,
+    // so an unsigned build can never masquerade as the signed `app-release.apk`.
+    signingConfigs {
+        val keystorePath: String? = System.getenv("ANDROID_KEYSTORE_PATH")
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS")
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
+        // The debug APK: AGP's auto-generated debug keystore, i.e. installable
+        // but carrying no release identity (what this repo calls the "unsigned
+        // debug APK" — it is not signed with the project's key).
         getByName("debug") {
             isMinifyEnabled = false
+        }
+        // The release APK: the artifact a tagged release ships. Signing is the
+        // ONLY thing the release build type adds — no minification/R8, so the
+        // signed APK is the same code the debug APK carries (one fewer variable
+        // between what CI tests and what users install).
+        getByName("release") {
+            isMinifyEnabled = false
+            // `null` when the signing env is absent (see above): a graceful
+            // no-op, never an error.
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 

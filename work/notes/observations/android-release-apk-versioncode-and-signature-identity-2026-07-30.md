@@ -1,0 +1,3 @@
+# Android release APK ships versionCode 1 / versionName 0.0.0 (2026-07-30)
+
+Spotted while wiring `android-apk-signing`: `crates/werust-android/app/build.gradle.kts` hardcodes `versionCode = 1` and `versionName = "0.0.0"`, so every tagged release will attach an `app-release.apk` that reports version 0.0.0 to Android and can never be sequenced as an update (the tag version reaches only the Rust core, via `WERUST_VERSION`, not the APK manifest). Related, and only relevant now that a release key exists: the release APK keeps the same `applicationId` as the debug APK but is signed with a different key, so a device holding the debug APK must uninstall it before the signed one will install.

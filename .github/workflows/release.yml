@@ -37,6 +37,17 @@ name: release
 # empty (there is no tag), and the build script falls through to `git describe`.
 # Pinned by `crates/werust-core/tests/release_plumbing_shape.rs`.
 #
+# THE ANDROID RELEASE KEY IS AN OPTIONAL SECRET, NEVER A COMMITTED KEYSTORE. The
+# `android-apk` leg attaches a release-SIGNED `app-release.apk` alongside the
+# debug APK when the four `ANDROID_KEYSTORE_*` / `ANDROID_KEY_*` repository
+# secrets are configured, and is a graceful NO-OP when they are not (forks,
+# dry-runs, or before the human creates them) — in which case the debug APK is
+# attached under the honest name `app-debug-unsigned.apk`. The keystore is
+# decoded from the secret into the runner's temp dir and handed to AGP's
+# `signingConfigs.release` through the environment; nothing about the signing
+# identity is committed. Setup + decisions:
+# docs/spikes/android-apk-signing/README.md.
+#
 # THE RPC ENDPOINT IS AN OPTIONAL SECRET, NEVER A COMMITTED URL. Every leg that
 # compiles Rust ALSO exports `WERUST_RPC_URL` from the OPTIONAL repository
 # secret of the same name, so a release can point ENS resolution at a private
@@ -193,6 +204,14 @@ jobs:
       # Optional private RPC endpoint (same secret pass-through as the desktop
       # leg; empty -> public default).
       WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
+      # RELEASE SIGNING, PRESENCE ONLY. '1' when the release keystore secret is
+      # configured, empty otherwise. GitHub does NOT expose the `secrets` context
+      # to a step's `if:` (only github/needs/strategy/matrix/job/runner/env/vars/
+      # steps/inputs are available there), but a job-level `env:` CAN read it — so
+      # the signing steps gate on `env.ANDROID_SIGNING_CONFIGURED`. Deliberately a
+      # FLAG and not the material: the keystore + passwords stay in the single
+      # step that needs them, out of the env every other step inherits.
+      ANDROID_SIGNING_CONFIGURED: ${{ secrets.ANDROID_KEYSTORE_B64 != '' && '1' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -231,26 +250,105 @@ jobs:
         # deliberately NOT in the pure-Rust verify gate, which lacks the SDK/NDK).
         run: docs/spikes/mobile-android-shell-and-static-lib/check-apk-abis.sh crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
 
-      # TAG PATH: attach the APK to the Release. This leg no longer `needs:
-      # goreleaser`, so the Release may not exist yet — idempotently create it
-      # first (`|| true` swallows the "already exists" error when the desktop leg
-      # or the other mobile leg got there first). This is a Release-EXISTENCE
-      # guarantee, NOT a desktop-build dependency.
-      - name: Attach the APK to the Release (tag)
+      # ---- RELEASE SIGNING (optional; task `android-apk-signing`) ------------
+      #
+      # A debug-keystore APK installs, but carries no stable release identity, so
+      # it cannot be updated in place or fed to any distribution channel. When the
+      # four repository secrets exist, the leg ALSO builds a properly signed
+      # `app-release.apk` and attaches it alongside the debug APK. When they do
+      # not (a fork, or before the human creates them), every step below is
+      # skipped — a graceful no-op, never a hard error — and the debug APK is
+      # renamed to say so.
+      #
+      # The signing is done by AGP (`signingConfigs.release` in
+      # crates/werust-android/app/build.gradle.kts) rather than by hand with
+      # jarsigner: AGP's release pipeline zipaligns AND signs with apksigner (v1
+      # JAR + v2 APK Signature Scheme), whereas jarsigner can only produce the v1
+      # signature, which Android 11+ rejects on its own for a targetSdk-30+ app.
+      # See docs/spikes/android-apk-signing/README.md (decision 1) and, in the
+      # same file, the keytool command + the four secrets a human must create.
+      - name: Decode the release keystore (only when the signing secrets exist)
+        if: env.ANDROID_SIGNING_CONFIGURED == '1'
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          keystore="${RUNNER_TEMP}/werust-release.jks"
+          printf '%s' "${ANDROID_KEYSTORE_B64}" | base64 -d > "${keystore}"
+          # Hand the path to the Gradle step below (a separate shell). The
+          # keystore lives in the runner's temp dir, never in the workspace, so it
+          # cannot be swept into an artifact.
+          echo "ANDROID_KEYSTORE_PATH=${keystore}" >> "${GITHUB_ENV}"
+
+      - name: Build the signed release APK
+        if: env.ANDROID_SIGNING_CONFIGURED == '1'
+        working-directory: crates/werust-android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: ./gradlew :app:assembleRelease
+
+      - name: BUILD-leg check — the release APK is signed and carries the Rust core
+        if: env.ANDROID_SIGNING_CONFIGURED == '1'
+        run: |
+          apk=crates/werust-android/app/build/outputs/apk/release/app-release.apk
+          # AGP names an UNSIGNED release build `app-release-unsigned.apk`, so the
+          # mere existence of this name is the first evidence the signing config
+          # applied.
+          test -f "${apk}"
+          # The artifact users actually install gets the SAME ABI guarantee as the
+          # debug APK.
+          docs/spikes/mobile-android-shell-and-static-lib/check-apk-abis.sh "${apk}"
+          # Offline signature proof — apksigner ships in the SDK build-tools AGP
+          # installed for compileSdk 34. Nothing here touches the network.
+          apksigner="$(find "${ANDROID_HOME}/build-tools" -name apksigner | sort -V | tail -n 1)"
+          test -n "${apksigner}"
+          "${apksigner}" verify --print-certs "${apk}"
+
+      # NO-SECRETS PATH: the only artifact is the debug-keystore APK, so name it
+      # for what it is. Nothing attached to a Release then claims a release
+      # signature it does not carry.
+      - name: Name the debug APK honestly when there is no release signature
+        if: env.ANDROID_SIGNING_CONFIGURED != '1'
+        run: |
+          out=crates/werust-android/app/build/outputs/apk/debug
+          mv "${out}/app-debug.apk" "${out}/app-debug-unsigned.apk"
+
+      # TAG PATH: attach every APK this run produced to the Release. This leg no
+      # longer `needs: goreleaser`, so the Release may not exist yet —
+      # idempotently create it first (`|| true` swallows the "already exists"
+      # error when the desktop leg or the other mobile leg got there first). This
+      # is a Release-EXISTENCE guarantee, NOT a desktop-build dependency.
+      #
+      # Which APKs exist depends on the signing path above, so the upload takes
+      # whichever of the three names is on disk (signed: app-release.apk +
+      # app-debug.apk; unsigned: app-debug-unsigned.apk alone).
+      - name: Attach the APKs to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
-          gh release upload "${GITHUB_REF_NAME}" crates/werust-android/app/build/outputs/apk/debug/app-debug.apk --clobber
+          apks=()
+          for apk in \
+            crates/werust-android/app/build/outputs/apk/release/app-release.apk \
+            crates/werust-android/app/build/outputs/apk/debug/app-debug.apk \
+            crates/werust-android/app/build/outputs/apk/debug/app-debug-unsigned.apk; do
+            [ -f "${apk}" ] && apks+=("${apk}")
+          done
+          gh release upload "${GITHUB_REF_NAME}" "${apks[@]}" --clobber
 
-      # DRY-RUN PATH: upload the APK as a workflow artifact, publish nothing.
-      - name: Upload the APK (dry-run)
+      # DRY-RUN PATH: upload whichever APKs exist as workflow artifacts, publish
+      # nothing. Missing paths are simply skipped by upload-artifact.
+      - name: Upload the APKs (dry-run)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: werust-android-apk
-          path: crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
+          path: |
+            crates/werust-android/app/build/outputs/apk/release/app-release.apk
+            crates/werust-android/app/build/outputs/apk/debug/app-debug.apk
+            crates/werust-android/app/build/outputs/apk/debug/app-debug-unsigned.apk
 
   # The iOS leg: build the Simulator `.app` on a macOS runner (Xcode/Simulator
   # are macOS-only), run the acceptance bundle check, zip the `.app`, then attach

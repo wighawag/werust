@@ -21,6 +21,13 @@ crates/werust-ios/build/
 crates/werust-ios/App/**/xcuserdata/
 crates/werust-ios/App/**/*.xcworkspace/xcuserdata/
 
+# Signing key material. The Android release keystore lives OUTSIDE the repo and
+# reaches CI only as the base64 `ANDROID_KEYSTORE_B64` secret
+# (docs/spikes/android-apk-signing/README.md); this is the safety net for a
+# `keytool -genkey` run in the working tree.
+*.jks
+*.keystore
+
 # Local-only env files (dev secrets, private RPC endpoints). NEVER commit a
 # real RPC URL, a private key, or any other secret into any tracked file.
 # `.env.example` (committed) documents the shape; real `.env*` files are not.

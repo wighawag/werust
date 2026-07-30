@@ -40,6 +40,17 @@
 //!    un-injected placeholder (task
 //!    `general-browser-menu-with-version-and-debug-entry`; the resolution itself
 //!    is `crates/werust-core/build.rs`).
+//! 8. The Android leg SIGNS a release APK when the release-keystore secrets are
+//!    configured (`app-release.apk` attached alongside the debug APK), and is a
+//!    graceful NO-OP when they are not — the debug APK is then attached under the
+//!    honest name `app-debug-unsigned.apk`. The signing key material is supplied
+//!    ONLY through the environment, so the Gradle `signingConfigs.release` block
+//!    is inert for local dev builds (task `android-apk-signing`).
+//!
+//! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
+//! never runs Gradle, never reads a secret's value, and performs no I/O beyond
+//! `std::fs::read_to_string`), so it passes identically on a fork with no secrets
+//! configured and on the real repo with all four.
 
 use std::path::{Path, PathBuf};
 
@@ -624,5 +635,307 @@ fn dry_run_snapshots_and_uploads_artifacts_without_publishing() {
             contains_substr(&j, "gh release upload"),
             "the `{leg}` leg must attach its artifact to the Release with `gh release upload` on a tag"
         );
+    }
+}
+
+// --- Criterion 8: the Android leg signs a release APK (task `android-apk-signing`) ---
+//
+// Two paths, BOTH pinned here by PARSING the workflow + the app module's Gradle
+// script (never by reading a secret's value, which a test cannot see anyway):
+//
+//   * SECRETS CONFIGURED — the release keystore is decoded from
+//     `ANDROID_KEYSTORE_B64` into a runner-temp file, `ANDROID_KEYSTORE_PATH`
+//     points Gradle at it, and `:app:assembleRelease` produces a SIGNED (and, as
+//     AGP always does once a `signingConfig` applies, zipaligned)
+//     `app-release.apk`, attached to the Release alongside the debug APK.
+//   * SECRETS ABSENT (forks, dry-runs) — every signing step is skipped and the
+//     debug APK is renamed `app-debug-unsigned.apk`, so no attached artifact
+//     claims a release signature it does not carry.
+//
+// Both paths therefore pass identically on a fork with no secrets configured.
+
+/// The CI-local PRESENCE FLAG every signing step gates on.
+///
+/// GitHub Actions does NOT expose the `secrets` context to a step's `if:` (the
+/// allowed contexts there are github/needs/strategy/matrix/job/runner/env/vars/
+/// steps/inputs), so `if: ${{ secrets.X != '' }}` cannot work. The job-level
+/// `env:` CAN read `secrets`, so the leg mirrors mere PRESENCE of the keystore
+/// secret into this flag and the steps gate on `env.<flag>`.
+const SIGNING_FLAG: &str = "ANDROID_SIGNING_CONFIGURED";
+
+/// The secret carrying the base64 release keystore (the one whose PRESENCE
+/// decides whether the leg signs at all).
+const KEYSTORE_SECRET: &str = "ANDROID_KEYSTORE_B64";
+
+fn job_steps(job: &Value) -> Vec<Value> {
+    job.get("steps")
+        .and_then(Value::as_sequence)
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A step's `if:` condition, or `""` when it is unconditional.
+fn step_if(step: &Value) -> &str {
+    step.get("if").and_then(Value::as_str).unwrap_or("")
+}
+
+/// Every step of `job` whose scalars mention `needle` — lets an assertion talk
+/// about "the step that does X" without pinning the step order.
+fn steps_mentioning(job: &Value, needle: &str) -> Vec<Value> {
+    job_steps(job)
+        .into_iter()
+        .filter(|s| contains_substr(s, needle))
+        .collect()
+}
+
+fn the_one_step_mentioning(job: &Value, needle: &str) -> Value {
+    let found = steps_mentioning(job, needle);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected EXACTLY one step of the android-apk leg to mention {needle:?}; found {}",
+        found.len()
+    );
+    found.into_iter().next().unwrap()
+}
+
+#[test]
+fn android_leg_gates_signing_on_an_env_presence_flag_not_the_secrets_context() {
+    let j = job("android-apk");
+    let env = j
+        .get("env")
+        .and_then(Value::as_mapping)
+        .expect("the android-apk leg must declare an `env:` block");
+    let flag = env
+        .get(Value::String(SIGNING_FLAG.into()))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "the android-apk leg's `env:` must derive `{SIGNING_FLAG}` from the PRESENCE of \
+                 `secrets.{KEYSTORE_SECRET}`, because a step `if:` cannot read the secrets context"
+            )
+        });
+    assert!(
+        flag.contains(&format!("secrets.{KEYSTORE_SECRET}")),
+        "`{SIGNING_FLAG}` must be derived from `secrets.{KEYSTORE_SECRET}`; got {flag:?}"
+    );
+    assert!(
+        flag.contains("!= ''"),
+        "`{SIGNING_FLAG}` must test the secret for PRESENCE (`!= ''`) so an unconfigured repo \
+         gracefully skips signing; got {flag:?}"
+    );
+
+    // The flag carries PRESENCE, never the key material: the base64 keystore and
+    // the two passwords must NOT sit in the job-wide `env:`, which every step of
+    // the leg (including the cargo/Gradle builds) would inherit. They belong to
+    // the single step that needs them.
+    for material in [
+        KEYSTORE_SECRET,
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_PASSWORD",
+    ] {
+        assert!(
+            !env.contains_key(Value::String(material.into())),
+            "the android-apk leg must NOT put `{material}` in the job-wide `env:` (key material \
+             belongs to the one step that uses it; the job env carries only the presence flag)"
+        );
+    }
+
+    // No step may gate on `secrets` directly — that expression is not available
+    // in a step `if:` and would silently evaluate to the empty string.
+    for step in job_steps(&j) {
+        let cond = step_if(&step);
+        assert!(
+            !cond.contains("secrets."),
+            "a step `if:` cannot read the `secrets` context (it is unavailable there) — gate on \
+             `env.{SIGNING_FLAG}` instead; got {cond:?}"
+        );
+    }
+}
+
+#[test]
+fn android_leg_builds_and_attaches_a_signed_release_apk_when_the_keystore_secret_is_configured() {
+    let j = job("android-apk");
+
+    // The keystore is materialised from the secret into a file and handed to
+    // Gradle through `ANDROID_KEYSTORE_PATH`, exported via GITHUB_ENV so the
+    // later Gradle step (a separate shell) sees it.
+    let decode = the_one_step_mentioning(&j, "ANDROID_KEYSTORE_PATH=");
+    assert!(
+        step_if(&decode).contains(SIGNING_FLAG),
+        "the keystore-decode step must be gated on `env.{SIGNING_FLAG}`; got {:?}",
+        step_if(&decode)
+    );
+    assert!(
+        contains_substr(&decode, "GITHUB_ENV"),
+        "the decode step must export ANDROID_KEYSTORE_PATH via GITHUB_ENV so the Gradle step sees it"
+    );
+    assert!(
+        contains_substr(&decode, "base64 -d"),
+        "the decode step must base64-decode the keystore secret into the keystore file"
+    );
+    assert!(
+        contains_substr(&decode, KEYSTORE_SECRET),
+        "the decode step must read the keystore from `secrets.{KEYSTORE_SECRET}`"
+    );
+
+    // The signed build itself: `assembleRelease`, gated, with the alias +
+    // passwords supplied from the secrets IN THAT STEP's env.
+    let sign = the_one_step_mentioning(&j, ":app:assembleRelease");
+    assert!(
+        step_if(&sign).contains(SIGNING_FLAG),
+        "the release-APK build must be gated on `env.{SIGNING_FLAG}` (a graceful no-op without \
+         the secrets); got {:?}",
+        step_if(&sign)
+    );
+    let sign_env = sign
+        .get("env")
+        .and_then(Value::as_mapping)
+        .expect("the signing step must declare its own `env:` with the keystore credentials");
+    for secret in [
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_ALIAS",
+        "ANDROID_KEY_PASSWORD",
+    ] {
+        let v = sign_env
+            .get(Value::String(secret.into()))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("the signing step's `env:` must pass `{secret}` to Gradle"));
+        assert!(
+            v.contains(&format!("secrets.{secret}")),
+            "`{secret}` must come from the repository secret of the same name, never a literal; \
+             got {v:?}"
+        );
+    }
+
+    // The artifact users actually install gets the SAME ABI guarantee as the
+    // debug APK (criterion 4 of the mobile-android task).
+    assert!(
+        steps_mentioning(&j, "app-release.apk")
+            .iter()
+            .any(|s| contains_substr(s, "check-apk-abis.sh")),
+        "the signed release APK must also be run through check-apk-abis.sh (it is the artifact \
+         users install)"
+    );
+
+    // Attached to the Release on a tag, uploaded as a workflow artifact on the
+    // dry-run — alongside the debug APK, distinguishable by name.
+    let attach = the_one_step_mentioning(&j, "gh release upload");
+    for apk in ["app-release.apk", "app-debug.apk"] {
+        assert!(
+            contains_substr(&attach, apk),
+            "the tag attach step must upload `{apk}` (the signed release APK alongside the debug APK)"
+        );
+    }
+    let upload = the_one_step_mentioning(&j, "actions/upload-artifact");
+    assert!(
+        contains_substr(&upload, "app-release.apk"),
+        "the dispatch dry-run must also surface `app-release.apk` as a workflow artifact"
+    );
+}
+
+#[test]
+fn android_leg_names_the_debug_apk_unsigned_when_the_signing_secrets_are_absent() {
+    let j = job("android-apk");
+
+    // The rename is the NO-SECRETS path: gated on the flag NOT being set.
+    let renames: Vec<Value> = steps_mentioning(&j, "app-debug-unsigned.apk")
+        .into_iter()
+        .filter(|s| {
+            let cond = step_if(s);
+            cond.contains(SIGNING_FLAG) && cond.contains("!=")
+        })
+        .collect();
+    assert_eq!(
+        renames.len(),
+        1,
+        "exactly one step must rename the debug APK to `app-debug-unsigned.apk`, gated on \
+         `env.{SIGNING_FLAG}` NOT being set (forks, unconfigured repos)"
+    );
+
+    // The honestly-named artifact must actually REACH both destinations,
+    // otherwise the no-secrets path would attach nothing at all.
+    for dest in ["gh release upload", "actions/upload-artifact"] {
+        let step = the_one_step_mentioning(&j, dest);
+        assert!(
+            contains_substr(&step, "app-debug-unsigned.apk"),
+            "the `{dest}` step must also handle `app-debug-unsigned.apk` (the no-secrets path's \
+             only artifact)"
+        );
+    }
+}
+
+#[test]
+fn android_app_gradle_declares_an_env_gated_release_signing_config() {
+    // The Gradle side of the seam. Asserted as TEXT (there is no Kotlin-DSL
+    // parser available in the pure-Rust gate), which is enough for the contract
+    // that matters: the release signing config exists, takes every input from the
+    // ENVIRONMENT, and is created only when that environment is present — so a
+    // local `./gradlew :app:assembleDebug` (and even `assembleRelease`) is
+    // completely unaffected, and no key material or keystore path is committed.
+    let path = repo_root().join("crates/werust-android/app/build.gradle.kts");
+    let gradle =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+    assert!(
+        gradle.contains("signingConfigs"),
+        "the app module must declare a `signingConfigs` block"
+    );
+    assert!(
+        gradle.contains("create(\"release\")"),
+        "the app module must create the `release` signing config"
+    );
+    for env_var in [
+        "ANDROID_KEYSTORE_PATH",
+        "ANDROID_KEYSTORE_PASSWORD",
+        "ANDROID_KEY_ALIAS",
+        "ANDROID_KEY_PASSWORD",
+    ] {
+        assert!(
+            gradle.contains(&format!("System.getenv(\"{env_var}\")")),
+            "the release signing config must read `{env_var}` from the environment"
+        );
+    }
+    // Gated on env PRESENCE: no `ANDROID_KEYSTORE_PATH` -> no release signing
+    // config at all, so local dev builds behave exactly as before.
+    assert!(
+        gradle.contains("!= null"),
+        "the release signing config must be gated behind the env var being present (`!= null`), \
+         so it does not affect local dev builds"
+    );
+    // A keystore or password must never be committed.
+    assert!(
+        !gradle.contains(".jks"),
+        "no keystore path may be committed in the Gradle script (the keystore comes from CI, \
+         base64 in a secret)"
+    );
+    assert!(
+        !gradle.contains("storePassword = \""),
+        "the store password must never be a committed literal"
+    );
+    assert!(
+        gradle.contains("storePassword = System.getenv("),
+        "the store password must come from the environment"
+    );
+}
+
+#[test]
+fn the_keystore_handling_steps_touch_no_network() {
+    // Criterion "network-isolated": the keystore never travels anywhere — it is
+    // decoded LOCALLY from the secret and its signature verified LOCALLY with the
+    // SDK's apksigner, so no step in the signing path fetches or posts anything.
+    // (This test itself is network-free too: it only parses repo files.)
+    let j = job("android-apk");
+    for needle in ["ANDROID_KEYSTORE_PATH=", "apksigner"] {
+        for step in steps_mentioning(&j, needle) {
+            let blob = strings_of(&step).join("\n");
+            for net in ["curl", "wget", "http://", "https://"] {
+                assert!(
+                    !blob.contains(net),
+                    "the signing step mentioning {needle:?} must touch NO network; found {net:?} \
+                     in:\n{blob}"
+                );
+            }
+        }
     }
 }

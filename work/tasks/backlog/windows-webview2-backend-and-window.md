@@ -1,7 +1,7 @@
 ---
 title: "Windows desktop: a WebView2 `Renderer` backend driven from a Win32 window"
 slug: windows-webview2-backend-and-window
-blockedBy: [windows-ipfs-origin-probe-on-ci, desktop-chrome-presentation-into-core]
+blockedBy: [desktop-chrome-presentation-into-core]
 covers: []
 ---
 
@@ -11,7 +11,7 @@ The Windows shell, funded by Amendment 1 of `docs/adr/0011-webview2-for-windows.
 
 A native werust on Windows: a new `Renderer` backend over **Edge WebView2**, bound with **`webview2-com`** + `webview2-com-sys` (0.39.1, what `wry` itself depends on; never the abandoned `webview2` crate), driven from a plain Win32 window that PAINTS the chrome from the shared derivation `desktop-chrome-presentation-into-core` produced.
 
-**Two blockers are real, and both are in `blockedBy`.** The origin probe decides the serving mechanism (a registered `ipfs://` scheme versus the promoted internal-https `origin_map`), and building the shell before that verdict risks writing the wrong half. The presentation extraction decides what the window paints from; without it this becomes a fourth hand-written copy of the display rules.
+**The origin question is SETTLED; do not re-litigate it.** The probe ran on 2026-07-30 (ADR-0011 Amendment 2, `docs/spikes/windows-ipfs-origin-probe-on-ci/`) and measured the verdict **`registered-ipfs-scheme`**: on WebView2 Runtime 150.0.4078.65, an `ipfs://` scheme registered with `HasAuthorityComponent = TRUE` + `TreatAsSecure = TRUE` gives a real tuple origin, a secure context, a same-origin `fetch` that resolves AND fires `WebResourceRequested`, and a working `pushState`, with a negative control reproducing the Android failure verbatim when the flag is off. So this shell serves REAL `ipfs://` origins like desktop and iOS, and `origin_map.rs` is NOT promoted. Re-run `.github/workflows/windows-origin-probe.yml` if you suspect the evergreen runtime moved under you; do not re-derive the answer by hand. The presentation extraction decides what the window paints from; without it this becomes a fourth hand-written copy of the display rules.
 
 **Where things actually live** (both premises the earlier macOS task got wrong):
 

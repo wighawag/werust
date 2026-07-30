@@ -1,7 +1,6 @@
 ---
 title: "Desktop binary usable as a CLI (subcommands like `werust resolve ronan.eth`, `werust fetch ipfs://...`) without a GUI"
 slug: headless-cli-mode
-spec: in-app-debug-menu-console-and-network
 blockedBy: []
 covers: []
 ---

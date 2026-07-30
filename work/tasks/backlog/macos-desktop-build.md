@@ -1,16 +1,19 @@
 ---
 title: "Native macOS desktop build (Apple Silicon + Intel universal binary as a .dmg or .app zip)"
 slug: macos-desktop-build
-spec: signed-multi-platform-builds
 blockedBy: []
 covers: []
 ---
 
 ## What to build
 
+Origin: split out of the retired `signed-multi-platform-builds` proposal (commit `fd11014`). It covers no spec criterion, so it carries `covers: []` and no `spec:` linkage, per the work contract.
+
 werust's CI already runs a `macos-14` job for the `ios-simulator-app` target. Extend that job (or create a sibling job that runs on the same macos-14 runner) to also produce a **native macOS desktop binary**. The macOS desktop app is a separate target from the iOS Simulator app — it runs as a native `Werust.app` on a Mac without Xcode or the Simulator, using WebKitGTK's sibling framework WebKit.framework (which macOS has built-in) OR the default system webview (WKWebView) through the existing `crates/webview-renderer` backend (which already supports the seam `Renderer` trait with WebKitGTK on Linux; macOS could use either WebKitGTK via Homebrew or the system WebKit framework natively).
 
 **Scope: build + bundle only. No signing, no notarization.** (Those are a separate follow-on that needs an Apple Developer account.)
+
+**Sizing warning (read before picking this up):** the title and the CI framing undersell it. The acceptance criteria below require a native macOS window with the FULL chrome (URL bar, trust indicator, menu, debug view) driving the shared core, which is a FOURTH SHELL alongside desktop GTK, iOS and Android, comparable in size to the iOS shell task, not a CI change. It also adds a platform to `docs/platform-capability-matrix.toml`, and the parity guard then FORCES an explicit cell for macOS in EVERY existing capability row (each one `implemented`, or `stubbed` with a real follow-on task, or `n-a` with a reason). Consider cutting it into (1) the WKWebView/AppKit backend + shell, (2) the parity-matrix column and its stub tasks, and (3) the CI packaging leg, before dispatching any of it.
 
 **Architecture:**
 - Build for `x86_64-apple-darwin` (Intel) and `aarch64-apple-darwin` (Apple Silicon).

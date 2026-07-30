@@ -1,7 +1,6 @@
 ---
 title: "Research: what webview/UI backend for Windows (and what would it take to make werust cross-platform — GTK, webview2, or the native Rust renderer?)"
 slug: windows-platform-research
-spec: signed-multi-platform-builds
 blockedBy: []
 covers: []
 needsAnswers: true
@@ -9,9 +8,11 @@ needsAnswers: true
 
 ## What to research
 
+Origin: split out of the retired `signed-multi-platform-builds` proposal (commit `fd11014`). It covers no spec criterion, so it carries `covers: []` and no `spec:` linkage, per the work contract.
+
 werust currently targets three platform families with three separate shell backends:
 
-| Platform | Shell | Rendering engine | Rust crete binding |
+| Platform | Shell | Rendering engine | Rust crate binding |
 |---|---|---|---|
 | Desktop Linux | GTK4 `Application` | WebKitGTK (via `webkit6` crate) | `crates/webview-renderer` |
 | Android | Kotlin `WebView` | Android System WebView (Blink) | `crates/werust-android/rust` |
@@ -38,7 +39,7 @@ The `Renderer` trait at `crates/webview-renderer/src/lib.rs` is the seam that ab
 
 ## What to produce
 
-A written ADR (`docs/adr/0005-webview2-for-windows.md` or similar) answering:
+A written ADR (`docs/adr/0011-webview2-for-windows.md` or similar; `0005` is already the platform-capability parity guard, and `0011` is the next free number) answering:
 
 - Which Rust WebView2 binding is mature enough to use? (`webview2` crate, `webview` crate, or direct COM interop via `windows-rs`?)
 - Can WebView2 intercept `ipfs://` custom schemes? Can it serve intercepted content with a real tuple origin (so client-side navs work without the opaque-origin workaround Android needed)?
@@ -61,7 +62,7 @@ The ADR ends with a **recommendation: go / no-go / defer**, and if go, a rough t
 
 ## Acceptance criteria
 
-- [ ] A committed ADR (`docs/adr/0005-webview2-for-windows.md`) with the research findings.
+- [ ] A committed ADR (`docs/adr/0011-webview2-for-windows.md`) with the research findings.
 - [ ] The ADR ends with a clear recommendation (go / no-go / defer) and, if go, a rough task breakdown.
 - [ ] The ADR is self-contained (anyone reading it can decide whether to fund the Windows build).
 - [ ] Key technical questions (custom-scheme interception, SvelteKit compatibility, CI strategy) are answered with references.

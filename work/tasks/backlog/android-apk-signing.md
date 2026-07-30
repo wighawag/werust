@@ -1,12 +1,13 @@
 ---
 title: "Sign the Android APK in CI (release keystore → signed APK attached to the GitHub Release)"
 slug: android-apk-signing
-spec: signed-multi-platform-builds
 blockedBy: []
 covers: []
 ---
 
 ## What to build
+
+Origin: split out of the retired `signed-multi-platform-builds` proposal (commit `fd11014`). It covers no spec criterion, so it carries `covers: []` and no `spec:` linkage, per the work contract.
 
 The existing CI (`android-apk` job in `.github/workflows/release.yml`) builds an **unsigned** `app-debug.apk`. A signed APK can be sideloaded without developer-mode warnings and is necessary for any distribution channel.
 

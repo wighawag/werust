@@ -1,0 +1,35 @@
+---
+title: "Stop telling every WebView2 failure to install the runtime, and make the Windows leg's header describe the filter it actually has"
+slug: windows-backend-error-mapping-and-leg-header-accuracy
+blockedBy: [windows-webview2-renderer-backend]
+covers: []
+---
+
+## What to build
+
+Two small, unrelated-to-each-other corrections found at Gate-2/Gate-3 of `windows-webview2-renderer-backend`. They are grouped only because each is a few lines in the same task's output. This is the Windows sibling of `macos-spike-doc-accuracy-and-harness-guard`, and the same scope discipline applies: no behaviour change beyond what is named here.
+
+**1. The runtime-missing message is used for failures that are not a missing runtime.** In `crates/windows-renderer/src/backend.rs`, `create_environment` maps BOTH `CreateCoreWebView2EnvironmentWithOptions` and its awaited result through `missing_runtime_error(...)`. But `with_user_data_folder` has already called `runtime_version()?`, which succeeds only when `GetAvailableCoreWebView2BrowserVersionString` reports a runtime. So by the time environment creation runs, the runtime is PROVEN present, and every refusal after that point — a non-writable or corrupt user-data folder, a group-policy block, a version refusal — hands the user "the Microsoft Edge WebView2 Runtime is not available … Install the Evergreen Runtime". That advice cannot help, and the real `HRESULT`, the only thing that could, survives only in a trailing parenthetical.
+
+Map the post-presence-check failure to a plain `RendererError::Backend` carrying the platform's own detail, and keep `missing_runtime_error` for the presence check where it is TRUE. This matters more than its size: honest failure is a product value in this repo (the fail-closed posture, the named load failures), and an error that confidently misdiagnoses itself is worse than a generic one. Cover it with a pure unit test on the Ubuntu gate, the way the existing runtime-missing message already is.
+
+**2. The leg's header describes a filter the leg no longer has.** `.github/workflows/windows-renderer.yml` still carries the paragraph "WHY THE `pull_request` FILTER IS NARROW", which names `windows-origin-probe` as "the only Windows-specific code in the tree" and lists the old trigger set. Both statements are now false IN THE SAME FILE that disproves them: the backend task correctly added `crates/windows-renderer/**` to the `pull_request` filter. The widening is RIGHT and is not to be reverted — the Windows backend is genuinely Windows-shaped and gating its PRs on the Windows leg is exactly the discrimination the original decision was making. What is missing is the sentence saying so. Rewrite the paragraph to describe the filter as it IS, keep the recorded trade-off (why `werust-core`, `fetcher` and `renderer` stay on the `push` filter rather than the PR one), and say plainly what changed and why.
+
+While there: `docs/spikes/windows-webview2-renderer-backend/**` was added to the PUSH filter, so a docs-only edit to that spike now burns a `windows-latest` run. Decide deliberately — keep it (re-running the leg when the recorded evidence changes is the same logic `macos-renderer.yml` uses for its spike paths) or drop it (a README typo does not need a Windows runner) — and record which and why. Do not leave it unmentioned.
+
+**Also record, no code needed:** `crates/windows-renderer` gained a public `os_color_scheme()` plus an HKCU registry read purely for the sibling chrome task, while the engine itself follows the OS via `PREFERRED_COLOR_SCHEME_AUTO` and needs none of it. That was ratified at Gate-3 (the platform-detail read belongs with the platform bindings, and it is pure-tested), but it never reached `docs/spikes/windows-webview2-renderer-backend/DECISIONS.md`. Add it there so the next reader does not find an unexplained registry dependency in an engine crate.
+
+**Scope:** one error-mapping fix with its test, one workflow header rewrite plus a recorded filter decision, one DECISIONS entry. No change to the backend's behaviour beyond the error type, no change to what the leg BUILDS or TESTS, no new dependency.
+
+## Acceptance criteria
+
+- [ ] A WebView2 environment-creation failure that occurs AFTER the runtime-presence check no longer claims the runtime is missing; it surfaces as a plain `RendererError::Backend` carrying the platform's own detail, and `missing_runtime_error` is used only where the runtime really is absent.
+- [ ] A pure unit test on the Ubuntu gate pins that distinction (both the true-missing message and the post-presence-check message).
+- [ ] The `windows-renderer.yml` header describes the `pull_request` filter the file actually has, including `crates/windows-renderer/**` and why it belongs there, while keeping the recorded reason `werust-core` / `fetcher` / `renderer` stay push-only.
+- [ ] The `docs/spikes/windows-webview2-renderer-backend/**` push-filter entry is either kept or dropped DELIBERATELY, with the reason recorded.
+- [ ] `DECISIONS.md` records the engine crate's `os_color_scheme()` + registry read and why it lives there rather than in the chrome crate.
+- [ ] `cargo fmt --check && cargo clippy && cargo build && cargo test` green.
+
+## Prompt
+
+> Goal: two small corrections in `windows-webview2-renderer-backend`'s output. (1) `create_environment` in `crates/windows-renderer/src/backend.rs` maps EVERY refusal through `missing_runtime_error`, but `with_user_data_folder` already proved the runtime present via `runtime_version()?` — so a corrupt profile folder, a policy block or a version refusal all tell the user to install a runtime they already have, with the real HRESULT buried in a parenthetical. Map post-presence-check failures to a plain `RendererError::Backend` keeping the platform detail, leave `missing_runtime_error` for the presence check, and pin both with a pure unit test on the Ubuntu gate. (2) `.github/workflows/windows-renderer.yml` still says "WHY THE `pull_request` FILTER IS NARROW" and calls `windows-origin-probe` "the only Windows-specific code in the tree", which the same file now disproves: `crates/windows-renderer/**` is in the PR filter. The widening is correct — do NOT revert it — so rewrite the paragraph to describe the filter as it is, keep the recorded reason `werust-core`/`fetcher`/`renderer` stay push-only, and deliberately decide (recording which) whether the spike-docs path stays in the push filter when a README typo would burn a `windows-latest` run. Also add the missing `DECISIONS.md` entry for the engine crate's `os_color_scheme()` + HKCU read, ratified at Gate-3 as belonging with the platform bindings. No other behaviour change, no new dependency.

@@ -5,6 +5,22 @@ members = [
     "crates/werust-core",
     "crates/renderer",
     "crates/webview-renderer",
+    # The toolkit-free half every system-webview backend shares (load lifecycle,
+    # navigate URL rule, the ADR-0008 off-thread `ipfs://` boundary). MOVED out
+    # of `webview-renderer` so the macOS backend can reuse it (never copy it).
+    "crates/webview-shared",
+    # The macOS WKWebView `Renderer` backend (ADR-0011's macOS split, sub-task 2).
+    # A workspace member so the Ubuntu `verify` gate compiles and tests its
+    # host-independent half (the decision rules + the source-shape guard); its
+    # WKWebView half is `#[cfg(target_os = "macos")]` and is built and exercised
+    # by `.github/workflows/macos-renderer.yml` on the existing `macos-14` runner.
+    "crates/macos-renderer",
+    # The macOS ORIGIN PROBE: the WebKit analogue of `windows-origin-probe`, which
+    # turns this repo's recorded iOS `WKURLSchemeHandler` MECHANISM ANALYSIS into a
+    # runtime MEASUREMENT (both WebKit ports share the mechanism). A workspace
+    # member so the Ubuntu gate compiles and tests its host-independent half; its
+    # WKWebView half is `#[cfg(target_os = "macos")]`.
+    "crates/macos-origin-probe",
     "crates/native-renderer",
     "crates/fetcher",
     "crates/script-engine",

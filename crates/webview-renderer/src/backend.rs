@@ -414,7 +414,7 @@ impl WebViewRenderer {
         use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
         use werust_core::ipfs::{RedirectSink, IPFS_SCHEME};
 
-        use crate::offthread::{complete_ipfs_request, retrieve_off_thread};
+        use webview_shared::offthread::{complete_ipfs_request, retrieve_off_thread};
 
         // The production content retriever: the DAG blocks fetched as a CAR from
         // a trustless gateway over the bound HTTP+TLS stack, each block verified
@@ -1003,7 +1003,7 @@ fn apply_os_color_scheme(scheme: OsColorScheme) {
     }
 }
 
-/// A [`RequestSink`](crate::offthread::RequestSink) over the live WebKitGTK
+/// A [`RequestSink`](webview_shared::offthread::RequestSink) over the live WebKitGTK
 /// [`WebKitURISchemeRequest`](webkit6::URISchemeRequest): the marshalling-thread
 /// completion of an off-thread `ipfs://` resolution.
 ///
@@ -1017,7 +1017,7 @@ struct WebKitRequestSink {
     request: webkit6::URISchemeRequest,
 }
 
-impl crate::offthread::RequestSink for WebKitRequestSink {
+impl webview_shared::offthread::RequestSink for WebKitRequestSink {
     fn finish(&mut self, response: renderer::SchemeResponse) {
         let bytes = glib::Bytes::from(&response.body);
         let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);

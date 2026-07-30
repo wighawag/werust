@@ -1,0 +1,18 @@
+{
+  "recorded": "NOT YET MEASURED. This file is a falsifiable PREDICTION written 2026-07-30 by the `macos-wkwebview-renderer-backend` task, which was built blind from Linux (no Mac, per ADR-0011 Amendment 1's recorded verification constraint). The `macos-renderer` workflow asserts every run against it, so the FIRST green run on a `macos-14` runner is what turns it into a recorded verdict — and a run that disagrees goes RED naming the exact field that moved. When that first run happens: if it is green, re-stamp this line with the date, the macOS build and the WebKit user agent from the report; if it is red, re-decide and re-record WITH the reason (see README.md, 'What still awaits a Mac'). The least confident field is case A's `secure_context`: WebKit's secure-context list does not cover custom schemes and there is no `TreatAsSecure` equivalent for a WKURLSchemeHandler, so it is predicted false — and it does not decide the verdict either way.",
+  "mechanism": "registered-ipfs-scheme",
+  "case_a": {
+    "origin": "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq",
+    "secure_context": false,
+    "fetch": "ok:200",
+    "fetch_handler_fired": true,
+    "push_state": "ok:/blog/"
+  },
+  "case_control": {
+    "origin": "null",
+    "secure_context": false,
+    "fetch": "reject:TypeError",
+    "fetch_handler_fired": false,
+    "push_state": "throw:SecurityError"
+  }
+}

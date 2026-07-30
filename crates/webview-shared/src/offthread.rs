@@ -1,7 +1,15 @@
 //! The concurrency BOUNDARY for `ipfs://` scheme resolution: run the blocking
-//! CAR fetch + per-block verify + DAG reassembly OFF the GTK main thread, then
+//! CAR fetch + per-block verify + DAG reassembly OFF the UI main thread, then
 //! marshal the completion (finish the request + mark the shared trust posture)
 //! BACK onto the main thread.
+//!
+//! It is TOOLKIT-FREE (it imports only `fetcher`, `renderer`, `werust_core` and
+//! this crate's own [`SharedLifecycle`](crate::lifecycle::SharedLifecycle)), which
+//! is why it lives in this shared crate rather than in a backend: the WebKitGTK
+//! backend marshals it with `gio::spawn_blocking` + `MainContext::spawn_local`,
+//! the macOS WKWebView backend with a worker thread + a main-queue hop, and both
+//! get the SAME fail-closed trust guarantee from the SAME code. The GTK wording
+//! below is the history that produced it, not a dependency on GTK.
 //!
 //! # Why this exists
 //!
@@ -50,7 +58,7 @@ use fetcher::ContentRetriever;
 use renderer::{RendererError, SchemeRequest, SchemeResponse};
 use werust_core::ipfs::{resolve_ipfs_request, RedirectSink};
 
-use crate::SharedLifecycle;
+use crate::lifecycle::SharedLifecycle;
 
 /// The `Send` result of an off-thread `ipfs://` resolution: the ONLY value that
 /// crosses the worker/main-thread boundary.
@@ -148,7 +156,7 @@ pub fn complete_ipfs_request<S: RequestSink>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::LoadLifecycle;
+    use crate::lifecycle::LoadLifecycle;
     use fetcher::{cid_v1_raw_sha256, RetrieveError, RetrievedContent};
     use renderer::TrustPosture;
     use std::cell::RefCell;

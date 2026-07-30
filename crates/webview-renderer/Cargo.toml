@@ -9,6 +9,11 @@ repository.workspace = true
 renderer = { path = "../renderer" }
 werust-core = { path = "../werust-core" }
 fetcher = { path = "../fetcher" }
+# The TOOLKIT-FREE half of a system-webview backend (the load lifecycle, the
+# navigate URL rule, the ADR-0008 off-thread `ipfs://` boundary). MOVED out of
+# this crate so `macos-renderer` can build on the SAME code without inheriting
+# the unconditional gtk4/webkit6 dependency below.
+webview-shared = { path = "../webview-shared" }
 gtk4 = { version = "=0.10.0", features = ["v4_14"] }
 # NOTE: webkit6 0.5.0's only gtk-feature-forward is `gtk_v4_18` (= gtk4/v4_18); it has
 # no `gtk_v4_14`. Enabling `gtk_v4_18` would force gtk4 >= 4.18, which Ubuntu 24.04 CI

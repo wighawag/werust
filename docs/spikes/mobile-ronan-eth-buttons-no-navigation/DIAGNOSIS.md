@@ -90,6 +90,16 @@ iOS does NOT share the cause, by construction. The iOS shell registers `ipfs` wi
 
 Recorded runtime confirmation for a Mac (residual risk, small): build the iOS shell, load `ronan.eth`, click blog/portfolio; expected: navigates and renders posts. If it ever does NOT, the fix analogue is the same internal-origin map behind the iOS edge, and this task's `origin_map` concept ports directly.
 
+### Addendum 2026-07-30 — the mechanism is now under a RUNTIME probe (`macos-wkwebview-renderer-backend`)
+
+The paragraph above is still, as written, a mechanism analysis. What changed is that the mechanism is no longer only reasoned about: the macOS WKWebView backend task built `crates/macos-origin-probe`, the WebKit analogue of `crates/windows-origin-probe`, which loads a canned SvelteKit-shaped page from `ipfs://<cid>/` through a registered `WKURLSchemeHandler` on a real `macos-14` runner and MEASURES the four facts this caveat rests on — the document `origin`, whether a same-origin `fetch('/blog/__data.json')` resolves *and* fires the handler, and whether `pushState` throws — against a negative control (the identical bytes with an opaque origin) that must reproduce the Android failure. It runs in `.github/workflows/macos-renderer.yml` and asserts against a recorded verdict, so a later WebKit change to this corner goes red naming the field that moved.
+
+What that does and does not settle, stated precisely:
+
+* `WKURLSchemeHandler` is ONE WebKit class. What the probe measures about the origin a handler-served document receives is a property of the WebKit port, which macOS and iOS share, so it addresses the load-bearing half of this caveat for both.
+* It does NOT build the iOS app, load `ronan.eth`, or click a blog link. The device-level steps recorded above stay open, and the residual risk they cover (something iOS-specific in `WKWebViewShellController`'s wiring rather than in WebKit's origin model) is untouched.
+* At the time of writing the probe has been BUILT but not yet RUN: it was authored from Linux and its `expected.json` is an explicitly falsifiable PREDICTION until the first `macos-14` run. See `docs/spikes/macos-wkwebview-renderer-backend/README.md` ("What CI proves" / "What still awaits a Mac") for the honest split, and re-read this addendum against that file's recorded verdict once the job has run.
+
 ## The ANR guard is not regressed
 
 The fix touches NO threading: it is a pure URL mapping in the Rust edge plus the pending-load mapping, with the `_blank` transport mapping through a session-free pure function. The ANR architecture is exactly as `android-anr-main-thread-diagnose-and-unblock` left it: session-driving actions still run on the single-threaded `coreExecutor` (never the UI thread), `shouldInterceptRequest` still runs on a WebView worker thread serialised by the `SyncSession` mutex (its host test `the_sync_session_serializes_the_ui_thread_and_the_webview_worker_thread` still passes), and console capture still pushes off the session lock (no UI-thread wait behind an in-flight retrieval). The on-device end-to-end ran with the UI responsive throughout (scrolling, chrome, debug view all live during loads), and the full workspace suite (including the ANR/sync-session tests) is green.

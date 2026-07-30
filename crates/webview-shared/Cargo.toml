@@ -1,0 +1,17 @@
+[package]
+name = "webview-shared"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The TOOLKIT-FREE half of a system-webview `Renderer` backend (the load
+# lifecycle, the navigate URL rule, the ADR-0008 off-thread `ipfs://` boundary).
+# It deliberately has NO gtk4/webkit6/objc2 dependency: that is the whole point —
+# `webview-renderer` (WebKitGTK) and `macos-renderer` (WKWebView) both build on
+# it, so the Ubuntu `verify` gate exercises the shared logic on every run and the
+# two backends cannot drift.
+[dependencies]
+renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
+fetcher = { path = "../fetcher" }

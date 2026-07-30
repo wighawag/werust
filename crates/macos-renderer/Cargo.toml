@@ -1,0 +1,80 @@
+[package]
+name = "macos-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
+fetcher = { path = "../fetcher" }
+# The TOOLKIT-FREE half of a system-webview backend, MOVED here out of
+# `webview-renderer` rather than copied: the load lifecycle, the navigate URL
+# rule, and the ADR-0008 off-thread `ipfs://` boundary. Sharing it is what keeps
+# this backend and the WebKitGTK one from drifting in what a load state or a
+# verified load MEANS.
+webview-shared = { path = "../webview-shared" }
+
+# The AppKit/WebKit half only exists on macOS, kept target-gated exactly as
+# `crates/windows-origin-probe` gates `webview2-com` and `crates/werust-android`
+# gates `jni`. That is what lets the Ubuntu `verify` gate compile and test this
+# crate's host-independent half (`pure.rs` + the source-shape guard) with no
+# Xcode, no SDK and no Mac.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "NSData",
+  "NSDate",
+  "NSDictionary",
+  "NSError",
+  "NSGeometry",
+  "NSKeyValueObserving",
+  "NSObjCRuntime",
+  "NSRunLoop",
+  "NSString",
+  "NSURL",
+  "NSURLRequest",
+  "NSURLResponse",
+  "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "NSAppearance",
+  "NSApplication",
+  "NSGraphics",
+  "NSResponder",
+  "NSRunningApplication",
+  "NSView",
+  "NSWindow",
+] }
+objc2-web-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "block2",
+  "objc2-app-kit",
+  "objc2-core-foundation",
+  "WKFrameInfo",
+  "WKNavigation",
+  "WKNavigationAction",
+  "WKNavigationDelegate",
+  "WKPreferences",
+  "WKScriptMessage",
+  "WKScriptMessageHandler",
+  "WKUIDelegate",
+  "WKURLSchemeHandler",
+  "WKURLSchemeTask",
+  "WKUserContentController",
+  "WKUserScript",
+  "WKWebView",
+  "WKWebViewConfiguration",
+  "WKWindowFeatures",
+] }
+
+[dev-dependencies]
+# The trust-hooks smoke example pins a canned, network-free content-addressed
+# fixture and derives its real CID, so the `ipfs://` hook is exercised through
+# the PRODUCTION verifying resolver with no gateway and no network.
+fetcher = { path = "../fetcher" }

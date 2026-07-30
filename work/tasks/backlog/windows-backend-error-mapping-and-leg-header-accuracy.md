@@ -19,7 +19,13 @@ While there: `docs/spikes/windows-webview2-renderer-backend/**` was added to the
 
 **Also record, no code needed:** `crates/windows-renderer` gained a public `os_color_scheme()` plus an HKCU registry read purely for the sibling chrome task, while the engine itself follows the OS via `PREFERRED_COLOR_SCHEME_AUTO` and needs none of it. That was ratified at Gate-3 (the platform-detail read belongs with the platform bindings, and it is pure-tested), but it never reached `docs/spikes/windows-webview2-renderer-backend/DECISIONS.md`. Add it there so the next reader does not find an unexplained registry dependency in an engine crate.
 
-**Scope:** one error-mapping fix with its test, one workflow header rewrite plus a recorded filter decision, one DECISIONS entry. No change to the backend's behaviour beyond the error type, no change to what the leg BUILDS or TESTS, no new dependency.
+**3. Three more doc/filter corrections, added at Gate-3 of `windows-win32-window-and-chrome`** (the window task landed after this one was written and produced its own small residue in the same files):
+
+- **`crates/desktop-paint/**` was added to the `pull_request` filter of BOTH `windows-renderer.yml` AND `macos-renderer.yml`**, so a PR touching the shared painter now gates on a Windows AND a macOS runner, and `windows_renderer_leg_shape.rs` does NOT pin it, so a later broadening has no test to change. That is the deliberately-narrow filter widening by accretion, twice in two tasks, which is the drift the guard was written to prevent. Decide it deliberately: either keep `desktop-paint` on the PR filter (defensible — it is the shared painter both native-widget edges consume, so a break there really is cross-platform) and PIN it in the guard so the next widening is a deliberate edit, or move it to `push` only. Record which and why.
+- **The repo `README.md` has no Windows section**, not even the word Windows, while the macOS sibling added "The macOS shell (werust-macos)" describing how to run it and pointing at its spike README. A person landing on the repo cannot discover `cargo run -p werust-windows`. Add the parallel section, modelled on the macOS one, and say plainly that the shell is unsigned and unpackaged until the release leg lands.
+- **`docs/spikes/windows-win32-window-and-chrome/README.md` claims the local cross-target run was `cargo xwin clippy -p werust-windows -p windows-renderer --tests --examples`, but the committed harness ends in `exec cargo xwin check`.** Either the recorded command was run by hand outside the harness (say so, plainly) or the harness should be the clippy it claims. Same class as item 2: do not leave a doc claiming a stronger check than the tool performs.
+
+**Scope:** one error-mapping fix with its test, one workflow header rewrite plus two recorded filter decisions, one README section, two DECISIONS/doc-accuracy corrections. No change to the backend's behaviour beyond the error type, no change to what the leg BUILDS or TESTS, no new dependency.
 
 ## Acceptance criteria
 
@@ -28,6 +34,9 @@ While there: `docs/spikes/windows-webview2-renderer-backend/**` was added to the
 - [ ] The `windows-renderer.yml` header describes the `pull_request` filter the file actually has, including `crates/windows-renderer/**` and why it belongs there, while keeping the recorded reason `werust-core` / `fetcher` / `renderer` stay push-only.
 - [ ] The `docs/spikes/windows-webview2-renderer-backend/**` push-filter entry is either kept or dropped DELIBERATELY, with the reason recorded.
 - [ ] `DECISIONS.md` records the engine crate's `os_color_scheme()` + registry read and why it lives there rather than in the chrome crate.
+- [ ] The `crates/desktop-paint/**` PR-filter entry on BOTH legs is decided deliberately (kept and PINNED by the narrow-filter guard, or moved to `push`), with the reason recorded.
+- [ ] `README.md` has a Windows shell section parallel to the macOS one, naming how to run it and that it is unsigned/unpackaged for now.
+- [ ] The Windows window spike README's claimed local command matches what the committed harness actually runs (or says explicitly that it was run by hand).
 - [ ] `cargo fmt --check && cargo clippy && cargo build && cargo test` green.
 
 ## Prompt

@@ -50,7 +50,7 @@ One consequence worth naming: with no main-document row, the "main-document row 
 
 The engine's container is the view a HOST embeds and resizes; before this, the page kept the size it had when the engine was realised while the window grew around it. It is engine behaviour (how the engine fills its own container), not chrome, so it belongs there rather than being worked around from the window — which could not reach the webview anyway once the backend is boxed behind the seam.
 
-**Touches:** `crates/macos-renderer`, another task's crate; its own CI leg re-tests it, and its shape guard still holds (no chrome name enters the backend).
+**Touches:** `crates/macos-renderer`, another task's crate; its own CI leg re-tests it (green with this line in place, run 30572253620: `trust_hooks_smoke` PASS, both hooks and the negative control), and its shape guard still holds (no chrome name enters the backend).
 
 ## 7. Hand-computed frames, not Auto Layout
 
@@ -80,7 +80,7 @@ Two jobs would double the runner time and let the window's leg drift from the en
 
 **Chosen:** `window_smoke` opens the real window FAR off-screen as an accessory app, loads a pinned in-memory hash-verified `ipfs://` page through the PRODUCTION verifying route, and reads values back OUT of the real `NSTextField`s / `NSMenu` — with a negative control whose bytes do not hash to their CID.
 
-Asserting on `ChromePaint` there would prove nothing a Linux run has not already proved. What only a Mac adds is that the Objective-C object graph constructs and behaves, so that is what the smoke measures. Off-screen + accessory follows the engine smoke's discipline: a CI run shows nothing and steals no focus. **Note:** as recorded in the README, this smoke had NOT been run against this code at the time of writing.
+Asserting on `ChromePaint` there would prove nothing a Linux run has not already proved. What only a Mac adds is that the Objective-C object graph constructs and behaves, so that is what the smoke measures. Off-screen + accessory follows the engine smoke's discipline: a CI run shows nothing and steals no focus. **Outcome:** the smoke has since been RUN against this code and PASSES, in [run 30572253620](https://github.com/wighawag/werust/actions/runs/30572253620) (macOS 14.8.7, Xcode 15.4); what it asserted, and what it still does not reach, is recorded in the README's [What CI proved](README.md#what-ci-proved).
 
 ## 12. The pump timer holds its target for the process's life
 

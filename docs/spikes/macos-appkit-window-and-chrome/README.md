@@ -2,7 +2,7 @@
 
 Task: `macos-appkit-window-and-chrome`. Decision it executes: [`docs/adr/0011-webview2-for-windows.md`](../../adr/0011-webview2-for-windows.md), the "how `macos-desktop-build` should be split" block, sub-task 3. Engine it sits on: [`macos-wkwebview-renderer-backend`](../macos-wkwebview-renderer-backend/README.md). Judgement calls made while building it: [`DECISIONS.md`](DECISIONS.md).
 
-**Read this first.** The macOS CI leg has **not yet run against this code** at the time of writing (this work was written on Linux, and the branch it lives on has not been pushed by the author of the change). Everything below is split into what an ORDINARY Ubuntu `verify` run proves today, what the LOCAL cross-target type-check proves, and what only the `macos-14` job — which this task extends and which triggers on the pull request — can prove. Nothing here claims a macOS runtime result. The engine task's own measured run is cited only where it is genuinely the engine's result, not this window's.
+**Read this first.** This work was WRITTEN on Linux, blind, and it has since been RUN on a Mac: the `macos-14` leg this task extends is green against this branch ([run 30572253620](https://github.com/wighawag/werust/actions/runs/30572253620), see [What CI proved](#what-ci-proved)). Everything below is still split by what proves it, because the three sources prove very different things: an ORDINARY Ubuntu `verify` run, the LOCAL cross-target type-check, and the `macos-14` job. Where a claim is a macOS runtime result it names the run; where it is host-independent it says so; where nothing has checked it, it lives under [What still awaits a Mac](#what-still-awaits-a-mac-stated-plainly). The engine task's own earlier measurement is cited only where it is genuinely the engine's result, not this window's.
 
 ## What landed
 
@@ -54,26 +54,32 @@ That means every `objc2` call, every `define_class!` block, every selector signa
 
 ## What CI proved
 
-**Nothing about this window, yet — the leg has not been run against this code.** Stating it plainly is the point of this section (ADR-0011 Amendment 1, and the Gate-2 lesson from the engine task: a prediction in a measurement's slot is worse than an admitted gap).
+**The `macos-renderer` leg is GREEN against this code.** Run [30572253620](https://github.com/wighawag/werust/actions/runs/30572253620) (`workflow_dispatch`, ref `work/task-macos-appkit-window-and-chrome`, commit `d9aeca8`, 2026-07-30, all steps succeeded in 1m01s). That commit's tree differs from the landed one only in `work/` bookkeeping files; no source line differs. The leg RECORDS what it measured on, and this run measured on **macOS 14.8.7 (build 23J520), Xcode 15.4 (15F31d), AppleWebKit/605.1.15** (the last as reported by the origin probe's own user agent).
 
-- The `macos-renderer` job now carries two new obligations: `cargo build/test -p werust-macos` and `cargo run -p werust-macos --example window_smoke`. Both are steps that EXIST; neither has produced a result for this code.
-- The job triggers on the pull request that lands this task (its path filters include `crates/werust-macos/**`), and can be dispatched by hand at any time: `gh workflow run macos-renderer.yml --ref <branch>`.
-- What the job proved for the ENGINE this window sits on is a real, earlier measurement and is recorded where it belongs: [`macos-wkwebview-renderer-backend/README.md`](../macos-wkwebview-renderer-backend/README.md) (run 30563185521, macOS 14.8.7, AppleWebKit/605.1.15 — both trust hooks, the fail-closed control, and the `ipfs://` origin verdict). This task changes one line of that engine (the autoresizing mask), which that same job re-tests.
+What each step establishes, and by what kind of evidence:
 
-When the run happens, the window smoke is what will have been proved:
+1. **The AppKit half COMPILES against a real SDK** (step *Build the macOS backend, the window and the origin probe*: `cargo build -p macos-renderer -p werust-macos -p macos-origin-probe`). Until this run, `src/window.rs` and `examples/window_smoke.rs` had only ever been type-checked cross-target from Linux; they are now built by the real toolchain.
+2. **The host-independent tests hold on macOS too** (step *Test the macOS crates and the shared toolkit-free half*): `werust-macos`'s 7 paint unit tests and its 10 source-shape guards pass there exactly as they do on the Ubuntu gate, alongside `macos-renderer` (3 + 12), `webview-shared` (5) and `macos-origin-probe` (20 + 4). This is platform COVERAGE of claims the Ubuntu gate already makes, not new claims: everything in [What the Ubuntu `verify` gate proves TODAY](#what-the-ubuntu-verify-gate-proves-today-every-ordinary-run) is checked on both hosts, and none of it needs a Mac to be true.
+3. **The engine's trust hooks still work with this task's one engine change in place** (step *Exercise BOTH trust hooks on a real WKWebView*): `trust_hooks_smoke` reports `posture: ContentVerified` on the hash-verified load, the injected provider round-tripping `chainId 0x1`, and `control state: Failed` / `control posture: UnverifiedOrigin` on the tampered control, ending `PASS`. That is what re-tests the autoresizing-mask line (DECISIONS 6).
+4. **The real window runs** (step *Build and drive the REAL AppKit window*): `window_smoke` ends in `PASS`. Every runtime claim about the WINDOW below comes from THAT program, and from nowhere else.
+5. **The recorded origin verdict still holds on this WebKit** (final step): `registered-ipfs-scheme`, asserted against `docs/spikes/macos-wkwebview-renderer-backend/expected.json`. That is the ENGINE's measurement, re-confirmed; it is recorded where it belongs, in [`macos-wkwebview-renderer-backend/README.md`](../macos-wkwebview-renderer-backend/README.md).
 
-- a real `NSWindow` + toolbar + menu + debug view CONSTRUCT and lay out on a real Mac (any Objective-C selector typo, missing feature flag or bad `define_class!` shows up here as a crash, which the type-check cannot catch);
-- the URL bar, the trust indicator (badge AND its ADR-0006 explanation tooltip) and the status line hold exactly what the core derived, read back OUT of the widgets;
-- the ⋮ `NSMenu`'s titles are the core `BrowserMenu`'s labels, in order, and its Debug item is enabled and activatable;
-- a hash-verified `ipfs://` page loads through the window and reads as verified;
-- the page view does not move or resize across a whole successful load (the URL-bar-progress rule, measured as a frame comparison);
-- the page's own `console.log` reaches the debug view's Console tab (page → shared shim → capture channel → shared store → a rendered row), and clearing the shared store empties both tabs;
-- the NEGATIVE CONTROL (bytes that do not hash to their CID) FAILS, raises the error banner with the core's protocol-named reason, displaces the page (the one state allowed to), and is never reported verified;
-- closing the debug window clears the slot, so Debug opens a fresh one.
+The assertions `window_smoke` made on the real object graph, in the order it made them (its verbatim output is in the run's step log; it is not restated here):
+
+- a real `NSWindow` + toolbar + menu + debug view CONSTRUCT and lay out on a real Mac, which is the class of failure the cross-target type-check cannot catch (a selector typo, a missing feature flag, a bad `define_class!`) and which would show up here as a crash;
+- on the fresh window: the trust indicator holds the core's badge, the badge's tooltip is the core's ADR-0006 EXPLANATION, the status line is the core's status, and there is neither an error banner nor an invalid-entry badge (all read back OUT of the real `NSTextField`s);
+- the ⋮ `NSMenu`'s titles are the core `BrowserMenu`'s labels, in order;
+- a hash-verified `ipfs://` page (offline, pinned, through the production verifying route) settles; the URL bar shows the loaded content-addressed URL; the trust indicator paints the core's verdict and reads as verified; the status line still mirrors the core;
+- that successful load raised NO banner, and **the page view did not move or resize across the whole load** (a frame comparison: the URL-bar-progress rule, measured);
+- the Debug item is enabled and activatable, activating it OPENED the view, the page's own `console.log` reached the Console tab (page → shared shim → capture channel → shared store → a rendered row), and clearing the shared store emptied both tabs;
+- the NEGATIVE CONTROL (bytes that do not hash to their CID) FAILED, raised the prominent error banner carrying the core's protocol-named reason (`⚠ This page failed to load: renderer backend error: ipfs:// content-addressed load failed: block hash mismatch: bytes do not match cid bafkrei…`), displaced the page (the one state allowed to), and was never reported verified;
+- closing the debug window cleared the slot, so Debug opens a fresh one.
+
+What this run did NOT touch is unchanged and is listed in the next section: a `macos-14` runner has no display, no GPU and no human, so appearance, dark mode, input, live resize and everything a user does by hand remain unproven. The leg is re-runnable at any time (`gh workflow run macos-renderer.yml --ref <branch>`) and triggers on pull requests touching `crates/werust-macos/**`.
 
 ## What still awaits a Mac (stated plainly)
 
-**This window was WRITTEN blind, from Linux.** Even a green CI run leaves all of the following unproven, because a `macos-14` runner is not a desktop with a display, a GPU and a human:
+**This window was WRITTEN blind, from Linux.** The green run above leaves all of the following unproven, because a `macos-14` runner is not a desktop with a display, a GPU and a human:
 
 - **How it LOOKS.** Nothing here judges legibility, spacing, font sizes, the hand-computed frames at unusual window sizes, or whether the accent colours (shared with the GTK edge) read well against a dark-mode chrome. The manual steps below exist for exactly this.
 - **Dark mode.** ADR-0009 compliance is asserted as an ABSENCE (this crate never sets an `NSAppearance`), and macOS is expected to propagate the effective appearance into both the chrome and the web process. That expectation is untested at runtime.

@@ -1,7 +1,7 @@
 ---
 title: "Package the macOS desktop build in CI: universal binary, unsigned `.app`, attached to the tagged Release"
 slug: macos-release-packaging-leg
-blockedBy: [macos-wkwebview-backend-and-window]
+blockedBy: [macos-appkit-window-and-chrome]
 covers: []
 ---
 

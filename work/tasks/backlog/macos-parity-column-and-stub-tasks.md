@@ -1,7 +1,7 @@
 ---
 title: "Add the `macos` column to the platform-capability parity matrix, and cut the stub tasks the guard then forces"
 slug: macos-parity-column-and-stub-tasks
-blockedBy: [macos-wkwebview-backend-and-window]
+blockedBy: [macos-appkit-window-and-chrome]
 covers: []
 ---
 
@@ -11,7 +11,7 @@ Sub-task 3 of the `macos-desktop-build` split prescribed by `docs/adr/0011-webvi
 
 `docs/platform-capability-matrix.toml` lists `platforms = ["desktop", "ios", "android"]`, and the guard (`crates/werust-core/tests/platform_capability_parity.rs`, riding the normal `verify` gate) requires an EXPLICIT cell for every capability times every platform. Adding `macos` therefore forces a cell in EVERY capability row (21 today), each of which must be `implemented`, or `stubbed` with a `task = "<slug>"` naming a task that really exists in `work/tasks/{backlog,ready,done}/`, or `n-a` with a `reason`. A `stubbed` cell with no resolvable task REDS the gate, which is the whole point of the mechanism.
 
-So this task is two halves: fill the column honestly against what `macos-wkwebview-backend-and-window` actually shipped, and CUT the follow-on tasks that the `stubbed` cells must point at. Do not paper over a gap with `n-a`: `n-a` means genuinely not applicable on that platform (as "system-back-navigates-history" is on desktop), not "not built yet".
+So this task is two halves: fill the column honestly against what `macos-wkwebview-renderer-backend` + `macos-appkit-window-and-chrome` actually shipped, and CUT the follow-on tasks that the `stubbed` cells must point at. Do not paper over a gap with `n-a`: `n-a` means genuinely not applicable on that platform (as "system-back-navigates-history" is on desktop), not "not built yet".
 
 Read `docs/adr/0005-platform-capability-parity-guard.md` first: the guard exists because the mobile `ipfs://` gap once shipped desktop-only behind an empty `{}` backend method and the release still looked green.
 

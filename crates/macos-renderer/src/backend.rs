@@ -61,7 +61,7 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{
     define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
 };
-use objc2_app_kit::{NSApplication, NSView};
+use objc2_app_kit::{NSApplication, NSAutoresizingMaskOptions, NSView};
 use objc2_foundation::{
     ns_string, NSData, NSDictionary, NSError, NSHTTPURLResponse, NSKeyValueChangeKey,
     NSKeyValueObservingOptions, NSObjectNSKeyValueObserverRegistration, NSPoint, NSRect, NSSize,
@@ -717,6 +717,15 @@ impl MacosRenderer {
                     std::ptr::null_mut(),
                 );
                 self.container.addSubview(&view);
+                // The engine fills its container, and KEEPS filling it when the
+                // container is resized. The container is the view a HOST embeds
+                // and lays out (the shell window resizes it on every window
+                // resize), so without this the page would keep the size it had
+                // when the engine was realised while its host grew around it.
+                view.setAutoresizingMask(
+                    NSAutoresizingMaskOptions::ViewWidthSizable
+                        | NSAutoresizingMaskOptions::ViewHeightSizable,
+                );
                 // The user-content controller the ENGINE actually consults is the
                 // one on its own (copied) configuration; adopt it so later
                 // `inject_script` / script-bridge registrations still land.

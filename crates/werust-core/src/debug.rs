@@ -131,6 +131,24 @@ pub enum ConsoleLevel {
 }
 
 impl ConsoleLevel {
+    /// Every console level, in declaration order.
+    ///
+    /// The single source of truth for "which console levels exist", so a caller
+    /// that must cover the whole axis iterates THIS instead of re-listing the
+    /// variants in a literal that silently goes stale — the same discipline
+    /// [`TrustPosture::ALL`] carries, and load-bearing for the same reason: the
+    /// debug view derives one CSS class per level and exports the complete class
+    /// family ([`DEBUG_CONSOLE_CSS_CLASSES`]) for painters to colour from, and
+    /// the test that proves the family covers every level drives it from here.
+    /// Kept complete by the const check below.
+    pub const ALL: [ConsoleLevel; 5] = [
+        ConsoleLevel::Log,
+        ConsoleLevel::Info,
+        ConsoleLevel::Warn,
+        ConsoleLevel::Error,
+        ConsoleLevel::Debug,
+    ];
+
     /// Map a PLATFORM's console level name onto werust's one console vocabulary.
     ///
     /// The three capture points report a level as text, and each platform spells
@@ -174,6 +192,37 @@ impl ConsoleLevel {
         }
     }
 }
+
+/// Keeps [`ConsoleLevel::ALL`] EXHAUSTIVE, at compile time.
+///
+/// The same const check [`LoadState::ALL`](renderer::LoadState::ALL) and
+/// [`TrustPosture::ALL`] carry: `listed` is a TOTAL match (no wildcard arm) whose
+/// every arm hands back the level's OWN entry in the list, so a sixth
+/// [`ConsoleLevel`] cannot reach a build — the match stops compiling until the
+/// variant is named here, and the arm the author then writes
+/// (`… => ConsoleLevel::ALL[5]`) stops compiling too (`index out of bounds`, the
+/// deny-by-default `unconditional_panic` lint) unless the variant is ALSO added
+/// to `ALL`. The loop closes the last hole: each level is held once, at the slot
+/// its arm claims.
+const _CONSOLE_LEVEL_ALL_IS_EVERY_LEVEL_IN_SLOT_ORDER: () = {
+    const fn listed(level: ConsoleLevel) -> ConsoleLevel {
+        match level {
+            ConsoleLevel::Log => ConsoleLevel::ALL[0],
+            ConsoleLevel::Info => ConsoleLevel::ALL[1],
+            ConsoleLevel::Warn => ConsoleLevel::ALL[2],
+            ConsoleLevel::Error => ConsoleLevel::ALL[3],
+            ConsoleLevel::Debug => ConsoleLevel::ALL[4],
+        }
+    }
+    let mut i = 0;
+    while i < ConsoleLevel::ALL.len() {
+        assert!(
+            listed(ConsoleLevel::ALL[i]) as u8 == ConsoleLevel::ALL[i] as u8,
+            "ConsoleLevel::ALL must hold every level, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// One captured CONSOLE entry: what the page logged, at what level, from where.
 ///
@@ -1052,6 +1101,221 @@ pub fn trust_posture_wire_name(posture: TrustPosture) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ROW PRESENTATION: the debug view's display rules.
+//
+// Pure functions of ONE captured entry (plus the refresh PLAN a tab applies to
+// its rows), living beside the store they render — the same layering the chrome
+// presentation has in `lib.rs` (`status_line`, `trust_indicator*`, …,
+// `docs/adr/0011`): the RULE is decided once in the toolkit-free core and each OS
+// edge is a PAINTER that assigns the result to widgets.
+//
+// They started life private to the GTK edge (`crates/werust/src/main.rs`, task
+// `debug-view-console-network-tabs-desktop`) and were moved here
+// behaviour-preservingly, with their tests, when the macOS debug view needed the
+// SAME derivation (task `macos-appkit-window-and-chrome`). That is the standing
+// lesson of the Kotlin and Swift twins: a second painter that re-implements a
+// display rule drifts from the first, and the drift ships (the trust EXPLANATION
+// was desktop-only for months). Nothing here knows about a widget, a toolkit or a
+// colour: a class NAME is a stable state identifier, and the stylesheet that
+// gives it a colour stays in the edge that has one.
+// ---------------------------------------------------------------------------
+
+/// Every class [`console_level_css_class`] can return: the console row's
+/// MUTUALLY-EXCLUSIVE level family, one class per [`ConsoleLevel`].
+///
+/// The debug-view twin of the chrome's
+/// [`TRUST_INDICATOR_CSS_CLASSES`](crate::TRUST_INDICATOR_CSS_CLASSES), exported
+/// for the same reason (task `export-the-chrome-css-class-set-from-core`): a
+/// painter that keeps its OWN literal list of level classes goes stale the moment
+/// a sixth level lands, and an edge whose stylesheet has no rule for an exported
+/// name renders that state INVISIBLY. Each edge's stylesheet guard iterates THIS
+/// (the GTK `APP_CSS` test, the macOS colour-table test), so a class with no
+/// styling reds the gate.
+///
+/// Deliberately NOT folded into
+/// [`CHROME_CSS_CLASS_SETS`](crate::CHROME_CSS_CLASS_SETS): that set is the
+/// browser CHROME's families (the trust badge, the error banner), which a painter
+/// toggles on ONE widget at a time; these colour a debug-view ROW. Same pattern,
+/// different surface, so they stay separate names rather than one set that means
+/// two things.
+pub const DEBUG_CONSOLE_CSS_CLASSES: &[&str] = &[
+    "debug-console-log",
+    "debug-console-info",
+    "debug-console-warn",
+    "debug-console-error",
+    "debug-console-debug",
+];
+
+/// The CSS class colouring one console row by its level: error red, warn amber,
+/// info blue, debug grey, log neutral. Pure, so the level-to-class mapping is
+/// pinned without a display.
+///
+/// The complete set of classes this can return is
+/// [`DEBUG_CONSOLE_CSS_CLASSES`]; a painter derives its list from there.
+#[must_use]
+pub fn console_level_css_class(level: ConsoleLevel) -> &'static str {
+    match level {
+        ConsoleLevel::Log => "debug-console-log",
+        ConsoleLevel::Info => "debug-console-info",
+        ConsoleLevel::Warn => "debug-console-warn",
+        ConsoleLevel::Error => "debug-console-error",
+        ConsoleLevel::Debug => "debug-console-debug",
+    }
+}
+
+/// The `<source>:<line>` tail of a console row: empty when the platform
+/// reported no source (the injected shim reports none for an unreadable stack
+/// frame), source-only when it reported no line. An absent field stays honestly
+/// absent rather than rendering a fabricated `:0`. Pure, for display-free tests.
+#[must_use]
+pub fn console_source_line(entry: &ConsoleEntry) -> String {
+    match (entry.source.is_empty(), entry.line) {
+        (true, _) => String::new(),
+        (false, Some(line)) => format!("{}:{line}", entry.source),
+        (false, None) => entry.source.clone(),
+    }
+}
+
+/// The full text of one console row: `[<level>] <message>` plus the source tail
+/// in parentheses when there is one. The level tag is the store's OWN wire name
+/// (`log`/`info`/`warn`/`error`/`debug`), so the Console tab speaks the capture
+/// store's vocabulary exactly. Pure, for display-free tests.
+#[must_use]
+pub fn console_row_text(entry: &ConsoleEntry) -> String {
+    let source = console_source_line(entry);
+    if source.is_empty() {
+        format!("[{}] {}", entry.level.wire_name(), entry.message)
+    } else {
+        format!("[{}] {} ({source})", entry.level.wire_name(), entry.message)
+    }
+}
+
+/// The status column of a network row: the response code, or `?` when the
+/// request has no status (a custom scheme answered without one, or the request
+/// failed before a response): an unknown stays honestly unknown.
+#[must_use]
+pub fn network_status_text(status: Option<u16>) -> String {
+    status.map_or_else(|| "?".to_string(), |s| s.to_string())
+}
+
+/// The MIME column of a network row, or `?` when unknown.
+#[must_use]
+pub fn network_mime_text(mime: &str) -> String {
+    if mime.is_empty() {
+        "?".to_string()
+    } else {
+        mime.to_string()
+    }
+}
+
+/// The size column of a network row: a human byte count (`512 B`, `1.5 KB`,
+/// `2.0 MB`), or `?` when unknown.
+#[must_use]
+pub fn network_size_text(size: Option<u64>) -> String {
+    match size {
+        None => "?".to_string(),
+        Some(bytes) if bytes < 1024 => format!("{bytes} B"),
+        Some(bytes) if bytes < 1024 * 1024 => format!("{:.1} KB", bytes as f64 / 1024.0),
+        Some(bytes) => format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// The per-request trust label of a network row: the SAME posture vocabulary
+/// the chrome trust indicator speaks (ADR-0006) — the indicator's glyph for the
+/// posture plus the core's wire name (`content-verified`, `unverified-origin`,
+/// `name-via-trusted-rpc`, `mutable-name`), never a new label minted for the
+/// debug view. Pure, for display-free tests.
+#[must_use]
+pub fn network_trust_label(posture: TrustPosture) -> String {
+    let glyph = match posture {
+        TrustPosture::ContentVerified => "✓",
+        TrustPosture::NameViaTrustedRpc => "◈",
+        TrustPosture::MutableName => "◇",
+        TrustPosture::UnverifiedOrigin => "⚠",
+    };
+    format!("{glyph} {}", trust_posture_wire_name(posture))
+}
+
+/// The CSS class colouring a network row's trust column: one of the SAME
+/// `trust-*` classes the chrome trust indicator toggles
+/// ([`TRUST_INDICATOR_CSS_CLASSES`](crate::TRUST_INDICATOR_CSS_CLASSES)), so a
+/// content-verified request is the same green the indicator's verified badge is.
+/// Pure, for display-free tests.
+#[must_use]
+pub fn network_trust_css_class(posture: TrustPosture) -> &'static str {
+    match posture {
+        TrustPosture::ContentVerified => "trust-verified",
+        TrustPosture::NameViaTrustedRpc => "trust-name-trusted-rpc",
+        TrustPosture::MutableName => "trust-mutable-name",
+        TrustPosture::UnverifiedOrigin => "trust-unverified",
+    }
+}
+
+/// What one debug-view tab must do to catch up with a store snapshot. Pure, so
+/// the eviction-at-the-cap behaviour is pinned display-free; each edge's
+/// application of it is one `match` (the GTK `ListBox`, the AppKit row stack).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailPlan {
+    /// Rebuild the whole list from the snapshot: the first paint, a `clear`
+    /// (the snapshot is shorter than what the view rendered), or the ring
+    /// buffer having evicted past the last-rendered entry, so every row the
+    /// view holds is stale.
+    Rebuild,
+    /// Append only the snapshot entries from `from` onward (the tail AFTER the
+    /// last-rendered entry), first DROPPING `drop` rows from the view's top:
+    /// the rows the ring buffer has already evicted from the store's front.
+    /// The drop is EXPLICIT, not implicit: appending alone leaves the view
+    /// holding rows the store discarded, its count climbing past the cap until
+    /// the anchor itself is evicted. After the drop + append the view's rows
+    /// match the snapshot exactly.
+    AppendFrom {
+        /// How many rows to remove from the view's TOP before appending.
+        drop: usize,
+        /// The snapshot index the appended tail starts at.
+        from: usize,
+    },
+    /// Nothing new to render (the steady idle tick).
+    Noop,
+}
+
+/// Plan one tab's refresh from the snapshot's entry SEQUENCES (oldest first,
+/// strictly increasing), how many rows the view currently holds, and the
+/// sequence of the last entry the view rendered.
+///
+/// The anchor is the sequence, never the length, because a ring buffer AT its
+/// cap never changes length: `pop_front` eviction keeps it pinned, so "same
+/// length" means both "nothing new" AND "N new, N evicted". The sequence tells
+/// those apart: if the anchor still falls inside the snapshot, exactly the
+/// entries after it are new; if it is ABSENT, everything the view holds was
+/// evicted (or the store was cleared) and only a rebuild is honest.
+///
+/// `rendered_rows` makes the eviction REMOVAL explicit: the view's rows end at
+/// the anchor, so of them only the snapshot rows up to and including the
+/// anchor's position are still in the store; the rest were evicted from the
+/// store's front and drop off the view's TOP on the append (zero while the
+/// buffer sits below its cap).
+#[must_use]
+pub fn tail_plan(sequences: &[u64], rendered_rows: usize, last_rendered: Option<u64>) -> TailPlan {
+    let Some(anchor) = last_rendered else {
+        // Nothing rendered yet (the first paint, or just after a clear): an
+        // empty snapshot is a no-op, a non-empty one renders everything.
+        return if sequences.is_empty() {
+            TailPlan::Noop
+        } else {
+            TailPlan::Rebuild
+        };
+    };
+    match sequences.iter().position(|&s| s == anchor) {
+        Some(index) if index + 1 < sequences.len() => TailPlan::AppendFrom {
+            drop: rendered_rows.saturating_sub(index + 1),
+            from: index + 1,
+        },
+        Some(_) => TailPlan::Noop,
+        None => TailPlan::Rebuild,
+    }
+}
+
 /// The lower-case scheme of `url` (`ipfs://cid` -> `ipfs`, `about:blank` ->
 /// `about`), or empty when the URL carries none.
 ///
@@ -1635,5 +1899,320 @@ mod tests {
             serde_json::from_str(&debug_json(&DebugCapture::new())).expect("valid JSON");
         assert_eq!(json["console"].as_array().map(Vec::len), Some(0));
         assert_eq!(json["network"].as_array().map(Vec::len), Some(0));
+    }
+
+    // -- ROW PRESENTATION ---------------------------------------------------
+    //
+    // These tests MOVED here with the rules they cover, out of the GTK edge
+    // (`crates/werust/src/main.rs`) where they were written by
+    // `debug-view-console-network-tabs-desktop`, when the macOS debug view
+    // needed the same derivation (task `macos-appkit-window-and-chrome`). They
+    // are unchanged in substance: the extraction is behaviour-preserving, and
+    // these are the assertions that say so.
+
+    #[test]
+    fn console_rows_carry_the_level_message_and_source_line_coloured_by_level() {
+        // Acceptance (Console tab): a captured console entry renders level +
+        // message + source:line, level-distinguished. The level tag is the
+        // store's own wire name, and the row's CSS class is distinct per level
+        // (error red, warn amber via each edge's `debug-console-*` styling).
+        let entry = ConsoleEntry::new(ConsoleLevel::Warn, "deprecated API")
+            .with_source("https://x/app.js")
+            .with_line(42);
+        assert_eq!(
+            console_row_text(&entry),
+            "[warn] deprecated API (https://x/app.js:42)"
+        );
+        assert_eq!(console_level_css_class(entry.level), "debug-console-warn");
+
+        // Every level has its OWN class, so the levels are visually distinct.
+        // Driven from `ConsoleLevel::ALL`, so a SIXTH level cannot arrive
+        // untested (the exhaustiveness lesson of
+        // `export-the-chrome-css-class-set-from-core`).
+        let classes: Vec<&str> = ConsoleLevel::ALL
+            .into_iter()
+            .map(console_level_css_class)
+            .collect();
+        for (i, class) in classes.iter().enumerate() {
+            assert!(class.starts_with("debug-console-"));
+            assert!(
+                !classes[..i].contains(class),
+                "every level is coloured distinctly: {classes:?}"
+            );
+        }
+
+        // An absent source/line stays honestly absent: no fabricated `:0`, no
+        // dangling parentheses.
+        let no_source = ConsoleEntry::new(ConsoleLevel::Error, "boom");
+        assert_eq!(console_source_line(&no_source), "");
+        assert_eq!(console_row_text(&no_source), "[error] boom");
+        let source_no_line =
+            ConsoleEntry::new(ConsoleLevel::Log, "hi").with_source("ipfs://cid/a.js");
+        assert_eq!(
+            console_row_text(&source_no_line),
+            "[log] hi (ipfs://cid/a.js)"
+        );
+    }
+
+    #[test]
+    fn every_console_class_the_derivation_can_return_is_in_the_exported_set() {
+        // The debug-view twin of the chrome's exported-class-set guarantee: the
+        // family a painter colours from must hold EVERY class
+        // `console_level_css_class` can return (or an edge would find no colour
+        // for a level and render it invisibly), and no dead name (or an edge
+        // would style a state that cannot happen). Exhaustive BY CONSTRUCTION:
+        // the drive is `ConsoleLevel::ALL`, which its own const check keeps
+        // complete, so a sixth level reds this test instead of landing with a
+        // stale family and a green suite.
+        let produced: Vec<&str> = ConsoleLevel::ALL
+            .into_iter()
+            .map(console_level_css_class)
+            .collect();
+        for class in &produced {
+            assert!(
+                DEBUG_CONSOLE_CSS_CLASSES.contains(class),
+                "`{class}` is returned for a real console level but is not in the exported set"
+            );
+        }
+        for exported in DEBUG_CONSOLE_CSS_CLASSES.iter().copied() {
+            assert!(
+                produced.contains(&exported),
+                "`{exported}` is exported but no console level produces it (a dead name)"
+            );
+        }
+        assert_eq!(DEBUG_CONSOLE_CSS_CLASSES.len(), ConsoleLevel::ALL.len());
+    }
+
+    #[test]
+    fn network_rows_carry_method_status_mime_and_size_with_unknowns_honest() {
+        // Acceptance (Network tab): the row columns render the entry's method,
+        // status, mime and size, and an UNKNOWN field renders as `?`, never a
+        // fabricated `0` (a failed request has no status; a shim-reported
+        // request may have no size).
+        let entry = NetworkEntry::new("GET", "ipfs://bafy/pic.png")
+            .with_status(200)
+            .with_mime("image/png")
+            .with_size(1536);
+        assert_eq!(entry.method, "GET");
+        assert_eq!(network_status_text(entry.status), "200");
+        assert_eq!(network_mime_text(&entry.mime), "image/png");
+        assert_eq!(network_size_text(entry.size), "1.5 KB");
+
+        let unknown = NetworkEntry::new("GET", "https://x/y");
+        assert_eq!(network_status_text(unknown.status), "?");
+        assert_eq!(network_mime_text(&unknown.mime), "?");
+        assert_eq!(network_size_text(unknown.size), "?");
+
+        // The size column is human-scaled at the unit boundaries.
+        assert_eq!(network_size_text(Some(0)), "0 B");
+        assert_eq!(network_size_text(Some(512)), "512 B");
+        assert_eq!(network_size_text(Some(1024)), "1.0 KB");
+        assert_eq!(network_size_text(Some(1024 * 1024)), "1.0 MB");
+    }
+
+    #[test]
+    fn the_network_trust_column_speaks_the_chrome_trust_indicators_exact_vocabulary() {
+        // Acceptance (Network tab trust): each request renders werust's HONEST
+        // per-request trust posture using the SAME vocabulary as the trust
+        // indicator (ADR-0006), never a new label: the indicator's glyph, the
+        // core's wire name, and one of the SAME `trust-*` CSS classes the
+        // indicator toggles (the chrome's own exported family, so a renamed
+        // class cannot leave this column pointing at a name nothing styles).
+        let mut labels = Vec::new();
+        // EVERY posture, from the seam's own exhaustive list, so a fifth posture
+        // cannot reach the Network tab untested.
+        for posture in TrustPosture::ALL {
+            // The glyph the chrome's own indicator shows for this posture. A
+            // total match, so a new posture does not compile until this drive
+            // states the glyph it expects.
+            let glyph = match posture {
+                TrustPosture::ContentVerified => "✓",
+                TrustPosture::NameViaTrustedRpc => "◈",
+                TrustPosture::MutableName => "◇",
+                TrustPosture::UnverifiedOrigin => "⚠",
+            };
+            let label = network_trust_label(posture);
+            assert_eq!(
+                label,
+                format!("{glyph} {}", trust_posture_wire_name(posture)),
+                "the Network tab speaks the trust indicator's vocabulary: {label}"
+            );
+            assert!(
+                crate::TRUST_INDICATOR_CSS_CLASSES.contains(&network_trust_css_class(posture)),
+                "the trust column reuses the indicator's own CSS classes"
+            );
+            assert!(
+                !labels.contains(&label),
+                "each posture is labelled distinctly: {label}"
+            );
+            labels.push(label);
+        }
+
+        // The honest split the spec names: an ipfs:// request content-verified,
+        // an https:// subresource unverified-origin.
+        assert_eq!(
+            network_trust_label(TrustPosture::ContentVerified),
+            "✓ content-verified"
+        );
+        assert_eq!(
+            network_trust_label(TrustPosture::UnverifiedOrigin),
+            "⚠ unverified-origin"
+        );
+        assert_eq!(
+            network_trust_css_class(TrustPosture::ContentVerified),
+            "trust-verified"
+        );
+        assert_eq!(
+            network_trust_css_class(TrustPosture::UnverifiedOrigin),
+            "trust-unverified"
+        );
+    }
+
+    #[test]
+    fn the_refresh_plan_appends_after_the_last_rendered_sequence_or_rebuilds() {
+        // First paint (nothing rendered yet): an empty store is a no-op, a
+        // non-empty one renders everything.
+        assert_eq!(tail_plan(&[], 0, None), TailPlan::Noop);
+        assert_eq!(tail_plan(&[1, 2, 3], 0, None), TailPlan::Rebuild);
+        // The steady state BELOW the cap: append exactly the entries AFTER the
+        // anchor, dropping nothing (nothing was evicted).
+        assert_eq!(
+            tail_plan(&[1, 2, 3], 1, Some(1)),
+            TailPlan::AppendFrom { drop: 0, from: 1 }
+        );
+        assert_eq!(
+            tail_plan(&[1, 2, 3], 2, Some(2)),
+            TailPlan::AppendFrom { drop: 0, from: 2 }
+        );
+        // Caught up: the anchor is the snapshot's last entry.
+        assert_eq!(tail_plan(&[1, 2, 3], 3, Some(3)), TailPlan::Noop);
+        // AT-CAP EVICTION: the ring buffer's length is pinned at the cap, but
+        // the anchor still falls inside the snapshot, so the view appends only
+        // the entries after it AND drops the evicted rows from its top. The
+        // view's rows end at the anchor, so of the 3 it holds only the snapshot
+        // rows up to and including the anchor's position are still in the
+        // store; the rest drop.
+        assert_eq!(
+            tail_plan(&[4, 5, 6], 3, Some(4)),
+            TailPlan::AppendFrom { drop: 2, from: 1 }
+        );
+        assert_eq!(
+            tail_plan(&[4, 5, 6], 3, Some(5)),
+            TailPlan::AppendFrom { drop: 1, from: 2 }
+        );
+        // The anchor itself was evicted (a full buffer turned over while the
+        // view was open): everything the view holds is stale, so REBUILD.
+        assert_eq!(tail_plan(&[4, 5, 6], 3, Some(2)), TailPlan::Rebuild);
+        // A CLEAR: the snapshot is shorter than what the view rendered (here
+        // empty), so rebuild.
+        assert_eq!(tail_plan(&[], 3, Some(2)), TailPlan::Rebuild);
+    }
+
+    #[test]
+    fn pushing_past_the_cap_still_renders_the_newest_entry_and_drops_the_evicted_rows() {
+        // The acceptance defect, driven against the REAL store (network-isolated,
+        // no display): once a ring buffer sits AT its cap its length never
+        // changes, so a length-anchored refresh freezes on rows the store has
+        // already discarded. The sequence-anchored plan must keep the view
+        // showing exactly what the store holds. The "view" here is a Vec of the
+        // rendered messages, applying `tail_plan` EXACTLY as a real debug view
+        // applies it to its rows (drop the evicted rows off the top, append the
+        // new tail, rebuild when the anchor is gone), so the assertions are
+        // about what a real view shows.
+        fn apply(
+            capture: &DebugCapture,
+            view: &mut Vec<String>,
+            last: &mut Option<u64>,
+        ) -> TailPlan {
+            let snapshot = capture.console();
+            let sequences: Vec<u64> = snapshot.iter().map(ConsoleEntry::sequence).collect();
+            let plan = tail_plan(&sequences, view.len(), *last);
+            match plan {
+                TailPlan::Rebuild => {
+                    view.clear();
+                    view.extend(snapshot.iter().map(|e| e.message.clone()));
+                }
+                TailPlan::AppendFrom { drop, from } => {
+                    view.drain(..drop);
+                    view.extend(snapshot[from..].iter().map(|e| e.message.clone()));
+                }
+                TailPlan::Noop => {}
+            }
+            *last = sequences.last().copied();
+            plan
+        }
+
+        let capture = DebugCapture::new();
+        let mut view: Vec<String> = Vec::new();
+        let mut last_rendered: Option<u64> = None;
+        for i in 0..MAX_CONSOLE_ENTRIES {
+            capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("m{i}")));
+        }
+        // The first paint rebuilds from the full (capped) store.
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert_eq!(view.len(), MAX_CONSOLE_ENTRIES);
+
+        // Push 10 past the cap ONE AT A TIME with a refresh between each (the
+        // pump-tick case): the store's length is UNCHANGED at every tick, but
+        // each tick evicts one row from the front. The view must stay AT the cap
+        // and mirror the store after every INCREMENTAL append, not only after a
+        // rebuild (an append-only path climbs past the cap on stale rows).
+        for i in 0..10 {
+            capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("new{i}")));
+            let snapshot = capture.console();
+            assert_eq!(snapshot.len(), MAX_CONSOLE_ENTRIES);
+            let plan = apply(&capture, &mut view, &mut last_rendered);
+            assert_eq!(
+                plan,
+                TailPlan::AppendFrom {
+                    drop: 1,
+                    from: MAX_CONSOLE_ENTRIES - 1
+                },
+                "each at-cap tick appends the one new entry and drops the one evicted row"
+            );
+            assert_eq!(
+                view.len(),
+                MAX_CONSOLE_ENTRIES,
+                "the row count STAYS AT the cap across incremental at-cap appends"
+            );
+            assert_eq!(
+                view.last().unwrap(),
+                &format!("new{i}"),
+                "the newest entry renders even at the cap"
+            );
+            assert!(
+                view.iter()
+                    .zip(snapshot.iter())
+                    .all(|(v, e)| v == &e.message),
+                "the view mirrors the store exactly: its top rows are never ones the store evicted"
+            );
+        }
+
+        // A FULL buffer turns over between ticks: the anchor itself is evicted,
+        // so the view rebuilds instead of appending onto stale rows.
+        for i in 0..MAX_CONSOLE_ENTRIES {
+            capture.push_console(ConsoleEntry::new(ConsoleLevel::Log, format!("x{i}")));
+        }
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert!(
+            view.iter()
+                .zip(capture.console().iter())
+                .all(|(v, e)| v == &e.message),
+            "a rebuild re-mirrors the store exactly"
+        );
+
+        // A clear: the snapshot is shorter than rendered, a rebuild empties it.
+        capture.clear();
+        assert_eq!(
+            apply(&capture, &mut view, &mut last_rendered),
+            TailPlan::Rebuild
+        );
+        assert!(view.is_empty());
     }
 }

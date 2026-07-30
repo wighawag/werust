@@ -1,16 +1,23 @@
 name: macos-renderer
 
-# The macOS ENGINE leg (task `macos-wkwebview-renderer-backend`,
-# `docs/adr/0011-webview2-for-windows.md`'s macOS split, sub-task 2). It does
-# three things a Linux gate can never do:
+# The macOS leg (tasks `macos-wkwebview-renderer-backend` and
+# `macos-appkit-window-and-chrome`, `docs/adr/0011-webview2-for-windows.md`'s
+# macOS split, sub-tasks 2 and 3). It does four things a Linux gate can never do:
 #
-#   1. BUILDS the `#[cfg(target_os = "macos")]` WKWebView backend against a real
-#      SDK, so the Objective-C wiring is compiled rather than merely parsed.
+#   1. BUILDS the `#[cfg(target_os = "macos")]` WKWebView backend AND the AppKit
+#      window against a real SDK, so the Objective-C wiring is compiled rather
+#      than merely parsed.
 #   2. EXERCISES both TRUST HOOKS on a real WKWebView -- an `ipfs://<cid>` load
 #      whose bytes hash-verify, and a page that sees the native EIP-1193
 #      `window.ethereum` and round-trips a request over the script bridge --
 #      offline, with a negative control that must fail.
-#   3. MEASURES the `WKURLSchemeHandler` origin behaviour
+#   3. CONSTRUCTS AND DRIVES THE REAL WINDOW (`werust-macos`'s `window_smoke`):
+#      a real `NSWindow`, toolbar, trust indicator, error banner, ⋮ menu and
+#      debug view, loaded off-screen with a pinned content-addressed fixture,
+#      asserting what the real WIDGETS hold. That is the only place the AppKit
+#      layer is executed at all; everything derivable about it is already
+#      unit-tested on the Ubuntu gate (`crates/werust-macos/src/paint.rs`).
+#   4. MEASURES the `WKURLSchemeHandler` origin behaviour
 #      (`crates/macos-origin-probe`), which is what turns this repo's recorded
 #      iOS MECHANISM ANALYSIS into a runtime fact: both WebKit ports share the
 #      mechanism, so a macOS measurement settles it for iOS too.
@@ -35,18 +42,22 @@ on:
     branches: [main]
     paths:
       - "crates/macos-renderer/**"
+      - "crates/werust-macos/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
       - "crates/renderer/**"
       - "crates/werust-core/**"
       - "crates/fetcher/**"
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
+      - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"
   pull_request:
     paths:
       - "crates/macos-renderer/**"
+      - "crates/werust-macos/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
+      - "crates/werust-core/**"
       - ".github/workflows/macos-renderer.yml"
 
 permissions:
@@ -75,18 +86,20 @@ jobs:
           key: ${{ runner.os }}-macos-renderer-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-macos-renderer-cargo-
 
-      - name: Build the macOS backend and the origin probe
+      - name: Build the macOS backend, the window and the origin probe
         # Only the macOS crates: the rest of the workspace (the `werust` binary,
         # `webview-renderer`) is GTK/WebKitGTK-bound and does not build here.
         # This is the step that compiles the `#[cfg(target_os = "macos")]`
-        # Objective-C wiring the Ubuntu gate can only parse.
-        run: cargo build -p macos-renderer -p macos-origin-probe
+        # Objective-C wiring the Ubuntu gate can only parse -- the engine's, and
+        # now the AppKit window's.
+        run: cargo build -p macos-renderer -p werust-macos -p macos-origin-probe
 
-      - name: Test the macOS backend and the shared toolkit-free half
+      - name: Test the macOS crates and the shared toolkit-free half
         # `webview-shared` is included deliberately: the load lifecycle and the
         # off-thread `ipfs://` boundary were MOVED there out of the WebKitGTK
         # crate, so they must pass on macOS too, not just on the Ubuntu gate.
-        run: cargo test -p macos-renderer -p macos-origin-probe -p webview-shared
+        # `werust-macos` brings its paint unit tests and its shape guard.
+        run: cargo test -p macos-renderer -p werust-macos -p macos-origin-probe -p webview-shared
 
       - name: Exercise BOTH trust hooks on a real WKWebView (with a negative control)
         # A backend qualifies on the trust hooks, not on rendering. This loads a
@@ -95,6 +108,18 @@ jobs:
         # sees the native EIP-1193 provider and round-trips a request, then
         # asserts a tampered CID FAILS the load and is never reported verified.
         run: cargo run -p macos-renderer --example trust_hooks_smoke
+
+      - name: Build and drive the REAL AppKit window (chrome, menu, debug view)
+        # The window half's only execution anywhere: it opens a real `NSWindow`
+        # FAR off-screen (accessory app: no Dock icon, no focus stolen), loads a
+        # pinned, in-memory hash-verified `ipfs://` page through the production
+        # verifying route, and asserts what the real widgets hold -- the URL bar,
+        # the trust indicator and its explanation, the status line, the ⋮ menu
+        # built from the core's `BrowserMenu`, and the debug view catching the
+        # page's own `console.log`. Then a negative control (bytes that do not
+        # hash to their CID) must FAIL, raise the error banner and displace the
+        # page. Offline and deterministic.
+        run: cargo run -p werust-macos --example window_smoke
 
       - name: Measure the WKURLSchemeHandler origin behaviour and assert the recorded verdict
         run: >

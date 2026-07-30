@@ -15,6 +15,15 @@ members = [
     # WKWebView half is `#[cfg(target_os = "macos")]` and is built and exercised
     # by `.github/workflows/macos-renderer.yml` on the existing `macos-14` runner.
     "crates/macos-renderer",
+    # The macOS WINDOW: the AppKit chrome over that backend (ADR-0011's macOS
+    # split, sub-task 3). A workspace member for the same reason its engine is:
+    # the Ubuntu `verify` gate compiles and tests its host-independent half
+    # (`paint.rs` — every display value, derived from the shared core — plus the
+    # capture wiring over the seam) and runs the source-shape guard over the
+    # AppKit source it cannot compile; the window itself is
+    # `#[cfg(target_os = "macos")]` and is built, tested and RUN off-screen by
+    # `.github/workflows/macos-renderer.yml` on the `macos-14` runner.
+    "crates/werust-macos",
     # The macOS ORIGIN PROBE: the WebKit analogue of `windows-origin-probe`, which
     # turns this repo's recorded iOS `WKURLSchemeHandler` MECHANISM ANALYSIS into a
     # runtime MEASUREMENT (both WebKit ports share the mechanism). A workspace

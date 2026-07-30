@@ -19,6 +19,10 @@ werust --help               # the usage message (also -h)
 
 Standard cargo workflow: `cargo build`, `cargo test` (the `verify` gate additionally runs `cargo fmt --check` and `cargo clippy`). Desktop builds need the WebKitGTK 6.0 system dev packages; see `.github/workflows/release.yml` for the exact list.
 
+### The macOS shell (`werust-macos`)
+
+On a Mac, `cargo run -p werust-macos [url]` opens the AppKit window over the `WKWebView` backend: the same URL bar, nav controls, trust indicator, error surface, in-URL-bar load progress, ⋮ menu and Console/Network debug view the GTK shell has, painted from the SAME `werust-core` derivation. It is a DEVELOPER build — unsigned, unnotarized and unbundled (packaging is its own task), and it is a separate binary because `werust` itself is bound to GTK/WebKitGTK. What CI proves about it, what still awaits a human on a Mac, and the manual verification steps are in [`docs/spikes/macos-appkit-window-and-chrome/README.md`](docs/spikes/macos-appkit-window-and-chrome/README.md).
+
 ### Private Ethereum RPC endpoint (`WERUST_RPC_URL`)
 
 ENS resolution (`ronan.eth` -> IPFS) goes through a trusted JSON-RPC endpoint whose public, keyless default is `https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161`. To use a private endpoint (your own node, e.g. the `https://your-private-rpc.example.com/` shape) WITHOUT committing its URL:

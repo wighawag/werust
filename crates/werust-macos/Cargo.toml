@@ -1,0 +1,84 @@
+[package]
+name = "werust-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The macOS product: `werust-macos` opens the AppKit window over the WKWebView
+# backend. A SEPARATE binary from `crates/werust` because that one depends on
+# gtk4/webkit6 UNCONDITIONALLY and cannot build on macOS (and two binaries cannot
+# share the name `werust` in one workspace) — see the crate docs and
+# `docs/spikes/macos-appkit-window-and-chrome/DECISIONS.md`.
+[[bin]]
+name = "werust-macos"
+path = "src/main.rs"
+
+[dependencies]
+renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
+# The macOS ENGINE (task `macos-wkwebview-renderer-backend`): the `Renderer`
+# implementation over WKWebView this window hosts. Its own WKWebView half is
+# `#[cfg(target_os = "macos")]`, so on Ubuntu this dependency contributes only
+# the pure decision rules — which is what lets this crate be a workspace member
+# the `verify` gate compiles and tests.
+macos-renderer = { path = "../macos-renderer" }
+
+# The AppKit half only exists on macOS, target-gated exactly as
+# `crates/macos-renderer` gates its WKWebView half. The Ubuntu `verify` gate
+# therefore compiles and tests this crate's host-independent half (`paint.rs` —
+# every display value the window paints, derived from the shared core — plus the
+# capture wiring over the seam) and runs `tests/macos_window_shape.rs`, the
+# source-shape guard, over the AppKit source it cannot compile.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "NSDate",
+  "NSDictionary",
+  "NSEnumerator",
+  "NSGeometry",
+  "NSNotification",
+  "NSObjCRuntime",
+  "NSRunLoop",
+  "NSString",
+  "NSTimer",
+  "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+  "std",
+  "objc2-core-foundation",
+  "NSAppearance",
+  "NSApplication",
+  "NSButton",
+  "NSButtonCell",
+  "NSCell",
+  "NSColor",
+  "NSControl",
+  "NSFont",
+  "NSGraphics",
+  "NSLayoutConstraint",
+  "NSMenu",
+  "NSMenuItem",
+  "NSProgressIndicator",
+  "NSResponder",
+  "NSClipView",
+  "NSScrollView",
+  "NSStackView",
+  "NSTabView",
+  "NSTabViewItem",
+  "NSText",
+  "NSTextField",
+  "NSUserInterfaceItemIdentification",
+  "NSView",
+  "NSWindow",
+] }
+
+[dev-dependencies]
+# The window smoke pins a canned, network-free content-addressed fixture and
+# derives its real CID, so the window is driven through the PRODUCTION verifying
+# `ipfs://` route with no gateway and no network (the same fixture shape the
+# engine's `trust_hooks_smoke` uses).
+fetcher = { path = "../fetcher" }
+webview-shared = { path = "../webview-shared" }

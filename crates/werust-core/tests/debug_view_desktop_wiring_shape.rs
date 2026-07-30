@@ -120,16 +120,34 @@ fn the_debug_entry_opens_a_tabbed_console_and_network_view_over_the_shared_store
 #[test]
 fn the_network_tab_reuses_the_trust_indicators_vocabulary_never_a_new_label() {
     // Criterion 2: the Network tab's per-request trust column renders the core's
-    // wire names (`content-verified` / `unverified-origin` / …) via
-    // `trust_posture_wire_name`, and colours them with the SAME `trust-*` CSS
-    // classes the chrome trust indicator toggles. No new trust label is minted
-    // for the debug view (ADR-0006). The exact glyph + wire-name + class mapping
-    // is pinned by the `main.rs` unit test
-    // `the_network_trust_column_speaks_the_chrome_trust_indicators_exact_vocabulary`.
+    // wire names (`content-verified` / `unverified-origin` / …) and colours them
+    // with the SAME `trust-*` CSS classes the chrome trust indicator toggles. No
+    // new trust label is minted for the debug view (ADR-0006).
+    //
+    // The rules themselves MOVED into `werust_core::debug` (task
+    // `macos-appkit-window-and-chrome`), so the desktop shell now CONSUMES them
+    // rather than defining them, and the exact glyph + wire-name + class mapping
+    // is pinned by the core unit test
+    // `the_network_trust_column_speaks_the_chrome_trust_indicators_exact_vocabulary`
+    // — one derivation, painted by both desktop views.
     let desktop = desktop_shell();
     assert!(
-        desktop.contains("trust_posture_wire_name"),
-        "the Network tab must render the core's trust wire names, not a minted label"
+        desktop.contains("werust_core::debug::{"),
+        "the debug view's row rules must come from the shared core module"
+    );
+    for shared in ["network_trust_label", "network_trust_css_class"] {
+        assert!(
+            desktop.contains(shared),
+            "the Network tab must render the core's `{shared}`, not a minted label"
+        );
+    }
+    // And it must not have kept a private copy of the rule it now imports: the
+    // glyph/class literals belong to the core, and the only `trust-*` names left
+    // in this edge are the stylesheet rules that colour them.
+    assert!(
+        !desktop.contains("fn network_trust_label(")
+            && !desktop.contains("fn network_trust_css_class("),
+        "the desktop shell must not keep a second copy of the trust-column rules"
     );
     for class in [
         "trust-verified",
@@ -138,8 +156,8 @@ fn the_network_tab_reuses_the_trust_indicators_vocabulary_never_a_new_label() {
         "trust-unverified",
     ] {
         assert!(
-            desktop.contains(class),
-            "the Network tab must reuse the trust indicator's `{class}` class"
+            desktop.contains(&format!(".{class} {{")),
+            "the edge must STYLE the trust indicator's `{class}` class its Network tab reuses"
         );
     }
 }

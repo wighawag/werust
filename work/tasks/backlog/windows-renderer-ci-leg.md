@@ -36,3 +36,43 @@ Also record the runner's WebView2 Runtime version in a step, the way `windows-or
 ## Prompt
 
 > Goal: land `.github/workflows/windows-renderer.yml` on `main` BEFORE any Windows shell code, so the two Windows code tasks can be dispatched against a real `windows-latest` runner by ref (`gh workflow run … --ref <branch>`), which is only legal once the workflow is on the default branch. That mechanic is exactly what blocked both macOS tasks at Gate 2 for shipping predictions instead of measurements. The leg must be GREEN THE DAY IT LANDS: there is no Windows shell yet, so build and test the toolkit-free crates that really do compile on `x86_64-pc-windows-msvc` (`webview-shared` above all, plus `renderer`, `werust-core`, `fetcher`, the probe's host-independent half) — determine that set empirically and name whatever you excluded. Record the runner's WebView2 Runtime version reusing `windows-origin-probe.yml`'s registry step. Model the file on `macos-renderer.yml`, but choose the NARROWEST `pull_request` path filter that still catches a Windows-affecting change and justify it in the header comment (the macOS leg's `crates/werust-core/**` PR trigger is under review for exactly this cost). Pin the shape — existence, `windows-latest`, `workflow_dispatch` — with a test in the `crates/werust-core/tests/release_plumbing_shape.rs` style, no new dependency. One workflow, one test, no shell code, no new crate.
+
+## Requeue 2026-07-30
+
+CONDUCTOR HANDOFF (2026-07-30, drive-tasks). Gate 2 blocked this correctly: acceptance criterion 2 demanded the leg be GREEN AS LANDED and the recorded evidence was a `cargo xwin check --tests` cross-sweep, which type-checks but does not link and runs ZERO tests. You could not have closed that from inside the build (`gh workflow run --ref` is refused while the workflow is absent from the default branch, and a PR could not run it either: GitHub cannot compute a merge ref, because the runner's own stuck-surface commits on main touch the very task file this branch moves backlog->done, PR #3). The conductor did it for you.
+
+THE LEG IS GREEN, MEASURED TWICE, ON A REAL `windows-latest` RUNNER:
+
+- main's tree, push-triggered by landing the workflow: run 30581522002 — SUCCESS.
+- THIS BRANCH's tree, `workflow_dispatch --ref work/task-windows-renderer-ci-leg`: https://github.com/wighawag/werust/actions/runs/30581549437 — SUCCESS, all steps.
+
+Verbatim from the branch run:
+
+    WebView2 Runtime (registry HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}): 150.0.4078.65
+
+Every crate in the leg's set BUILT and its tests RAN and PASSED on x86_64-pc-windows-msvc — 448 tests, zero failures, zero ignored:
+
+    fetcher                              36 passed
+    renderer                             20 passed
+    webview-shared                        5 passed
+    werust-core (lib)                   276 passed
+    werust-core browser_menu_edge_wiring_shape        6 passed
+    werust-core chrome_css_class_set_edge_wiring_shape 4 passed
+    werust-core debug_capture_edge_wiring_shape        9 passed
+    werust-core debug_view_desktop_wiring_shape        5 passed
+    werust-core debug_view_mobile_wiring_shape         5 passed
+    werust-core ipfs_redirects_fixture                18 passed
+    werust-core platform_capability_parity             9 passed
+    werust-core redirect_navigation_edge_shape         5 passed
+    werust-core release_plumbing_shape                20 passed
+    werust-core windows_renderer_leg_shape             7 passed
+    windows-origin-probe (lib)           23 passed
+
+Note what that settles beyond the criterion: the CRLF workaround works (every `*_shape.rs` test parses committed source and passed), the loopback-TCP and sleep-based tests in `fetcher`/`werust-core` pass on Windows, the temp-dir scratch handling in `retrieval.rs` passes, and `windows-origin-probe`'s 23 host-independent tests have now RUN on Windows for the first time. Those were exactly the runtime-only risks your README listed as unprovable by the sweep.
+
+WHAT TO DO WITH THIS — re-stamp, do NOT re-derive, and do NOT relabel the sweep as a measurement:
+
+1. `docs/spikes/windows-renderer-ci-leg/README.md`: the "What this measurement does NOT prove" section is now largely OBSOLETE. Replace the prediction framing with the RECORDING: both run URLs, the WebView2 Runtime version, the per-crate test counts above, and the date. Keep the `cargo xwin` sweep in the README as the METHOD that chose the crate set (it is still the honest provenance of the exclusions), but stop presenting it as the proof of green.
+2. Keep the named exclusions and their reasons exactly as they are — `werust`/`webview-renderer` red on pkg-config, the cfg-gated-away platform crates, `native-renderer`/`script-engine` left out on cost. That reasoning was not disturbed by the run.
+3. Anything the run genuinely did NOT exercise stays honestly listed (nothing in this leg drives WebView2 itself yet; that is the backend task's job).
+4. HOUSEKEEPING, so your rebase is clean: the conductor landed `.github/workflows/windows-renderer.yml` and `.github/actions/webview2-runtime-version/action.yml` on `main` as commit c9e7430, as BYTE-IDENTICAL copies of your own files, purely to make the dispatch legal. They will merge without conflict. Do not revert them, do not duplicate them, and do not treat their presence on main as someone else's competing design — they are yours. Everything else (the shape test, the spike README, the done-move) still lands with this branch.

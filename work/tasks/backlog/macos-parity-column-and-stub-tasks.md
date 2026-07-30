@@ -13,6 +13,8 @@ Sub-task 3 of the `macos-desktop-build` split prescribed by `docs/adr/0011-webvi
 
 So this task is two halves: fill the column honestly against what `macos-wkwebview-renderer-backend` + `macos-appkit-window-and-chrome` actually shipped, and CUT the follow-on tasks that the `stubbed` cells must point at. Do not paper over a gap with `n-a`: `n-a` means genuinely not applicable on that platform (as "system-back-navigates-history" is on desktop), not "not built yet".
 
+> FORWARD-POINTER (planted by the conductor, 2026-07-30). A WINDOWS shell landed while this task sat in the backlog, and its sibling `windows-parity-column-and-stub-tasks` will add a `windows` column to the SAME file. **Add only the `macos` column here.** Do not add `windows` as a bonus: that column's honesty depends on reading the two Windows spike READMEs, which is that task's job, and a guessed Windows cell is exactly the green-looking claim ADR-0005 exists to prevent. Do make your macOS cells easy to sit beside a Windows column (same ordering, same cell style), since the two will be read as a pair. Whichever lands second simply rebases; there is no shared decision to coordinate beyond honesty.
+
 Read `docs/adr/0005-platform-capability-parity-guard.md` first: the guard exists because the mobile `ipfs://` gap once shipped desktop-only behind an empty `{}` backend method and the release still looked green.
 
 ADR sizing: 1 to 2 person-days, plus whatever the forced stub tasks themselves are worth (author them, do not build them here).

@@ -3,7 +3,6 @@ title: "Export the chrome's CSS-class SET from core so a painter cannot keep a s
 slug: export-the-chrome-css-class-set-from-core
 blockedBy: []
 covers: []
-needsAnswers: true
 ---
 
 ## What to build

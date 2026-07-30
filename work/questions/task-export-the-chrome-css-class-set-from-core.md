@@ -59,3 +59,9 @@
 <!-- q5 fields: id=q5 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Resolution (2026-07-30, via drive-tasks)
+
+RESOLVED by the conductor, not by a human answer. The bounce was a FIXABLE Gate-2 block, so it was recovered in-loop: `dorfl requeue` (keep + continue) with a precise handoff naming the fix (make the drive list exhaustive BY CONSTRUCTION so a new `TrustPosture` variant is a COMPILE error, not a silently-green test), then re-dispatched. The rebuild continued from the kept branch, added `TrustPosture::ALL` / `LoadState::ALL` / `LoadStep::ALL` / `FailureKind::ALL` with per-enum compile-time completeness checks, and Gate 2 approved it. The task is DONE.
+
+These questions are therefore obsolete and need no answer. Left in place (append-only) rather than deleted, so the bounce-and-recovery is still legible.

@@ -1,0 +1,94 @@
+name: windows-origin-probe
+
+# GATE 0 of the Windows work (task `windows-ipfs-origin-probe-on-ci`,
+# `docs/adr/0011-webview2-for-windows.md` step 0). It answers, by MEASUREMENT on
+# a real WebView2 runtime, whether a REGISTERED `ipfs://` scheme gives a
+# document a real tuple origin that serves a SvelteKit-shaped client-side
+# navigation — the question that cost a field bug on Android and produced
+# `crates/werust-android/rust/src/origin_map.rs`.
+#
+# It needs no Windows hardware: a `windows-latest` runner has the WebView2
+# Runtime as part of the OS. Canned bytes, no werust core, no IPFS, no network.
+#
+# This is a SEPARATE leg from the pure-Rust `verify` gate, exactly like
+# `mobile-ios.yml`: the Ubuntu gate compiles and tests the probe's
+# host-independent half (the decision rule, the canned site, the CLI) but can
+# never run WebView2.
+#
+# WHY IT MUST STAY RE-RUNNABLE: the WebView2 Runtime is EVERGREEN and cannot be
+# pinned, and this exact corner regressed in stable 144 in January 2026
+# (WebView2Feedback #5495). The probe therefore ASSERTS the run against the
+# recorded verdict in `docs/spikes/windows-ipfs-origin-probe-on-ci/expected.json`
+# and goes red with the field that moved. `workflow_dispatch` is the on-demand
+# entry point; the path filter re-runs it whenever the probe or its recorded
+# verdict changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/windows-origin-probe/**"
+      - "docs/spikes/windows-ipfs-origin-probe-on-ci/**"
+      - ".github/workflows/windows-origin-probe.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  origin-probe:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record the runner's WebView2 Runtime version
+        # A result without its runtime version is not a result. The probe reads
+        # the version itself through
+        # `GetAvailableCoreWebView2BrowserVersionString` and puts it in the
+        # report; this step reads the same fact out of the registry so a missing
+        # runtime is diagnosed HERE rather than as a confusing probe failure.
+        shell: pwsh
+        run: |
+          $keys = @(
+            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}',
+            'HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          )
+          $found = $false
+          foreach ($key in $keys) {
+            if (Test-Path $key) {
+              $version = (Get-ItemProperty $key).pv
+              Write-Host "WebView2 Runtime (registry $key): $version"
+              $found = $true
+            }
+          }
+          if (-not $found) { Write-Host 'No WebView2 Runtime registry entry found.' }
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-origin-probe-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-origin-probe-cargo-
+
+      - name: Build the probe
+        # Only the probe: this leg deliberately does NOT build the workspace,
+        # which is Linux/GTK-bound. No Windows shell exists yet, and gate 0 is
+        # what decides how one would be written.
+        run: cargo build -p windows-origin-probe
+
+      - name: Measure both origin cases and assert the recorded verdict
+        run: >
+          cargo run -p windows-origin-probe --
+          --expected docs/spikes/windows-ipfs-origin-probe-on-ci/expected.json
+          --out probe-report.json
+
+      - name: Upload the measured report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-origin-probe-report
+          path: probe-report.json
+          if-no-files-found: warn

@@ -61,6 +61,8 @@ The task asked whether Tauri / Lapce / Zed solve this. Findings (read 2026-07-30
 
 ## 4. The probe that would settle it (design, not run)
 
+> **RUN, and settled, on 2026-07-30.** This design was built as `crates/windows-origin-probe` and measured on a `windows-latest` runner by task `windows-ipfs-origin-probe-on-ci`. Case A PASSES: a registered `ipfs://` scheme with `HasAuthorityComponent` gives a real tuple origin, a resolving same-origin `fetch` that reaches `WebResourceRequested`, and a working `pushState`. Verdict and evidence: [`docs/spikes/windows-ipfs-origin-probe-on-ci/README.md`](../windows-ipfs-origin-probe-on-ci/README.md); ADR-0011 Amendment 2. The section below is kept as written, as the design the probe implements.
+
 The repo has already paid once for deciding a platform-origin question from documents instead of a device (`mobile-ipfs-scheme-interception-ios-and-android` recorded the opaque-origin risk as a caveat, deferred the runtime check because the gate could not run a device, and the bug was found in the field: DIAGNOSIS.md, "What would have prevented this bug"). The Android answer was a committed on-device probe, `crates/werust-android/app/src/androidTest/.../SpaClientNavOriginTest.kt`. The Windows analogue should exist BEFORE any Windows backend is written, and it is small.
 
 **Shape** (mirroring the Android probe, network-isolated, canned bytes, seconds per run, no werust core, no IPFS, no ENS):

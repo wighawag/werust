@@ -10,6 +10,12 @@ members = [
     "crates/script-engine",
     "crates/werust-android/rust",
     "crates/werust-ios/rust",
+    # Gate 0 of the Windows work (ADR-0011): a WebView2 origin PROBE, not shell
+    # code. A workspace member so the Ubuntu `verify` gate compiles and tests
+    # its host-independent half (the decision rule, the canned site, the CLI);
+    # its WebView2 half is `#[cfg(windows)]` and runs in
+    # `.github/workflows/windows-origin-probe.yml`.
+    "crates/windows-origin-probe",
 ]
 
 [workspace.package]

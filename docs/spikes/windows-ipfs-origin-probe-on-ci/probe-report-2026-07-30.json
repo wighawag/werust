@@ -1,0 +1,76 @@
+{
+  "webview2_runtime_version": "150.0.4078.65",
+  "cid": "bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq",
+  "case_a": {
+    "page_url": "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/",
+    "navigation": "completed:success",
+    "origin": "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq",
+    "secure_context": true,
+    "fetch": "ok:200",
+    "fetch_handler_fired": true,
+    "push_state": "ok:/blog/",
+    "module_script": "ok:module",
+    "css_font_handler_fired": true,
+    "service_worker": "reject:InvalidStateError",
+    "handler_uris": [
+      "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/",
+      "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/blog/__data.json?x-sveltekit-invalidated=01",
+      "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.woff2",
+      "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.mjs"
+    ],
+    "console": [
+      "Log.entryAdded: {\"entry\":{\"level\":\"warning\",\"source\":\"other\",\"text\":\"Failed to decode downloaded font: ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.woff2\",\"timestamp\":1.785421219091574e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}}",
+      "Log.entryAdded: {\"entry\":{\"level\":\"warning\",\"source\":\"other\",\"text\":\"OTS parsing error: Size of decompressed WOFF 2.0 font exceeds 300MB\",\"timestamp\":1.785421219091643e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}}"
+    ],
+    "harness_error": null
+  },
+  "case_b": {
+    "page_url": "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/",
+    "navigation": "completed:success",
+    "origin": "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid",
+    "secure_context": true,
+    "fetch": "ok:200",
+    "fetch_handler_fired": true,
+    "push_state": "ok:/blog/",
+    "module_script": "ok:module",
+    "css_font_handler_fired": true,
+    "service_worker": "reject:TypeError",
+    "handler_uris": [
+      "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/",
+      "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/blog/__data.json?x-sveltekit-invalidated=01",
+      "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/probe.woff2",
+      "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/probe.mjs",
+      "https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/favicon.ico"
+    ],
+    "console": [
+      "Log.entryAdded: {\"entry\":{\"level\":\"warning\",\"source\":\"other\",\"text\":\"Failed to decode downloaded font: https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/probe.woff2\",\"timestamp\":1.785421226894703e+12,\"url\":\"https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/blog/\"}}",
+      "Log.entryAdded: {\"entry\":{\"level\":\"warning\",\"source\":\"other\",\"text\":\"OTS parsing error: Size of decompressed WOFF 2.0 font exceeds 300MB\",\"timestamp\":1.78542122689476e+12,\"url\":\"https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/blog/\"}}",
+      "Log.entryAdded: {\"entry\":{\"level\":\"error\",\"networkRequestId\":\"8424.5\",\"source\":\"network\",\"text\":\"Failed to load resource: net::ERR_NAME_NOT_RESOLVED\",\"timestamp\":1.785421226978978e+12,\"url\":\"https://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq.ipfs.werust.invalid/favicon.ico\"}}",
+      "Log.entryAdded: {\"entry\":{\"level\":\"error\",\"source\":\"network\",\"text\":\"An unknown error occurred when fetching the script.\",\"timestamp\":1.78542122712259e+12}}"
+    ],
+    "harness_error": null
+  },
+  "case_control": {
+    "page_url": "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/",
+    "navigation": "completed:success",
+    "origin": "null",
+    "secure_context": false,
+    "fetch": "reject:TypeError",
+    "fetch_handler_fired": false,
+    "push_state": "throw:SecurityError",
+    "module_script": "reject:TypeError",
+    "css_font_handler_fired": false,
+    "service_worker": "unavailable",
+    "handler_uris": [
+      "ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/"
+    ],
+    "console": [
+      "Log.entryAdded: {\"entry\":{\"category\":\"cors\",\"level\":\"error\",\"lineNumber\":36,\"source\":\"javascript\",\"stackTrace\":{\"callFrames\":[{\"columnNumber\":21,\"functionName\":\"\",\"lineNumber\":36,\"scriptId\":\"7\",\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"},{\"columnNumber\":35,\"functionName\":\"attempt\",\"lineNumber\":21,\"scriptId\":\"7\",\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"},{\"columnNumber\":18,\"functionName\":\"\",\"lineNumber\":35,\"scriptId\":\"7\",\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"},{\"columnNumber\":2,\"functionName\":\"\",\"lineNumber\":65,\"scriptId\":\"7\",\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}]},\"text\":\"Fetch API cannot load ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/blog/__data.json?x-sveltekit-invalidated=01. URL scheme \\\"ipfs\\\" is not supported.\",\"timestamp\":1.785421228821879e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}}",
+      "Log.entryAdded: {\"entry\":{\"category\":\"cors\",\"level\":\"error\",\"source\":\"javascript\",\"text\":\"Access to script at 'ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.mjs' from origin 'null' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.\",\"timestamp\":1.785421229403557e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}}",
+      "Log.entryAdded: {\"entry\":{\"category\":\"cors\",\"level\":\"error\",\"networkRequestId\":\"1616.2\",\"source\":\"network\",\"text\":\"Failed to load resource: net::ERR_FAILED\",\"timestamp\":1.785421229403722e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.mjs\"}}",
+      "Log.entryAdded: {\"entry\":{\"category\":\"cors\",\"level\":\"error\",\"source\":\"javascript\",\"text\":\"Access to font at 'ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.woff2' from origin 'null' has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header is present on the requested resource.\",\"timestamp\":1.785421229403799e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/\"}}",
+      "Log.entryAdded: {\"entry\":{\"category\":\"cors\",\"level\":\"error\",\"networkRequestId\":\"1616.3\",\"source\":\"network\",\"text\":\"Failed to load resource: net::ERR_FAILED\",\"timestamp\":1.785421229403912e+12,\"url\":\"ipfs://bafybeidbbasdtwcrvqkwk4hf5k3apzuc6txfje524zhiih5a2b4rtwpfzq/probe.woff2\"}}"
+    ],
+    "harness_error": null
+  }
+}

@@ -17,6 +17,8 @@ A native `Werust.app` on macOS: a new `Renderer` backend over **WKWebView** plus
 
 **Trust hooks are the qualification bar, not rendering** (ADR-0001): the backend qualifies only when `ipfs://` custom-scheme interception and EIP-1193 provider injection both work, exactly as on the other edges. WebKit gives `WKURLSchemeHandler`-served documents real tuple origins, which is why macOS is the better-placed platform, but note the repo's own honesty caveat: iOS parity on that point is a recorded MECHANISM ANALYSIS whose runtime confirmation still awaits a Mac (`docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md`, "iOS parity"). Confirming it on macOS retires that caveat for both.
 
+**A SECOND extraction this task must own (found at Gate-3 of `desktop-chrome-presentation-into-core`).** That task moved the CHROME presentation into core, but the DEBUG-VIEW row presentation stayed private in the GTK edge: `console_level_css_class`, `console_source_line`, `console_row_text`, `network_status_text` / `_mime_text` / `_size_text` / `_trust_label` / `_trust_css_class` in `crates/werust/src/main.rs`. They are the same class of thing (pure functions of a captured entry) and the acceptance criterion below says the debug view paints from the shared derivation, so extract them into `werust-core` the same way, behaviour-preserving, BEFORE painting the macOS debug view. Do not re-derive them in the new edge.
+
 **Scope: unsigned.** No code signing, no notarization (they need an Apple Developer account). An unsigned `.app` opens via right-click then Open, or `xattr -d com.apple.quarantine`. Packaging and the release leg are sub-task 4 (`macos-release-packaging-leg`); the parity-matrix column is sub-task 3.
 
 ADR sizing for this step: 8 to 14 person-days, lower because sub-task 1 landed first.
@@ -26,7 +28,8 @@ ADR sizing for this step: 8 to 14 person-days, lower because sub-task 1 landed f
 - [ ] A native macOS binary opens an AppKit window with a WKWebView rendering content, driven by the shared `BrowserShell` (no browsing decision in Swift/ObjC).
 - [ ] The `Renderer` trait from `crates/renderer` is implemented with NO widening; navigation, history, load lifecycle, script-message bridge and custom-scheme interception all go through it.
 - [ ] Both trust hooks work: an `ipfs://<cid>` URL renders hash-verified content, and a page sees the native EIP-1193 `window.ethereum`.
-- [ ] The chrome (URL bar, nav controls, trust indicator, error/loading surfaces, invalid-entry badge, menu, debug view) paints from the SHARED derivation produced by `desktop-chrome-presentation-into-core`, not from a re-derivation.
+- [ ] The chrome (URL bar, nav controls, trust indicator, error/loading surfaces, invalid-entry badge, menu) paints from the SHARED derivation produced by `desktop-chrome-presentation-into-core`, not from a re-derivation.
+- [ ] The DEBUG-VIEW row presentation helpers are extracted into `werust-core` (behaviour-preserving, tests moving with them) and BOTH the GTK and the macOS debug views paint from them, so the second window does not fork a second copy.
 - [ ] The macOS code does not live in a crate that unconditionally depends on gtk4/webkit6; anything reused from `webview-renderer` is moved to a shared, toolkit-free home rather than copied.
 - [ ] Trait-contract tests cover the new backend where testable without a Mac; visible macOS behaviour is recorded manual steps in a spike README.
 - [ ] Whether a `WKURLSchemeHandler`-served document gets a REAL tuple origin (same-origin `fetch` + `pushState` working) is CONFIRMED at runtime on macOS and recorded, since that also retires the iOS mechanism-analysis caveat.

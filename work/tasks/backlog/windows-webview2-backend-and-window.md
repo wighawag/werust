@@ -26,6 +26,8 @@ A native werust on Windows: a new `Renderer` backend over **Edge WebView2**, bou
 
 **A user-visible default is pre-specified:** a machine WITHOUT the WebView2 Runtime must fail HONESTLY, naming the missing runtime and pointing at the download, never crash. Evergreen runtime is part of Windows 11 and present on most Windows 10 machines, but "no installer needed" is not a promise anyone can make.
 
+**The debug-view presentation may already be shared by the time you start.** `desktop-chrome-presentation-into-core` moved the CHROME rules into core but left the DEBUG-VIEW row helpers (`console_level_css_class`, `console_source_line`, `console_row_text`, `network_status_text` / `_mime_text` / `_size_text` / `_trust_label` / `_trust_css_class`) private in the GTK edge; `macos-wkwebview-backend-and-window` owns extracting them. If that landed first, CONSUME the shared versions. If it did not, extract them here the same way (behaviour-preserving, tests moving with them) rather than re-deriving them in the Windows edge.
+
 **Scope: the backend + the window + honest failure.** The `windows` parity-matrix column and its forced stub tasks, and the CI packaging leg, are separate tasks cut after this lands, mirroring the macOS sub-task structure. Toolchain note for whoever cuts CI: `x86_64-pc-windows-msvc` statically links `WebView2LoaderStatic.lib` (single-exe), while `*-pc-windows-gnu` needs `WebView2Loader.dll` shipped alongside; and the Ubuntu `verify` gate cannot compile a `#[cfg(windows)]` backend, so source-shape tests (this repo's existing pattern) plus a native `windows-latest` job are both needed.
 
 ADR sizing for this step: 8 to 12 days for the backend, 8 to 14 for the window and chrome (lower because the extraction landed first).
@@ -36,7 +38,7 @@ ADR sizing for this step: 8 to 12 days for the backend, 8 to 14 for the window a
 - [ ] The `Renderer` trait from `crates/renderer` is implemented with NO widening; the scheme-name-set constraint is handled by lazy environment creation, not by changing the trait.
 - [ ] Both trust hooks work: an `ipfs://<cid>` URL renders hash-verified content through the mechanism THE PROBE CHOSE, and a page sees the native EIP-1193 `window.ethereum`.
 - [ ] A SvelteKit-style client-side navigation works (same-origin `fetch` + `pushState`), verified against the probe's recorded verdict rather than assumed.
-- [ ] The chrome paints from the SHARED derivation, not a re-derivation.
+- [ ] The chrome paints from the SHARED derivation, not a re-derivation, and the debug view paints from the shared debug-row helpers (consuming them if the macOS task already extracted them, extracting them here if not).
 - [ ] The Windows code does not live in a crate depending on gtk4/webkit6; `offthread.rs` is shared, not copied.
 - [ ] A machine without the WebView2 Runtime gets an honest, named failure.
 - [ ] What was proven on CI versus what remains analysis awaiting real hardware is stated explicitly (Amendment 1's recorded constraint).

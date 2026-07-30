@@ -19,3 +19,9 @@ is their durable home for triage — promote-to-task / keep / delete.
   (crates/werust/src/main.rs:524-609 (console_level_css_class, console_source_line, console_row_text, network_status_text/mime_text/size_text/trust_label/trust_css_class); work/tasks/backlog/macos-wkwebview-backend-and-window.md acceptance clause naming the debug view)
 - Should CONTEXT.md pin the presentation-in-the-core / edge-is-a-PAINTER pair now that it is load-bearing across ADR-0011, three backlog tasks and the code? The glossary defines seam but not painter, so the next author could re-fork the term.
   (CONTEXT.md has no chrome/presentation/painter entry; the words are used normatively in crates/werust-core/src/lib.rs:601-622 and crates/werust/src/main.rs:17-23)
+
+## Conductor triage (2026-07-30, via drive-tasks)
+
+- **The unowned debug-view extraction: FIXED.** `macos-wkwebview-backend-and-window` now OWNS extracting the debug-view row helpers (`console_level_css_class`, `console_source_line`, `console_row_text`, `network_status_text`/`_mime_text`/`_size_text`/`_trust_label`/`_trust_css_class`) into `werust-core` behaviour-preservingly before painting its debug view, and `windows-webview2-backend-and-window` says to consume them if that landed first, or extract them the same way if not. Neither shell may re-derive them.
+- Awaiting the human: ratifying the crate-root `pub fn` API shape for the 12 moved rules (cheaper to change now than after two more edges consume it), and whether `CONTEXT.md` should pin the "presentation in the core / an edge is a PAINTER" vocabulary.
+- Still open, unowned: the CSS-class toggle lists are hard-coded in the GTK painter while the class NAMES are now decided in core, with no test tying them together, so a fifth trust posture would silently leave painters stale. Fix by exporting the class set from core; it becomes urgent when the second painter exists.

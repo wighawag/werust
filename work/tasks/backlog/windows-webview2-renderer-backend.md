@@ -1,0 +1,51 @@
+---
+title: "Windows: the WebView2 `Renderer` backend (engine only, no window chrome)"
+slug: windows-webview2-renderer-backend
+blockedBy: [windows-renderer-ci-leg]
+covers: []
+---
+
+## What to build
+
+The ENGINE half of the Windows desktop shell, split out so the seam work can land and be reviewed without the chrome painting riding along (the same cut that worked for macOS: `macos-wkwebview-renderer-backend` then `macos-appkit-window-and-chrome`). Its sibling `windows-win32-window-and-chrome` builds the window on top of it. Funded by Amendment 1 of `docs/adr/0011-webview2-for-windows.md`; everything technical in that ADR stands, build to it.
+
+A `Renderer` implementation over **Edge WebView2**, bound with **`webview2-com`** + `webview2-com-sys` (0.39.1, what `wry` itself depends on; never the abandoned `webview2` crate), hosted in a plain Win32 window that is BARE — a minimal or off-screen `HWND` is fine and expected. This task proves the SEAM, not the product surface.
+
+**The origin question is SETTLED by MEASUREMENT; do not re-litigate it and do not re-derive it by hand.** The probe ran on 2026-07-30 (ADR-0011 Amendment 2, `docs/spikes/windows-ipfs-origin-probe-on-ci/`) and measured the verdict **`registered-ipfs-scheme`**: on WebView2 Runtime 150.0.4078.65, an `ipfs://` scheme registered through `ICoreWebView2CustomSchemeRegistration` with `HasAuthorityComponent = TRUE` + `TreatAsSecure = TRUE` gives the document a real `ipfs://<cid>` tuple origin, a secure context, a same-origin `fetch` that RESOLVES *and* fires `WebResourceRequested`, and a working `pushState`; the negative control reproduced the Android failure verbatim with the flag off. So this shell serves REAL `ipfs://` origins like desktop Linux, macOS and iOS, and `origin_map.rs` is NOT promoted — it stays an Android module. If you suspect the evergreen runtime moved under you, RE-RUN `.github/workflows/windows-origin-probe.yml`; that is the only legitimate way to reopen it.
+
+**Where things actually live** (both premises an earlier version of this task got wrong for macOS):
+
+- The `Renderer` trait is `crates/renderer/src/lib.rs` (`pub trait Renderer`, line 695), NOT `crates/webview-renderer`.
+- `crates/webview-renderer` depends on `gtk4` and `webkit6` UNCONDITIONALLY, so nothing in it compiles on Windows. The Windows backend needs its own crate.
+- **`crates/webview-shared` already exists** — the macOS engine task MOVED the toolkit-free half there (`LoadLifecycle`/`SharedLifecycle`, the `navigate` URL rule, the ADR-0008 off-thread `ipfs://` boundary). REUSE it as-is. Do not copy `offthread.rs`, do not re-implement the lifecycle, and if something you need is still trapped in the GTK crate, MOVE it into `webview-shared` (behaviour-preservingly, tests travelling with it) rather than forking it.
+- **Lean on the two existing WKWebView backends** (`crates/macos-renderer`, `crates/werust-ios/rust`) for the SHAPE of a `Renderer` impl over a system webview — the lifecycle bookkeeping, the script-message bridge, the scheme-handler-to-`fetcher` plumbing. The COM/bindings layer is genuinely different; the seam bookkeeping is not. Say which parts you leaned on.
+
+**The mapping is already written.** `docs/spikes/windows-platform-research/README.md` section 5 maps every `Renderer` method onto WebView2 with NO trait widening, and several rows are more native than the existing edges: session history (`GoBack` / `get_CanGoBack` / `add_HistoryChanged`), the SPA same-document URL change (`add_SourceChanged` with `IsNewDocument == FALSE`, which desktop has to INFER from `notify::uri`), a real status code on a scheme response (`CreateWebResourceResponse`, so the `_redirects` / site-404 row works), `PreferredColorScheme = AUTO` for ADR-0009, `add_NewWindowRequested` + `put_Handled(TRUE)` feeding the existing `renderer::new_window_action` for ADR-0010, and real Chrome devtools via `OpenDevToolsWindow`.
+
+**The one structural constraint:** the SET of custom scheme NAMES is fixed at environment creation and immutable for the browser-process lifetime, while `register_scheme_handler` is called after construction today. The prescribed fix is a LAZY environment (create the container `HWND` eagerly so `view_handle` works, create the environment + controller on first `navigate`), NOT a trait change.
+
+**ADR-0008 (retrieval off the UI thread) is satisfiable** with `WebResourceRequested` + `GetDeferral` / `Deferral::Complete`, reusing the existing off-thread boundary in `webview-shared` rather than inventing a second pattern.
+
+**A user-visible default is pre-specified:** a machine WITHOUT the WebView2 Runtime must fail HONESTLY, naming the missing runtime and pointing at the download, never crash. Evergreen runtime is part of Windows 11 and present on most Windows 10 machines, but "no installer needed" is not a promise anyone can make. This belongs to the ENGINE (it is where environment creation fails), so it is in scope here.
+
+### You CAN get a real Windows run mid-task, so do NOT ship a prediction
+
+`windows-renderer-ci-leg` landed `.github/workflows/windows-renderer.yml` on `main` precisely so this task is measurable: `gh workflow run windows-renderer.yml --ref <your work branch>` is legal and runs the leg against YOUR code. EXTEND that workflow (add this crate to its build and test steps, add a trust-hooks smoke example modelled on `cargo run -p macos-renderer --example trust_hooks_smoke`, extend the path filters), then get a run and record what it actually proved, verbatim. Both macOS tasks were correctly blocked at Gate 2 for recording a prediction as though it were a measurement; do not repeat it. Anything the leg did not exercise stays honestly listed as awaiting real Windows hardware — this repo has none, and ADR-0011 Amendment 1 requires that CI-versus-hardware split to be stated, not blurred.
+
+**Scope boundary: no window chrome.** No URL bar, no trust indicator, no invalid-entry badge, no menus, no debug view, no error banner. Those are `windows-win32-window-and-chrome`. No packaging, no signing, no installer, no parity-matrix column.
+
+## Acceptance criteria
+
+- [ ] A `Renderer` implementation over WebView2 compiles on `x86_64-pc-windows-msvc`, with NO widening of the trait.
+- [ ] It lives in its own crate that does NOT depend on gtk4/webkit6, and it CONSUMES `crates/webview-shared` (lifecycle, `navigate` rule, off-thread `ipfs://` boundary) rather than copying or re-implementing any of it.
+- [ ] The custom-scheme-name-set constraint is handled by LAZY environment creation (container `HWND` eager so `view_handle` works, environment + controller on first `navigate`), not by a trait change.
+- [ ] Both trust hooks work on a real WebView2: an `ipfs://<cid>` URL loads hash-verified content through the REGISTERED scheme the probe chose, and a page sees the native EIP-1193 `window.ethereum` and round-trips a request over the script bridge — with a negative control that must FAIL.
+- [ ] Navigation, session history, the load lifecycle, the script-message bridge and custom-scheme interception all go through the seam; the SPA same-document URL change uses `add_SourceChanged` (`IsNewDocument == FALSE`) rather than an inference.
+- [ ] A machine without the WebView2 Runtime gets an honest, named failure pointing at the download, and never a crash; this is covered by a test that does not need a Windows runner where that is possible.
+- [ ] `.github/workflows/windows-renderer.yml` is EXTENDED to build, test and exercise this crate, and a real run against this branch is recorded (run URL + verbatim output). No prediction is presented as a measurement.
+- [ ] What CI proved versus what still awaits real Windows hardware is stated explicitly (ADR-0011 Amendment 1).
+- [ ] The Ubuntu `verify` gate stays green: the `#[cfg(windows)]` half is cfg-gated, with this repo's source-shape test pattern giving cover where the gate cannot compile it.
+
+## Prompt
+
+> Goal: the ENGINE half of the Windows shell, no chrome. Implement the `Renderer` trait (`crates/renderer/src/lib.rs:695`) over Edge WebView2 via `webview2-com`/`webview2-com-sys` 0.39.1 (never the abandoned `webview2` crate), in its own crate — `crates/webview-renderer` depends on gtk4/webkit6 unconditionally and cannot host it — CONSUMING the existing `crates/webview-shared` (lifecycle, `navigate` rule, ADR-0008 off-thread `ipfs://` boundary) rather than copying it. Build to the method-by-method mapping in `docs/spikes/windows-platform-research/README.md` section 5, which needs no trait widening; the one constraint (custom scheme NAMES fixed at environment creation) is handled by creating the environment LAZILY on first `navigate`, with the container HWND eager so `view_handle` works. The origin question is SETTLED by measurement — `registered-ipfs-scheme`, ADR-0011 Amendment 2 — so serve real `ipfs://` origins and do not re-derive it; re-run the probe workflow if you suspect the evergreen runtime moved. Trust hooks are the qualification bar, not rendering: `ipfs://` interception + EIP-1193 injection, with a negative control that fails. A machine without the WebView2 Runtime must fail honestly naming the runtime, never crash. A bare or off-screen HWND host is fine: the window, URL bar, trust indicator, menus and debug view are the sibling task `windows-win32-window-and-chrome`; no packaging, no signing, no parity column. `.github/workflows/windows-renderer.yml` is already on main so you CAN dispatch it against your own branch — extend it to exercise this crate, run it, and record the real result. Do not ship a prediction as a measurement (that blocked both macOS tasks at Gate 2), and state plainly what CI proved versus what awaits real Windows hardware.

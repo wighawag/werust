@@ -393,7 +393,7 @@ final class WerustCore {
         /// The short human-readable hint for the current pipeline step, or empty
         /// for no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile
         /// status text matches desktop.
-        private func loadStepHint() -> String {
+        func loadStepHint() -> String {
             switch loadStep {
             case "resolving-name": return "resolving name"
             case "fetching-record": return "fetching record"
@@ -434,31 +434,54 @@ final class WerustCore {
         /// SAME rule desktop/Android apply, from the SAME chrome-JSON fact.
         func errorBannerVisible() -> Bool { error != nil }
 
-        /// Whether the NON-BLOCKING loading banner should be shown: exactly while
-        /// a load is in flight (`loading`). A passive view update driven by the
-        /// existing chrome-refresh pump (NOT a new timer / poll / tight loop), so
-        /// the Android ANR guard is not regressed. The IN-FLIGHT counterpart of
+        /// Whether there is a load to indicate at all: a backend load in flight
+        /// (`loading`) OR a pinned pre-content resolution step (a non-idle
+        /// `loadStep`). The second half matters: while the core resolves an
+        /// ENS/IPNS name the backend has not started its load yet, so `loading` is
+        /// false during EXACTLY the long `ronan.eth` freeze window the old banner
+        /// sat out. `loadStep` is idle on every settled/failed chrome, so this can
+        /// never linger after a load ends.
+        ///
+        /// A passive view update driven by the existing chrome-refresh pump (NOT a
+        /// new timer / poll / tight loop). The IN-FLIGHT counterpart of
         /// `errorBannerVisible()` (which fires on a FAILED load); the two are
         /// mutually exclusive. The SAME rule desktop/Android apply, from the SAME
-        /// chrome-JSON `loading` fact (task `loading-banner-with-phase-and-cancel`).
-        func loadingBannerVisible() -> Bool { loading }
+        /// chrome-JSON facts (task
+        /// `loading-progress-in-the-url-bar-not-a-banner`).
+        func loadProgressVisible() -> Bool { loading || loadStep != "idle" }
 
-        /// The loading-banner text: names the current pipeline phase (one of the
-        /// existing `LoadStep` wire values, verbatim) so a slow load reads as
-        /// working, not frozen — the field-test v0.2.7 finding this task answers.
-        /// The phase names are the `LoadStep` vocabulary verbatim (capitalised +
-        /// ellipsised for the banner), so the banner and the debug Network tab
-        /// cannot disagree. A generic "Loading…" is shown when a load is in flight
-        /// but no step is known yet (`loadStep` idle), so the banner never lies
-        /// about a frozen phase. The SAME mapping desktop/Android apply.
-        func loadingBannerText() -> String {
+        /// The progress fraction the URL-bar progress line paints: `0` on a settled
+        /// chrome (painting nothing at all), else a value that ADVANCES with the
+        /// real pipeline phase so a slow load reads as working rather than frozen.
+        ///
+        /// The fractions are deliberately monotonic and never reach `1`: the phases
+        /// are milestones on the actual lifecycle, not a byte-accurate measurement,
+        /// so the line must not claim a load is done while it is still running. A
+        /// load in flight with no phase yet still shows a small sliver, so
+        /// "something started" is visible immediately. The SAME mapping desktop and
+        /// Android apply, from the SAME `loadStep` fact.
+        func loadProgressFraction() -> Float {
+            guard loadProgressVisible() else { return 0 }
             switch loadStep {
-            case "resolving-name": return "Resolving name…"
-            case "fetching-record": return "Fetching record…"
-            case "fetching-content": return "Fetching content…"
-            case "rendering": return "Rendering…"
-            default: return "Loading…"
+            case "resolving-name": return 0.25
+            case "fetching-record": return 0.45
+            case "fetching-content": return 0.7
+            case "rendering": return 0.9
+            default: return 0.1
             }
+        }
+
+        /// The phase NAME behind the current progress (for the progress line's
+        /// accessibility label): the existing `LoadStep` hint vocabulary verbatim
+        /// ("resolving name", "fetching record", …), so the URL bar, the footer
+        /// status line and the debug Network tab cannot disagree about which phase a
+        /// slow load is stuck in. A generic "loading" covers a load in flight with
+        /// no phase known yet; empty on a settled chrome. The SAME mapping
+        /// desktop/Android apply.
+        func loadProgressHint() -> String {
+            guard loadProgressVisible() else { return "" }
+            let hint = loadStepHint()
+            return hint.isEmpty ? "loading" : hint
         }
 
         /// The PROMINENT error-banner text for a failed load: the accurate,

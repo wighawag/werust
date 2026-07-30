@@ -623,6 +623,11 @@ fn main() -> glib::ExitCode {
 /// controls, and the load indicator. Grouped so a single [`refresh_chrome`] call
 /// keeps every piece of chrome in step with the seam's state.
 struct Chrome {
+    /// The URL bar. It doubles as the LOAD-PROGRESS surface: while a load is in
+    /// flight its built-in progress fraction is painted from
+    /// [`load_progress_fraction`], so the load state is visible in the chrome
+    /// WITHOUT any widget taking height from the page view (task
+    /// `loading-progress-in-the-url-bar-not-a-banner`).
     url_entry: Entry,
     back: Button,
     forward: Button,
@@ -640,20 +645,6 @@ struct Chrome {
     /// failure was missed), so a failed load now also raises this banner the user
     /// cannot miss. Hidden on a loading/idle/settled-ok chrome.
     error_banner: Label,
-    /// The NON-BLOCKING loading banner: a bar across the top of the view that
-    /// appears WHILE a load is in flight, naming the current pipeline phase (one
-    /// of the existing `LoadStep` values, verbatim) and offering a Cancel that
-    /// calls the SAME `BrowserShell::stop` the toolbar Stop button uses. This is
-    /// the field-test v0.2.7 fix — on a long retrieval the user stared at a frozen
-    /// page with no signal anything was happening; this banner says "working:
-    /// fetching content…" with a way out. Driven by the existing chrome-refresh
-    /// pump (no new timer / poll / tight loop), so the Android ANR guard is not
-    /// regressed. Hidden on a settled/failed chrome (the [`error_banner`] takes
-    /// the slot then). Task `loading-banner-with-phase-and-cancel`.
-    loading_banner: GtkBox,
-    /// The phase-name label inside [`loading_banner`](Chrome::loading_banner),
-    /// updated by [`refresh`](Chrome::refresh) as the phase advances.
-    loading_banner_label: Label,
     /// The small "invalid URL" BADGE next to the URL bar, shown ONLY when the last
     /// URL-bar entry was INVALID (a scheme-less garbage entry that did not
     /// navigate). Paired with the URL-bar text rendered invalid (red underline via
@@ -695,21 +686,35 @@ impl Chrome {
         self.stop.set_sensitive(state.is_loading());
         self.reload.set_sensitive(!state.is_loading());
         self.status.set_text(&status_line(state));
-        // The NON-BLOCKING loading banner: shown ONLY while a load is in flight,
-        // naming the current pipeline phase (one of the existing `LoadStep`
-        // values, verbatim). Its CANCEL calls the SAME `BrowserShell::stop` the
-        // toolbar Stop button uses (wired once at construction). Hidden on a
-        // settled/failed chrome (the error banner takes the slot on a failure) —
-        // the two are mutually exclusive, since a load is either in flight or has
-        // settled. Driven by this existing refresh, so no new timer / poll / tight
-        // loop (the Android ANR guard is not regressed). Task
-        // `loading-banner-with-phase-and-cancel`.
-        let show_loading = loading_banner_visible(state);
-        self.loading_banner.set_visible(show_loading);
-        if show_loading {
-            self.loading_banner_label
-                .set_text(&loading_banner_text(state));
-        }
+        // The LOAD-PROGRESS indicator lives IN the URL bar: the entry's own
+        // progress fraction advances with the real pipeline phase and falls to
+        // zero (painting nothing) once the load settles. Unlike the banner it
+        // replaces, this changes NO widget geometry, so a navigation never resizes
+        // the page view and the content cannot jump under the pointer (task
+        // `loading-progress-in-the-url-bar-not-a-banner`). Cancelling is the
+        // toolbar Stop button, which is already sensitive exactly while a load is
+        // in flight — the banner's Cancel was a second affordance for the same
+        // `BrowserShell::stop`, so nothing is lost. Driven by this existing
+        // refresh, so no new timer / poll / tight loop (the Android ANR guard is
+        // not regressed).
+        self.url_entry
+            .set_progress_fraction(load_progress_fraction(state));
+        // The phase NAME rides along as the URL bar's tooltip (plus the footer
+        // status line, which already names it), so the bar says WHICH phase is
+        // slow without stealing a fixed slot from the toolbar. Cleared when
+        // nothing is in flight, so a stale phase never lingers on hover. The
+        // cancel hint is added ONLY while the backend load is in flight, which is
+        // exactly when Stop is sensitive: during the PRE-CONTENT resolution window
+        // there is no backend load to stop, so promising a cancel there would lie.
+        let phase_tooltip = load_progress_visible(state).then(|| {
+            let hint = load_progress_hint(state);
+            if state.is_loading() {
+                format!("{hint}… — press Stop (✕) to cancel")
+            } else {
+                format!("{hint}…")
+            }
+        });
+        self.url_entry.set_tooltip_text(phase_tooltip.as_deref());
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate, protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
@@ -758,42 +763,66 @@ impl Chrome {
     }
 }
 
-/// Whether the NON-BLOCKING loading banner should be shown: exactly while a
-/// load is in flight ([`ChromeState::is_loading`]). A passive view update driven
-/// by the existing chrome-refresh pump (NOT a new timer / poll / tight loop), so
-/// the Android ANR guard is not regressed. A pure function of [`ChromeState`] so
-/// it is testable without a display; the mobile shells apply the SAME rule from
-/// the chrome JSON `loading` fact (task `loading-banner-with-phase-and-cancel`).
+/// Whether there is a load to indicate at all: a backend load in flight
+/// ([`ChromeState::is_loading`]) **or** a pinned pre-content resolution step (a
+/// non-[`Idle`](LoadStep::Idle) step). The second half matters: while the shell
+/// resolves an ENS/IPNS name the backend has not started its load yet, so
+/// `is_loading()` is false during EXACTLY the long `ronan.eth` freeze window the
+/// old banner sat out. `load_step` is `Idle` on every settled/failed chrome, so
+/// this can never linger after a load ends.
+///
+/// A passive view update driven by the existing chrome-refresh pump (NOT a new
+/// timer / poll / tight loop), so the Android ANR guard is not regressed. A pure
+/// function of [`ChromeState`] so it is testable without a display; the mobile
+/// shells apply the SAME rule from the chrome JSON `loading` + `loadStep` facts
+/// (task `loading-progress-in-the-url-bar-not-a-banner`).
 ///
 /// This is the IN-FLIGHT counterpart of [`error_banner_visible`]: the error
-/// banner appears on a FAILED load, the loading banner appears while a load is
-/// STILL RUNNING. The two are mutually exclusive in practice (a load is either
-/// in flight or has settled as finished/failed/idle), and both hide on a
-/// settled-ok chrome, so they never compete for the same slot.
-fn loading_banner_visible(state: &ChromeState) -> bool {
-    state.is_loading()
+/// banner appears on a FAILED load, the URL-bar progress appears while a load is
+/// STILL RUNNING. The two are mutually exclusive in practice (a load is either in
+/// flight or has settled as finished/failed/idle), and unlike the two banners
+/// they never compete for a slot at all: progress is painted INSIDE the URL bar.
+fn load_progress_visible(state: &ChromeState) -> bool {
+    state.is_loading() || state.load_step() != LoadStep::Idle
 }
 
-/// The loading-banner text: names the current pipeline phase (one of the
-/// existing [`LoadStep`] values, verbatim) so a slow load reads as working, not
-/// frozen — the field-test v0.2.7 finding this task answers (the user stares at a
-/// frozen page on long retrievals with no signal anything is happening). The
-/// phase names are the [`LoadStep`] vocabulary verbatim (capitalised +
-/// ellipsised for the banner surface), so the banner and the debug Network tab
-/// cannot disagree. Empty of a phase only when a load is in flight but no step is
-/// known yet (an [`LoadStep::Idle`] with [`LoadState::Started`]), in which case a
-/// generic "Loading…" is shown so the banner never lies about a frozen phase.
-/// Pure, for the same reason as [`status_line`].
+/// The URL bar's progress fraction for the current load: `0.0` on a settled
+/// chrome (painting nothing at all), else a value that ADVANCES with the real
+/// pipeline phase so a slow load reads as working rather than frozen — the
+/// field-test v0.2.7 finding, now answered WITHOUT displacing the page.
 ///
-/// The banner CANCEL calls the SAME `BrowserShell::stop` the toolbar Stop button
-/// uses (no new mechanic); that wiring lives in the GTK handler, not here.
-fn loading_banner_text(state: &ChromeState) -> String {
+/// The fractions are deliberately monotonic and never reach `1.0`: the phases are
+/// milestones on the actual lifecycle, not a byte-accurate measurement, so the
+/// bar must not claim a load is done while it is still running. A load in flight
+/// with no phase yet still shows a small sliver, so "something started" is
+/// visible immediately. Pure, for the same reason as [`status_line`].
+fn load_progress_fraction(state: &ChromeState) -> f64 {
+    if !load_progress_visible(state) {
+        return 0.0;
+    }
     match state.load_step() {
-        LoadStep::Idle => "Loading…".to_string(),
-        LoadStep::ResolvingName => "Resolving name…".to_string(),
-        LoadStep::FetchingRecord => "Fetching record…".to_string(),
-        LoadStep::FetchingContent => "Fetching content…".to_string(),
-        LoadStep::Rendering => "Rendering…".to_string(),
+        LoadStep::Idle => 0.1,
+        LoadStep::ResolvingName => 0.25,
+        LoadStep::FetchingRecord => 0.45,
+        LoadStep::FetchingContent => 0.7,
+        LoadStep::Rendering => 0.9,
+    }
+}
+
+/// The phase NAME behind the current progress, for the URL bar's tooltip: the
+/// existing [`LoadStep`] hint vocabulary verbatim ("resolving name", "fetching
+/// record", …), so the URL bar, the footer status line and the debug Network tab
+/// cannot disagree about which phase a slow load is stuck in. A generic
+/// "loading" covers a load in flight with no phase known yet, so it never lies
+/// about a frozen phase; empty on a settled chrome (there is no phase to name).
+/// Pure, for the same reason as [`status_line`].
+fn load_progress_hint(state: &ChromeState) -> &'static str {
+    if !load_progress_visible(state) {
+        return "";
+    }
+    match state.load_step() {
+        LoadStep::Idle => "loading",
+        step => step.hint(),
     }
 }
 
@@ -972,7 +1001,9 @@ fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
 /// visually distinct (a NEUTRAL grey loading badge shown while a load is in
 /// flight, a green content-verified badge, a blue name-via-trusted-RPC badge, a
 /// purple mutable-name badge, an amber unverified-origin one), plus the error
-/// banner, the invalid-URL badge, the menu info item, and the debug view's
+/// banner, the invalid-URL badge, the URL bar's own load-progress bar (the
+/// `entry > progress` node, painted from the live pipeline phase), the menu info
+/// item, and the debug view's
 /// level-coloured console rows. Kept as one constant next to the classes the
 /// chrome and the debug view toggle (`trust-loading` / `trust-verified` /
 /// `trust-name-trusted-rpc` / `trust-mutable-name` / `trust-unverified`,
@@ -988,8 +1019,7 @@ const APP_CSS: &str = "\
 .error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .invalid-url-badge { color: #c01c28; font-weight: bold; padding: 0 6px; }\
-.loading-banner { background-color: #1a5fb4; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
-.loading-banner button { font-weight: bold; }\
+entry > progress { background-color: #1a5fb4; min-height: 3px; }\
 .menu-info-item { padding: 4px 8px; }\
 .url-invalid { color: #c01c28; text-decoration: underline; text-decoration-color: #c01c28; }\
 .debug-console-log { padding: 2px 6px; }\
@@ -1155,25 +1185,13 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         .build();
     error_banner.add_css_class("error-banner");
 
-    // The NON-BLOCKING loading banner: a bar across the top of the view, shown
-    // ONLY while a load is in flight, naming the current pipeline phase (one of
-    // the existing `LoadStep` values, verbatim) and offering a Cancel that calls
-    // the SAME `BrowserShell::stop` the toolbar Stop button uses (task
-    // `loading-banner-with-phase-and-cancel`). It starts hidden; the phase label
-    // is hexpand so the Cancel button sits at the END of the row. Driven by the
-    // existing chrome-refresh pump (no new timer / poll / tight loop).
-    let loading_banner_label = Label::builder()
-        .halign(gtk4::Align::Start)
-        .hexpand(true)
-        .xalign(0.0)
-        .wrap(true)
-        .build();
-    let loading_banner_cancel = Button::with_label("Cancel");
-    let loading_banner = GtkBox::new(Orientation::Horizontal, 8);
-    loading_banner.append(&loading_banner_label);
-    loading_banner.append(&loading_banner_cancel);
-    loading_banner.add_css_class("loading-banner");
-    loading_banner.set_visible(false);
+    // The LOAD-PROGRESS indicator is the URL bar itself: `Chrome::refresh` paints
+    // the entry's own progress fraction from the live pipeline phase, so an
+    // in-flight load is visible in the chrome without ANY widget taking height
+    // from the page view (task `loading-progress-in-the-url-bar-not-a-banner`).
+    // Nothing to construct here: the surface is `url_entry` above, styled by the
+    // `entry > progress` rule in `APP_CSS`, and CANCEL is the toolbar Stop button
+    // (sensitive exactly while a load is in flight).
 
     // The small "invalid URL" badge sits in the toolbar next to the URL bar,
     // shown ONLY when the last entry was invalid (field finding D). It starts
@@ -1203,19 +1221,18 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         status: status.clone(),
         trust: trust.clone(),
         error_banner: error_banner.clone(),
-        loading_banner: loading_banner.clone(),
-        loading_banner_label: loading_banner_label.clone(),
         invalid_badge: invalid_badge.clone(),
     });
 
     let root = GtkBox::new(Orientation::Vertical, 0);
     root.append(&toolbar);
-    // The loading banner and the error banner share the slot directly under the
-    // toolbar and ABOVE the page view. They are mutually exclusive (a load is
-    // either in flight or has settled as finished/failed/idle), so only one is
-    // visible at a time; both surface a load state the user cannot miss in the
-    // content area, not buried in the footer status line.
-    root.append(&loading_banner);
+    // The error banner sits directly under the toolbar and ABOVE the page view, so
+    // a failed load's reason is unmissable in the content area rather than buried
+    // in the footer status line. A FAILURE is the only load state allowed to
+    // displace the page: there is nothing rendered to displace, and the user must
+    // act. In-flight progress deliberately does NOT live here — it is painted
+    // inside the URL bar, where it cannot resize the page on every navigation
+    // (task `loading-progress-in-the-url-bar-not-a-banner`).
     root.append(&error_banner);
     root.append(&view);
     root.append(&status);
@@ -1284,18 +1301,6 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
             refresh();
         }
     });
-    // The loading banner's CANCEL calls the SAME `BrowserShell::stop` the toolbar
-    // Stop button uses — no new mechanic, just a second affordance surfaced in the
-    // banner while a load is in flight (task `loading-banner-with-phase-and-cancel`).
-    loading_banner_cancel.connect_clicked({
-        let shell = shell.clone();
-        let refresh = refresh.clone();
-        move |_| {
-            shell.borrow_mut().stop();
-            refresh();
-        }
-    });
-
     // Navigate to the startup URL through the seam and focus the live view so the
     // OS/GTK routes scroll/click/focus/keyboard input to the page (interactive).
     shell.borrow_mut().navigate(url)?;
@@ -1358,10 +1363,11 @@ mod tests {
     use super::{
         banner, console_level_css_class, console_row_text, console_source_line,
         error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
-        invalid_entry_badge_visible, loading_banner_text, loading_banner_visible,
-        network_mime_text, network_size_text, network_status_text, network_trust_css_class,
-        network_trust_label, should_open_web_inspector, status_line, tail_plan, trust_indicator,
-        trust_indicator_css_class, trust_indicator_detail, TailPlan, DEFAULT_URL,
+        invalid_entry_badge_visible, load_progress_fraction, load_progress_hint,
+        load_progress_visible, network_mime_text, network_size_text, network_status_text,
+        network_trust_css_class, network_trust_label, should_open_web_inspector, status_line,
+        tail_plan, trust_indicator, trust_indicator_css_class, trust_indicator_detail, TailPlan,
+        DEFAULT_URL,
     };
     use gtk4::prelude::*;
     use gtk4::{gdk, gio, Label};
@@ -1464,67 +1470,108 @@ mod tests {
     }
 
     #[test]
-    fn loading_banner_names_the_phase_while_a_load_is_in_flight_and_hides_when_settled() {
-        // Acceptance (task `loading-banner-with-phase-and-cancel`): while a load
-        // is in flight a NON-BLOCKING banner in the chrome names the current
-        // pipeline phase (one of the existing `LoadStep` values, verbatim) and
-        // updates as the phase advances; it disappears on Finished / Failed /
-        // Idle. The banner is a pure function of `ChromeState` (driven by the
-        // existing chrome-refresh pump), so it is testable without a display.
+    fn load_progress_is_a_url_bar_fraction_that_never_displaces_the_page() {
+        // Acceptance (task `loading-progress-in-the-url-bar-not-a-banner`): the
+        // in-flight load indicator is a PROGRESS FRACTION painted INSIDE the URL
+        // bar, not a banner that takes height from the page view. The old banner
+        // was a real child above the view, so every navigation resized the page
+        // twice (banner in, banner out) and the content jumped under the pointer.
+        // A fraction changes NO widget geometry: `0.0` paints nothing, so an idle
+        // chrome and a loading chrome are exactly the same size.
+        //
+        // Pure functions of `ChromeState` (driven by the existing chrome-refresh
+        // pump, no new timer / poll / tight loop), so they are testable without a
+        // display; the mobile shells apply the SAME rules from the SAME chrome
+        // facts.
         use renderer::LoadState;
         use werust_core::LoadStep;
 
-        // Hidden when nothing is loading (idle / finished / failed).
-        assert!(!loading_banner_visible(&ChromeState::default()));
-        let failed = ChromeState {
-            load_state: LoadState::Failed,
-            last_error: Some("name not resolved".into()),
-            ..ChromeState::default()
-        };
-        assert!(!loading_banner_visible(&failed));
+        // Nothing in flight (idle / finished / failed): no progress, no hint.
+        for settled in [
+            ChromeState::default(),
+            ChromeState {
+                load_state: LoadState::Finished,
+                ..ChromeState::default()
+            },
+            ChromeState {
+                load_state: LoadState::Failed,
+                last_error: Some("name not resolved".into()),
+                ..ChromeState::default()
+            },
+        ] {
+            assert!(!load_progress_visible(&settled));
+            assert_eq!(
+                load_progress_fraction(&settled),
+                0.0,
+                "a settled chrome paints NO progress in the URL bar"
+            );
+            assert_eq!(load_progress_hint(&settled), "");
+        }
 
-        // Shown while loading, naming the LIVE step. The phase names are the
-        // existing `LoadStep` vocabulary verbatim (so the banner and the debug
-        // Network tab cannot disagree), capitalised + ellipsised for the banner.
-        let resolving = ChromeState {
-            load_state: LoadState::Started,
+        // In flight: a visible fraction that ADVANCES with the real pipeline
+        // phase, so a slow load reads as working rather than frozen. The hint is
+        // the existing `LoadStep` vocabulary (the same words the status line and
+        // the debug Network tab speak), so no surface can disagree.
+        let phases = [
+            (LoadState::Started, LoadStep::Idle, "loading"),
+            (
+                LoadState::Started,
+                LoadStep::ResolvingName,
+                "resolving name",
+            ),
+            (
+                LoadState::Started,
+                LoadStep::FetchingRecord,
+                "fetching record",
+            ),
+            (
+                LoadState::Started,
+                LoadStep::FetchingContent,
+                "fetching content",
+            ),
+            (LoadState::Committed, LoadStep::Rendering, "rendering"),
+        ];
+        let mut previous = 0.0;
+        for (load_state, load_step, hint) in phases {
+            let state = ChromeState {
+                load_state,
+                load_step,
+                ..ChromeState::default()
+            };
+            assert!(load_progress_visible(&state), "{load_step:?} is in flight");
+            let fraction = load_progress_fraction(&state);
+            assert!(
+                fraction > previous,
+                "{load_step:?} advances the bar: {fraction} must exceed {previous}"
+            );
+            assert!(
+                fraction < 1.0,
+                "{load_step:?} is not done, so the bar is never full: {fraction}"
+            );
+            assert_eq!(load_progress_hint(&state), hint);
+            previous = fraction;
+        }
+
+        // The PRE-CONTENT resolution window is covered too: while the shell is
+        // resolving a name the backend has not started a load yet (`is_loading()`
+        // is false, the step is pinned), which is EXACTLY the long `ronan.eth`
+        // freeze the old banner missed. A pinned step means work is in flight, so
+        // the URL bar shows progress (the named follow-up of the banner task).
+        let resolving_before_handoff = ChromeState {
+            load_state: LoadState::Idle,
             load_step: LoadStep::ResolvingName,
             ..ChromeState::default()
         };
-        assert!(loading_banner_visible(&resolving));
-        assert_eq!(loading_banner_text(&resolving), "Resolving name…");
-
-        let record = ChromeState {
-            load_state: LoadState::Started,
-            load_step: LoadStep::FetchingRecord,
-            ..ChromeState::default()
-        };
-        assert_eq!(loading_banner_text(&record), "Fetching record…");
-
-        let content = ChromeState {
-            load_state: LoadState::Started,
-            load_step: LoadStep::FetchingContent,
-            ..ChromeState::default()
-        };
-        assert_eq!(loading_banner_text(&content), "Fetching content…");
-
-        let rendering = ChromeState {
-            load_state: LoadState::Committed,
-            load_step: LoadStep::Rendering,
-            ..ChromeState::default()
-        };
-        assert_eq!(loading_banner_text(&rendering), "Rendering…");
-
-        // A loading state with no known step (Idle step) still shows the banner
-        // (a load IS in flight), with a generic "Loading…" so it never lies about
-        // a frozen phase.
-        let loading_no_step = ChromeState {
-            load_state: LoadState::Started,
-            load_step: LoadStep::Idle,
-            ..ChromeState::default()
-        };
-        assert!(loading_banner_visible(&loading_no_step));
-        assert_eq!(loading_banner_text(&loading_no_step), "Loading…");
+        assert!(!resolving_before_handoff.is_loading());
+        assert!(
+            load_progress_visible(&resolving_before_handoff),
+            "the name-resolution window shows progress even before the backend load starts"
+        );
+        assert!(load_progress_fraction(&resolving_before_handoff) > 0.0);
+        assert_eq!(
+            load_progress_hint(&resolving_before_handoff),
+            "resolving name"
+        );
     }
 
     #[test]

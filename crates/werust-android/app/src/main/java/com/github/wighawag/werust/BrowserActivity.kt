@@ -2,6 +2,7 @@ package com.github.wighawag.werust
 
 import android.annotation.SuppressLint
 import android.content.pm.ApplicationInfo
+import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Paint
 import android.os.Bundle
@@ -26,6 +27,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.PopupMenu
+import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
@@ -103,19 +105,20 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var trust: TextView
     private lateinit var errorBanner: TextView
     /**
-     * The NON-BLOCKING loading banner: a bar directly under the toolbar and ABOVE
-     * the WebView, shown ONLY while a load is in flight, naming the current
-     * pipeline phase (one of the existing `LoadStep` values, verbatim) and offering
-     * a Cancel that calls the SAME `core.stop()` the toolbar Stop button uses. The
-     * field-test v0.2.7 fix — on a long retrieval the user stared at a frozen page
-     * with no signal anything was happening; this banner says "working: fetching
-     * content…" with a way out. Driven by the existing chrome-refresh pump (no new
-     * timer / poll / tight loop), so the Android ANR guard is not regressed. Hidden
-     * on a settled/failed chrome (the [errorBanner] takes the slot then). Task
-     * `loading-banner-with-phase-and-cancel`.
+     * The LOAD-PROGRESS line: a thin determinate bar directly under the URL-bar row,
+     * whose progress advances with the real pipeline phase while a load is in flight
+     * and which goes INVISIBLE (never GONE) once the load settles. It replaces the
+     * loading BANNER, which was a full-height bar in this same vertical chrome:
+     * showing/hiding it resized the weighted WebView on every navigation, so the
+     * page jumped twice per load. Keeping the strip INVISIBLE rather than GONE means
+     * its height is reserved permanently, so no load state changes the layout (task
+     * `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
+     * button, enabled exactly while a load is in flight; the phase NAME stays in the
+     * footer status line, which already names it. Driven by the existing
+     * chrome-refresh pump (no new timer / poll / tight loop), so the Android ANR
+     * guard is not regressed.
      */
-    private lateinit var loadingBanner: LinearLayout
-    private lateinit var loadingBannerText: TextView
+    private lateinit var loadingProgress: ProgressBar
     private lateinit var invalidBadge: TextView
     private lateinit var webView: WebView
 
@@ -347,48 +350,30 @@ class BrowserActivity : ComponentActivity() {
             visibility = View.GONE
         }
 
-        // The NON-BLOCKING loading banner: a bar directly under the toolbar and
-        // ABOVE the WebView, shown ONLY while a load is in flight, naming the
-        // current pipeline phase (one of the existing `LoadStep` values, verbatim)
-        // and offering a Cancel that calls the SAME `core.stop()` the toolbar Stop
-        // button uses (task `loading-banner-with-phase-and-cancel`). A horizontal
-        // row: a weighted phase label (hexpand) + a Cancel button at the END.
-        // Starts hidden. Driven by the existing chrome-refresh pump (no new timer /
-        // poll / tight loop), so the Android ANR guard is not regressed.
-        loadingBannerText = TextView(this).apply {
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.CENTER_VERTICAL
-            layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f)
-        }
-        val loadingBannerCancel = Button(this).apply {
-            text = "Cancel"
-            minWidth = 0
-            minimumWidth = 0
-            setPadding(dp(12), 0, dp(12), 0)
-            setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0x00000000)
-            // Cancel calls the SAME `core.stop()` the toolbar Stop button uses — a
-            // cheap non-blocking core call (no resolve/network), so it runs inline
-            // on the UI thread; still refresh the chrome afterwards. No new
-            // mechanic, just a second affordance surfaced in the banner.
-            setOnClickListener { core.stop(); afterCoreAction() }
-        }
-        loadingBanner = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(0xFF1A5FB4.toInt())
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            gravity = Gravity.CENTER_VERTICAL
-            visibility = View.GONE
-            addView(loadingBannerText)
-            addView(loadingBannerCancel)
+        // The LOAD-PROGRESS line: a thin determinate bar in werust's blue, directly
+        // under the URL-bar row (where every mobile browser puts it). Its progress
+        // advances with the real pipeline phase; when nothing is in flight it goes
+        // INVISIBLE rather than GONE, so the 3dp strip it occupies is reserved for
+        // good and no load state ever resizes the WebView (task
+        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar
+        // Stop button; the phase NAME is in the footer status line.
+        loadingProgress = ProgressBar(
+            this, null, android.R.attr.progressBarStyleHorizontal
+        ).apply {
+            max = 100
+            isIndeterminate = false
+            progressTintList = ColorStateList.valueOf(0xFF1A5FB4.toInt())
+            progressBackgroundTintList = ColorStateList.valueOf(0x00000000)
+            visibility = View.INVISIBLE
         }
 
         browserChrome.addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-        // The loading banner and the error banner share the slot directly under
-        // the toolbar and ABOVE the WebView. They are mutually exclusive (a load
-        // is either in flight or has settled as finished/failed/idle), so only one
-        // is visible at a time; both surface a load state the user cannot miss.
-        browserChrome.addView(loadingBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+        // The progress line sits directly under the toolbar at a FIXED height that
+        // is never given back (INVISIBLE, not GONE, when idle), so it cannot
+        // displace the page. The error banner sits under it and ABOVE the WebView:
+        // a FAILURE is the only load state allowed to displace the page (there is
+        // nothing rendered to displace, and the user must act).
+        browserChrome.addView(loadingProgress, LinearLayout.LayoutParams(MATCH_PARENT, dp(3)))
         browserChrome.addView(errorBanner, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
         browserChrome.addView(webView)
         browserChrome.addView(footer, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
@@ -576,20 +561,20 @@ class BrowserActivity : ComponentActivity() {
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone.
         trust.text = chrome.trustIndicator()
-        // The NON-BLOCKING loading banner: shown ONLY while a load is in flight,
-        // naming the current pipeline phase (one of the existing `LoadStep` values,
-        // verbatim). Its CANCEL calls the SAME `core.stop()` the toolbar Stop button
-        // uses (wired once at construction). Hidden on a settled/failed chrome (the
-        // error banner takes the slot on a failure) — the two are mutually
-        // exclusive, since a load is either in flight or has settled. Driven by this
-        // existing refresh, so no new timer / poll / tight loop (the Android ANR
-        // guard is not regressed). Task `loading-banner-with-phase-and-cancel`.
-        if (chrome.loadingBannerVisible()) {
-            loadingBannerText.text = chrome.loadingBannerText()
-            loadingBanner.visibility = View.VISIBLE
-        } else {
-            loadingBanner.visibility = View.GONE
-        }
+        // The LOAD-PROGRESS line: its progress advances with the real pipeline phase
+        // while a load is in flight (including the pre-content name-resolution
+        // window, where the backend has not started yet), and it goes INVISIBLE —
+        // never GONE — once the load settles, so the strip it occupies is never
+        // given back and a navigation cannot resize the page (task
+        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
+        // button, enabled exactly while a load is in flight; the phase NAME is in
+        // the footer status line (and this line's content description). Driven by
+        // this existing refresh, so no new timer / poll / tight loop (the Android
+        // ANR guard is not regressed).
+        loadingProgress.progress = chrome.loadProgressPercent()
+        loadingProgress.contentDescription = chrome.loadProgressHint()
+        loadingProgress.visibility =
+            if (chrome.loadProgressVisible()) View.VISIBLE else View.INVISIBLE
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden

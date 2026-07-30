@@ -349,7 +349,7 @@ class WerustCore : AutoCloseable {
          * no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile status
          * text matches desktop.
          */
-        private fun loadStepHint(): String = when (loadStep) {
+        fun loadStepHint(): String = when (loadStep) {
             "resolving-name" -> "resolving name"
             "fetching-record" -> "fetching record"
             "fetching-content" -> "fetching content"
@@ -381,32 +381,58 @@ class WerustCore : AutoCloseable {
         }
 
         /**
-         * Whether the NON-BLOCKING loading banner should be shown: exactly while
-         * a load is in flight (`loading`). A passive view update driven by the
-         * existing chrome-refresh pump (NOT a new timer / poll / tight loop), so
-         * the Android ANR guard is not regressed. The IN-FLIGHT counterpart of
-         * [errorBannerVisible] (which fires on a FAILED load); the two are
-         * mutually exclusive. The SAME rule desktop/iOS apply, from the SAME
-         * chrome-JSON `loading` fact (task `loading-banner-with-phase-and-cancel`).
+         * Whether there is a load to indicate at all: a backend load in flight
+         * (`loading`) OR a pinned pre-content resolution step (a non-idle
+         * `loadStep`). The second half matters: while the core resolves an ENS/IPNS
+         * name the backend has not started its load yet, so `loading` is false
+         * during EXACTLY the long `ronan.eth` freeze window the old banner sat out.
+         * `loadStep` is idle on every settled/failed chrome, so this can never
+         * linger after a load ends.
+         *
+         * A passive view update driven by the existing chrome-refresh pump (NOT a
+         * new timer / poll / tight loop), so the Android ANR guard is not
+         * regressed. The IN-FLIGHT counterpart of [errorBannerVisible] (which
+         * fires on a FAILED load); the two are mutually exclusive. The SAME rule
+         * desktop/iOS apply, from the SAME chrome-JSON facts (task
+         * `loading-progress-in-the-url-bar-not-a-banner`).
          */
-        fun loadingBannerVisible(): Boolean = loading
+        fun loadProgressVisible(): Boolean = loading || loadStep != "idle"
 
         /**
-         * The loading-banner text: names the current pipeline phase (one of the
-         * existing `LoadStep` wire values, verbatim) so a slow load reads as
-         * working, not frozen — the field-test v0.2.7 finding this task answers.
-         * The phase names are the `LoadStep` vocabulary verbatim (capitalised +
-         * ellipsised for the banner), so the banner and the debug Network tab
-         * cannot disagree. A generic "Loading…" is shown when a load is in flight
-         * but no step is known yet (`loadStep` idle), so the banner never lies
-         * about a frozen phase. The SAME mapping desktop/iOS apply.
+         * The progress the URL-bar progress line paints, in PERCENT (0-100, the
+         * `ProgressBar` scale): `0` on a settled chrome (painting nothing at all),
+         * else a value that ADVANCES with the real pipeline phase so a slow load
+         * reads as working rather than frozen.
+         *
+         * The steps are deliberately monotonic and never reach 100: the phases are
+         * milestones on the actual lifecycle, not a byte-accurate measurement, so
+         * the line must not claim a load is done while it is still running. A load
+         * in flight with no phase yet still shows a small sliver, so "something
+         * started" is visible immediately. The SAME mapping desktop and iOS apply,
+         * from the SAME `loadStep` fact.
          */
-        fun loadingBannerText(): String = when (loadStep) {
-            "resolving-name" -> "Resolving name…"
-            "fetching-record" -> "Fetching record…"
-            "fetching-content" -> "Fetching content…"
-            "rendering" -> "Rendering…"
-            else -> "Loading…"
+        fun loadProgressPercent(): Int = when {
+            !loadProgressVisible() -> 0
+            loadStep == "resolving-name" -> 25
+            loadStep == "fetching-record" -> 45
+            loadStep == "fetching-content" -> 70
+            loadStep == "rendering" -> 90
+            else -> 10
+        }
+
+        /**
+         * The phase NAME behind the current progress (for the progress line's
+         * content description): the existing `LoadStep` hint vocabulary verbatim
+         * ("resolving name", "fetching record", …), so the URL bar, the footer
+         * status line and the debug Network tab cannot disagree about which phase a
+         * slow load is stuck in. A generic "loading" covers a load in flight with no
+         * phase known yet; empty on a settled chrome. The SAME mapping desktop/iOS
+         * apply.
+         */
+        fun loadProgressHint(): String = when {
+            !loadProgressVisible() -> ""
+            loadStepHint().isEmpty() -> "loading"
+            else -> loadStepHint()
         }
 
         /**

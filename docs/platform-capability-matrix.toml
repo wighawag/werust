@@ -1,8 +1,9 @@
 # werust platform-capability parity matrix (the checked-in source of truth for
 # the `verify`-enforced parity guard; see docs/adr/0005-platform-capability-parity-guard.md).
 #
-# WHY THIS FILE EXISTS: werust ships three contexts (desktop WebKitGTK, iOS
-# WKWebView, Android System WebView), each an OS edge over the shared
+# WHY THIS FILE EXISTS: werust ships several contexts (`desktop` = the Linux
+# WebKitGTK shell, `macos` = the AppKit + WKWebView shell, iOS WKWebView,
+# Android System WebView), each an OS edge over the shared
 # `werust-core` seams. A cross-cutting user-facing CAPABILITY (address bar,
 # back/forward, `ipfs://` render, ENS `.eth` resolution, EIP-1193 provider,
 # trust indicator) can silently ship on ONE platform only when a seam method is
@@ -34,7 +35,13 @@
 # for it to EVERY existing capability. Either way the guard forces the cells.
 
 # The shipped contexts. Adding one here forces a cell in every capability row.
-platforms = ["desktop", "ios", "android"]
+#
+# `desktop` is the LINUX GTK/WebKitGTK shell specifically (the name predates a
+# second desktop edge; `macos` sits beside it rather than under it). A rename to
+# `linux` would touch this file, the guard's expected list, ADR-0005 and the
+# pending `windows` column, so it is left to a human: see
+# work/notes/observations/desktop-platform-key-now-means-linux-only-2026-07-31.md.
+platforms = ["desktop", "macos", "ios", "android"]
 
 # ---------------------------------------------------------------------------
 # Capabilities, seeded with CURRENT REALITY (2026-07-23). The guard passes today
@@ -45,8 +52,16 @@ platforms = ["desktop", "ios", "android"]
 name = "address-bar"
 description = "URL bar: type/commit a URL, reflect the current URL in the chrome."
 # Core logic (BrowserShell) driven through the seam; each backend implements
-# navigate + current_url. Verified on all three.
+# navigate + current_url. Verified on all three of those edges.
+# macOS: the AppKit `NSTextField` URL bar paints `ChromeState::url_text` through
+# the shared `desktop-paint` snapshot and commits the RAW typed text to
+# `BrowserShell::navigate` (`urlCommitted:` in crates/werust-macos/src/window.rs),
+# over `MacosRenderer`'s `navigate` + `current_url`. READ BACK OUT OF THE REAL
+# WIDGET on a macos-14 runner by `crates/werust-macos/examples/window_smoke.rs`
+# (run 30572253620): after a hash-verified load the bar holds the loaded
+# content-addressed URL. Task `macos-appkit-window-and-chrome`.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -66,7 +81,17 @@ description = "Track a SAME-DOCUMENT (SPA client-side) URL change — a SvelteKi
 # `IosHandle::on_url_changed`. All three emit ONLY `UrlChanged` (no load-state /
 # posture change), so a same-document nav within a verified site keeps its posture.
 # Task `track-webview-url-on-spa-clientside-navigation`.
+# macOS observes the SAME same-document signal iOS does, through the same WebKit
+# API: `NavigationBridge` KVO-observes `WKWebView.URL`
+# (`observeValueForKeyPath:` in crates/macos-renderer/src/backend.rs) and drives
+# the shared `LoadLifecycle::url_changed`, which is a no-op when the URL already
+# matches a real load — so only a genuine same-document change surfaces
+# `UrlChanged`, and it moves neither the load state nor the posture. The
+# observation COMPILES and registers on macOS (macos-renderer CI leg), but no CI
+# step performs a `pushState`, so the macOS evidence is compilation + the
+# source-shape guard over the shared rule, not a driven SPA navigation.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -75,7 +100,12 @@ name = "back-forward"
 description = "Session history: go_back / go_forward and their availability."
 # Each backend owns its session-history truth (webview-renderer, IosBackend,
 # AndroidBackend all implement go_back/go_forward/can_go_*).
+# macOS: `MacosRenderer` implements go_back/go_forward/can_go_* over
+# `WKWebView`'s own back-forward list, and the AppKit ◀ / ▶ buttons take their
+# enabled state from `ChromeState::can_go_back` / `_forward` through the shared
+# paint snapshot — the same one fact the on-screen control everywhere else reads.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -117,6 +147,7 @@ description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back t
 # signal in work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md
 # rather than folded into this row.
 desktop = { state = "n-a", reason = "a GTK desktop window has no OS-level system Back button/gesture the app must handle; desktop Back is the on-screen control (capability `back-forward`)" }
+macos = { state = "n-a", reason = "a macOS window has no OS-level system Back button/gesture the app must handle (nothing routes Back to the app, and nothing exits it); macOS Back is the on-screen control, capability `back-forward`. Its platform analogue is the WKWebView two-finger swipe-back gesture, a distinct affordance with its own enablement (`allowsBackForwardNavigationGestures`), tracked separately in work/notes/observations/macos-swipe-back-gesture-not-enabled-2026-07-31.md" }
 ios = { state = "n-a", reason = "iOS has no hardware/system Back button delivered to the app; its platform analogue is the WKWebView edge-swipe back gesture, a distinct affordance tracked separately (see work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md)" }
 android = { state = "implemented" }
 
@@ -125,7 +156,13 @@ name = "ens-eth-resolution"
 description = "Bare `.eth` URL-bar entry resolved namehash -> resolver -> contenthash (ENS)."
 # Toolkit-free core logic in `werust-core` (ens/contenthash/ethereum modules),
 # driven by the shell regardless of backend, so it is available on every edge.
+# macOS adds NOTHING here and needs to: the AppKit window hands the raw entry to
+# the same `BrowserShell`, which owns the RPC provider and the namehash ->
+# resolver -> contenthash path. Same basis as the iOS/Android cells (the shared
+# core, exercised by its own tests on every gate); no macOS CI step resolves a
+# real name, because the macos-14 smokes are deliberately offline.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -139,7 +176,19 @@ description = "Intercept `ipfs://<cid>` and render hash-verified content through
 # routing through the SAME `werust_core::ipfs::resolve_ipfs_request` path), and
 # the OS edge dispatches it — Android via `WebViewClient.shouldInterceptRequest`,
 # iOS via a `WKURLSchemeHandler` for `ipfs`. The former silent no-op is gone.
+# macOS intercepts through the same WebKit class iOS does: `MacosRenderer::install_ipfs`
+# registers a `WKURLSchemeHandler` for `ipfs` that routes through the SAME
+# `werust_core::ipfs::resolve_ipfs_request` + verifying `fetcher` path, across the
+# shared ADR-0008 off-thread boundary (`webview-shared`). MEASURED on a macos-14
+# runner, not argued: `macos-renderer`'s `trust_hooks_smoke` loaded a pinned
+# in-memory page through the production verifying route and reported
+# `TrustPosture::ContentVerified`, while the negative control (bytes that do not
+# hash to their CID) ended `Failed` / `UnverifiedOrigin` (run 30563185521); the
+# sibling `macos-origin-probe` measured that a handler-served document really
+# gets an `ipfs://<cid>` tuple origin, with its own negative control failing in
+# the same process (docs/spikes/macos-wkwebview-renderer-backend/README.md).
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -166,7 +215,20 @@ description = "User-choosable IPFS retrieval backend: pick the default trustless
 # is what makes `werust://settings` actually reachable there (the requeue's Gate-2
 # fix; before it the `werust` scheme was registered Rust-side but dead on iOS).
 # Task `retrieval-backend-user-setting`.
+# macOS pays that same WebKit price and pays it in the same place:
+# `MacosRenderer::install_ipfs` builds its `TrustlessGatewayCarRetriever` from the
+# persisted `retrieval::active_gateway_endpoint()` and registers the `werust`
+# scheme through its OWN `WKURLSchemeHandler` beside `ipfs` (routing to
+# `retrieval::apply_settings_request`), before the first navigation — the
+# `WKWebViewConfiguration` is copied when the `WKWebView` is constructed, so a
+# later registration is refused and reported. The selector, the persistence and
+# the page are the shared core, unchanged. HONEST LIMIT: nothing has LOADED
+# `werust://settings` on a Mac — the macos-14 smokes drive `ipfs://` only — so the
+# macOS evidence is the registration + the shared core's own tests, not a driven
+# settings page (docs/spikes/macos-wkwebview-renderer-backend/README.md, "the
+# `werust://settings` internal page ... wired but not driven").
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -184,7 +246,16 @@ description = "Inject the native EIP-1193 provider into pages via the script-mes
 # `WKWebView.evaluateJavaScript`. So a page's `window.ethereum` works on mobile
 # through the SAME keyless read-only path desktop uses. The former silent no-op is
 # gone.
+# macOS: `MacosRenderer::install_provider` registers the `PROVIDER_BRIDGE`
+# script-message channel and injects the SAME `werust_core::provider` shim at
+# document start, pushing each answer back into the live page by evaluating the
+# settle-call JS (a `Send` queue drained on the main thread, the iOS shape).
+# MEASURED on a macos-14 runner (run 30563185521): the page reported
+# `window.ethereum` as an object and `request({ method: 'eth_chainId' })` resolved
+# to `0x1`, which can only happen if the page -> native -> page round trip
+# completed. Keyless and read-only, like every other edge.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -205,7 +276,21 @@ description = "Follow the OS light/dark setting so `prefers-color-scheme` and UA
 # follows the OS by default; the app pins no `UIUserInterfaceStyle` and leaves
 # `overrideUserInterfaceStyle == .unspecified`, so it follows the OS without
 # forcing. Task `webview-follow-os-color-scheme`, `docs/adr/0009`.
+# macOS is the edge where following costs NOTHING and is done by NOT acting:
+# AppKit propagates the user's effective `NSAppearance` into both the chrome and
+# the `WKWebView`'s web process, so `prefers-color-scheme` already matches the OS
+# (the GTK edge must set `gtk-application-prefer-dark-theme` precisely because GTK
+# does not inherit it). Marked implemented on the same basis as the iOS cell (the
+# platform follows by default and werust pins nothing), and the ABSENCE is
+# ENFORCED rather than assumed: `crates/werust-macos/tests/macos_window_shape.rs`
+# reds the Ubuntu gate if any `NSAppearance` is ever set on a window, view or
+# webview, and `MacosRenderer::os_color_scheme` reads `effectiveAppearance`
+# through the SAME shared `renderer::OsColorScheme` rule the other edges use.
+# HONEST LIMIT: no CI runner has a display, so nobody has yet WATCHED the chrome
+# and a `prefers-color-scheme` page follow a live Light/Dark switch — that is
+# manual step 8 of docs/spikes/macos-appkit-window-and-chrome/README.md.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -231,7 +316,17 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # WerustCore.swift) reading the `loading` field of the chrome JSON — so the prior
 # page's trust posture never lingers while a new, possibly differently-trusted
 # page loads.
+# macOS paints the indicator from the SAME derivation, never a second one: the
+# label, its tooltip and its colour come from `trust_indicator` /
+# `_detail` / `_css_class` through the shared `desktop-paint` snapshot (unit-tested
+# against the real core on the Ubuntu gate across seven chrome states, including
+# the neutral loading state that wins over any posture), and the AppKit layer only
+# assigns them. MEASURED on a macos-14 runner (run 30572253620): read back out of
+# the real `NSTextField`, a fresh window showed the core's badge with the core's
+# ADR-0006 explanation as its tooltip, a hash-verified `ipfs://` page read as
+# verified, and the tampered control was never reported verified.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -240,7 +335,9 @@ name = "web-inspector"
 description = "The platform's OWN full web inspector (WebKit/Chrome devtools: a typeable console REPL + a network view + DOM/sources), reached per-platform, gated on a debug build so a release build is not silently inspectable."
 # Each platform enables its NATIVE inspector (not a custom werust window), at the
 # SAME devtools capability (console REPL + network), gated on a debug build. The
-# reach differs per platform ("per its reach"), but all three are really wired.
+# reach differs per platform ("per its reach"), but all three of those edges are
+# really wired. macOS is the exception and is `stubbed` below: it reaches no
+# inspector at all.
 # Desktop: `WebViewRenderer::new` sets `WebKitSettings.enable-developer-extras`
 # (gated `cfg!(debug_assertions)` via `developer_extras_enabled`) and the shell
 # (crates/werust/src/main.rs) binds F12 to `WebInspector::show` over the page
@@ -255,7 +352,17 @@ description = "The platform's OWN full web inspector (WebKit/Chrome devtools: a 
 # decision is recorded at
 # work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md.
 # Task `enable-web-inspector-devtools-all-platforms`.
+# macOS is the one edge where this is NOT wired: a `WKWebView` is inspectable only
+# when `isInspectable` is set (macOS 13.3+ / Safari 16.4, the same property the
+# iOS edge sets under `#if DEBUG`), and neither `crates/macos-renderer` nor
+# `crates/werust-macos` sets it or touches `WKPreferences`, so Safari's Web
+# Inspector cannot attach to a werust page at all. That is UNWIRED, not merely
+# unreached — macOS has a first-class platform inspector, so `n-a` would be a lie —
+# and the debug view (`debug-view-console-network`) is read-only by design and is
+# no substitute for the REPL this row names. Task
+# `macos-web-inspector-safari-devtools`.
 desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "macos-web-inspector-safari-devtools" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -271,7 +378,14 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 # a banner in WKWebViewShellController.swift) reading the chrome JSON `error`
 # field. The subtle footer status remains too, but a failure is now unmissable.
 # Task prominent-load-failure-and-ipns-resolution-diagnosis.
+# macOS raises the banner from the SAME `error_banner_visible` / `_text` /
+# `_css_class` facts, in a strip between the toolbar and the page — the ONE state
+# allowed to displace the page view. MEASURED on a macos-14 runner (run
+# 30572253620): the negative control's hash mismatch raised the banner carrying
+# the core's protocol-named reason verbatim ("... block hash mismatch: bytes do
+# not match cid bafkrei…"), and a successful load raised none.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -287,7 +401,16 @@ description = "Surface a LIVE loading-progress indicator tied to the real resolu
 # WerustCore.kt, Swift WerustCore.swift), exactly as the trust indicator reads the
 # shared `loading`/`trustPosture` facts. Loading stays ORTHOGONAL to the trust
 # posture. Task clearer-loading-and-error-indicator.
+# macOS shows the same step in the status line and, additionally, an
+# `NSProgressIndicator` fed by `load_progress_visible` / `_fraction` / `_hint`
+# INSIDE the URL bar's rectangle (task
+# `loading-progress-in-the-url-bar-not-a-banner`), so progress never takes height
+# from the page. Both come from the shared paint snapshot and are driven
+# mid-pipeline by its Ubuntu unit tests. MEASURED on a macos-14 runner (run
+# 30572253620): the page view's frame was compared before and after a whole load
+# and did not move or resize.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -312,10 +435,19 @@ description = "Route a scheme-less URL-bar entry consistently: a bare `.eth` -> 
 # `Chrome.invalidEntryVisible()`/`invalidEntryBadge()` (WerustCore.swift) + the
 # badge/underline in WKWebViewShellController.swift. The iOS edge's former
 # edge-level `normalizeURL` (which prepended `https://` before the core saw the
-# entry, pre-empting the core classifier) is GONE — all three edges pass the RAW
+# entry, pre-empting the core classifier) is GONE — those three edges pass the RAW
 # typed text so the ONE core rule decides. Task
 # `scheme-less-entry-https-fallback-and-keep-bar-on-error`.
+# macOS is the same shape: `urlCommitted:` hands the RAW typed text to the core
+# (no edge-level `https://` prepend, the mistake the iOS edge had to unlearn), and
+# the badge + the URL field's red text are painted from the same two chrome fields
+# through the shared `desktop-paint` snapshot. HONEST LIMIT:
+# the invalid-entry surface is checked by the Ubuntu paint unit tests
+# (badge text, colour, the field keeping the typed text) and by the source-shape
+# guard; no CI step TYPES into the real URL bar, so the runtime half is manual
+# step 5 of docs/spikes/macos-appkit-window-and-chrome/README.md.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -355,7 +487,18 @@ description = "A `target=\"_blank\"` link / `window.open(url)` (a new-window req
 # steps at docs/spikes/blank-and-window-open-links-navigate-in-place/README.md;
 # the shared in-place decision is recorded at docs/adr/0010. Task
 # `blank-and-window-open-links-navigate-in-place`, field finding C.
+# macOS: `MacosRenderer`'s `NavigationBridge` conforms to `WKUIDelegate` and
+# implements `webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:`,
+# routing the target through the SAME shared `renderer::new_window_action`, loading
+# it into the existing view via the normal load path (so an `ipfs://` `_blank`
+# target still hits the hash-verified handler) and returning nil, so WebKit creates
+# no second `WKWebView`. The AppKit window neither opens a window nor re-decides
+# the rule (asserted by `crates/werust-macos/tests/macos_window_shape.rs`). HONEST
+# LIMIT: compiled and shape-guarded, but no CI step CLICKS a `_blank` link on
+# macOS — that is manual step 9 of
+# docs/spikes/macos-appkit-window-and-chrome/README.md.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -373,7 +516,13 @@ description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an 
 # mobile `Chrome.errorBanner()` / `errorIsRetryable()` reading the chrome JSON
 # `retryable` field (Kotlin WerustCore.kt, Swift WerustCore.swift). Error stays
 # ORTHOGONAL to the trust posture. Task clearer-loading-and-error-indicator.
+# macOS reads the SAME two fields (`error_banner_text` + `_css_class`) through the
+# shared paint snapshot and colours the banner from the class's palette entry, so
+# a timeout reads amber ("reload to retry") and a hard failure red with its reason
+# kept verbatim. Both branches are driven by the Ubuntu paint unit tests, and a
+# core class with no colour in this edge's palette reds that gate.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -394,13 +543,21 @@ description = "Resolve a NOT-FOUND path under an `ipfs://` site per the SITE's o
 # via `WerustCore.Resolution.Ok.status` over the `nativeResolutionStatus` JNI
 # accessor); iOS answers an `HTTPURLResponse` carrying the status on the
 # `WKURLSchemeTask` (WKWebViewShellController.swift, via
-# `werust_ios_resolution_status`). Task
+# `werust_ios_resolution_status`). macOS answers the status-carrying
+# `NSHTTPURLResponse` on the `WKURLSchemeTask` (the `SchemeBridge` in
+# crates/macos-renderer/src/backend.rs builds it from `SchemeResponse::status` for
+# exactly this reason), the AppKit twin of the iOS `HTTPURLResponse` answer, so a
+# site's own 404 page renders as the not-found it is; the decision and the rule
+# grammar are the shared core, unchanged, and no macOS CI step loads a
+# `_redirects` fixture, so the macOS evidence is the status-carrying response plus
+# the core's own tests. Task
 # `ipfs-web-redirects-and-404-fallback-support`; the subset that landed (served
 # 200/404/410/451 + placeholders/splat) is recorded in
 # docs/spikes/ipfs-web-redirects-and-404-fallback-support/DECISIONS.md. The 3xx
 # half is its OWN capability row below (`ipfs-redirects-3xx-navigation`) because it
 # is a NAVIGATION, not a served response.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -416,7 +573,7 @@ description = "A GENERAL browser menu (the \u22ee menu every browser has, struct
 # Rust workspace `CARGO_PKG_VERSION`) — reached directly on desktop, and over the
 # FFI on mobile (`nativeVersion`/`nativeMenuJson` JNI, `werust_ios_version`/
 # `werust_ios_menu_json` C-ABI, both SESSION-FREE because the menu is a property of
-# the BUILD). So all three menus show the SAME version and the SAME items by
+# the BUILD). So every menu shows the SAME version and the SAME items by
 # construction; no edge hardcodes either. What each edge adds is only the NATIVE
 # menu surface, built by ITERATING the core's items and rendering each by its kind
 # (an `info` item non-interactive, an `action` item dispatched by its stable id):
@@ -441,7 +598,16 @@ description = "A GENERAL browser menu (the \u22ee menu every browser has, struct
 # docs/spikes/general-browser-menu-with-version-and-debug-entry/README.md.
 # Task `general-browser-menu-with-version-and-debug-entry`, spec
 # `in-app-debug-menu-console-and-network`.
+# macOS renders the core's `BrowserMenu` TWICE from the ONE model, by iterating it
+# exactly as the other edges do: a ⋮ `NSMenu` at the end of the toolbar and the
+# macOS menu-bar menu, an `info` item disabled, an `action` item dispatched by its
+# stable id, the version from the one shared `werust_core::version()`. The Debug
+# entry really opens the view here (see `debug-view-console-network`), not a
+# not-built-yet notice. MEASURED on a macos-14 runner (run 30572253620): the real
+# `NSMenu`'s titles were the core's labels, in order, and activating Debug opened
+# the view.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -471,7 +637,16 @@ description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-
 # (Android's `WebResourceResponse` refuses a 300-399 status outright, and a status
 # on `SchemeResponse` is explicitly not a redirect channel). Task
 # `ipfs-redirects-3xx-navigation-support`.
+# macOS owns the sink the same way desktop does: `MacosRenderer::install_ipfs`
+# RETURNS the `RedirectSink` its handler pushes into, and
+# `werust_macos::window::run` hands that same sink to the shell via
+# `with_redirect_sink`; the window's 50ms pump drains it, which is also what feeds
+# `RedirectSink::note_navigation` the new top-level URL, so the per-chain bound and
+# the main-frame check stay current. Like the row above, the rules are the shared
+# core and no macOS CI step loads a `_redirects` fixture: wired and pumped, not yet
+# driven by a real 3xx site.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -535,7 +710,28 @@ description = "CAPTURE the page's console messages and network requests into wer
 # docs/spikes/debug-console-network-capture-per-platform/README.md.
 # Task `debug-console-network-capture-per-platform`, spec
 # `in-app-debug-menu-console-and-network`.
+#   * macos    — CONSOLE is real and measured: `desktop_paint::install_debug_capture`
+#                registers the dedicated `CAPTURE_BRIDGE` channel (never the
+#                provider's trust channel) and injects the SHARED `console_shim`,
+#                the byte-for-byte string desktop and iOS inject, and
+#                `window_smoke` watched a page's own `console.log` travel page ->
+#                shim -> channel -> shared store -> a rendered row on a macos-14
+#                runner (run 30572253620). NETWORK is where macOS falls SHORT of
+#                what this row names: the only network capture point is the
+#                best-effort `network_shim` (`fetch`/`XHR` the PAGE makes), so
+#                there is NO main-document entry mirroring the load's own posture
+#                and no row for the `ipfs://`/`werust://` requests the scheme
+#                handler itself serves. iOS has exactly those points
+#                (`werust_ios_capture_network`, driven from both
+#                `WKURLSchemeHandler`s and the navigation delegate) and macOS can
+#                have them too, so this is a KNOWN GAP, not a platform limit: the
+#                cell is `stubbed`, not a quiet `implemented` over a partial reach.
+#                (The subresource limit iOS also has — no per-resource callback in
+#                WebKit for `<img>`/`<script>`/CSS `url()` — stays accepted by the
+#                spec's Out of Scope.) Task
+#                `macos-debug-network-capture-main-document-and-scheme-handled`.
 desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "macos-debug-network-capture-main-document-and-scheme-handled" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -573,6 +769,19 @@ description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug
 # docs/spikes/debug-view-console-network-tabs-mobile/README.md.
 # Tasks `debug-view-console-network-tabs-{desktop,mobile}`, spec
 # `in-app-debug-menu-console-and-network`.
+# The macOS cell (task `macos-appkit-window-and-chrome`): the ⋮/menu-bar Debug
+# entry opens a SEPARATE "werust Debug" `NSWindow` with an `NSTabView` of the
+# Console and Network tabs over the SAME shared `DebugCapture` store, rows built by
+# the core's row derivation (`console_row_text`, `network_*`, including the trust
+# column in the chrome's exact vocabulary), refreshed INCREMENTALLY via the core's
+# `tail_plan` on the EXISTING 50ms chrome pump (no new timer), read-only, with
+# Clear driving the shared `clear()`. MEASURED on a macos-14 runner (run
+# 30572253620): activating Debug opened the view, a page's `console.log` appeared
+# as a row, Clear emptied both tabs, and closing the window let a later Debug open
+# a fresh one. What the tabs can SHOW is bounded by the capture points above, so
+# the macOS Network tab is honestly thinner than desktop's until the stubbed row
+# above lands.
 desktop = { state = "implemented" }
+macos = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }

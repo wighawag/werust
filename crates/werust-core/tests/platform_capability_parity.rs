@@ -2,8 +2,9 @@
 //! spec `ens-to-ipfs-resolution-phase1-rpc-skeleton`,
 //! `docs/adr/0005-platform-capability-parity-guard.md`).
 //!
-//! THE PROBLEM THIS GUARD EXISTS FOR: werust ships three contexts (desktop
-//! WebKitGTK, iOS WKWebView, Android System WebView), each an OS edge over the
+//! THE PROBLEM THIS GUARD EXISTS FOR: werust ships several contexts (`desktop` =
+//! the Linux WebKitGTK shell, `macos` = the AppKit + WKWebView shell, iOS
+//! WKWebView, Android System WebView), each an OS edge over the
 //! shared `werust-core` seams. A cross-cutting user-facing CAPABILITY can
 //! silently ship on ONE platform only when a seam method is no-op'd on a backend
 //! and nothing flags it. That is exactly what hid the mobile `ipfs://` gap:
@@ -28,7 +29,8 @@
 //! sibling `release_plumbing_shape.rs` test lives here.
 //!
 //! Acceptance criteria mapped to assertions below:
-//! 1. A checked-in matrix lists each capability x {desktop, iOS, Android} with an
+//! 1. A checked-in matrix lists each capability x every declared platform
+//!    ({desktop, macos, iOS, Android} today) with an
 //!    explicit `implemented` / `stubbed`(+task) / `n-a`(+reason) state
 //!    (`the_real_matrix_is_well_formed_and_covers_every_platform`).
 //! 2. The guard FAILS when a cell is `stubbed`/unimplemented WITHOUT a resolvable
@@ -290,11 +292,16 @@ fn real_task_exists(slug: &str) -> bool {
 
 #[test]
 fn the_real_matrix_is_well_formed_and_covers_every_platform() {
-    // Criterion 1: the checked-in matrix declares the three contexts and gives an
+    // Criterion 1: the checked-in matrix declares every shipped context and gives an
     // explicit, well-formed cell for every capability x platform (no omission).
     let matrix = load_real_matrix();
     let platforms: BTreeSet<&str> = matrix.platforms.iter().map(String::as_str).collect();
-    for expected in ["desktop", "ios", "android"] {
+    // `macos` joined the list with the AppKit shell (task
+    // `macos-parity-column-and-stub-tasks`), so a later change cannot quietly drop
+    // the column and take its cells with it — dropping a platform would otherwise
+    // hide every gap it tracks, which is the omission failure mode this guard
+    // exists for. (`desktop` names the Linux/GTK edge; see the matrix header.)
+    for expected in ["desktop", "macos", "ios", "android"] {
         assert!(
             platforms.contains(expected),
             "the matrix must cover the `{expected}` context; platforms = {:?}",

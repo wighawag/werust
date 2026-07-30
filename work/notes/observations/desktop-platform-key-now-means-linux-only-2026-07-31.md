@@ -1,0 +1,5 @@
+# The `desktop` platform key now means "Linux/GTK only", and a second desktop column sits beside it (2026-07-31)
+
+Noticed while adding the `macos` column to `docs/platform-capability-matrix.toml` (task `macos-parity-column-and-stub-tasks`): the matrix's platform keys are `desktop`, `ios`, `android`, where `desktop` has always meant the Linux WebKitGTK shell specifically. With `macos` added (and `windows` coming from the sibling task `windows-parity-column-and-stub-tasks`), the file now reads as if macOS and Windows were not desktops. The column was added as `macos` beside `desktop` rather than renamed, because a rename to `linux` would touch this file, the guard's expected-platform list in `crates/werust-core/tests/platform_capability_parity.rs`, the prose of `docs/adr/0005-platform-capability-parity-guard.md`, and whichever of the two parity-column tasks lands second.
+
+Not fixed here (out of scope, and it is a naming decision with three other owners). Recorded so a human can decide once both desktop columns exist: keep `desktop` as the Linux edge's historical key, or rename it to `linux` in one deliberate change.

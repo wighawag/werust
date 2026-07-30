@@ -3,8 +3,11 @@ title: "Research: what webview/UI backend for Windows (and what would it take to
 slug: windows-platform-research
 blockedBy: []
 covers: []
-needsAnswers: true
 ---
+
+> **FORWARD-POINTER (planted by drive-tasks, 2026-07-30, on the human's explicit instruction).** This research now runs BEFORE `macos-desktop-build` is cut up, deliberately: the human's reasoning is that Windows and macOS may share ONE answer. Both candidate paths are "a new `Renderer` backend over the platform's system webview, driven from a native window" (WebView2 on Windows, WKWebView on macOS), and werust already has a THIRD instance of that shape shipping on mobile (iOS drives WKWebView through the same Rust core over FFI). So the ADR must NOT stop at "can Windows work?": it must answer whether there is a **generic desktop shell seam** worth extracting, i.e. whether the desktop chrome (URL bar, trust indicator, menu, debug view) can be driven from ONE shared core-facing layer with a thin per-platform window/webview edge, the way the mobile shells already are. `macos-desktop-build` will be split using this finding, so state the recommendation in a form that decides that split: one generic desktop shell seam serving Windows + macOS (+ possibly Linux), or genuinely separate per-platform shells. Note the cost asymmetry honestly: GTK/WebKitGTK on Linux is a fourth, differently-shaped edge, so "generic" may mean generic across the NEW platforms only.
+>
+> The `needsAnswers: true` gate was cleared by that same instruction ("let's do windows first"): the open question WAS whether to fund this research, and the human has funded it. The research itself is the answer-producing work.
 
 ## What to research
 
@@ -66,6 +69,7 @@ The ADR ends with a **recommendation: go / no-go / defer**, and if go, a rough t
 - [ ] The ADR ends with a clear recommendation (go / no-go / defer) and, if go, a rough task breakdown.
 - [ ] The ADR is self-contained (anyone reading it can decide whether to fund the Windows build).
 - [ ] Key technical questions (custom-scheme interception, SvelteKit compatibility, CI strategy) are answered with references.
+- [ ] The ADR answers the GENERIC-DESKTOP-SEAM question in the forward-pointer above, in a form that decides how `macos-desktop-build` is split: one shared desktop shell seam across the new platforms, or separate per-platform shells. Compare against the EXISTING precedent in this repo (the iOS shell already drives WKWebView through the shared Rust core over FFI) rather than reasoning from first principles.
 
 ## Prompt
 

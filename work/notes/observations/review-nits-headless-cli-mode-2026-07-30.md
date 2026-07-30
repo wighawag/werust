@@ -23,3 +23,9 @@ is their durable home for triage — promote-to-task / keep / delete.
   (DECISIONS.md decision 5; docs/adr/0005 parity guard.)
 - Coverage note: the three tests pin the pure seams (parse_args routing, resolve_output formatting incl. the fail-closed unsupported arm and JSON escaping, usage listing). run_resolve itself (RpcProvider::new wiring plus the exit-status mapping) is covered only by the manual transcript in docs/spikes/headless-cli-mode/README.md. Acceptable for 8 lines of glue over a shared constructor, but if the CLI grows a second verb it is worth a seam that lets the provider be injected.
   (main.rs run_resolve; tests are display- and network-free (nothing constructs RpcProvider), so no shared-location pollution risk.)
+
+## Human triage (2026-07-30, via drive-tasks)
+
+- **`resolve` must follow a mutable name: TASKED.** Ruling: no `--follow` flag and no second verb; `resolve` performs the FULL resolution, so an ENS name pointing at IPNS is followed through to the actual `ipfs://<cid>`. Filed as `work/tasks/backlog/cli-resolve-follows-mutable-names-to-the-cid.md`.
+- **`--json` vocabulary from core: TASKED**, same task. The `kind` strings come from a `werust-core` helper reusing the ENSIP-7 `ipfs-ns`/`ipns-ns` spelling, not literals in the binary.
+- Still open, not ruled on: the `--version`/`-V`/`-h` flag aliases, and a leading `--json` (`werust --json resolve x`) falling through to the GUI instead of refusing.

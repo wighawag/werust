@@ -21,3 +21,9 @@ is their durable home for triage — promote-to-task / keep / delete.
   (crates/werust/src/main.rs doc comment on app_id, section Why the version is not spliced in verbatim)
 - Acceptance criterion 2 (launching v0.2.9 while v0.2.8 runs opens a NEW window) is verified by proxy, not end to end: a headless Gio.Application probe shows new version -> primary, and two real binaries were built and confirmed to bake distinct versions via their banners, but the two-window launch was deliberately not run (opening windows on the operator desktop). Disclosed honestly in the spike README; residual risk is low since the probe isolates the one rule that decides the hand-off.
   (docs/spikes/versioned-gtk-app-id-and-stale-process-detection/README.md, sections The measurement and Confirming with the real binaries)
+
+## Human triage (2026-07-30, via drive-tasks)
+
+- **Wider sanitisation: RATIFIED.** `app_id()` folding every character outside `[A-Za-z0-9-]` (not only dots) and prefixing the element with `v` is accepted as the intended behaviour, for the recorded reason: the build-time version is not always a release triple, and an invalid application id fails silently by dropping uniqueness.
+- **Concurrent shared store: ACCEPTED, no follow-up.** Two different versions now being able to run at once against the SAME WebKit cookie/localStorage/cache store (storage is keyed on `prgname`, not the application id) is "acceptable and expected".
+- Still open, not ruled on: the missing production call-site pin (a shape test asserting `main()` passes `werust_core::version()` into `app_id`), and the doc comment's "valid by construction" wording vs the 255-character id limit.

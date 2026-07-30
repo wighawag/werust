@@ -21,3 +21,9 @@ is their durable home for triage — promote-to-task / keep / delete.
   (crates/werust-core/tests/release_plumbing_shape.rs, android_app_gradle_declares_an_env_gated_release_signing_config)
 - Signing correctness depends on the SECOND gradlew invocation seeing ANDROID_KEYSTORE_PATH, which was exported via GITHUB_ENV after the first invocation already started a Gradle daemon. Gradle normally applies the client environment per build on Linux, and the failure mode here is loud (test -f app-release.apk fails), but if the first real tagged run misbehaves, --no-daemon on the release build is the fix worth knowing about.
   (.github/workflows/release.yml: assembleDebug step, then Decode the release keystore writes GITHUB_ENV, then assembleRelease in a new shell)
+
+## Human triage (2026-07-30, via drive-tasks)
+
+- **versionCode/versionName: TASKED.** Filed as `work/tasks/backlog/android-apk-version-from-the-release-tag.md`, which derives both from the release tag off the SAME version source the Rust core uses, so the signed APK can actually be sequenced as an update. It also carries the debug-to-signed uninstall transition note for the Android README.
+- The human confirmed the keystore setup in `docs/spikes/android-apk-signing/README.md` is sufficient to follow as-is.
+- Still open, not ruled on: R8/minification off on the release build, the `app-debug.apk` vs `app-debug-unsigned.apk` naming asymmetry across the two paths, the missing pin on the line wiring `signingConfig` into the release build type, and the Gradle-daemon/`GITHUB_ENV` ordering caveat.

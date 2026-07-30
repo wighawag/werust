@@ -1721,12 +1721,21 @@ mod tests {
         // cannot leave this column pointing at a name nothing styles.
         let indicator_classes = TRUST_INDICATOR_CSS_CLASSES;
         let mut labels = Vec::new();
-        for (posture, glyph) in [
-            (TrustPosture::ContentVerified, "✓"),
-            (TrustPosture::NameViaTrustedRpc, "◈"),
-            (TrustPosture::MutableName, "◇"),
-            (TrustPosture::UnverifiedOrigin, "⚠"),
-        ] {
+        // EVERY posture, from the core seam's own exhaustive list, so a fifth
+        // posture cannot reach the Network tab untested: its column class must be
+        // one of the chrome's exported `trust-*` names (which the core's
+        // exhaustiveness test and the stylesheet guard above then cover), not a
+        // fifth vocabulary minted here.
+        for posture in TrustPosture::ALL {
+            // The glyph the chrome's own indicator shows for this posture. A total
+            // match, so a new posture does not compile until this drive states the
+            // glyph it expects.
+            let glyph = match posture {
+                TrustPosture::ContentVerified => "✓",
+                TrustPosture::NameViaTrustedRpc => "◈",
+                TrustPosture::MutableName => "◇",
+                TrustPosture::UnverifiedOrigin => "⚠",
+            };
             let label = network_trust_label(posture);
             // The label is the indicator's glyph plus the core's wire name, so an
             // ipfs:// row reads `✓ content-verified` and an https:// row

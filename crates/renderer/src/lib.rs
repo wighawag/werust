@@ -45,6 +45,20 @@ pub enum LoadState {
 }
 
 impl LoadState {
+    /// Every load state, in lifecycle order.
+    ///
+    /// The single source of truth for "which load states exist", so a caller that
+    /// must cover the whole axis (a chrome-rule drive, an exhaustiveness test)
+    /// iterates THIS instead of re-listing the variants in a literal that silently
+    /// goes stale. Kept complete by the const check below.
+    pub const ALL: [LoadState; 5] = [
+        LoadState::Idle,
+        LoadState::Started,
+        LoadState::Committed,
+        LoadState::Finished,
+        LoadState::Failed,
+    ];
+
     /// Whether a load is currently in flight (started or committed but not yet
     /// finished/failed/idle).
     #[must_use]
@@ -52,6 +66,38 @@ impl LoadState {
         matches!(self, LoadState::Started | LoadState::Committed)
     }
 }
+
+/// Keeps [`LoadState::ALL`] EXHAUSTIVE, at compile time.
+///
+/// `listed` is a total match — no wildcard arm — whose every arm hands back the
+/// state's OWN entry in the list, so a new [`LoadState`] variant cannot reach a
+/// build twice over: the match stops compiling until the variant is named here,
+/// and the arm the author then writes (`… => LoadState::ALL[5]`, the next slot)
+/// stops compiling too — `index out of bounds`, the deny-by-default
+/// `unconditional_panic` lint — unless the variant is ALSO added to `ALL`. The
+/// loop closes the last hole: it proves the list holds each state, once, at the
+/// slot its arm claims, so a reordered or duplicated entry is a compile error as
+/// well. (The `as u8` casts compare two fieldless-enum values in const context,
+/// where `==` is not available.)
+const _LOAD_STATE_ALL_IS_EVERY_STATE_IN_SLOT_ORDER: () = {
+    const fn listed(state: LoadState) -> LoadState {
+        match state {
+            LoadState::Idle => LoadState::ALL[0],
+            LoadState::Started => LoadState::ALL[1],
+            LoadState::Committed => LoadState::ALL[2],
+            LoadState::Finished => LoadState::ALL[3],
+            LoadState::Failed => LoadState::ALL[4],
+        }
+    }
+    let mut i = 0;
+    while i < LoadState::ALL.len() {
+        assert!(
+            listed(LoadState::ALL[i]) as u8 == LoadState::ALL[i] as u8,
+            "LoadState::ALL must hold every load state, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// The **trust posture** of the current load: was the page CONTENT-VERIFIED
 /// (fetched and hash-checked on the content-addressed path) or merely SERVED by
@@ -134,6 +180,24 @@ pub enum TrustPosture {
 }
 
 impl TrustPosture {
+    /// Every trust posture, in declaration order.
+    ///
+    /// The single source of truth for "which postures exist", so a caller that
+    /// must cover the whole axis iterates THIS instead of re-listing the variants
+    /// in a literal that silently goes stale. That is load-bearing for the chrome:
+    /// `werust-core` derives one CSS class per posture and exports the complete
+    /// class set for painters to toggle, and the test that proves the set covers
+    /// every posture drives it from here (task
+    /// `export-the-chrome-css-class-set-from-core`), so the Phase-2 name-verified
+    /// posture cannot land with a stale class set and a green suite. Kept complete
+    /// by the const check below.
+    pub const ALL: [TrustPosture; 4] = [
+        TrustPosture::UnverifiedOrigin,
+        TrustPosture::ContentVerified,
+        TrustPosture::NameViaTrustedRpc,
+        TrustPosture::MutableName,
+    ];
+
     /// Whether the current page was content-verified (its bytes hash-checked on
     /// the content-addressed path), as opposed to merely served.
     #[must_use]
@@ -188,6 +252,35 @@ impl TrustPosture {
         }
     }
 }
+
+/// Keeps [`TrustPosture::ALL`] EXHAUSTIVE at compile time, by exactly the
+/// construction [`LoadState::ALL`]'s check uses (see it for the full reasoning):
+/// the total `listed` match refuses to compile until a new posture is named here,
+/// and the arm it is named in (`… => TrustPosture::ALL[4]`) refuses to compile
+/// until the posture is in `ALL` as well.
+///
+/// This is the tooth the chrome's CSS-class set hangs from: the exhaustiveness
+/// test drives `TrustPosture::ALL`, so the Phase-2 name-verified posture cannot
+/// arrive with a stale exported class set and a green suite (task
+/// `export-the-chrome-css-class-set-from-core`).
+const _TRUST_POSTURE_ALL_IS_EVERY_POSTURE_IN_SLOT_ORDER: () = {
+    const fn listed(posture: TrustPosture) -> TrustPosture {
+        match posture {
+            TrustPosture::UnverifiedOrigin => TrustPosture::ALL[0],
+            TrustPosture::ContentVerified => TrustPosture::ALL[1],
+            TrustPosture::NameViaTrustedRpc => TrustPosture::ALL[2],
+            TrustPosture::MutableName => TrustPosture::ALL[3],
+        }
+    }
+    let mut i = 0;
+    while i < TrustPosture::ALL.len() {
+        assert!(
+            listed(TrustPosture::ALL[i]) as u8 == TrustPosture::ALL[i] as u8,
+            "TrustPosture::ALL must hold every posture, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// A load-lifecycle event emitted by a backend as a load progresses.
 ///

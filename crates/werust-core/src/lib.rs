@@ -345,6 +345,20 @@ pub enum LoadStep {
 }
 
 impl LoadStep {
+    /// Every pipeline step, in the order a full load walks them.
+    ///
+    /// The single source of truth for "which steps exist", so a caller that must
+    /// cover the whole axis (the chrome-rule drives in the tests below) iterates
+    /// THIS instead of re-listing the variants in a literal that silently goes
+    /// stale. Kept complete by the const check below.
+    pub const ALL: [LoadStep; 5] = [
+        LoadStep::Idle,
+        LoadStep::ResolvingName,
+        LoadStep::FetchingRecord,
+        LoadStep::FetchingContent,
+        LoadStep::Rendering,
+    ];
+
     /// A short, human-readable hint for this step, for the loading indicator's
     /// status text ("resolving name", "fetching content", …). Empty for
     /// [`Idle`](LoadStep::Idle) (no load to describe), so a caller can append it
@@ -374,6 +388,38 @@ impl LoadStep {
         }
     }
 }
+
+/// Keeps [`LoadStep::ALL`] EXHAUSTIVE, at compile time.
+///
+/// `listed` is a total match — no wildcard arm — whose every arm hands back the
+/// step's OWN entry in the list, so a new [`LoadStep`] variant cannot reach a
+/// build twice over: the match stops compiling until the variant is named here,
+/// and the arm the author then writes (`… => LoadStep::ALL[5]`, the next slot)
+/// stops compiling too — `index out of bounds`, the deny-by-default
+/// `unconditional_panic` lint — unless the variant is ALSO added to `ALL`. The
+/// loop closes the last hole: it proves the list holds each step, once, at the
+/// slot its arm claims, so a reordered or duplicated entry is a compile error as
+/// well. (The `as u8` casts compare two fieldless-enum values in const context,
+/// where `==` is not available.)
+const _LOAD_STEP_ALL_IS_EVERY_STEP_IN_SLOT_ORDER: () = {
+    const fn listed(step: LoadStep) -> LoadStep {
+        match step {
+            LoadStep::Idle => LoadStep::ALL[0],
+            LoadStep::ResolvingName => LoadStep::ALL[1],
+            LoadStep::FetchingRecord => LoadStep::ALL[2],
+            LoadStep::FetchingContent => LoadStep::ALL[3],
+            LoadStep::Rendering => LoadStep::ALL[4],
+        }
+    }
+    let mut i = 0;
+    while i < LoadStep::ALL.len() {
+        assert!(
+            listed(LoadStep::ALL[i]) as u8 == LoadStep::ALL[i] as u8,
+            "LoadStep::ALL must hold every step, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// The kind of a surfaced load failure: is it a TRANSIENT/timeout failure the
 /// user can simply RETRY, or a HARD failure (unsupported protocol, verification
@@ -411,6 +457,18 @@ pub enum FailureKind {
 }
 
 impl FailureKind {
+    /// Every failure severity, loudest last.
+    ///
+    /// The single source of truth for "which severities exist", so a caller that
+    /// must cover the whole axis iterates THIS instead of re-listing the variants
+    /// in a literal that silently goes stale. Load-bearing for the chrome: the
+    /// error banner derives one CSS class per severity and this crate exports the
+    /// complete class set for painters to toggle, so the test that proves the set
+    /// covers every severity drives it from here (task
+    /// `export-the-chrome-css-class-set-from-core`). Kept complete by the const
+    /// check below.
+    pub const ALL: [FailureKind; 2] = [FailureKind::Transient, FailureKind::Hard];
+
     /// Classify a surfaced failure `reason` as [`Transient`](FailureKind::Transient)
     /// (retryable) or [`Hard`](FailureKind::Hard).
     ///
@@ -467,6 +525,30 @@ impl FailureKind {
         }
     }
 }
+
+/// Keeps [`FailureKind::ALL`] EXHAUSTIVE at compile time, by exactly the
+/// construction [`LoadStep::ALL`]'s check uses (see it for the full reasoning):
+/// the total `listed` match refuses to compile until a new severity is named here,
+/// and the arm it is named in (`… => FailureKind::ALL[2]`) refuses to compile
+/// until the severity is in `ALL` as well — which is what keeps the error
+/// banner's exported CSS-class set honest (task
+/// `export-the-chrome-css-class-set-from-core`).
+const _FAILURE_KIND_ALL_IS_EVERY_KIND_IN_SLOT_ORDER: () = {
+    const fn listed(kind: FailureKind) -> FailureKind {
+        match kind {
+            FailureKind::Transient => FailureKind::ALL[0],
+            FailureKind::Hard => FailureKind::ALL[1],
+        }
+    }
+    let mut i = 0;
+    while i < FailureKind::ALL.len() {
+        assert!(
+            listed(FailureKind::ALL[i]) as u8 == FailureKind::ALL[i] as u8,
+            "FailureKind::ALL must hold every failure kind, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// The chrome state the shell reflects: everything the window must draw ABOUT the
 /// current page, distinct from the page content itself.
@@ -918,8 +1000,11 @@ pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
 ///
 /// Decisions recorded at
 /// `docs/spikes/export-the-chrome-css-class-set-from-core/DECISIONS.md`: why a
-/// `pub const` slice rather than an enum, and why the set is grouped by family
-/// rather than exported flat.
+/// `pub const` slice rather than an enum, why the set is grouped by family rather
+/// than exported flat, and how the exhaustiveness test's drive is made exhaustive
+/// BY CONSTRUCTION (it iterates [`TrustPosture::ALL`] / [`FailureKind::ALL`],
+/// which a compile-time check keeps complete, so a fifth posture cannot arrive
+/// with a stale set and a green suite).
 ///
 /// LAYERING: these are stable state IDENTIFIERS, not styling. The stylesheet
 /// that gives each name a colour stays in the edge that has a stylesheet (the
@@ -5467,44 +5552,59 @@ mod tests {
         );
     }
 
+    /// One failure REASON per [`FailureKind`], plus `None` (nothing failed): the
+    /// failure-severity axis of [`every_chrome_state_shape`].
+    ///
+    /// [`ChromeState`] carries the reason as free TEXT and derives the severity
+    /// from it ([`FailureKind::classify`]), so driving the severity axis needs a
+    /// sample reason per kind. Both halves are pinned: the sample list is a match
+    /// over [`FailureKind`] with no wildcard arm (a third severity does not
+    /// COMPILE until it names its sample here) and each sample is asserted to
+    /// really classify as its own kind (so a sample cannot rot into a duplicate of
+    /// another severity and quietly stop driving one).
+    fn every_failure_reason() -> Vec<Option<&'static str>> {
+        let mut reasons: Vec<Option<&'static str>> = vec![None];
+        for kind in FailureKind::ALL {
+            let reason = match kind {
+                FailureKind::Transient => "transport error: timeout: global",
+                FailureKind::Hard => "points to Swarm, not supported",
+            };
+            assert_eq!(
+                FailureKind::classify(reason),
+                kind,
+                "`{reason}` is this drive's sample for {kind:?} but classifies as something else"
+            );
+            reasons.push(Some(reason));
+        }
+        reasons
+    }
+
     /// Every SHAPE of [`ChromeState`] a chrome rule can branch on: the cartesian
     /// product of all its axes (load state x pipeline step x trust posture x
     /// failure severity x the invalid-entry axis x the history flags x an
     /// empty/non-empty URL).
     ///
-    /// Exhaustive by construction, so a rule that starts branching on an axis it
-    /// does not read TODAY (the next posture, the next failure severity) is still
-    /// driven by the callers below rather than silently escaping them. A few
-    /// thousand plain values, so it stays a fast unit test.
+    /// Every ENUM axis is driven EXHAUSTIVELY BY CONSTRUCTION — from
+    /// [`LoadState::ALL`], [`LoadStep::ALL`], [`TrustPosture::ALL`] and (through
+    /// [`every_failure_reason`]) [`FailureKind::ALL`], each of which a compile-time
+    /// check keeps complete — so adding a variant to any of them cannot compile
+    /// until the new variant joins its list, and it is then driven through the
+    /// callers below rather than silently escaping them. That is the tooth that
+    /// makes the CSS-class-set test bite on the Phase-2 name-verified posture.
+    ///
+    /// The remaining axes are NOT enum-shaped and are driven over representative
+    /// values instead: an empty vs non-empty URL, an absent vs present
+    /// invalid-entry text, and both history flags. So a rule that started
+    /// branching on the CONTENT of one of those strings (a particular scheme, say)
+    /// could still escape this drive; a rule that branches on a state MACHINE
+    /// cannot. A few thousand plain values, so it stays a fast unit test.
     fn every_chrome_state_shape() -> Vec<ChromeState> {
         let mut shapes = Vec::new();
-        for load_state in [
-            LoadState::Idle,
-            LoadState::Started,
-            LoadState::Committed,
-            LoadState::Finished,
-            LoadState::Failed,
-        ] {
-            for load_step in [
-                LoadStep::Idle,
-                LoadStep::ResolvingName,
-                LoadStep::FetchingRecord,
-                LoadStep::FetchingContent,
-                LoadStep::Rendering,
-            ] {
-                for posture in [
-                    TrustPosture::UnverifiedOrigin,
-                    TrustPosture::ContentVerified,
-                    TrustPosture::NameViaTrustedRpc,
-                    TrustPosture::MutableName,
-                ] {
-                    for last_error in [
-                        None,
-                        // A TRANSIENT (retryable) failure and a HARD one: the two
-                        // severities the banner class distinguishes.
-                        Some("transport error: timeout: global"),
-                        Some("points to Swarm, not supported"),
-                    ] {
+        let failure_reasons = every_failure_reason();
+        for load_state in LoadState::ALL {
+            for load_step in LoadStep::ALL {
+                for posture in TrustPosture::ALL {
+                    for last_error in failure_reasons.iter().copied() {
                         for invalid_entry in [None, Some("not a url")] {
                             for can_go_back in [false, true] {
                                 for can_go_forward in [false, true] {
@@ -5544,8 +5644,12 @@ mod tests {
         //
         // The drive is the CARTESIAN PRODUCT of every ChromeState axis (see
         // `every_chrome_state_shape`), not just the axes today's rules happen to
-        // read: a new class introduced on ANY axis (a posture, a load state, a
-        // failure severity, the invalid-entry axis, …) must still land in the set.
+        // read, and every ENUM axis is exhaustive BY CONSTRUCTION (`LoadState::ALL`,
+        // `LoadStep::ALL`, `TrustPosture::ALL`, `FailureKind::ALL`, each kept
+        // complete by a compile-time check). So a FIFTH trust posture cannot be
+        // added without compiling against this drive: the new posture is driven
+        // here, its class comes back, and this test reds unless the exported set
+        // grew with it.
         let mut produced_trust = std::collections::BTreeSet::new();
         let mut produced_banner = std::collections::BTreeSet::new();
         for state in every_chrome_state_shape() {

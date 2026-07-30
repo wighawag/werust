@@ -1,0 +1,3 @@
+# `fetcher` builds with two `generic-array` deprecation warnings
+
+2026-07-30 — While running the `verify` gate for `desktop-chrome-presentation-into-core`, every `cargo build`/`clippy`/`test` prints two warnings from `crates/fetcher/src/lib.rs:496` and `:530`: `use of deprecated method sha2::digest::generic_array::GenericArray::<T, N>::as_slice: please upgrade to generic-array 1.x`. Pre-existing and unrelated to that task (the hash-verify boundary works); captured because the noise sits permanently in the gate output and will become a hard break whenever the `sha2`/`digest` lineage moves to `generic-array 1.x`.

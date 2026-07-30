@@ -225,7 +225,8 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # While a load is in flight the indicator is a NEUTRAL loading state on every
 # platform (task chrome-loading-state-resets-trust-indicator): each chrome applies
 # the SAME loading-wins rule over the posture from the SAME `loading` fact —
-# desktop `trust_indicator`/`_detail`/`_css_class` in crates/werust/src/main.rs,
+# desktop `trust_indicator`/`_detail`/`_css_class` in werust-core (painted by
+# crates/werust/src/main.rs),
 # and the mobile `Chrome.trustIndicator()` (Kotlin WerustCore.kt, Swift
 # WerustCore.swift) reading the `loading` field of the chrome JSON — so the prior
 # page's trust posture never lingers while a new, possibly differently-trusted
@@ -264,8 +265,8 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 # The reason is the SAME `last_error` the core surfaces (the resolver/decoder
 # taxonomy, e.g. "IPNS record did not verify: …"); each chrome raises a
 # high-contrast banner from the SAME fact: desktop `error_banner_visible` /
-# `error_banner_text` in crates/werust/src/main.rs (a red banner under the
-# toolbar), and the mobile `Chrome.errorBannerVisible()` / `errorBanner()`
+# `error_banner_text` in werust-core (painted by crates/werust/src/main.rs as a
+# red banner under the toolbar), and the mobile `Chrome.errorBannerVisible()` / `errorBanner()`
 # (Kotlin WerustCore.kt + a banner in BrowserActivity.kt; Swift WerustCore.swift +
 # a banner in WKWebViewShellController.swift) reading the chrome JSON `error`
 # field. The subtle footer status remains too, but a failure is now unmissable.
@@ -280,8 +281,8 @@ description = "Surface a LIVE loading-progress indicator tied to the real resolu
 # The step is the core's `ChromeState::load_step` (`werust-core`), driven by the
 # ACTUAL lifecycle: the ENS/IPNS resolution stages in `BrowserShell::navigate_ens_name`
 # then the backend's Started/Committed load state (`refresh_chrome`). Every edge
-# names the SAME step from the SAME fact: desktop `status_line` in
-# crates/werust/src/main.rs ("loading… — <step>"), and the mobile
+# names the SAME step from the SAME fact: desktop `status_line` in werust-core,
+# painted by crates/werust/src/main.rs ("loading… — <step>"), and the mobile
 # `Chrome.statusLine()` reading the chrome JSON `loadStep` field (Kotlin
 # WerustCore.kt, Swift WerustCore.swift), exactly as the trust indicator reads the
 # shared `loading`/`trustPosture` facts. Loading stays ORTHOGONAL to the trust
@@ -302,8 +303,9 @@ description = "Route a scheme-less URL-bar entry consistently: a bare `.eth` -> 
 # `ens-eth-resolution` is. The INVALID surface (a small "invalid URL" badge + the
 # URL-bar text rendered invalid/red-underlined) is painted per edge from that ONE
 # chrome fact, exactly as the trust indicator / error banner are: desktop
-# `invalid_entry_badge_visible`/`_text` + the `invalid-url-badge`/`url-invalid`
-# CSS in crates/werust/src/main.rs; the mobile edges carry the `invalidEntry`
+# `invalid_entry_badge_visible`/`_text` in werust-core + the
+# `invalid-url-badge`/`url-invalid` CSS in crates/werust/src/main.rs; the mobile
+# edges carry the `invalidEntry`
 # field in the chrome JSON (both `ffi_json` twins) and paint the badge +
 # red-underline from it — Android `Chrome.invalidEntryVisible()`/`invalidEntryBadge()`
 # (WerustCore.kt) + the badge/underline in BrowserActivity.kt, iOS
@@ -365,8 +367,9 @@ description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an 
 # timeout/transport reason is transient; unsupported/verification/malformed is
 # hard) — the hard reason is kept verbatim, never re-meaned, so `prominent-load-failure`
 # is preserved. Every edge shows the SAME distinction from the SAME fact: desktop
-# `error_banner_text` / `error_banner_css_class` in crates/werust/src/main.rs (a
-# softer amber "timed out — reload to retry" vs the red "failed to load"), and the
+# `error_banner_text` / `error_banner_css_class` in werust-core (painted by
+# crates/werust/src/main.rs: a softer amber "timed out — reload to retry" vs the
+# red "failed to load"), and the
 # mobile `Chrome.errorBanner()` / `errorIsRetryable()` reading the chrome JSON
 # `retryable` field (Kotlin WerustCore.kt, Swift WerustCore.swift). Error stays
 # ORTHOGONAL to the trust posture. Task clearer-loading-and-error-indicator.

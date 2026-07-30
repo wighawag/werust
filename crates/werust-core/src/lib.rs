@@ -598,6 +598,275 @@ impl ChromeState {
     }
 }
 
+// -- The chrome PRESENTATION rules -----------------------------------------
+//
+// The display rules the window paints FROM a [`ChromeState`]: the status line,
+// the trust indicator (+ its detail and CSS class), the error banner, the
+// invalid-entry badge, and the URL bar's load progress. They are pure functions
+// of the chrome facts above, so they live HERE rather than at an edge (task
+// `desktop-chrome-presentation-into-core`, `docs/adr/0011`): they were written
+// in the GTK binary, and every new window (Win32, AppKit) would otherwise mint
+// another copy of one rule set — the mistake the hand-written Kotlin and Swift
+// twins already made. An edge is a PAINTER: it calls these and sets widget
+// properties.
+//
+// The `trust-*` / `error-banner*` strings these return are CSS class NAMES only
+// by convention — plain stable identifiers for "which of the N states is this",
+// which is a presentation fact, not a toolkit call. The stylesheet that gives
+// each one a colour stays in the edge that has a stylesheet.
+//
+// The Kotlin (`WerustCore.kt`) and Swift (`WerustCore.swift`) twins are NOT
+// collapsed onto these yet: that is the follow-up task
+// `mobile-chrome-presentation-from-one-derivation`, whose open question is
+// whether a non-Rust edge consumes this derivation over the FFI or through an
+// extended chrome JSON.
+
+/// Whether there is a load to indicate at all: a backend load in flight
+/// ([`ChromeState::is_loading`]) **or** a pinned pre-content resolution step (a
+/// non-[`Idle`](LoadStep::Idle) step). The second half matters: while the shell
+/// resolves an ENS/IPNS name the backend has not started its load yet, so
+/// `is_loading()` is false during EXACTLY the long `ronan.eth` freeze window the
+/// old banner sat out. `load_step` is `Idle` on every settled/failed chrome, so
+/// this can never linger after a load ends.
+///
+/// A passive view update driven by the existing chrome-refresh pump (NOT a new
+/// timer / poll / tight loop), so the Android ANR guard is not regressed. A pure
+/// function of [`ChromeState`] so it is testable without a display; the mobile
+/// shells apply the SAME rule from the chrome JSON `loading` + `loadStep` facts
+/// (task `loading-progress-in-the-url-bar-not-a-banner`).
+///
+/// This is the IN-FLIGHT counterpart of [`error_banner_visible`]: the error
+/// banner appears on a FAILED load, the URL-bar progress appears while a load is
+/// STILL RUNNING. The two are mutually exclusive in practice (a load is either in
+/// flight or has settled as finished/failed/idle), and unlike the two banners
+/// they never compete for a slot at all: progress is painted INSIDE the URL bar.
+#[must_use]
+pub fn load_progress_visible(state: &ChromeState) -> bool {
+    state.is_loading() || state.load_step() != LoadStep::Idle
+}
+
+/// The URL bar's progress fraction for the current load: `0.0` on a settled
+/// chrome (painting nothing at all), else a value that ADVANCES with the real
+/// pipeline phase so a slow load reads as working rather than frozen — the
+/// field-test v0.2.7 finding, now answered WITHOUT displacing the page.
+///
+/// The fractions are deliberately monotonic and never reach `1.0`: the phases are
+/// milestones on the actual lifecycle, not a byte-accurate measurement, so the
+/// bar must not claim a load is done while it is still running. A load in flight
+/// with no phase yet still shows a small sliver, so "something started" is
+/// visible immediately. Pure, for the same reason as [`status_line`].
+#[must_use]
+pub fn load_progress_fraction(state: &ChromeState) -> f64 {
+    if !load_progress_visible(state) {
+        return 0.0;
+    }
+    match state.load_step() {
+        LoadStep::Idle => 0.1,
+        LoadStep::ResolvingName => 0.25,
+        LoadStep::FetchingRecord => 0.45,
+        LoadStep::FetchingContent => 0.7,
+        LoadStep::Rendering => 0.9,
+    }
+}
+
+/// The phase NAME behind the current progress, for the URL bar's tooltip: the
+/// existing [`LoadStep`] hint vocabulary verbatim ("resolving name", "fetching
+/// record", …), so the URL bar, the footer status line and the debug Network tab
+/// cannot disagree about which phase a slow load is stuck in. A generic
+/// "loading" covers a load in flight with no phase known yet, so it never lies
+/// about a frozen phase; empty on a settled chrome (there is no phase to name).
+/// Pure, for the same reason as [`status_line`].
+#[must_use]
+pub fn load_progress_hint(state: &ChromeState) -> &'static str {
+    if !load_progress_visible(state) {
+        return "";
+    }
+    match state.load_step() {
+        LoadStep::Idle => "loading",
+        step => step.hint(),
+    }
+}
+
+/// The one-line status shown in the chrome: a surfaced failure wins, otherwise a
+/// loading indicator that names the REAL pipeline STEP (resolving name / fetching
+/// record / fetching content / rendering) so a slow load reads as "working",
+/// otherwise idle. Kept pure so it is trivially correct and reusable.
+///
+/// The step hint is the core's [`ChromeState::load_step`] (driven by the actual
+/// lifecycle), so "loading…" gains a live "— <step>" tail while a load is in
+/// flight (task `clearer-loading-and-error-indicator`).
+#[must_use]
+pub fn status_line(state: &ChromeState) -> String {
+    if let Some(reason) = &state.last_error {
+        format!("failed: {reason}")
+    } else if state.is_loading() {
+        let hint = state.load_step().hint();
+        if hint.is_empty() {
+            "loading…".to_string()
+        } else {
+            format!("loading… — {hint}")
+        }
+    } else {
+        "idle".to_string()
+    }
+}
+
+/// Whether the PROMINENT in-view error banner should be shown: exactly when the
+/// last load failed ([`ChromeState::last_error`] is set).
+///
+/// The whole point of fail-closed is that the user UNDERSTANDS why nothing
+/// rendered (`docs/adr/0001`: the honesty stance). The subtle one-line
+/// [`status_line`] footer was "not easily seen" (the human missed a real
+/// `ronan.eth` IPNS failure), so a failed load ALSO raises this high-contrast
+/// banner across the top of the view — an error state the user cannot miss —
+/// while a loading/idle chrome hides it. A pure function of [`ChromeState`] so it
+/// is testable without a display; the mobile shells apply the same rule from the
+/// chrome JSON.
+#[must_use]
+pub fn error_banner_visible(state: &ChromeState) -> bool {
+    state.last_error.is_some()
+}
+
+/// The PROMINENT error-banner text for a failed load: a protocol-named,
+/// accurate reason drawn straight from [`ChromeState::last_error`] (the decoder /
+/// resolver taxonomy — e.g. "IPNS record did not verify: …", "points to Swarm,
+/// not supported"), never a generic "failed". Empty when there is no failure (the
+/// banner is hidden then). Pure, for the same reason as [`status_line`].
+///
+/// The reason text is the SAME `last_error` the core surfaces, so the banner and
+/// the footer never disagree; it is only shown far more prominently.
+///
+/// A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a HARD
+/// failure (task `clearer-loading-and-error-indicator`): a transient failure
+/// reads as a softer "timed out" with an explicit "reload to retry" affordance
+/// (the Reload button IS the retry — a failed ENS load re-resolves), while a hard
+/// failure keeps the prominent "failed to load" wording with its protocol-named
+/// reason. The distinction is the core's [`ChromeState::failure_is_retryable`]
+/// (a pure classification of the reason), so the two never disagree with the
+/// footer.
+#[must_use]
+pub fn error_banner_text(state: &ChromeState) -> String {
+    match &state.last_error {
+        Some(reason) if state.failure_is_retryable() => {
+            format!("⏳ This page timed out — reload to retry: {reason}")
+        }
+        Some(reason) => format!("⚠ This page failed to load: {reason}"),
+        None => String::new(),
+    }
+}
+
+/// The CSS class for the error banner, distinguishing a TRANSIENT/timeout failure
+/// (a softer, retryable amber banner) from a HARD failure (the prominent red
+/// banner). A pure function of [`ChromeState`] so the banner styling is testable
+/// without a display; each edge's painter toggles the two classes exactly
+/// like the trust-indicator classes.
+#[must_use]
+pub fn error_banner_css_class(state: &ChromeState) -> &'static str {
+    if state.failure_is_retryable() {
+        "error-banner-transient"
+    } else {
+        "error-banner"
+    }
+}
+
+/// Whether the small "invalid URL" BADGE should be shown: exactly when the last
+/// URL-bar entry was INVALID (a scheme-less garbage entry that did not navigate).
+///
+/// This is the field-finding-D surface (finding D,
+/// `work/notes/observations/field-test-v0.2.3-back-nav-anr-urlbar-noprotocol-2026-07-23.md`):
+/// a garbage entry does not navigate; instead of silently resetting the bar, the
+/// chrome shows a small badge and renders the URL-bar text as invalid (red
+/// underline), keeping the typed text for the user to fix. A pure read of the
+/// orthogonal [`ChromeState::has_invalid_entry`] axis — distinct from a load
+/// failure ([`error_banner_visible`]) — so it is testable without a display and
+/// the mobile shells apply the SAME rule from the chrome JSON.
+#[must_use]
+pub fn invalid_entry_badge_visible(state: &ChromeState) -> bool {
+    state.has_invalid_entry()
+}
+
+/// The small "invalid URL" badge text for an invalid entry, empty otherwise (the
+/// badge is hidden then). Pure, for the same reason as [`invalid_entry_badge_visible`].
+#[must_use]
+pub fn invalid_entry_badge_text(state: &ChromeState) -> &'static str {
+    if state.has_invalid_entry() {
+        "⛔ invalid URL"
+    } else {
+        ""
+    }
+}
+
+/// The short label the chrome's trust indicator shows: a distinct, legible badge
+/// for a content-verified load vs a served-by-an-unverified-origin load
+/// (`docs/adr/0001`: the trust posture is a product surface, not a silent
+/// internal). A pure function of [`ChromeState`] so it is trivially correct and
+/// testable without a display; the label text carries a shield vs a plain-globe
+/// glyph so the states read at a glance even before colour.
+///
+/// The name-via-trusted-RPC state (an ENS-resolved Phase-1 page: bytes verified,
+/// but the name->CID mapping came from a trusted RPC) is a DISTINCT middle badge
+/// that is deliberately NOT labelled "verified" — Phase 1 makes no
+/// name-verification claim.
+///
+/// While a load is IN FLIGHT (`is_loading()`) the indicator is a NEUTRAL loading
+/// state that WINS over the posture, making NO trust claim at all — the
+/// trust-honesty fix (`chrome-loading-state-resets-trust-indicator`): on
+/// navigation to a possibly differently-trusted page, the indicator must not keep
+/// asserting the previous page's (or a not-yet-proven) trust while the new page
+/// loads. The real posture is revealed only once the load SETTLES
+/// (finished/failed/idle). This loading-wins precedence lives at the same display
+/// layer as the two-axis posture precedence, and is applied identically on the
+/// mobile shells (they consult the same `loading` fact from the chrome JSON).
+#[must_use]
+pub fn trust_indicator(state: &ChromeState) -> &'static str {
+    if state.is_loading() {
+        "⋯ loading…"
+    } else if state.is_content_verified() {
+        "✓ verified"
+    } else if state.is_name_via_trusted_rpc() {
+        "◈ name via trusted RPC"
+    } else if state.is_mutable_name() {
+        "◇ content verified, mutable name"
+    } else {
+        "⚠ unverified origin"
+    }
+}
+
+/// The longer explanation shown as the trust indicator's tooltip, so the badge is
+/// self-explaining on hover. Pure, for the same reason as [`trust_indicator`].
+#[must_use]
+pub fn trust_indicator_detail(state: &ChromeState) -> &'static str {
+    if state.is_loading() {
+        "werust is loading this page and is not yet asserting a trust level for it: the trust indicator shows the real posture only once the load settles."
+    } else if state.is_content_verified() {
+        "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
+    } else if state.is_name_via_trusted_rpc() {
+        "This page's content was hash-verified, but its name was resolved over a TRUSTED RPC (not a light client), which could misdirect the name to different content. werust makes no name-verification claim here."
+    } else if state.is_mutable_name() {
+        "This page's content was hash-verified, but its name is MUTABLE: the controller (an IPNS key holder, or an ENS name owner) can repoint it to different content at any time. werust makes no immutability claim here."
+    } else {
+        "This page was served by an origin werust does not trust by default; its content was not hash-verified."
+    }
+}
+
+/// The CSS class for the current posture's badge — exactly one of the three
+/// trust classes. A pure function of [`ChromeState`] so the badge styling is
+/// testable without a display.
+#[must_use]
+pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
+    if state.is_loading() {
+        "trust-loading"
+    } else if state.is_content_verified() {
+        "trust-verified"
+    } else if state.is_name_via_trusted_rpc() {
+        "trust-name-trusted-rpc"
+    } else if state.is_mutable_name() {
+        "trust-mutable-name"
+    } else {
+        "trust-unverified"
+    }
+}
+
 /// The browser shell: the seam-driven logic behind the window.
 ///
 /// Holds the rendering backend as a `dyn Renderer` (the seam) and the derived
@@ -4977,6 +5246,529 @@ mod tests {
             shell.chrome(),
             &before,
             "capturing entries changes nothing about the page's chrome"
+        );
+    }
+
+    // -- The chrome PRESENTATION rules (moved out of the GTK edge) -----------
+    //
+    // These were unit-tested in `crates/werust/src/main.rs` while the derivation
+    // lived there; they moved HERE with the functions (task
+    // `desktop-chrome-presentation-into-core`), unchanged in substance, so the
+    // rules are proven in the toolkit-free core with no display.
+    #[test]
+    fn status_line_names_the_live_pipeline_step_while_loading() {
+        // Acceptance (loading progress): while a load is in flight the status line
+        // names the REAL pipeline step (resolving name / fetching content /
+        // rendering) so a slow load reads as working, not frozen. A settled/idle
+        // load shows no step, and a failure still wins.
+        let fetching = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&fetching), "loading… — fetching content");
+
+        let resolving = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::ResolvingName,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&resolving), "loading… — resolving name");
+
+        let rendering = ChromeState {
+            load_state: LoadState::Committed,
+            load_step: LoadStep::Rendering,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&rendering), "loading… — rendering");
+
+        // A loading state with no known step (Idle step) falls back to plain
+        // "loading…" rather than a dangling dash.
+        let loading_no_step = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::Idle,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&loading_no_step), "loading…");
+
+        // A settled load shows idle; a failure still wins over any step.
+        assert_eq!(status_line(&ChromeState::default()), "idle");
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(
+            status_line(&failed),
+            "failed: points to Swarm, not supported"
+        );
+    }
+
+    #[test]
+    fn load_progress_is_a_url_bar_fraction_that_never_displaces_the_page() {
+        // Acceptance (task `loading-progress-in-the-url-bar-not-a-banner`): the
+        // in-flight load indicator is a PROGRESS FRACTION painted INSIDE the URL
+        // bar, not a banner that takes height from the page view. The old banner
+        // was a real child above the view, so every navigation resized the page
+        // twice (banner in, banner out) and the content jumped under the pointer.
+        // A fraction changes NO widget geometry: `0.0` paints nothing, so an idle
+        // chrome and a loading chrome are exactly the same size.
+        //
+        // Pure functions of `ChromeState` (driven by the existing chrome-refresh
+        // pump, no new timer / poll / tight loop), so they are testable without a
+        // display; the mobile shells apply the SAME rules from the SAME chrome
+        // facts.
+
+        // Nothing in flight (idle / finished / failed): no progress, no hint.
+        for settled in [
+            ChromeState::default(),
+            ChromeState {
+                load_state: LoadState::Finished,
+                ..ChromeState::default()
+            },
+            ChromeState {
+                load_state: LoadState::Failed,
+                last_error: Some("name not resolved".into()),
+                ..ChromeState::default()
+            },
+        ] {
+            assert!(!load_progress_visible(&settled));
+            assert_eq!(
+                load_progress_fraction(&settled),
+                0.0,
+                "a settled chrome paints NO progress in the URL bar"
+            );
+            assert_eq!(load_progress_hint(&settled), "");
+        }
+
+        // In flight: a visible fraction that ADVANCES with the real pipeline
+        // phase, so a slow load reads as working rather than frozen. The hint is
+        // the existing `LoadStep` vocabulary (the same words the status line and
+        // the debug Network tab speak), so no surface can disagree.
+        let phases = [
+            (LoadState::Started, LoadStep::Idle, "loading"),
+            (
+                LoadState::Started,
+                LoadStep::ResolvingName,
+                "resolving name",
+            ),
+            (
+                LoadState::Started,
+                LoadStep::FetchingRecord,
+                "fetching record",
+            ),
+            (
+                LoadState::Started,
+                LoadStep::FetchingContent,
+                "fetching content",
+            ),
+            (LoadState::Committed, LoadStep::Rendering, "rendering"),
+        ];
+        let mut previous = 0.0;
+        for (load_state, load_step, hint) in phases {
+            let state = ChromeState {
+                load_state,
+                load_step,
+                ..ChromeState::default()
+            };
+            assert!(load_progress_visible(&state), "{load_step:?} is in flight");
+            let fraction = load_progress_fraction(&state);
+            assert!(
+                fraction > previous,
+                "{load_step:?} advances the bar: {fraction} must exceed {previous}"
+            );
+            assert!(
+                fraction < 1.0,
+                "{load_step:?} is not done, so the bar is never full: {fraction}"
+            );
+            assert_eq!(load_progress_hint(&state), hint);
+            previous = fraction;
+        }
+
+        // The PRE-CONTENT resolution window is covered too: while the shell is
+        // resolving a name the backend has not started a load yet (`is_loading()`
+        // is false, the step is pinned), which is EXACTLY the long `ronan.eth`
+        // freeze the old banner missed. A pinned step means work is in flight, so
+        // the URL bar shows progress (the named follow-up of the banner task).
+        let resolving_before_handoff = ChromeState {
+            load_state: LoadState::Idle,
+            load_step: LoadStep::ResolvingName,
+            ..ChromeState::default()
+        };
+        assert!(!resolving_before_handoff.is_loading());
+        assert!(
+            load_progress_visible(&resolving_before_handoff),
+            "the name-resolution window shows progress even before the backend load starts"
+        );
+        assert!(load_progress_fraction(&resolving_before_handoff) > 0.0);
+        assert_eq!(
+            load_progress_hint(&resolving_before_handoff),
+            "resolving name"
+        );
+    }
+
+    #[test]
+    fn a_transient_timeout_banner_is_distinct_and_retryable_while_a_hard_fail_keeps_its_reason() {
+        // Acceptance: a transient/timeout failure is surfaced DISTINCTLY from a
+        // hard failure, with an obvious retry affordance; a hard failure keeps its
+        // prominent protocol-named reason. Both banners carry the honest reason
+        // verbatim; only the framing + the CSS class differ.
+        let transient = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("transport error: timeout: global".into()),
+            ..ChromeState::default()
+        };
+        assert!(error_banner_visible(&transient));
+        let text = error_banner_text(&transient);
+        assert!(
+            text.to_lowercase().contains("retry"),
+            "a transient failure offers a retry affordance: {text}"
+        );
+        assert!(
+            text.contains("transport error: timeout: global"),
+            "the honest reason is kept: {text}"
+        );
+        assert_eq!(error_banner_css_class(&transient), "error-banner-transient");
+
+        // A hard failure: the prominent "failed to load" wording, its
+        // protocol-named reason, and NO retry affordance.
+        let hard = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        let hard_text = error_banner_text(&hard);
+        assert!(
+            hard_text.contains("failed to load"),
+            "a hard failure reads as a load failure: {hard_text}"
+        );
+        assert!(hard_text.contains("points to Swarm, not supported"));
+        assert!(
+            !hard_text.to_lowercase().contains("retry"),
+            "a hard failure offers no retry: {hard_text}"
+        );
+        assert_eq!(error_banner_css_class(&hard), "error-banner");
+
+        // A verification failure is HARD even though it is a failure of a fetched
+        // record: retrying will not make it verify.
+        let verify_fail = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("IPNS record did not verify: bad signature".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(error_banner_css_class(&verify_fail), "error-banner");
+        assert!(!error_banner_text(&verify_fail)
+            .to_lowercase()
+            .contains("retry"));
+    }
+
+    #[test]
+    fn status_line_prefers_a_failure_then_loading_then_idle() {
+        // The chrome's status line is a pure function of ChromeState: a surfaced
+        // failure wins, otherwise loading vs idle follows the load state.
+        let idle = ChromeState::default();
+        assert_eq!(status_line(&idle), "idle");
+
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&loading), "loading…");
+
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("name not resolved".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(status_line(&failed), "failed: name not resolved");
+    }
+
+    #[test]
+    fn an_invalid_entry_shows_the_badge_distinct_from_a_load_error() {
+        // Field finding D: an INVALID URL-bar entry (a scheme-less garbage entry
+        // that did not navigate) shows the small "invalid URL" badge, distinct
+        // from a load-error banner. A valid/idle chrome hides it; a LOAD failure
+        // (`last_error`) is NOT the invalid badge (the two axes are orthogonal).
+        let idle = ChromeState::default();
+        assert!(!invalid_entry_badge_visible(&idle));
+        assert_eq!(invalid_entry_badge_text(&idle), "");
+
+        let load_failure = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("name not resolved".into()),
+            ..ChromeState::default()
+        };
+        assert!(
+            !invalid_entry_badge_visible(&load_failure),
+            "a load failure is not the invalid-entry badge"
+        );
+
+        let invalid = ChromeState {
+            url_text: "not a url".into(),
+            invalid_entry: Some("not a url".into()),
+            ..ChromeState::default()
+        };
+        assert!(invalid_entry_badge_visible(&invalid));
+        assert!(invalid_entry_badge_text(&invalid).contains("invalid URL"));
+        // The invalid-entry badge is orthogonal to a load error: it carries no
+        // `last_error`, so the error banner stays hidden.
+        assert!(!error_banner_visible(&invalid));
+    }
+
+    #[test]
+    fn a_failed_load_raises_a_prominent_error_banner_with_the_accurate_protocol_named_reason() {
+        // Acceptance (the fail-closed honesty fix): a failed load raises a
+        // PROMINENT in-view error banner the user cannot miss, carrying the
+        // accurate, protocol-named reason (the resolver/decoder taxonomy verbatim),
+        // NOT only the subtle footer status line the human missed. It is hidden on
+        // an idle or an in-flight load, and only appears on a failure.
+        let idle = ChromeState::default();
+        assert!(
+            !error_banner_visible(&idle),
+            "no banner when nothing has failed"
+        );
+        assert_eq!(error_banner_text(&idle), "");
+
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            ..ChromeState::default()
+        };
+        assert!(
+            !error_banner_visible(&loading),
+            "no banner while a load is in flight"
+        );
+
+        // A real IPNS failure (the ronan.eth taxonomy): the banner is VISIBLE and
+        // carries the protocol-named reason, not a generic "failed".
+        let ipns_failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some(
+                "IPNS record did not verify: dag-cbor data does not match the protobuf fields"
+                    .into(),
+            ),
+            ..ChromeState::default()
+        };
+        assert!(
+            error_banner_visible(&ipns_failed),
+            "a failed load raises the prominent banner"
+        );
+        let text = error_banner_text(&ipns_failed);
+        assert!(
+            text.contains("IPNS record did not verify"),
+            "the banner carries the accurate protocol-named reason: {text}"
+        );
+        assert!(
+            text.contains("failed to load"),
+            "the banner reads as a load failure the user cannot miss: {text}"
+        );
+
+        // An unsupported-protocol failure likewise surfaces its named reason.
+        let unsupported = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("points to Swarm, not supported".into()),
+            ..ChromeState::default()
+        };
+        assert!(error_banner_visible(&unsupported));
+        assert!(error_banner_text(&unsupported).contains("points to Swarm"));
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_neutral_loading_state_that_hides_the_posture_while_loading() {
+        // Acceptance (the trust-honesty fix): while a load is in flight the trust
+        // indicator is a NEUTRAL loading state (no trust claim), NOT the
+        // carried-over posture of the previous page. The display rule is
+        // loading-wins: even a load whose backend posture still reads
+        // content-verified (mid-transition) must show the loading badge, so the
+        // indicator never asserts a trust level for a page that is not yet shown.
+        for posture in [
+            TrustPosture::UnverifiedOrigin,
+            TrustPosture::ContentVerified,
+            TrustPosture::NameViaTrustedRpc,
+            TrustPosture::MutableName,
+        ] {
+            let loading = ChromeState {
+                load_state: LoadState::Started,
+                trust_posture: posture,
+                ..ChromeState::default()
+            };
+            assert_eq!(
+                trust_indicator(&loading),
+                "⋯ loading…",
+                "while loading, the indicator is a neutral loading state, not the {posture:?} posture"
+            );
+            // The loading badge makes NO trust claim: it never reads "verified"
+            // and never asserts the origin is (un)verified.
+            assert!(!trust_indicator(&loading)
+                .to_lowercase()
+                .contains("verified"));
+            assert_eq!(trust_indicator_css_class(&loading), "trust-loading");
+            // The tooltip is honest that werust is not yet asserting a trust level.
+            assert!(trust_indicator_detail(&loading)
+                .to_lowercase()
+                .contains("loading"));
+            assert!(!trust_indicator_detail(&loading)
+                .to_lowercase()
+                .contains("verified"));
+        }
+
+        // A Committed load is still in flight, so it is still the neutral state.
+        let committed = ChromeState {
+            load_state: LoadState::Committed,
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&committed), "⋯ loading…");
+
+        // Once the load SETTLES (Finished), the real posture appears — the loading
+        // state does not swallow the settled badge.
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&settled), "✓ verified");
+
+        // A FAILED load is not "loading": it shows its (unverified) posture, not the
+        // spinner — a failed load must never read as a stale success.
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            last_error: Some("name not resolved".into()),
+            ..ChromeState::default()
+        };
+        assert_eq!(trust_indicator(&failed), "⚠ unverified origin");
+    }
+
+    #[test]
+    fn trust_indicator_distinguishes_verified_from_unverified_and_is_a_pure_fn_of_posture() {
+        // Acceptance: the chrome's trust indicator shows a clear, distinct state
+        // for a content-verified load vs an unverified served-origin load, and it
+        // is driven by the posture the seam reports (the actual load path), not by
+        // any URL string. The two labels are visibly different and legible.
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+
+        assert_eq!(trust_indicator(&served), "⚠ unverified origin");
+        assert_eq!(trust_indicator(&verified), "✓ verified");
+        assert_ne!(
+            trust_indicator(&served),
+            trust_indicator(&verified),
+            "the two trust states are visually distinct"
+        );
+
+        // The detail/tooltip likewise distinguishes the two and names the reason.
+        assert!(trust_indicator_detail(&verified).contains("content-verified"));
+        assert!(trust_indicator_detail(&served).contains("not"));
+
+        // The default (nothing loaded yet) is the untrusted posture: werust does
+        // not claim verification it has not proven.
+        assert_eq!(
+            trust_indicator(&ChromeState::default()),
+            "⚠ unverified origin"
+        );
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_distinct_name_via_trusted_rpc_badge_never_labelled_verified() {
+        // Acceptance: an ENS-resolved Phase-1 page (bytes verified, name resolved
+        // over a trusted RPC) renders as its OWN legible, visually-distinct badge
+        // — distinct from BOTH the verified and the unverified-origin badges — and
+        // it is NEVER surfaced as "verified" / "name-verified".
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        let name_via_rpc = ChromeState {
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            ..ChromeState::default()
+        };
+
+        let label = trust_indicator(&name_via_rpc);
+        assert_eq!(label, "◈ name via trusted RPC");
+        // Distinct from the other two badges.
+        assert_ne!(label, trust_indicator(&verified));
+        assert_ne!(label, trust_indicator(&served));
+        // NEVER labelled "verified" / "name-verified": Phase 1 makes no such claim.
+        assert!(
+            !label.to_lowercase().contains("verified"),
+            "the name-via-trusted-RPC badge must never read as verified: {label}"
+        );
+        assert!(!trust_indicator_detail(&name_via_rpc)
+            .to_lowercase()
+            .contains("name-verified"));
+        // The tooltip is honest that the name came from a trusted RPC.
+        assert!(trust_indicator_detail(&name_via_rpc).contains("TRUSTED RPC"));
+
+        // The badge carries its own CSS class, distinct from the other two, so the
+        // three states are visually distinct.
+        assert_eq!(
+            trust_indicator_css_class(&name_via_rpc),
+            "trust-name-trusted-rpc"
+        );
+        assert_eq!(trust_indicator_css_class(&verified), "trust-verified");
+        assert_eq!(trust_indicator_css_class(&served), "trust-unverified");
+    }
+
+    #[test]
+    fn trust_indicator_shows_a_distinct_mutable_name_badge_never_labelled_verified() {
+        // Acceptance: a client-verified IPNS page (bytes verified, name mutable)
+        // renders as its OWN legible, visually-distinct badge — distinct from the
+        // verified, name-via-trusted-RPC, and unverified badges — and it is NEVER
+        // surfaced as "verified".
+        let verified = ChromeState {
+            trust_posture: TrustPosture::ContentVerified,
+            ..ChromeState::default()
+        };
+        let name_via_rpc = ChromeState {
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            ..ChromeState::default()
+        };
+        let served = ChromeState {
+            trust_posture: TrustPosture::UnverifiedOrigin,
+            ..ChromeState::default()
+        };
+        let mutable = ChromeState {
+            trust_posture: TrustPosture::MutableName,
+            ..ChromeState::default()
+        };
+
+        let label = trust_indicator(&mutable);
+        assert_eq!(label, "◇ content verified, mutable name");
+        // Distinct from the other three badges.
+        assert_ne!(label, trust_indicator(&verified));
+        assert_ne!(label, trust_indicator(&name_via_rpc));
+        assert_ne!(label, trust_indicator(&served));
+        // Its "verified" only ever appears as part of "content verified", never as
+        // a bare immutability claim; the badge is honest that the NAME is mutable.
+        assert!(
+            label.contains("mutable name"),
+            "the mutable-name badge must say the name is mutable: {label}"
+        );
+        // The tooltip is honest that the name is mutable / controller-repointable,
+        // and makes NO immutability claim (it may say it makes "no immutability
+        // claim", but must not assert the name IS immutable).
+        let detail = trust_indicator_detail(&mutable);
+        assert!(detail.contains("MUTABLE"));
+        assert!(
+            detail.contains("can repoint"),
+            "the tooltip is honest the controller can repoint the name: {detail}"
+        );
+
+        // Its own CSS class, distinct from the other three.
+        assert_eq!(trust_indicator_css_class(&mutable), "trust-mutable-name");
+        assert_ne!(
+            trust_indicator_css_class(&mutable),
+            trust_indicator_css_class(&name_via_rpc)
         );
     }
 }

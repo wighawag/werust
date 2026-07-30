@@ -3,6 +3,7 @@ title: "macOS: the AppKit window that PAINTS the chrome over the WKWebView backe
 slug: macos-appkit-window-and-chrome
 blockedBy: [macos-wkwebview-renderer-backend]
 covers: []
+needsAnswers: true
 ---
 
 ## What to build

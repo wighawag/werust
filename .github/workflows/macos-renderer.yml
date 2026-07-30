@@ -1,0 +1,111 @@
+name: macos-renderer
+
+# The macOS ENGINE leg (task `macos-wkwebview-renderer-backend`,
+# `docs/adr/0011-webview2-for-windows.md`'s macOS split, sub-task 2). It does
+# three things a Linux gate can never do:
+#
+#   1. BUILDS the `#[cfg(target_os = "macos")]` WKWebView backend against a real
+#      SDK, so the Objective-C wiring is compiled rather than merely parsed.
+#   2. EXERCISES both TRUST HOOKS on a real WKWebView -- an `ipfs://<cid>` load
+#      whose bytes hash-verify, and a page that sees the native EIP-1193
+#      `window.ethereum` and round-trips a request over the script bridge --
+#      offline, with a negative control that must fail.
+#   3. MEASURES the `WKURLSchemeHandler` origin behaviour
+#      (`crates/macos-origin-probe`), which is what turns this repo's recorded
+#      iOS MECHANISM ANALYSIS into a runtime fact: both WebKit ports share the
+#      mechanism, so a macOS measurement settles it for iOS too.
+#
+# It needs no Mac hardware: `macos-14` is the runner the iOS leg already uses.
+#
+# A SEPARATE leg from the pure-Rust `verify` gate, exactly like `mobile-ios.yml`
+# and `windows-origin-probe.yml`: the Ubuntu gate compiles and tests the
+# host-independent halves (the pure decision rules, the source-shape guard, the
+# probe's verdict rule) but can never build WebKit.
+#
+# WHY THE PROBE MUST STAY RE-RUNNABLE: WebKit ships with the OS and cannot be
+# pinned, and this is the exact corner that cost a field bug on the other engine.
+# The probe therefore ASSERTS the run against the recorded verdict in
+# `docs/spikes/macos-wkwebview-renderer-backend/expected.json` and goes red
+# naming the field that moved. `workflow_dispatch` is the on-demand entry point;
+# the path filter re-runs it whenever the backend, the probe or the recorded
+# verdict changes.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "crates/macos-renderer/**"
+      - "crates/macos-origin-probe/**"
+      - "crates/webview-shared/**"
+      - "crates/renderer/**"
+      - "crates/werust-core/**"
+      - "crates/fetcher/**"
+      - "docs/spikes/macos-wkwebview-renderer-backend/**"
+      - ".github/workflows/macos-renderer.yml"
+  pull_request:
+    paths:
+      - "crates/macos-renderer/**"
+      - "crates/macos-origin-probe/**"
+      - "crates/webview-shared/**"
+      - ".github/workflows/macos-renderer.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  macos-engine:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Record what this run measured on
+        # A platform result without its platform version is not a result.
+        run: |
+          sw_vers
+          xcodebuild -version || true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-macos-renderer-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-macos-renderer-cargo-
+
+      - name: Build the macOS backend and the origin probe
+        # Only the macOS crates: the rest of the workspace (the `werust` binary,
+        # `webview-renderer`) is GTK/WebKitGTK-bound and does not build here.
+        # This is the step that compiles the `#[cfg(target_os = "macos")]`
+        # Objective-C wiring the Ubuntu gate can only parse.
+        run: cargo build -p macos-renderer -p macos-origin-probe
+
+      - name: Test the macOS backend and the shared toolkit-free half
+        # `webview-shared` is included deliberately: the load lifecycle and the
+        # off-thread `ipfs://` boundary were MOVED there out of the WebKitGTK
+        # crate, so they must pass on macOS too, not just on the Ubuntu gate.
+        run: cargo test -p macos-renderer -p macos-origin-probe -p webview-shared
+
+      - name: Exercise BOTH trust hooks on a real WKWebView (with a negative control)
+        # A backend qualifies on the trust hooks, not on rendering. This loads a
+        # hash-verified `ipfs://<cid>` page through the production verifying
+        # resolver (pinned in memory: no gateway, no network), asserts the page
+        # sees the native EIP-1193 provider and round-trips a request, then
+        # asserts a tampered CID FAILS the load and is never reported verified.
+        run: cargo run -p macos-renderer --example trust_hooks_smoke
+
+      - name: Measure the WKURLSchemeHandler origin behaviour and assert the recorded verdict
+        run: >
+          cargo run -p macos-origin-probe --
+          --expected docs/spikes/macos-wkwebview-renderer-backend/expected.json
+          --out macos-origin-probe-report.json
+
+      - name: Upload the measured origin report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-origin-probe-report
+          path: macos-origin-probe-report.json
+          if-no-files-found: warn

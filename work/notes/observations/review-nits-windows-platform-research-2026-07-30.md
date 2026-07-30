@@ -19,3 +19,9 @@ is their durable home for triage — promote-to-task / keep / delete.
   (crates/webview-renderer/Cargo.toml lines 9-16; offthread.rs imports are genuinely toolkit-free (fetcher, renderer, werust_core, crate::SharedLifecycle), so only the crate boundary is the blocker. ADR hedges with or a sibling crate.)
 - Two side-effects are not in the DECISIONS block: a new observation note was minted (a site's service worker registers on Android's internal-https ipfs origin but not on a real custom-scheme origin, unverified on werust and covered by no parity row), and the ADR pre-specifies a user-visible Windows default (a machine without the WebView2 Runtime must fail honestly naming the runtime rather than crash). Ratify both?
   (work/notes/observations/service-worker-registration-differs-by-ipfs-serving-origin-2026-07-30.md (no frontmatter, matching ~20 other observations here); ADR Consequences, last bullet.)
+
+## Human/conductor triage (2026-07-30, via drive-tasks)
+
+- **macos-desktop-build split-brain: FIXED by the conductor.** The task was replaced by the four sub-tasks ADR-0011 prescribes: `desktop-chrome-presentation-into-core` (first, platform-neutral), `macos-wkwebview-backend-and-window`, `macos-parity-column-and-stub-tasks`, `macos-release-packaging-leg`. The wrong `Renderer` path premise (`crates/webview-renderer/src/lib.rs`, actually `crates/renderer/src/lib.rs:695`) is corrected in the new tasks.
+- **The gtk4/webkit6 unconditional dependency: FOLDED IN.** `macos-wkwebview-backend-and-window` states plainly that `crates/webview-renderer` cannot host the new backend and that `offthread.rs` must move to a shared toolkit-free home rather than be copied.
+- Awaiting the human: ratifying ADR-0011's `Status: accepted` (it defers Windows AND pre-decides the presentation extraction + the macOS split shape), and ratifying the two side-effects (the service-worker observation, and the Windows runtime-missing honest-failure default).

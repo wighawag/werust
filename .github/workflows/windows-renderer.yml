@@ -13,16 +13,22 @@ name: windows-renderer
 #   `windows-latest` runner by ref, exactly as `macos-renderer.yml` made the
 #   AppKit window provable (run 30572253620).
 #
-# WHAT IT PROVES TODAY. There is no Windows shell yet, so it proves the thing
-# that IS provable and is genuinely worth proving: that the repo's TOOLKIT-FREE
-# half compiles and passes its tests on `x86_64-pc-windows-msvc`. `webview-shared`
-# leads that set — it holds `LoadLifecycle`/`SharedLifecycle`, the `navigate` URL
-# rule and the ADR-0008 off-thread `ipfs://` boundary the WebView2 backend will
-# reuse VERBATIM, so proving it on Windows is proving the backend's own
-# foundation. The set was determined by MEASUREMENT (a `cargo xwin check
-# --target x86_64-pc-windows-msvc --tests` sweep over every workspace member),
-# not by assumption; the method, the results and the named exclusions are
-# recorded in `docs/spikes/windows-renderer-ci-leg/README.md`.
+# WHAT IT PROVES TODAY. It builds and tests the repo's TOOLKIT-FREE half on
+# `x86_64-pc-windows-msvc` — `webview-shared` leads that set, holding
+# `LoadLifecycle`/`SharedLifecycle`, the `navigate` URL rule and the ADR-0008
+# off-thread `ipfs://` boundary the WebView2 backend reuses VERBATIM — and, since
+# task `windows-webview2-renderer-backend`, it also builds, tests and RUNS
+# `crates/windows-renderer`: the `#[cfg(windows)]` WebView2 `Renderer` backend the
+# Ubuntu gate can only PARSE. The `trust_hooks_smoke` step is the one that
+# matters, because a backend qualifies for werust on the TRUST HOOKS, not on
+# rendering: it loads a hash-verified `ipfs://<cid>` page through the production
+# verifying resolver (pinned in memory — no gateway, no network), asserts the
+# document got its REAL `ipfs://<cid>` tuple origin and sees the native EIP-1193
+# `window.ethereum`, and then asserts a tampered CID FAILS the load and is never
+# reported verified. The original crate set was determined by MEASUREMENT (a
+# `cargo xwin check --target x86_64-pc-windows-msvc --tests` sweep over every
+# workspace member), not by assumption; the method, the results and the named
+# exclusions are recorded in `docs/spikes/windows-renderer-ci-leg/README.md`.
 #
 # EXCLUDED, with reasons: `werust` and `webview-renderer` bind gtk4/webkit6
 # through pkg-config and are measured RED for this target (nothing on a Windows
@@ -62,15 +68,18 @@ on:
   push:
     branches: [main]
     paths:
+      - "crates/windows-renderer/**"
       - "crates/webview-shared/**"
       - "crates/renderer/**"
       - "crates/werust-core/**"
       - "crates/fetcher/**"
       - "crates/windows-origin-probe/**"
+      - "docs/spikes/windows-webview2-renderer-backend/**"
       - ".github/actions/webview2-runtime-version/**"
       - ".github/workflows/windows-renderer.yml"
   pull_request:
     paths:
+      - "crates/windows-renderer/**"
       - "crates/webview-shared/**"
       - "crates/windows-origin-probe/**"
       - ".github/actions/webview2-runtime-version/**"
@@ -99,8 +108,8 @@ jobs:
       - name: Record what this run measured on
         # The ONE registry read, shared with `windows-origin-probe.yml`. The
         # WebView2 Runtime is evergreen: a Windows result without its runtime
-        # version is not a result. (Nothing in THIS leg drives WebView2 yet — it
-        # is recorded so the log dates the run for the backend task that will.)
+        # version is not a result, and this leg now DRIVES a real WebView2 in the
+        # trust-hooks step below, so this is what dates that measurement.
         uses: ./.github/actions/webview2-runtime-version
 
       - name: Cache cargo
@@ -113,18 +122,28 @@ jobs:
           key: ${{ runner.os }}-windows-renderer-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-windows-renderer-cargo-
 
-      - name: Build the toolkit-free crates on x86_64-pc-windows-msvc
+      - name: Build the Windows backend and the toolkit-free crates on x86_64-pc-windows-msvc
         # Package-SCOPED, never a bare workspace build: the workspace contains
         # GTK/WebKitGTK-bound crates that cannot build on a Windows runner.
-        # `windows-origin-probe` builds its `cfg(windows)` WebView2 half here,
-        # which the Ubuntu gate can only parse.
-        run: cargo build -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+        # `windows-renderer` and `windows-origin-probe` build their `cfg(windows)`
+        # WebView2 halves here, which the Ubuntu gate can only parse.
+        run: cargo build -p windows-renderer -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
 
-      - name: Test the toolkit-free crates on x86_64-pc-windows-msvc
-        # The half the Windows backend will reuse verbatim, exercised on the
-        # platform that will reuse it: `webview-shared`'s load lifecycle, navigate
+      - name: Test the Windows backend and the toolkit-free crates on x86_64-pc-windows-msvc
+        # The backend's own tests, plus the half it reuses verbatim, exercised on
+        # the platform that reuses it: `webview-shared`'s load lifecycle, navigate
         # URL rule and off-thread `ipfs://` boundary; `werust-core`'s chrome
         # derivation, ENS/IPNS and debug capture; `fetcher`'s hash-verify
-        # boundary; and the origin probe's decision rules, which no leg runs on
-        # Windows today. All offline.
-        run: cargo test -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+        # boundary; and the origin probe's decision rules. All offline.
+        run: cargo test -p windows-renderer -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+
+      - name: Exercise BOTH trust hooks on a real WebView2 (with a negative control)
+        # A backend qualifies on the trust hooks, not on rendering. This loads a
+        # hash-verified `ipfs://<cid>` page through the production verifying
+        # resolver (pinned in memory: no gateway, no network), asserts the
+        # document got its REAL `ipfs://<cid>` tuple origin — ADR-0011 Amendment
+        # 2's verdict, observed from inside the BACKEND rather than the probe —
+        # asserts the page sees the native EIP-1193 provider and round-trips a
+        # request, then asserts a tampered CID FAILS the load and is never
+        # reported verified. A smoke where everything passes has measured nothing.
+        run: cargo run -p windows-renderer --example trust_hooks_smoke

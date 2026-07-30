@@ -3066,6 +3066,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "windows-renderer"
+version = "0.2.9"
+dependencies = [
+ "fetcher",
+ "renderer",
+ "serde_json",
+ "webview-shared",
+ "webview2-com",
+ "werust-core",
+ "windows",
+]
+
+[[package]]
 name = "windows-result"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

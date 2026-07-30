@@ -21,8 +21,10 @@
 //! they were **MOVED** here rather than copied, so the two desktop backends
 //! cannot drift in what a load state, a rejected URL, or a verified load MEANS.
 //! `docs/adr/0011-webview2-for-windows.md` (finding 5) already predicted this:
-//! the `offthread.rs` split is "toolkit-free and reusable unchanged", and a
-//! future WebView2 backend is its third consumer.
+//! the `offthread.rs` split is "toolkit-free and reusable unchanged". Its THIRD
+//! consumer is now real — `crates/windows-renderer`, the WebView2 backend, uses
+//! all three here unchanged, marshalling the off-thread boundary with a WebView2
+//! deferral instead of `gio::spawn_blocking` or a main-queue hop.
 //!
 //! # What is NOT here
 //!

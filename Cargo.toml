@@ -35,6 +35,15 @@ members = [
     "crates/script-engine",
     "crates/werust-android/rust",
     "crates/werust-ios/rust",
+    # The Windows WebView2 `Renderer` backend (ADR-0011's Windows split,
+    # sub-task 2, funded by Amendment 1 and unblocked by Amendment 2's measured
+    # `registered-ipfs-scheme` verdict). A workspace member for the same reason
+    # `macos-renderer` is: the Ubuntu `verify` gate compiles and tests its
+    # host-independent half (`pure.rs` — the decisions the COM wiring makes — plus
+    # the source-shape guard); its WebView2 half is `#[cfg(windows)]` and is
+    # built, tested and RUN by `.github/workflows/windows-renderer.yml` on a
+    # `windows-latest` runner.
+    "crates/windows-renderer",
     # Gate 0 of the Windows work (ADR-0011): a WebView2 origin PROBE, not shell
     # code. A workspace member so the Ubuntu `verify` gate compiles and tests
     # its host-independent half (the decision rule, the canned site, the CLI);

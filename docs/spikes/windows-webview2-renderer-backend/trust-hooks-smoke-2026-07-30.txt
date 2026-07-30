@@ -1,0 +1,29 @@
+Verbatim output of the trust-hooks smoke on a real WebView2, from CI run
+https://github.com/wighawag/werust/actions/runs/30585224388 (workflow
+`windows-renderer`, job `windows-crates`, runner `windows-latest`,
+Windows 10.0.26100, WebView2 Runtime 150.0.4078.65), 2026-07-30.
+
+Step: "Exercise BOTH trust hooks on a real WebView2 (with a negative control)"
+Command: cargo run -p windows-renderer --example trust_hooks_smoke
+
+The runner's WebView2 Runtime version, read in the SAME run by the shared
+`.github/actions/webview2-runtime-version` composite action:
+
+WebView2 Runtime (registry HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}): 150.0.4078.65
+
+The smoke's own stdout, unedited apart from the leading CI timestamps:
+
+     Running `target\debug\examples\trust_hooks_smoke.exe`
+WebView2 Runtime: 150.0.4078.65
+page report: {"origin":"ipfs://bafkreih2auwkjsxeesvxgr2f2r4gvruvniinu2x7ro5bodi57n3fo57uoy","secureContext":true,"provider":"object","chainId":"0x1"}
+load state:  Finished
+posture:     ContentVerified
+control state:   Failed
+control posture: UnverifiedOrigin
+
+PASS: both trust hooks work on a real WebView2, the document got its real ipfs:// origin, and the negative control failed as it must.
+
+The FIRST measuring run, https://github.com/wighawag/werust/actions/runs/30584851232,
+produced byte-identical output (same runtime build, same CID, same postures) from
+the same code; it ran before this spike's README and this file were stamped from
+it, which is the only difference between the two trees.

@@ -67,9 +67,16 @@ const WEBVIEW2_CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
 /// The crate set measured green on `x86_64-pc-windows-msvc` (see the spike
 /// README for the method and the named exclusions). `webview-shared` leads it:
 /// it holds `LoadLifecycle`/`SharedLifecycle`, the `navigate` URL rule and the
-/// ADR-0008 off-thread `ipfs://` boundary the Windows backend will reuse
-/// verbatim.
+/// ADR-0008 off-thread `ipfs://` boundary the Windows backend reuses verbatim.
+///
+/// `windows-renderer` joined it with task `windows-webview2-renderer-backend`:
+/// the `#[cfg(windows)]` WebView2 backend itself, which is the whole reason this
+/// leg landed ahead of the shell code. Extending this list is DELIBERATELY not a
+/// one-line workflow edit — the assertions below hold the build steps, the test
+/// steps and the `push` path filter to this ONE list, so a crate cannot join the
+/// leg without also joining the filter that re-runs it.
 const GREEN_ON_WINDOWS: &[&str] = &[
+    "windows-renderer",
     "webview-shared",
     "renderer",
     "werust-core",

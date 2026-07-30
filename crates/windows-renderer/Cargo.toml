@@ -1,0 +1,45 @@
+[package]
+name = "windows-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
+fetcher = { path = "../fetcher" }
+# The TOOLKIT-FREE half of a system-webview backend, CONSUMED (never copied):
+# the load lifecycle, the navigate URL rule, and the ADR-0008 off-thread
+# `ipfs://` boundary. `docs/adr/0011-webview2-for-windows.md` (finding 5)
+# predicted this crate would be its third consumer, after the WebKitGTK and
+# WKWebView backends; it is.
+webview-shared = { path = "../webview-shared" }
+# The script-message bridge envelope is JSON. WebView2 has ONE page->host
+# channel (`window.chrome.webview.postMessage`) rather than WebKit's NAMED
+# `window.webkit.messageHandlers.<name>`, so the channel name travels inside the
+# message; parsing that envelope is a host-independent rule, exercised by the
+# Ubuntu `verify` gate.
+serde_json = "1"
+
+# The WebView2 half only exists on Windows, kept target-gated exactly as
+# `crates/macos-renderer` gates `objc2`, `crates/windows-origin-probe` gates
+# `webview2-com` and `crates/werust-android` gates `jni`. That is what lets the
+# Ubuntu `verify` gate compile and test this crate's host-independent half
+# (`pure.rs` + the source-shape guard) with no Windows SDK and no Windows box.
+[target.'cfg(windows)'.dependencies]
+# ADR-0011 finding 4: `webview2-com` (wravery/webview2-rs), the bindings `wry`
+# itself depends on — NEVER the abandoned `webview2` crate, which last shipped in
+# 2021 and predates `ICoreWebView2CustomSchemeRegistration` entirely.
+webview2-com = "0.39.1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # `WNDCLASSW`/`RegisterClassW` carry `HBRUSH`/`HICON`, so the container window
+    # cannot be registered without the GDI handle types.
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

@@ -8,7 +8,7 @@ the window opens with the core's own default chrome:
   ok   no error banner on a window that has not failed anything
   ok   no invalid-entry badge on a fresh window
 the ⋮ menu is the shared core's BrowserMenu, item for item:
-       menu: ["werust d7f8d97", "Debug"]
+       menu: ["werust b312f31", "Debug"]
   ok   the HMENU's titles are the core's item labels, in order
 a hash-VERIFIED ipfs:// page (offline, pinned):
   ok   the verified load settles

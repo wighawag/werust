@@ -2,20 +2,17 @@
 title: "TOFU for mutable names: let the user bless a name's current CID, then warn when it changes (SSH-host-key-style pin-and-warn)"
 slug: ipns-tofu-pin-and-warn-on-change
 spec: ens-to-ipfs-resolution-phase1-rpc-skeleton
-needsAnswers: true
 blockedBy: [ipns-name-resolution-and-render]
 covers: [1]
 ---
 
-<!-- open-questions -->
+## Answered questions (human, 2026-07-30, via drive-tasks — build to these)
 
-## Open questions
+The three open questions below were ANSWERED; the gate is cleared. Treat these as settled decisions, and record any refinement in a spike DECISIONS block rather than reopening them.
 
-1. **UX of the bless + warning flow.** How does the user record a mutable name's current CID as genuine (an explicit action on the trust indicator? a first-visit prompt?), and how is a later CHANGE surfaced (a popup? a banner? a distinct posture)? A change should be legible ("this name now points to different content than the version you trusted on <date>"), not silently accepted and not a hard block.
-2. **Pin store — where + isolation.** Where is the pinned name->CID+timestamp store kept (a small file; likely alongside the settings mechanism from `retrieval-backend-user-setting`), and how is it isolated in tests (shared-write rule)? Does it also record the resolution posture at bless time?
-3. **Scope of "mutable name".** Applies to IPNS AND ENS (both mutable per the two-axis trust model). Confirm it covers both, and how it interacts with the `MutableName` / `NameViaTrustedRpc` postures (a blessed-then-changed name is a louder warning than plain mutable).
-
-<!-- /open-questions -->
+1. **UX of the bless + warning flow.** The bless is an EXPLICIT user action reached from the TRUST INDICATOR, not a first-visit prompt (a prompt on first visit trains people to dismiss it, and werust's trust surface is already the place the posture is explained). Clicking the indicator opens a small surface showing the name, the CID it currently resolves to, and a "trust this content" action; blessing records the pin. A later resolution to a DIFFERENT CID is surfaced with the SAME prominence the repo already reserves for a fail-closed failure: a distinct, louder posture on the indicator PLUS the high-contrast in-view banner treatment, carrying a legible line of the form "this name now points to different content than the version you trusted on <date>". It is NEVER silently accepted, and it is NEVER a hard block: the user can look and decide. (Note the sibling constraint from `loading-progress-in-the-url-bar-not-a-banner`: a FAILURE-class banner may displace the page, transient in-flight state may not. A changed pin is failure-class.)
+2. **Pin store — where + isolation.** A `pins.json` living NEXT TO the existing `retrieval.json`, reusing the settings mechanism in `crates/werust-core/src/retrieval.rs` verbatim: the same directory resolution and the same `WERUST_SETTINGS_DIR` env lever, and the same directory-taking `load_from` / `save_to` cores so tests isolate the store into a temp dir and assert the real one is untouched (the shared-write rule). Each pin records name -> CID + timestamp + the resolution POSTURE at bless time, so a later change can say which trust level the user was actually blessing.
+3. **Scope of "mutable name".** BOTH IPNS and ENS, per the settled two-axis model (`docs/adr/0006`): both are controller-repointable, so both are blessable. A blessed-then-CHANGED name is a strictly LOUDER signal than plain `MutableName` or `NameViaTrustedRpc`, and it must not be flattened into either; an UNBLESSED name behaves exactly as it does today.
 
 ## What to build
 

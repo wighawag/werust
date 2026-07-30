@@ -755,11 +755,22 @@ pub fn error_banner_text(state: &ChromeState) -> String {
     }
 }
 
+/// Every class [`error_banner_css_class`] can return: the error banner's
+/// MUTUALLY-EXCLUSIVE severity family (hard vs transient).
+///
+/// A painter toggles exactly ONE of these on and every other one off, so it must
+/// iterate THIS rather than its own literal list — see [`CHROME_CSS_CLASS_SETS`]
+/// for why a painter-local list is a latent stale-badge bug.
+pub const ERROR_BANNER_CSS_CLASSES: &[&str] = &["error-banner", "error-banner-transient"];
+
 /// The CSS class for the error banner, distinguishing a TRANSIENT/timeout failure
 /// (a softer, retryable amber banner) from a HARD failure (the prominent red
 /// banner). A pure function of [`ChromeState`] so the banner styling is testable
 /// without a display; each edge's painter toggles the two classes exactly
 /// like the trust-indicator classes.
+///
+/// The complete set of classes this can return is
+/// [`ERROR_BANNER_CSS_CLASSES`]; a painter derives its toggle list from there.
 #[must_use]
 pub fn error_banner_css_class(state: &ChromeState) -> &'static str {
     if state.failure_is_retryable() {
@@ -849,9 +860,29 @@ pub fn trust_indicator_detail(state: &ChromeState) -> &'static str {
     }
 }
 
-/// The CSS class for the current posture's badge — exactly one of the three
-/// trust classes. A pure function of [`ChromeState`] so the badge styling is
-/// testable without a display.
+/// Every class [`trust_indicator_css_class`] can return: the trust indicator's
+/// MUTUALLY-EXCLUSIVE posture family (the neutral loading badge plus the four
+/// settled [`TrustPosture`] badges).
+///
+/// A painter toggles exactly ONE of these on and every other one off, so it must
+/// iterate THIS rather than its own literal list — see [`CHROME_CSS_CLASS_SETS`]
+/// for why a painter-local list is a latent stale-badge bug. The debug view's
+/// per-request trust column REUSES this family (ADR-0006, one vocabulary), so it
+/// is covered by the same guarantee.
+pub const TRUST_INDICATOR_CSS_CLASSES: &[&str] = &[
+    "trust-loading",
+    "trust-verified",
+    "trust-name-trusted-rpc",
+    "trust-mutable-name",
+    "trust-unverified",
+];
+
+/// The CSS class for the current posture's badge — exactly one of the trust
+/// classes ([`TRUST_INDICATOR_CSS_CLASSES`]). A pure function of [`ChromeState`]
+/// so the badge styling is testable without a display.
+///
+/// The complete set of classes this can return is
+/// [`TRUST_INDICATOR_CSS_CLASSES`]; a painter derives its toggle list from there.
 #[must_use]
 pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
     if state.is_loading() {
@@ -866,6 +897,35 @@ pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
         "trust-unverified"
     }
 }
+
+/// The COMPLETE chrome CSS-class set, grouped into the MUTUALLY-EXCLUSIVE
+/// FAMILIES a painter toggles as a unit: the trust indicator's postures
+/// ([`TRUST_INDICATOR_CSS_CLASSES`]) and the error banner's severities
+/// ([`ERROR_BANNER_CSS_CLASSES`]).
+///
+/// WHY THIS EXISTS: the class NAMES are decided here (the `*_css_class` rules
+/// above), but a painter's correctness depends on knowing EVERY name a family can
+/// produce — it turns one class on and must turn all the others OFF, so a name
+/// its own literal list omits is a name nothing ever clears, and a stale badge
+/// colour lingers across a transition. With the list copied into each painter,
+/// adding a fifth posture here would leave every painter stale with a GREEN test
+/// suite (the latent bug this const closes, before the AppKit and Win32 painters
+/// inherit it). Two tests pin it: the core's exhaustiveness test (every value a
+/// `*_css_class` function can return is a member, and the set carries no dead
+/// name) and each edge's no-unstyled-class test (every exported name has a rule
+/// in that edge's stylesheet, so a correctly-toggled but INVISIBLE state reds the
+/// gate too).
+///
+/// Decisions recorded at
+/// `docs/spikes/export-the-chrome-css-class-set-from-core/DECISIONS.md`: why a
+/// `pub const` slice rather than an enum, and why the set is grouped by family
+/// rather than exported flat.
+///
+/// LAYERING: these are stable state IDENTIFIERS, not styling. The stylesheet
+/// that gives each name a colour stays in the edge that has a stylesheet (the
+/// GTK `APP_CSS`); core has no notion of colour.
+pub const CHROME_CSS_CLASS_SETS: &[&[&str]] =
+    &[TRUST_INDICATOR_CSS_CLASSES, ERROR_BANNER_CSS_CLASSES];
 
 /// The browser shell: the seam-driven logic behind the window.
 ///
@@ -5405,6 +5465,159 @@ mod tests {
             load_progress_hint(&resolving_before_handoff),
             "resolving name"
         );
+    }
+
+    /// Every SHAPE of [`ChromeState`] a chrome rule can branch on: the cartesian
+    /// product of all its axes (load state x pipeline step x trust posture x
+    /// failure severity x the invalid-entry axis x the history flags x an
+    /// empty/non-empty URL).
+    ///
+    /// Exhaustive by construction, so a rule that starts branching on an axis it
+    /// does not read TODAY (the next posture, the next failure severity) is still
+    /// driven by the callers below rather than silently escaping them. A few
+    /// thousand plain values, so it stays a fast unit test.
+    fn every_chrome_state_shape() -> Vec<ChromeState> {
+        let mut shapes = Vec::new();
+        for load_state in [
+            LoadState::Idle,
+            LoadState::Started,
+            LoadState::Committed,
+            LoadState::Finished,
+            LoadState::Failed,
+        ] {
+            for load_step in [
+                LoadStep::Idle,
+                LoadStep::ResolvingName,
+                LoadStep::FetchingRecord,
+                LoadStep::FetchingContent,
+                LoadStep::Rendering,
+            ] {
+                for posture in [
+                    TrustPosture::UnverifiedOrigin,
+                    TrustPosture::ContentVerified,
+                    TrustPosture::NameViaTrustedRpc,
+                    TrustPosture::MutableName,
+                ] {
+                    for last_error in [
+                        None,
+                        // A TRANSIENT (retryable) failure and a HARD one: the two
+                        // severities the banner class distinguishes.
+                        Some("transport error: timeout: global"),
+                        Some("points to Swarm, not supported"),
+                    ] {
+                        for invalid_entry in [None, Some("not a url")] {
+                            for can_go_back in [false, true] {
+                                for can_go_forward in [false, true] {
+                                    for url_text in ["", "ipfs://bafy/index.html"] {
+                                        shapes.push(ChromeState {
+                                            url_text: url_text.to_string(),
+                                            load_state,
+                                            load_step,
+                                            trust_posture: posture,
+                                            last_error: last_error.map(str::to_string),
+                                            invalid_entry: invalid_entry.map(str::to_string),
+                                            can_go_back,
+                                            can_go_forward,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        shapes
+    }
+
+    #[test]
+    fn every_chrome_css_class_the_derivation_can_return_is_in_the_exported_set() {
+        // Acceptance (task `export-the-chrome-css-class-set-from-core`): the
+        // COMPLETE chrome CSS-class set is exported beside the `*_css_class`
+        // functions, and it is EXHAUSTIVE — every value those functions can
+        // return is a member. A painter toggles exactly one class of a family on
+        // and every other one off, so a class the core can return but the set
+        // omits is a class no painter ever CLEARS: a stale badge colour lingering
+        // across a transition. Adding a fifth posture (or a third failure
+        // severity) without extending the set therefore reds the gate HERE,
+        // before three painters inherit the stale list.
+        //
+        // The drive is the CARTESIAN PRODUCT of every ChromeState axis (see
+        // `every_chrome_state_shape`), not just the axes today's rules happen to
+        // read: a new class introduced on ANY axis (a posture, a load state, a
+        // failure severity, the invalid-entry axis, …) must still land in the set.
+        let mut produced_trust = std::collections::BTreeSet::new();
+        let mut produced_banner = std::collections::BTreeSet::new();
+        for state in every_chrome_state_shape() {
+            let trust = trust_indicator_css_class(&state);
+            assert!(
+                TRUST_INDICATOR_CSS_CLASSES.contains(&trust),
+                "`{trust}` is returned for {state:?} but is not in the exported set"
+            );
+            produced_trust.insert(trust);
+            // The banner class is only painted when the banner shows.
+            if error_banner_visible(&state) {
+                let banner = error_banner_css_class(&state);
+                assert!(
+                    ERROR_BANNER_CSS_CLASSES.contains(&banner),
+                    "`{banner}` is returned for {state:?} but is not in the exported set"
+                );
+                produced_banner.insert(banner);
+            }
+        }
+
+        // The other direction, so the set cannot carry a DEAD name either (a
+        // class every painter toggles off forever, and whose stylesheet rule the
+        // no-unstyled-class guard then demands for nothing): the set is EXACTLY
+        // what the derivation produces.
+        assert_eq!(
+            produced_trust,
+            TRUST_INDICATOR_CSS_CLASSES
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the exported trust set is exactly what `trust_indicator_css_class` produces"
+        );
+        assert_eq!(
+            produced_banner,
+            ERROR_BANNER_CSS_CLASSES
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the exported banner set is exactly what `error_banner_css_class` produces"
+        );
+
+        // The COMPLETE set is both families and nothing else, with no name shared
+        // between them (a class in two families would be toggled off by one
+        // painter loop while the other turned it on).
+        let complete: Vec<&str> = CHROME_CSS_CLASS_SETS
+            .iter()
+            .flat_map(|family| family.iter().copied())
+            .collect();
+        let unique: std::collections::BTreeSet<&str> = complete.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            complete.len(),
+            "no chrome CSS class appears in two families: {complete:?}"
+        );
+        assert_eq!(
+            unique,
+            produced_trust
+                .union(&produced_banner)
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the complete set is the trust postures plus the banner severities"
+        );
+        // Every exported name is a usable CSS class name (non-empty, no dot, no
+        // whitespace): an edge interpolates it straight into a stylesheet rule.
+        for class in complete {
+            assert!(
+                !class.is_empty()
+                    && !class.contains('.')
+                    && !class.chars().any(char::is_whitespace),
+                "`{class}` is not a plain CSS class name"
+            );
+        }
     }
 
     #[test]

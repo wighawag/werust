@@ -49,7 +49,7 @@ use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
     invalid_entry_badge_visible, load_progress_fraction, load_progress_hint, load_progress_visible,
     status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail, BrowserShell,
-    ChromeState,
+    ChromeState, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
 };
 
 /// The URL werust opens when none is given on the command line.
@@ -1034,9 +1034,10 @@ impl Chrome {
             // Distinguish a transient/timeout banner (softer amber, retryable)
             // from a hard-failure banner (prominent red): toggle exactly one
             // class, like the trust-indicator set, so a stale class never lingers
-            // across a transition.
+            // across a transition. The toggle set is the CORE's exported severity
+            // family, never a literal restated here (see the trust set below).
             let active = error_banner_css_class(state);
-            for class in ["error-banner", "error-banner-transient"] {
+            for class in ERROR_BANNER_CSS_CLASSES.iter().copied() {
                 if class == active {
                     self.error_banner.add_css_class(class);
                 } else {
@@ -1048,20 +1049,18 @@ impl Chrome {
         // neutral loading badge while a load is in flight, else the trust posture:
         // content-verified / name-via-trusted-RPC / mutable-name / unverified
         // origin), plus a CSS class so the states are visually distinct. Exactly
-        // one class is active at a time, so the toggle set must list EVERY class
-        // `trust_indicator_css_class` can return — including `trust-loading` and
-        // `trust-mutable-name` — or a stale class would linger on a transition.
+        // one class is active at a time, so the toggle set must contain EVERY
+        // class `trust_indicator_css_class` can return, or a stale class would
+        // linger on a transition. So the set is the CORE's own exported posture
+        // family — the same crate that DECIDES the names lists them — and never a
+        // literal copied into this painter: a copy silently goes stale the moment
+        // a fifth posture lands, and nothing would clear the missing class
+        // (task `export-the-chrome-css-class-set-from-core`).
         self.trust.set_text(trust_indicator(state));
         self.trust
             .set_tooltip_text(Some(trust_indicator_detail(state)));
         let active = trust_indicator_css_class(state);
-        for class in [
-            "trust-loading",
-            "trust-verified",
-            "trust-name-trusted-rpc",
-            "trust-mutable-name",
-            "trust-unverified",
-        ] {
+        for class in TRUST_INDICATOR_CSS_CLASSES.iter().copied() {
             if class == active {
                 self.trust.add_css_class(class);
             } else {
@@ -1244,8 +1243,11 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let status = Label::new(Some("idle"));
     // The trust indicator sits in the toolbar, next to the URL bar, so the trust
     // posture of the current page is always visible in the chrome.
+    // Both the label and its class come from the shared derivation for the SAME
+    // default state, so the badge's first paint cannot disagree with the class it
+    // carries (and the class name is not restated in this painter).
     let trust = Label::new(Some(trust_indicator(&ChromeState::default())));
-    trust.add_css_class("trust-unverified");
+    trust.add_css_class(trust_indicator_css_class(&ChromeState::default()));
 
     // The PROMINENT in-view error banner: a high-contrast red bar across the top
     // of the view, shown ONLY on a failed load (the fail-closed honesty fix). It
@@ -1257,7 +1259,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         .wrap(true)
         .visible(false)
         .build();
-    error_banner.add_css_class("error-banner");
+    error_banner.add_css_class(error_banner_css_class(&ChromeState::default()));
 
     // The LOAD-PROGRESS indicator is the URL bar itself: `Chrome::refresh` paints
     // the entry's own progress fraction from the live pipeline phase, so an
@@ -1438,7 +1440,7 @@ mod tests {
         app_id, banner, console_level_css_class, console_row_text, console_source_line,
         network_mime_text, network_size_text, network_status_text, network_trust_css_class,
         network_trust_label, parse_args, resolve_output, should_open_web_inspector, tail_plan,
-        usage, Command, TailPlan, DEFAULT_URL,
+        usage, Command, TailPlan, APP_CSS, DEFAULT_URL,
     };
     use gtk4::prelude::*;
     use gtk4::{gdk, gio, Label};
@@ -1450,6 +1452,9 @@ mod tests {
         trust_posture_wire_name, ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry,
     };
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
+    use werust_core::{
+        CHROME_CSS_CLASS_SETS, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
+    };
 
     #[test]
     fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
@@ -1673,18 +1678,48 @@ mod tests {
     }
 
     #[test]
+    fn every_chrome_css_class_the_core_exports_has_a_rule_in_the_app_css() {
+        // Acceptance (task `export-the-chrome-css-class-set-from-core`): the
+        // painter toggles the core's exported class set, so every name in that
+        // set must also be STYLED here. The cousin of a stale class is an
+        // UNSTYLED one: a new state that is toggled perfectly but has no rule in
+        // `APP_CSS` renders invisibly, so the user sees no badge change at all.
+        // `APP_CSS` is a plain `&str`, so containment of the rule's selector is
+        // enough — and it stays HERE, in the edge that has a stylesheet, because
+        // the core has no notion of colour.
+        let styled = |class: &str| APP_CSS.contains(&format!(".{class} {{"));
+        let mut checked = 0;
+        for family in CHROME_CSS_CLASS_SETS {
+            for class in family.iter().copied() {
+                assert!(
+                    styled(class),
+                    "the core exports `{class}` but `APP_CSS` has no `.{class} {{ … }}` rule, so the state would render invisibly"
+                );
+                checked += 1;
+            }
+        }
+        assert_eq!(
+            checked,
+            TRUST_INDICATOR_CSS_CLASSES.len() + ERROR_BANNER_CSS_CLASSES.len(),
+            "both exported families are checked, not just one"
+        );
+        // The guard has teeth: a class the core did NOT export is not styled
+        // either, so the assertion above is not vacuously true.
+        assert!(!styled("trust-not-a-posture"));
+    }
+
+    #[test]
     fn the_network_trust_column_speaks_the_chrome_trust_indicators_exact_vocabulary() {
         // Acceptance (Network tab trust): each request renders werust's HONEST
         // per-request trust posture using the SAME vocabulary as the trust
         // indicator (ADR-0006), never a new label: the indicator's glyph, the
         // core's wire name, and one of the SAME `trust-*` CSS classes the
         // indicator toggles.
-        let indicator_classes = [
-            "trust-verified",
-            "trust-name-trusted-rpc",
-            "trust-mutable-name",
-            "trust-unverified",
-        ];
+        // The classes are the CORE's exported posture family (the same set the
+        // chrome painter toggles), so the debug view's reuse is covered by the
+        // exhaustiveness + no-unstyled-class guarantee too, and a renamed class
+        // cannot leave this column pointing at a name nothing styles.
+        let indicator_classes = TRUST_INDICATOR_CSS_CLASSES;
         let mut labels = Vec::new();
         for (posture, glyph) in [
             (TrustPosture::ContentVerified, "✓"),

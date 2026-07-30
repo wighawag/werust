@@ -4,7 +4,7 @@ A Windows desktop werust is feasible and the shape is now settled: a new `Render
 
 ## Status
 
-accepted
+accepted, but its DEFER was overturned on 2026-07-30 — see [Amendment 1](#amendment-1-2026-07-30--the-defer-is-overturned-windows-and-macos-are-funded-now) at the foot of this file. Everything else in this ADR (the mechanism, the bindings choice, the trait mapping, the origin question, the probe design, the sizing, the macOS split shape, and the chrome-presentation extraction) STANDS and is what the funded work builds to.
 
 Research only: this ADR changed no code. Evidence, sources and dates: [`docs/spikes/windows-platform-research/README.md`](../spikes/windows-platform-research/README.md). Judgement calls behind the recommendation: [`docs/spikes/windows-platform-research/DECISIONS.md`](../spikes/windows-platform-research/DECISIONS.md).
 
@@ -68,8 +68,25 @@ The load-bearing technical worry was specific and well-earned. On Android an `ip
 
 ## Consequences
 
-- Windows stays unsupported, and that is now a RECORDED choice with revisit triggers rather than an accident. `docs/platform-capability-matrix.toml` gains no `windows` column, so the parity guard is untouched (adding the column is deliberately part of the future Windows work, not of this research).
+- ~~Windows stays unsupported~~ (overturned by Amendment 1: Windows is funded). `docs/platform-capability-matrix.toml` gains no `windows` column FROM THIS RESEARCH; adding the column remains part of the Windows shell work, not of this ADR.
 - The next desktop-shell task in this repo, whichever platform it serves, should start with the shared chrome-presentation extraction. If a second desktop shell lands BEFORE that extraction, the display rules become quadruplicated and the debt compounds in four places.
 - The Windows origin answer is deliberately left open. Anyone tempted to close it from documents should read `docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md` first; the probe is cheap and the field bug was not.
 - werust's `origin_map.rs` is now known to be the same mechanism Tauri ships on Windows and Android. It should be treated as a candidate SHARED module (not an Android wart) the moment a second platform needs it, and its doc comment's framing as an Android-specific hack will then need updating.
 - A user-visible Windows behaviour is pre-specified for whoever builds it: a machine without the WebView2 Runtime must fail HONESTLY (name the missing runtime, point at the download) rather than crash, in the same fail-closed spirit as the rest of the product.
+
+## Amendment 1 (2026-07-30) — the DEFER is overturned: Windows and macOS are funded now
+
+**What changed:** nothing technical. The human read this ADR and funded both new desktop platforms anyway, for REACH: werust is meant to be a general-purpose browser, and a browser that runs only on Linux desktop plus two mobile OSes cannot be evaluated by most of the people it is for. Having the platforms early is also expected to GUIDE the architecture rather than merely follow it.
+
+This is revisit trigger **(a)** of the Decision block firing ("a real user or distribution demand signal for Windows appears"), not a technical reversal. Every finding above stands, including the parts that make the DEFER look attractive: the cost is still a fourth (and fifth) shell dominated by chrome painting, and the Windows origin behaviour is still UNDETERMINED.
+
+**What the funding does NOT change:**
+
+- **The probe is still gate 0 for Windows.** No Windows shell code is written before the origin probe answers whether a registered `ipfs://` scheme really gives a working same-origin `fetch` + `pushState`. The probe runs on a `windows-latest` CI runner, so it needs no Windows hardware; that is the whole reason it can go first. If it fails, the mechanism is the promoted `origin_map.rs`, and that is a decision the probe makes, not a preference.
+- **The shared chrome-presentation extraction still goes first, and matters MORE now.** With two new windows funded, the Consequences bullet above ("if a second desktop shell lands BEFORE that extraction, the display rules become quadruplicated") is no longer hypothetical: it would become quintuplicated, since the Kotlin and Swift twins already exist.
+- **macOS still leads Windows** among the two shells, for the reasons in the Decision block: a better-placed origin story, an existing `macos-14` runner, and an existing working WKWebView backend to lean on.
+- **The sizing stands.** 22 to 39 person-days for Windows, less the shared extraction; macOS is comparable minus its engine work. Funding does not shrink the chrome-painting line, it only decides to pay it.
+
+**The verification constraint, recorded honestly:** neither shell can be verified on real hardware from this development machine (no Mac, no Windows box). Both must be built blind and verified in CI, exactly as the iOS shell was, and that path has a known cost: this repo already carries a recorded MECHANISM ANALYSIS for iOS origins whose runtime confirmation still awaits a Mac (`docs/spikes/mobile-ronan-eth-buttons-no-navigation/DIAGNOSIS.md`). Each new platform should therefore land with an explicit statement of what was proven by CI versus what remains analysis awaiting hardware, rather than letting the distinction blur.
+
+**Order funded:** (1) shared chrome-presentation extraction, (2) the Windows origin probe on CI, (3) the macOS WKWebView backend + window, (4) the Windows shell built on the probe's verdict, (5) parity columns and packaging legs for both.

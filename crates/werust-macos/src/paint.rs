@@ -37,8 +37,9 @@
 //! the GTK edge's `APP_CSS`). [`CLASS_COLORS`] is this edge's stylesheet: the
 //! same palette the GTK window uses, so a content-verified badge is the same
 //! green on both desktops, and [`class_color`] is total over every exported class
-//! (a test drives the exported sets, so an unstyled state reds the gate exactly
-//! as it does on GTK).
+//! (the gate drives the core's `CssClassFamily::ALL` — every exported FAMILY, not
+//! a list named here — so a new family or a new state reds this gate exactly as
+//! it does on GTK).
 
 use renderer::Renderer;
 #[cfg(test)]
@@ -51,8 +52,9 @@ use werust_core::debug::{
 use werust_core::menu::{BrowserMenu, MenuItemKind};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
-    invalid_entry_badge_visible, load_progress_fraction, load_progress_hint, load_progress_visible,
-    status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail, ChromeState,
+    invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip,
+    load_progress_visible, status_line, trust_indicator, trust_indicator_css_class,
+    trust_indicator_detail, ChromeState, STOP_AFFORDANCE_LABEL,
 };
 
 /// A colour, as the three 0.0–1.0 components AppKit's
@@ -92,8 +94,11 @@ const fn rgb(hex: u32) -> Rgb {
 /// A class the core exports but this table omits would render with no colour at
 /// all — the "correctly toggled but invisible" failure the GTK edge's
 /// no-unstyled-class test exists for. [`class_color`] is therefore driven by the
-/// core's exported sets in `every_exported_class_has_a_colour`, so the gate reds
-/// when a new state lands unstyled.
+/// core's family AGGREGATE (`CssClassFamily::ALL`) in
+/// `every_exported_class_has_a_colour`, so the gate reds both when a new state
+/// lands unstyled and when a whole new FAMILY lands — which a family list written
+/// out here would have missed entirely (task
+/// `one-derivation-close-the-aggregate-and-tooltip-gaps`).
 ///
 /// # ADR-0009 (follow the OS colour scheme)
 ///
@@ -216,18 +221,11 @@ impl ChromePaint {
         let error_class = error_banner_css_class(state);
         // The phase NAME rides along as the URL bar's tooltip (the status line
         // already names it too), so the bar says WHICH phase is slow without
-        // taking a fixed slot in the toolbar. The cancel hint is added ONLY while
-        // the backend load is in flight, which is exactly when Stop is enabled:
-        // during the PRE-CONTENT resolution window there is no backend load to
-        // stop, so promising a cancel there would lie.
-        let progress_tooltip = load_progress_visible(state).then(|| {
-            let hint = load_progress_hint(state);
-            if state.is_loading() {
-                format!("{hint}… — press Stop (✕) to cancel")
-            } else {
-                format!("{hint}…")
-            }
-        });
+        // taking a fixed slot in the toolbar. The SENTENCE is the CORE's one rule
+        // — phase, plus the cancel hint exactly while there is a backend load Stop
+        // can cancel — not a second copy here; this edge contributes only the
+        // label its own Stop button carries (`window::build`, a "✕" title).
+        let progress_tooltip = load_progress_tooltip(state, STOP_AFFORDANCE_LABEL);
         Self {
             url_text: state.url_text.clone(),
             invalid_entry: invalid_entry_badge_visible(state),
@@ -498,11 +496,11 @@ pub fn install_debug_capture(backend: &mut dyn Renderer, capture: DebugCapture) 
 mod tests {
     use super::*;
     use renderer::{LoadEvent, LoadState, RendererError, ViewHandle};
-    use werust_core::debug::{
-        ConsoleLevel, CAPTURE_BRIDGE, DEBUG_CONSOLE_CSS_CLASSES, MAX_CONSOLE_ENTRIES,
-    };
+    use werust_core::debug::{ConsoleLevel, CAPTURE_BRIDGE, MAX_CONSOLE_ENTRIES};
     use werust_core::menu::{MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
-    use werust_core::{LoadStep, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES};
+    use werust_core::{
+        CssClassFamily, LoadStep, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
+    };
 
     #[test]
     fn the_paint_is_the_cores_derivation_verbatim() {
@@ -557,6 +555,11 @@ mod tests {
             assert_eq!(paint.invalid_badge_text, invalid_entry_badge_text(state));
             assert_eq!(paint.progress_visible, load_progress_visible(state));
             assert_eq!(paint.progress_fraction, load_progress_fraction(state));
+            assert_eq!(
+                paint.progress_tooltip,
+                load_progress_tooltip(state, STOP_AFFORDANCE_LABEL),
+                "the URL bar's progress sentence is the core's one rule, not a second copy here"
+            );
             assert_eq!(paint.can_go_back, state.can_go_back);
             assert_eq!(paint.can_go_forward, state.can_go_forward);
             assert_eq!(paint.is_loading, state.is_loading());
@@ -617,16 +620,16 @@ mod tests {
         // The macOS face of the GTK edge's no-unstyled-class guard: the core
         // exports the class NAMES, this edge owns the palette, and a state that
         // is derived perfectly but has no colour here would paint invisibly.
-        // Driven from the core's exported sets (each of which its own core test
-        // proves exhaustive over its enum), so a fifth trust posture or a sixth
-        // console level reds THIS gate too.
+        // Driven from the core's aggregate over EVERY exported family
+        // (`CssClassFamily::ALL`, kept complete by a compile-time check), never a
+        // family list written out here: each family is already exhaustive over its
+        // CLASSES, so a fifth trust posture or a sixth console level reds this
+        // gate — and now a whole new FAMILY does too, instead of joining no gate
+        // at all and painting invisibly (task
+        // `one-derivation-close-the-aggregate-and-tooltip-gaps`).
         let mut checked = 0;
-        for family in [
-            TRUST_INDICATOR_CSS_CLASSES,
-            ERROR_BANNER_CSS_CLASSES,
-            DEBUG_CONSOLE_CSS_CLASSES,
-        ] {
-            for class in family.iter().copied() {
+        for family in CssClassFamily::ALL {
+            for class in family.classes().iter().copied() {
                 assert!(
                     class_color(class).is_some(),
                     "the core exports `{class}` but this edge has no colour for it, so the state \

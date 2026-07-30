@@ -283,18 +283,37 @@ fn the_class_names_and_labels_are_never_restated_in_the_window() {
         );
     }
     // The palette (the one thing an edge legitimately owns) lives in `paint.rs`
-    // and is driven by the core's exported class SETS, never by a literal list.
+    // and its coverage gate is driven by the core's aggregate over EVERY exported
+    // family, never by a family list written out here: a hand-written list is
+    // exhaustive over the CLASSES it names but not over the FAMILIES, so a sixth
+    // family would join no gate and paint invisibly with a green suite (task
+    // `one-derivation-close-the-aggregate-and-tooltip-gaps`).
     let paint = paint();
     assert!(
         paint.contains("pub const CLASS_COLORS"),
         "the edge's stylesheet belongs to the edge"
     );
-    assert!(
-        paint.contains("TRUST_INDICATOR_CSS_CLASSES")
-            && paint.contains("ERROR_BANNER_CSS_CLASSES")
-            && paint.contains("DEBUG_CONSOLE_CSS_CLASSES"),
-        "the no-unstyled-class guard must be driven by the CORE's exported sets"
+    let paint_code = code_only(&paint);
+    let gate = between(
+        &paint_code,
+        "fn every_exported_class_has_a_colour()",
+        "\n    }\n",
     );
+    assert!(
+        gate.contains("for family in CssClassFamily::ALL") && gate.contains("family.classes()"),
+        "the no-unstyled-class guard must iterate the CORE's family aggregate: {gate:?}"
+    );
+    for hand_written in [
+        "TRUST_INDICATOR_CSS_CLASSES",
+        "ERROR_BANNER_CSS_CLASSES",
+        "DEBUG_CONSOLE_CSS_CLASSES",
+    ] {
+        assert!(
+            !gate.contains(hand_written),
+            "`{hand_written}` is named in the palette gate; WHICH families are checked must come \
+             from the core's aggregate"
+        );
+    }
 }
 
 #[test]

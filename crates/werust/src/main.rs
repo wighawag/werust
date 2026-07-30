@@ -58,9 +58,9 @@ use werust_core::ethereum::RpcProvider;
 use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
-    invalid_entry_badge_visible, load_progress_fraction, load_progress_hint, load_progress_visible,
-    status_line, trust_indicator, trust_indicator_css_class, trust_indicator_detail, BrowserShell,
-    ChromeState, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
+    invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip, status_line,
+    trust_indicator, trust_indicator_css_class, trust_indicator_detail, BrowserShell, ChromeState,
+    ERROR_BANNER_CSS_CLASSES, STOP_AFFORDANCE_LABEL, TRUST_INDICATOR_CSS_CLASSES,
 };
 
 /// The URL werust opens when none is given on the command line.
@@ -868,19 +868,13 @@ impl Chrome {
             .set_progress_fraction(load_progress_fraction(state));
         // The phase NAME rides along as the URL bar's tooltip (plus the footer
         // status line, which already names it), so the bar says WHICH phase is
-        // slow without stealing a fixed slot from the toolbar. Cleared when
-        // nothing is in flight, so a stale phase never lingers on hover. The
-        // cancel hint is added ONLY while the backend load is in flight, which is
-        // exactly when Stop is sensitive: during the PRE-CONTENT resolution window
-        // there is no backend load to stop, so promising a cancel there would lie.
-        let phase_tooltip = load_progress_visible(state).then(|| {
-            let hint = load_progress_hint(state);
-            if state.is_loading() {
-                format!("{hint}… — press Stop (✕) to cancel")
-            } else {
-                format!("{hint}…")
-            }
-        });
+        // slow without stealing a fixed slot from the toolbar. The SENTENCE — the
+        // phase, and the cancel hint exactly while there is a backend load Stop
+        // can cancel — is the core's one rule, not this edge's: it was written out
+        // verbatim here and in the AppKit painter, which is how the Kotlin and
+        // Swift twins started drifting. This edge contributes only the label its
+        // own Stop control carries.
+        let phase_tooltip = load_progress_tooltip(state, STOP_AFFORDANCE_LABEL);
         self.url_entry.set_tooltip_text(phase_tooltip.as_deref());
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate, protocol-named reason across the top of the view so the user
@@ -1305,13 +1299,9 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use werust_core::contenthash::{DecodedContenthash, ProtoCode};
-    use werust_core::debug::{
-        ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry, DEBUG_CONSOLE_CSS_CLASSES,
-    };
+    use werust_core::debug::{ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry};
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
-    use werust_core::{
-        CHROME_CSS_CLASS_SETS, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
-    };
+    use werust_core::CssClassFamily;
 
     #[test]
     fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
@@ -1471,20 +1461,19 @@ mod tests {
         // enough — and it stays HERE, in the edge that has a stylesheet, because
         // the core has no notion of colour.
         //
-        // The DEBUG-VIEW's own exported family (`DEBUG_CONSOLE_CSS_CLASSES`, the
-        // console levels) is checked here too: it moved into the core with the
-        // row rules (task `macos-appkit-window-and-chrome`), and an unstyled
-        // level would be exactly as invisible as an unstyled badge. It is a
-        // SEPARATE family rather than a member of `CHROME_CSS_CLASS_SETS`,
-        // because that set is what a chrome painter toggles on one widget.
+        // WHICH families are checked is the CORE's aggregate (`CssClassFamily::ALL`),
+        // never a list written out here: a hand-written list was exhaustive over
+        // the CLASSES of the families it named but not over the FAMILIES, so a
+        // sixth family joined no gate at all and painted invisibly with a green
+        // suite (task `one-derivation-close-the-aggregate-and-tooltip-gaps`). The
+        // aggregate deliberately covers MORE than `CHROME_CSS_CLASS_SETS`: the
+        // debug view's console levels colour a row and are not toggled on a chrome
+        // widget, but an unstyled level is exactly as invisible as an unstyled
+        // badge, so coverage spans every exported family.
         let styled = |class: &str| APP_CSS.contains(&format!(".{class} {{"));
         let mut checked = 0;
-        for family in CHROME_CSS_CLASS_SETS
-            .iter()
-            .copied()
-            .chain([DEBUG_CONSOLE_CSS_CLASSES])
-        {
-            for class in family.iter().copied() {
+        for family in CssClassFamily::ALL {
+            for class in family.classes().iter().copied() {
                 assert!(
                     styled(class),
                     "the core exports `{class}` but `APP_CSS` has no `.{class} {{ … }}` rule, so the state would render invisibly"
@@ -1494,10 +1483,15 @@ mod tests {
         }
         assert_eq!(
             checked,
-            TRUST_INDICATOR_CSS_CLASSES.len()
-                + ERROR_BANNER_CSS_CLASSES.len()
-                + DEBUG_CONSOLE_CSS_CLASSES.len(),
-            "every exported family is checked, not just one"
+            CssClassFamily::ALL
+                .iter()
+                .map(|family| family.classes().len())
+                .sum::<usize>(),
+            "every class of every exported family is checked, not just one family"
+        );
+        assert!(
+            CssClassFamily::ALL.len() > 1 && checked > CssClassFamily::ALL.len(),
+            "the drive is the whole aggregate, not a degenerate one-family loop"
         );
         // The guard has teeth: a class the core did NOT export is not styled
         // either, so the assertion above is not vacuously true.

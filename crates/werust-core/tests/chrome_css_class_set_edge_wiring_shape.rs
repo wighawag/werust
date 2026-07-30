@@ -26,6 +26,18 @@
 //! - The layering holds: the stylesheet stays in the edge and core gains no
 //!   notion of colour
 //!   (`the_stylesheet_stays_in_the_edge_and_core_gains_no_styling_concept`).
+//!
+//! EXTENDED by task `one-derivation-close-the-aggregate-and-tooltip-gaps`, which
+//! closed the level ABOVE: each family was exhaustive over its CLASSES, but each
+//! painter's coverage GATE hand-wrote which FAMILIES it checked, so a sixth
+//! family would join neither gate and paint invisibly on both desktops with both
+//! suites green. Both gates now iterate the core's `CssClassFamily::ALL`
+//! (`both_coverage_gates_iterate_the_family_aggregate_not_a_hand_written_list`),
+//! and the URL-bar progress SENTENCE is composed once in the core rather than
+//! twice at the edges (`the_progress_tooltip_sentence_lives_only_in_the_core`).
+//! Both are source-shape guards for the same reason as the toggle guard above:
+//! the macOS half of the wiring cannot be exercised on this gate, and a painter
+//! that drifted back to a literal list would keep a green suite.
 
 use std::path::{Path, PathBuf};
 
@@ -58,11 +70,7 @@ fn the_gtk_painter_toggles_from_the_exported_class_set_not_a_literal_list() {
     let desktop = desktop_shell();
     // The painter IMPORTS the exported set from the core (one shared decision),
     // rather than restating the names.
-    for exported in [
-        "ERROR_BANNER_CSS_CLASSES",
-        "TRUST_INDICATOR_CSS_CLASSES",
-        "CHROME_CSS_CLASS_SETS",
-    ] {
+    for exported in ["ERROR_BANNER_CSS_CLASSES", "TRUST_INDICATOR_CSS_CLASSES"] {
         assert!(
             desktop.contains(exported),
             "the desktop shell must consume the core's `{exported}`"
@@ -98,6 +106,85 @@ fn the_gtk_painter_toggles_from_the_exported_class_set_not_a_literal_list() {
         assert!(
             !refresh.contains(class),
             "`{class}` is hard-coded in the painter; it must come from the core's exported set"
+        );
+    }
+}
+
+/// The macOS painter's host-independent half, which the Ubuntu gate DOES compile
+/// (its palette gate lives there).
+fn macos_paint() -> String {
+    source("crates/werust-macos/src/paint.rs")
+}
+
+#[test]
+fn both_coverage_gates_iterate_the_family_aggregate_not_a_hand_written_list() {
+    // Acceptance (task `one-derivation-close-the-aggregate-and-tooltip-gaps`):
+    // each painter's no-unstyled-class gate must be driven by the CORE's
+    // aggregate over every exported family, so a SIXTH family reds both gates
+    // instead of joining neither. A gate that names its families itself is
+    // exhaustive over the classes of the families it happens to know, which is
+    // exactly the hole this task closes.
+    for (edge, gate_fn, source_text) in [
+        (
+            "crates/werust/src/main.rs",
+            "fn every_chrome_css_class_the_core_exports_has_a_rule_in_the_app_css()",
+            desktop_shell(),
+        ),
+        (
+            "crates/werust-macos/src/paint.rs",
+            "fn every_exported_class_has_a_colour()",
+            macos_paint(),
+        ),
+    ] {
+        let gate = between(&source_text, gate_fn, "\n    }\n");
+        let code: String = gate
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("for family in CssClassFamily::ALL") && code.contains("family.classes()"),
+            "{edge}'s coverage gate must iterate the core's family aggregate: {code:?}"
+        );
+        for hand_written in [
+            "TRUST_INDICATOR_CSS_CLASSES",
+            "ERROR_BANNER_CSS_CLASSES",
+            "DEBUG_CONSOLE_CSS_CLASSES",
+            "CHROME_CSS_CLASS_SETS",
+        ] {
+            assert!(
+                !code.contains(hand_written),
+                "{edge}'s coverage gate names `{hand_written}` itself; WHICH families are checked \
+                 must come from the core's aggregate"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_progress_tooltip_sentence_lives_only_in_the_core() {
+    // Acceptance (task `one-derivation-close-the-aggregate-and-tooltip-gaps`): the
+    // URL bar's progress tooltip is a pure function of `ChromeState`, so it is
+    // composed ONCE beside the other `load_progress_*` rules and both desktop
+    // painters CALL it. It had been written out verbatim in both edges — two
+    // copies of one sentence, which is exactly how the Kotlin and Swift twins
+    // started to drift.
+    let core = source("crates/werust-core/src/lib.rs");
+    assert!(
+        core.contains("pub fn load_progress_tooltip(state: &ChromeState, stop_label: &str)"),
+        "the sentence is a core rule, beside the other `load_progress_*` rules"
+    );
+    for (edge, text) in [
+        ("crates/werust/src/main.rs", desktop_shell()),
+        ("crates/werust-macos/src/paint.rs", macos_paint()),
+    ] {
+        assert!(
+            text.contains("load_progress_tooltip(state, STOP_AFFORDANCE_LABEL)"),
+            "{edge} must call the core's tooltip rule with the label its Stop control carries"
+        );
+        assert!(
+            !text.contains("to cancel"),
+            "{edge} still composes the progress sentence itself; it belongs to the core"
         );
     }
 }

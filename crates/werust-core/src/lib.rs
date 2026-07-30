@@ -769,6 +769,47 @@ pub fn load_progress_hint(state: &ChromeState) -> &'static str {
     }
 }
 
+/// The label werust's Stop control carries on every edge today: the GTK toolbar
+/// button (the themed `process-stop-symbolic` cross), the AppKit toolbar button,
+/// and both mobile Stop buttons all read as this glyph.
+///
+/// It exists so the ONE progress sentence ([`load_progress_tooltip`]) names the
+/// SAME affordance everywhere rather than each painter passing its own literal —
+/// the parameter is there for an edge whose Stop control really is labelled
+/// differently, not as an invitation to fork the wording.
+pub const STOP_AFFORDANCE_LABEL: &str = "✕";
+
+/// The URL bar's progress TOOLTIP for the current load: the phase name (the
+/// shared [`load_progress_hint`] vocabulary), plus a cancel hint naming the Stop
+/// affordance exactly when there is a backend load Stop can cancel. [`None`] on a
+/// settled chrome, which CLEARS the tooltip, so a stale phase never lingers on
+/// hover.
+///
+/// The cancel half is deliberately gated on [`ChromeState::is_loading`] rather
+/// than on [`load_progress_visible`]: during the PRE-CONTENT resolution window
+/// (a name being resolved before the backend load starts) there is no backend
+/// load to stop, so promising a cancel there would lie — and Stop is insensitive
+/// then anyway, on that same fact.
+///
+/// `stop_label` is the painter's label for its Stop control ([`STOP_AFFORDANCE_LABEL`]
+/// on every werust edge today): the sentence names a UI affordance the EDGE owns,
+/// so an edge that labels Stop differently passes its own label instead of
+/// forking the sentence. Pure, for the same reason as [`status_line`]; it lives
+/// here because both desktop painters had written it out verbatim, which is how
+/// the Kotlin and Swift twins began to drift (`docs/adr/0011`).
+#[must_use]
+pub fn load_progress_tooltip(state: &ChromeState, stop_label: &str) -> Option<String> {
+    if !load_progress_visible(state) {
+        return None;
+    }
+    let hint = load_progress_hint(state);
+    Some(if state.is_loading() {
+        format!("{hint}… — press Stop ({stop_label}) to cancel")
+    } else {
+        format!("{hint}…")
+    })
+}
+
 /// The one-line status shown in the chrome: a surfaced failure wins, otherwise a
 /// loading indicator that names the REAL pipeline STEP (resolving name / fetching
 /// record / fetching content / rendering) so a slow load reads as "working",
@@ -1009,8 +1050,107 @@ pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
 /// LAYERING: these are stable state IDENTIFIERS, not styling. The stylesheet
 /// that gives each name a colour stays in the edge that has a stylesheet (the
 /// GTK `APP_CSS`); core has no notion of colour.
+///
+/// SCOPE: this is the TOGGLING set — the chrome families a painter turns on and
+/// off on one widget — and stays deliberately narrower than the set of families
+/// this crate exports (the debug view's console levels colour a ROW, so they are
+/// not a member). A painter's no-unstyled-class GATE must therefore not iterate
+/// this: it iterates [`CssClassFamily::ALL`], which covers every exported family.
 pub const CHROME_CSS_CLASS_SETS: &[&[&str]] =
     &[TRUST_INDICATOR_CSS_CLASSES, ERROR_BANNER_CSS_CLASSES];
+
+/// Every CSS-class FAMILY this crate exports, as one aggregate for the painters'
+/// COVERAGE gates.
+///
+/// WHY THIS EXISTS: [`CHROME_CSS_CLASS_SETS`] and friends made each family
+/// exhaustive over its CLASSES, so a fifth [`TrustPosture`] cannot arrive with a
+/// stale set and a green suite. The set of FAMILIES had no such tooth: each
+/// painter's no-unstyled-class gate hand-wrote which families it checked (the GTK
+/// `APP_CSS` guard, the macOS palette guard), so a SIXTH family would join
+/// neither gate and render invisibly on BOTH desktops while both suites stayed
+/// green — the same failure one level up. Both gates now iterate [`ALL`](CssClassFamily::ALL),
+/// which the const check below keeps complete, so a new family reds both gates
+/// the moment it lands.
+///
+/// NOT a replacement for [`CHROME_CSS_CLASS_SETS`], which keeps its NARROWER
+/// meaning: that set is what a chrome painter TOGGLES on one widget (exactly one
+/// class on, every other one off), which is why the debug view's row levels
+/// ([`DEBUG_CONSOLE_CSS_CLASSES`](crate::debug::DEBUG_CONSOLE_CSS_CLASSES)) are
+/// deliberately not a member of it. This aggregate is for coverage only: a
+/// painter must never toggle a console class on a chrome widget.
+///
+/// LAYERING is unchanged: these are stable state IDENTIFIERS, never styling. The
+/// stylesheet that gives each name a colour stays in the edge that has one.
+///
+/// Shape decisions (why an enum here when the families are `const` slices, and
+/// why the stop label is a parameter next door) are recorded at
+/// `docs/spikes/one-derivation-close-the-aggregate-and-tooltip-gaps/DECISIONS.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CssClassFamily {
+    /// The chrome trust indicator's posture badges
+    /// ([`TRUST_INDICATOR_CSS_CLASSES`]), toggled on the trust badge.
+    TrustIndicator,
+    /// The prominent error banner's severities ([`ERROR_BANNER_CSS_CLASSES`]),
+    /// toggled on the banner.
+    ErrorBanner,
+    /// The debug view's console LEVELS
+    /// ([`DEBUG_CONSOLE_CSS_CLASSES`](crate::debug::DEBUG_CONSOLE_CSS_CLASSES)),
+    /// which colour a row rather than being toggled on one widget.
+    DebugConsole,
+}
+
+impl CssClassFamily {
+    /// Every exported class family. The single source of truth for "which
+    /// families exist", so a coverage gate iterates THIS instead of re-listing
+    /// the families in a literal that silently goes stale. Kept complete by the
+    /// const check below.
+    pub const ALL: [CssClassFamily; 3] = [
+        CssClassFamily::TrustIndicator,
+        CssClassFamily::ErrorBanner,
+        CssClassFamily::DebugConsole,
+    ];
+
+    /// The complete list of class names in this family — the very `const` the
+    /// rules that produce them are exported beside, never a second copy.
+    #[must_use]
+    pub const fn classes(self) -> &'static [&'static str] {
+        match self {
+            CssClassFamily::TrustIndicator => TRUST_INDICATOR_CSS_CLASSES,
+            CssClassFamily::ErrorBanner => ERROR_BANNER_CSS_CLASSES,
+            CssClassFamily::DebugConsole => crate::debug::DEBUG_CONSOLE_CSS_CLASSES,
+        }
+    }
+}
+
+/// Keeps [`CssClassFamily::ALL`] EXHAUSTIVE at compile time, by exactly the
+/// construction [`LoadStep::ALL`]'s check uses (see it for the full reasoning):
+/// the total `listed` match refuses to compile until a new family is named here,
+/// and the arm it is named in (`… => CssClassFamily::ALL[3]`) refuses to compile
+/// until the family is in `ALL` as well.
+///
+/// This is the tooth the two painters' coverage gates hang from: both iterate
+/// `ALL`, so a sixth exported family cannot reach a green build without joining
+/// the GTK stylesheet gate AND the macOS palette gate (task
+/// `one-derivation-close-the-aggregate-and-tooltip-gaps`). [`CssClassFamily::classes`]
+/// is a total match for the same reason: a family that named itself here but
+/// listed no classes would not compile either.
+const _CSS_CLASS_FAMILY_ALL_IS_EVERY_FAMILY_IN_SLOT_ORDER: () = {
+    const fn listed(family: CssClassFamily) -> CssClassFamily {
+        match family {
+            CssClassFamily::TrustIndicator => CssClassFamily::ALL[0],
+            CssClassFamily::ErrorBanner => CssClassFamily::ALL[1],
+            CssClassFamily::DebugConsole => CssClassFamily::ALL[2],
+        }
+    }
+    let mut i = 0;
+    while i < CssClassFamily::ALL.len() {
+        assert!(
+            listed(CssClassFamily::ALL[i]) as u8 == CssClassFamily::ALL[i] as u8,
+            "CssClassFamily::ALL must hold every family, once, in slot order"
+        );
+        i += 1;
+    }
+};
 
 /// The browser shell: the seam-driven logic behind the window.
 ///
@@ -5552,6 +5692,86 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_url_bar_progress_tooltip_is_composed_once_here_for_every_painter() {
+        // Acceptance (task `one-derivation-close-the-aggregate-and-tooltip-gaps`):
+        // the URL bar's progress tooltip is a pure function of `ChromeState`, so
+        // it is composed HERE beside the other `load_progress_*` rules and every
+        // painter CALLS it. It was written out twice — verbatim, comments and all
+        // — in the GTK and the AppKit edges, which is exactly how the Kotlin and
+        // Swift twins started drifting.
+
+        // Settled: no tooltip at all, so a stale phase never lingers on hover.
+        for settled in [
+            ChromeState::default(),
+            ChromeState {
+                load_state: LoadState::Finished,
+                ..ChromeState::default()
+            },
+        ] {
+            assert_eq!(
+                load_progress_tooltip(&settled, STOP_AFFORDANCE_LABEL),
+                None,
+                "a settled chrome has no phase to name"
+            );
+        }
+
+        // A BACKEND load in flight: the phase name plus the cancel hint, which is
+        // honest exactly then — Stop is sensitive/enabled on precisely this fact.
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..ChromeState::default()
+        };
+        assert_eq!(
+            load_progress_tooltip(&loading, STOP_AFFORDANCE_LABEL).as_deref(),
+            Some("fetching content… — press Stop (✕) to cancel"),
+            "the sentence both desktop edges show today, now derived once"
+        );
+
+        // The PRE-CONTENT resolution window: work is in flight but there is no
+        // backend load for Stop to cancel, so the sentence promises no cancel.
+        let resolving = ChromeState {
+            load_state: LoadState::Idle,
+            load_step: LoadStep::ResolvingName,
+            ..ChromeState::default()
+        };
+        assert!(!resolving.is_loading());
+        assert_eq!(
+            load_progress_tooltip(&resolving, STOP_AFFORDANCE_LABEL).as_deref(),
+            Some("resolving name…"),
+            "promising a cancel with no backend load to stop would lie"
+        );
+
+        // The phase half is the shared `load_progress_hint`, never a second
+        // vocabulary, over the whole in-flight axis.
+        for step in LoadStep::ALL {
+            let state = ChromeState {
+                load_state: LoadState::Started,
+                load_step: step,
+                ..ChromeState::default()
+            };
+            let tooltip = load_progress_tooltip(&state, STOP_AFFORDANCE_LABEL)
+                .expect("a load in flight names its phase");
+            assert!(
+                tooltip.starts_with(load_progress_hint(&state)),
+                "`{tooltip}` must open with the shared phase hint"
+            );
+        }
+
+        // The STOP AFFORDANCE is the painter's, so the label is a parameter: an
+        // edge whose Stop control is labelled differently passes its own label
+        // instead of forking the sentence.
+        assert_eq!(
+            load_progress_tooltip(&loading, "Esc").as_deref(),
+            Some("fetching content… — press Stop (Esc) to cancel")
+        );
+        assert_eq!(
+            STOP_AFFORDANCE_LABEL, "✕",
+            "the label every werust edge shows on its Stop control today"
+        );
+    }
+
     /// One failure REASON per [`FailureKind`], plus `None` (nothing failed): the
     /// failure-severity axis of [`every_chrome_state_shape`].
     ///
@@ -5715,6 +5935,77 @@ mod tests {
         // Every exported name is a usable CSS class name (non-empty, no dot, no
         // whitespace): an edge interpolates it straight into a stylesheet rule.
         for class in complete {
+            assert!(
+                !class.is_empty()
+                    && !class.contains('.')
+                    && !class.chars().any(char::is_whitespace),
+                "`{class}` is not a plain CSS class name"
+            );
+        }
+    }
+
+    #[test]
+    fn the_family_aggregate_holds_every_exported_class_family_for_the_coverage_gates() {
+        // Acceptance (task `one-derivation-close-the-aggregate-and-tooltip-gaps`):
+        // the previous task made each family exhaustive over its CLASSES, but the
+        // SET OF FAMILIES was hand-written in each painter's coverage gate, so a
+        // SIXTH family would join neither gate and render invisibly on both
+        // desktops with both suites green. `CssClassFamily::ALL` is that missing
+        // aggregate, kept exhaustive BY CONSTRUCTION (the const check beside it).
+        let aggregate: Vec<&[&str]> = CssClassFamily::ALL
+            .iter()
+            .map(|family| family.classes())
+            .collect();
+        for exported in [
+            TRUST_INDICATOR_CSS_CLASSES,
+            ERROR_BANNER_CSS_CLASSES,
+            crate::debug::DEBUG_CONSOLE_CSS_CLASSES,
+        ] {
+            assert!(
+                aggregate.contains(&exported),
+                "the core exports {exported:?} but the coverage aggregate omits it, so no \
+                 painter's gate would ever check it"
+            );
+        }
+        assert_eq!(
+            aggregate.len(),
+            3,
+            "a new family must be NAMED here too, so its arrival is a deliberate edit"
+        );
+
+        // The narrower TOGGLING set keeps its own meaning: `CHROME_CSS_CLASS_SETS`
+        // is what a chrome painter turns on/off on ONE widget (exactly one on),
+        // and the debug view's row levels are deliberately NOT part of it. The
+        // aggregate is for COVERAGE gates only, so it is a strict SUPERSET.
+        for toggled in CHROME_CSS_CLASS_SETS {
+            assert!(
+                aggregate.contains(toggled),
+                "every toggling family is covered by the aggregate too"
+            );
+        }
+        assert!(
+            !CHROME_CSS_CLASS_SETS.contains(&crate::debug::DEBUG_CONSOLE_CSS_CLASSES),
+            "the console levels colour a debug ROW; no painter toggles them on a chrome widget"
+        );
+        assert!(
+            aggregate.len() > CHROME_CSS_CLASS_SETS.len(),
+            "the aggregate is the wider coverage view, not a rename of the toggling set"
+        );
+
+        // No class belongs to two families (one painter loop would clear what
+        // another just set), every family is non-empty, and every name is a plain
+        // CSS class an edge can interpolate straight into a stylesheet selector.
+        let all: Vec<&str> = aggregate.iter().flat_map(|f| f.iter().copied()).collect();
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            all.len(),
+            "no class is in two families: {all:?}"
+        );
+        for family in &aggregate {
+            assert!(!family.is_empty(), "an empty family styles nothing");
+        }
+        for class in all {
             assert!(
                 !class.is_empty()
                     && !class.contains('.')

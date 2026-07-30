@@ -1,0 +1,70 @@
+[package]
+name = "werust-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The Windows product: `werust-windows` opens the Win32 window over the WebView2
+# backend. A SEPARATE binary from `crates/werust` for the same reason
+# `werust-macos` is: that one depends on gtk4/webkit6 UNCONDITIONALLY and cannot
+# build on Windows (and two binaries cannot share the name `werust` in one
+# workspace) — see the crate docs and
+# `docs/spikes/windows-win32-window-and-chrome/DECISIONS.md`.
+[[bin]]
+name = "werust-windows"
+path = "src/main.rs"
+
+[dependencies]
+renderer = { path = "../renderer" }
+werust-core = { path = "../werust-core" }
+# The window's HOST-INDEPENDENT half, SHARED with the AppKit window: every value
+# painted, the palette, the `BrowserMenu` items, the debug rows and the capture
+# points. CONSUMED, never copied — a second copy of this carrier is precisely
+# what `docs/adr/0011`'s Consequences section warns about.
+desktop-paint = { path = "../desktop-paint" }
+# The Windows ENGINE (task `windows-webview2-renderer-backend`): the `Renderer`
+# implementation over WebView2 this window hosts. Its own WebView2 half is
+# `#[cfg(windows)]`, so on Ubuntu this dependency contributes only the pure
+# decision rules — which is what lets this crate be a workspace member the
+# `verify` gate compiles and tests.
+windows-renderer = { path = "../windows-renderer" }
+
+# The Win32 half only exists on Windows, target-gated exactly as
+# `crates/windows-renderer` gates WebView2 and `crates/werust-macos` gates
+# AppKit. The Ubuntu `verify` gate therefore compiles and tests this crate's
+# host-independent half (the durable-profile rule, plus the whole shared paint
+# half) and runs `tests/windows_window_shape.rs`, the source-shape guard, over
+# the Win32 source it cannot compile.
+#
+# Note what is NOT here: no `webview2-com`. The window talks to the engine only
+# through the `Renderer` seam and one small devtools handle, so the trust-carrying
+# dependency surface stays with the engine.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    # The chrome draws its own surfaces (brushes, text colours, the UI font),
+    # which is how ADR-0009 is followed on a toolkit that propagates nothing.
+    "Win32_Graphics_Gdi",
+    # The title bar is drawn by the system: `DWMWA_USE_IMMERSIVE_DARK_MODE` is
+    # how it follows the same OS setting.
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    # The common controls: the progress bar, the tab control, the list views and
+    # the tooltip that carries the trust EXPLANATION.
+    "Win32_UI_Controls",
+    # `SetFocus`, and the virtual-key codes the URL bar's subclass reads.
+    "Win32_UI_Input_KeyboardAndMouse",
+    # `SetWindowSubclass`/`DefSubclassProc`: Win32's EDIT control swallows Enter,
+    # so the URL bar is subclassed to turn it into a command.
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+# The window smoke pins a canned, network-free content-addressed fixture and
+# derives its real CID, so the window is driven through the PRODUCTION verifying
+# `ipfs://` route with no gateway and no network (the same fixture shape the
+# engine's `trust_hooks_smoke` uses).
+fetcher = { path = "../fetcher" }
+webview-shared = { path = "../webview-shared" }

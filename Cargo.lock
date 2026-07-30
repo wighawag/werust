@@ -424,6 +424,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "desktop-paint"
+version = "0.2.9"
+dependencies = [
+ "renderer",
+ "werust-core",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2953,6 +2961,7 @@ dependencies = [
 name = "werust-macos"
 version = "0.2.9"
 dependencies = [
+ "desktop-paint",
  "fetcher",
  "macos-renderer",
  "objc2",
@@ -2961,6 +2970,19 @@ dependencies = [
  "renderer",
  "webview-shared",
  "werust-core",
+]
+
+[[package]]
+name = "werust-windows"
+version = "0.2.9"
+dependencies = [
+ "desktop-paint",
+ "fetcher",
+ "renderer",
+ "webview-shared",
+ "werust-core",
+ "windows",
+ "windows-renderer",
 ]
 
 [[package]]

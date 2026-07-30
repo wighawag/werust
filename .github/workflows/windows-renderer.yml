@@ -19,9 +19,20 @@ name: windows-renderer
 # off-thread `ipfs://` boundary the WebView2 backend reuses VERBATIM — and, since
 # task `windows-webview2-renderer-backend`, it also builds, tests and RUNS
 # `crates/windows-renderer`: the `#[cfg(windows)]` WebView2 `Renderer` backend the
-# Ubuntu gate can only PARSE. The `trust_hooks_smoke` step is the one that
-# matters, because a backend qualifies for werust on the TRUST HOOKS, not on
-# rendering: it loads a hash-verified `ipfs://<cid>` page through the production
+# Ubuntu gate can only PARSE. Since task `windows-win32-window-and-chrome` it
+# also builds, tests and RUNS `crates/werust-windows` -- the Win32 WINDOW over
+# that backend -- through `window_smoke`, which CONSTRUCTS the real window
+# off-screen (toolbar, trust indicator and its EXPLANATION, error banner, ⋮ menu,
+# tabbed debug view), loads a pinned hash-verified `ipfs://` fixture through the
+# production verifying route and asserts what the real WIDGETS hold, then fails a
+# tampered CID and asserts the banner takes the page. That is the ONLY place the
+# Win32 layer is executed at all; everything derivable about it is unit-tested on
+# the Ubuntu gate (`crates/desktop-paint`, the shared painter half both native
+# desktop windows consume).
+#
+# The `trust_hooks_smoke` step is the one that
+# matters for the ENGINE, because a backend qualifies for werust on the TRUST
+# HOOKS, not on rendering: it loads a hash-verified `ipfs://<cid>` page through the production
 # verifying resolver (pinned in memory — no gateway, no network), asserts the
 # document got its REAL `ipfs://<cid>` tuple origin and sees the native EIP-1193
 # `window.ethereum`, and then asserts a tampered CID FAILS the load and is never
@@ -63,12 +74,30 @@ name: windows-renderer
 # minutes after it merges rather than before, on a leg that gates nothing.
 # `crates/werust-core/tests/windows_renderer_leg_shape.rs` pins this choice, so
 # broadening it has to be a decision rather than a reflex.
+#
+# WHAT THE PR FILTER CARRIES TODAY, and why it grew. It is no longer only the
+# probe: `crates/windows-renderer/**` joined it with the backend task and
+# `crates/werust-windows/**` + `crates/desktop-paint/**` with the window task.
+# The first two are genuinely Windows-shaped — their `cfg(windows)` halves compile
+# NOWHERE else, so a PR touching them is exactly the case this leg exists to
+# gate. `desktop-paint` is not Windows-shaped, but it is the SHARED half both
+# native desktop windows paint from, so a change to it changes what the window
+# smoke asserts. The trade-off above is unchanged and still deliberate:
+# `werust-core`, `fetcher` and `renderer` stay OFF the PR filter (they are caught
+# on `push` and by `workflow_dispatch`), because gating every core PR on a
+# cross-platform runner is the cost under review. The header paragraph above
+# still describes the ORIGINAL narrow filter; rewriting it to describe the filter
+# as it now is belongs to task
+# `windows-backend-error-mapping-and-leg-header-accuracy`, which owns that
+# correction — this note exists so the widening is not silent in the meantime.
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
       - "crates/windows-renderer/**"
+      - "crates/werust-windows/**"
+      - "crates/desktop-paint/**"
       - "crates/webview-shared/**"
       - "crates/renderer/**"
       - "crates/werust-core/**"
@@ -80,6 +109,8 @@ on:
   pull_request:
     paths:
       - "crates/windows-renderer/**"
+      - "crates/werust-windows/**"
+      - "crates/desktop-paint/**"
       - "crates/webview-shared/**"
       - "crates/windows-origin-probe/**"
       - ".github/actions/webview2-runtime-version/**"
@@ -127,7 +158,7 @@ jobs:
         # GTK/WebKitGTK-bound crates that cannot build on a Windows runner.
         # `windows-renderer` and `windows-origin-probe` build their `cfg(windows)`
         # WebView2 halves here, which the Ubuntu gate can only parse.
-        run: cargo build -p windows-renderer -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+        run: cargo build -p windows-renderer -p werust-windows -p desktop-paint -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
 
       - name: Test the Windows backend and the toolkit-free crates on x86_64-pc-windows-msvc
         # The backend's own tests, plus the half it reuses verbatim, exercised on
@@ -135,7 +166,7 @@ jobs:
         # URL rule and off-thread `ipfs://` boundary; `werust-core`'s chrome
         # derivation, ENS/IPNS and debug capture; `fetcher`'s hash-verify
         # boundary; and the origin probe's decision rules. All offline.
-        run: cargo test -p windows-renderer -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
+        run: cargo test -p windows-renderer -p werust-windows -p desktop-paint -p webview-shared -p renderer -p werust-core -p fetcher -p windows-origin-probe
 
       - name: Exercise BOTH trust hooks on a real WebView2 (with a negative control)
         # A backend qualifies on the trust hooks, not on rendering. This loads a
@@ -147,3 +178,17 @@ jobs:
         # request, then asserts a tampered CID FAILS the load and is never
         # reported verified. A smoke where everything passes has measured nothing.
         run: cargo run -p windows-renderer --example trust_hooks_smoke
+
+      - name: Build and drive the REAL Win32 window (chrome, menu, debug view)
+        # The window half's only execution anywhere: it opens a real top-level
+        # window FAR off-screen (never activated, so nothing is shown and no
+        # focus is stolen), loads a pinned, in-memory hash-verified `ipfs://` page
+        # through the production verifying route, and asserts what the real
+        # widgets hold -- the URL bar, the trust indicator AND its explanation
+        # (read back off the real tooltip), the status line, the ⋮ menu built from
+        # the core's `BrowserMenu`, the debug view catching the page's own
+        # `console.log`, and the DURABLE `%LOCALAPPDATA%` profile really existing
+        # on disk. Then a negative control (bytes that do not hash to their CID)
+        # must FAIL, raise the error banner and displace the page. Offline and
+        # deterministic.
+        run: cargo run -p werust-windows --example window_smoke

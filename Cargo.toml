@@ -24,6 +24,24 @@ members = [
     # `#[cfg(target_os = "macos")]` and is built, tested and RUN off-screen by
     # `.github/workflows/macos-renderer.yml` on the `macos-14` runner.
     "crates/werust-macos",
+    # The toolkit-free half every NATIVE-WIDGET desktop painter shares: the
+    # values a window paints (derived from `werust-core`), the palette that
+    # gives the core's exported class names a colour, the `BrowserMenu` items
+    # and the debug-view rows. Extracted out of `werust-macos::paint` by task
+    # `windows-win32-window-and-chrome` so the Win32 window consumes the one
+    # carrier instead of minting a second copy of it (and a third transcription
+    # of the palette). Toolkit-free, so the Ubuntu `verify` gate compiles and
+    # unit-tests it against the REAL core — which is what makes "the native
+    # windows paint the shared derivation" a checked fact on every run.
+    "crates/desktop-paint",
+    # The Windows WINDOW: the Win32 chrome over the WebView2 backend (ADR-0011's
+    # Windows split, sub-task 3). A workspace member for the same reason its
+    # engine is: the Ubuntu `verify` gate compiles and tests its host-independent
+    # half (the durable-profile rule and the capture wiring over the seam) and
+    # runs the source-shape guard over the Win32 source it cannot compile; the
+    # window itself is `#[cfg(windows)]` and is built, tested and RUN off-screen
+    # by `.github/workflows/windows-renderer.yml` on a `windows-latest` runner.
+    "crates/werust-windows",
     # The macOS ORIGIN PROBE: the WebKit analogue of `windows-origin-probe`, which
     # turns this repo's recorded iOS `WKURLSchemeHandler` MECHANISM ANALYSIS into a
     # runtime MEASUREMENT (both WebKit ports share the mechanism). A workspace

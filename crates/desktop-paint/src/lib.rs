@@ -1,27 +1,51 @@
-//! The window's HOST-INDEPENDENT half: every value the AppKit layer paints,
-//! derived HERE from the shared `werust-core` rules.
+//! The native-widget desktop painter's HOST-INDEPENDENT half: every value an OS
+//! edge paints, derived HERE from the shared `werust-core` rules — ONCE, for
+//! every such edge.
 //!
-//! This module is the seam between "decide" and "draw". `werust-core` decides
+//! This crate is the seam between "decide" and "draw". `werust-core` decides
 //! (`status_line`, `trust_indicator` / `_detail` / `_css_class`,
 //! `error_banner_*`, `invalid_entry_badge_*`, `load_progress_*`, and the debug
-//! view's `console_row_text` / `network_*` row rules); [`window`](crate::window)
-//! draws. Between them sits one plain-Rust snapshot per surface — [`ChromePaint`],
+//! view's `console_row_text` / `network_*` row rules); the AppKit window
+//! (`werust-macos`) and the Win32 window (`werust-windows`) draw. Between them
+//! sits one plain-Rust snapshot per surface — [`ChromePaint`],
 //! [`ConsoleRowPaint`], [`NetworkRowPaint`], [`MenuItemPaint`] — assembled by
 //! calling the core, never by restating it.
 //!
-//! # Why a snapshot rather than calling the core from Objective-C-land
+//! # Why ONE crate rather than one module per edge
+//!
+//! It landed as `werust-macos::paint` with the AppKit window, and the Win32
+//! window would have been its second copy — of the CARRIER and, worse, of the
+//! PALETTE, whose hex values are already transcribed once into the GTK edge's
+//! `APP_CSS`. "The same green on both desktops" was a promise kept by
+//! transcription; a third transcription is how the Kotlin and Swift chrome twins
+//! drifted and how the trust EXPLANATION shipped desktop-only for months
+//! (`docs/adr/0011` Consequences). So the module was EXTRACTED here verbatim,
+//! with its tests, and both windows consume it. It is the painter's face of what
+//! `webview-shared` is for the backends: the toolkit-free half every edge of a
+//! kind shares.
+//!
+//! The GTK edge is deliberately NOT a consumer: it has a real stylesheet
+//! (`APP_CSS`) and toggles CSS classes on GTK widgets, so it needs the core's
+//! class NAMES but not an in-code palette. AppKit and Win32 have no stylesheet at
+//! all, which is why they need this. Folding GTK in would be a rewrite of a
+//! working painter for no new guarantee; instead
+//! `the_gtk_stylesheet_and_the_shared_palette_agree` asserts the two never
+//! disagree about a colour.
+//!
+//! # Why a snapshot rather than calling the core from the toolkit layer
 //!
 //! Two reasons, both about being CHECKED rather than merely written:
 //!
-//! 1. **It is testable on the gate.** This file compiles on Ubuntu against the
-//!    REAL `werust-core`, so `cargo test -p werust-macos` asserts that what the
-//!    window will paint IS the core's derivation — on a machine with no Mac. Only
-//!    the widget assignment is left unproven by the gate, and that is what the
-//!    `macos-14` CI leg and the recorded manual steps cover.
-//! 2. **It keeps the un-gated half small and dumb.** The AppKit layer is the code
-//!    the Ubuntu gate can never compile, so the less DECIDING it contains, the
-//!    less can be wrong there. It reads a struct field and sets a widget
-//!    property.
+//! 1. **It is testable on the gate.** This crate compiles on Ubuntu against the
+//!    REAL `werust-core`, so `cargo test -p desktop-paint` asserts that what a
+//!    window will paint IS the core's derivation — on a machine with no Mac and
+//!    no Windows box. Only the widget assignment is left unproven by the gate,
+//!    and that is what the `macos-14` / `windows-latest` CI legs and the recorded
+//!    manual steps cover.
+//! 2. **It keeps the un-gated half small and dumb.** The AppKit and Win32 layers
+//!    are the code the Ubuntu gate can never compile, so the less DECIDING they
+//!    contain, the less can be wrong there. Each reads a struct field and sets a
+//!    widget property.
 //!
 //! This is the same shape the mobile edges already use — Kotlin and Swift paint
 //! from `chrome_json()`, a carrier of the same one derivation — with a Rust
@@ -34,12 +58,12 @@
 //! The core exports stable class NAMES (`TRUST_INDICATOR_CSS_CLASSES`,
 //! `ERROR_BANNER_CSS_CLASSES`, `DEBUG_CONSOLE_CSS_CLASSES`) and has no notion of
 //! colour; the stylesheet stays in the edge (`docs/adr/0011`'s layering, kept by
-//! the GTK edge's `APP_CSS`). [`CLASS_COLORS`] is this edge's stylesheet: the
-//! same palette the GTK window uses, so a content-verified badge is the same
-//! green on both desktops, and [`class_color`] is total over every exported class
-//! (the gate drives the core's `CssClassFamily::ALL` — every exported FAMILY, not
-//! a list named here — so a new family or a new state reds this gate exactly as
-//! it does on GTK).
+//! the GTK edge's `APP_CSS`). [`CLASS_COLORS`] is the native-widget edges'
+//! stylesheet: the same palette the GTK window uses, so a content-verified badge
+//! is the same green on every desktop, and [`class_color`] is total over every
+//! exported class (the gate drives the core's `CssClassFamily::ALL` — every
+//! exported FAMILY, not a list named here — so a new family or a new state reds
+//! this gate exactly as it does on GTK).
 
 use renderer::Renderer;
 #[cfg(test)]
@@ -57,11 +81,12 @@ use werust_core::{
     trust_indicator_detail, ChromeState, STOP_AFFORDANCE_LABEL,
 };
 
-/// A colour, as the three 0.0–1.0 components AppKit's
-/// `NSColor::colorWithSRGBRed_green_blue_alpha` takes.
+/// A colour, as three 0.0–1.0 components.
 ///
-/// Deliberately NOT an `NSColor`: this module must compile on the Ubuntu gate,
-/// where AppKit does not exist. The window converts it in one place.
+/// Deliberately NOT a toolkit colour type: this crate must compile on the Ubuntu
+/// gate, where neither AppKit nor GDI exists. Each window converts it in ONE
+/// place (`NSColor::colorWithSRGBRed_green_blue_alpha` on macOS, a `COLORREF`
+/// on Win32).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rgb {
     /// The red component, 0.0–1.0.
@@ -83,7 +108,8 @@ const fn rgb(hex: u32) -> Rgb {
     }
 }
 
-/// This edge's STYLESHEET: the colour each exported state class is painted in.
+/// The native-widget edges' STYLESHEET: the colour each exported state class is
+/// painted in.
 ///
 /// For a label state (`trust-*`, `debug-console-*`) that is the TEXT colour; for
 /// the error banner (`error-banner*`) it is the banner's FILL, whose text is
@@ -102,14 +128,14 @@ const fn rgb(hex: u32) -> Rgb {
 ///
 /// # ADR-0009 (follow the OS colour scheme)
 ///
-/// These are ACCENT colours on otherwise standard AppKit controls: the window,
-/// the toolbar, the URL field, the buttons, the tabs and the debug rows are all
-/// system-drawn and therefore already follow the user's light/dark appearance,
-/// and this crate never sets an `NSAppearance` (forcing dark — or light — is
-/// exactly what ADR-0009 forbids). The accent hues are shared with the GTK edge
-/// rather than re-picked per appearance, so werust's trust vocabulary reads the
-/// same on both desktops; if a hue proves unreadable in dark mode that is a
-/// tuning follow-up for BOTH edges, not a reason for macOS to mint its own.
+/// These are ACCENT colours on otherwise system-drawn controls: the window, the
+/// toolbar, the URL field, the buttons, the tabs and the debug rows are drawn by
+/// the platform and therefore already follow the user's light/dark setting, and
+/// no edge here forces an appearance (forcing dark — or light — is exactly what
+/// ADR-0009 forbids). The accent hues are shared with the GTK edge rather than
+/// re-picked per platform or per appearance, so werust's trust vocabulary reads
+/// the same on every desktop; if a hue proves unreadable in dark mode that is a
+/// tuning follow-up for ALL edges, not a reason for one to mint its own.
 pub const CLASS_COLORS: &[(&str, Rgb)] = &[
     // The chrome's trust-indicator family (`TRUST_INDICATOR_CSS_CLASSES`).
     ("trust-loading", rgb(0x5c_5c_5c)),
@@ -214,7 +240,7 @@ impl ChromePaint {
     /// constructor adds no rule of its own beyond looking a colour up for a class
     /// the core chose. That is the property
     /// `the_paint_is_the_cores_derivation_verbatim` asserts, so "nothing is
-    /// re-derived on macOS" is checked rather than promised.
+    /// re-derived in an OS edge" is checked rather than promised.
     #[must_use]
     pub fn of(state: &ChromeState) -> Self {
         let trust_class = trust_indicator_css_class(state);
@@ -264,9 +290,9 @@ pub struct MenuItemPaint {
 
 /// The ⋮ menu's items, in order, from the shared [`BrowserMenu`].
 ///
-/// The macOS menu is BUILT from this list, so a new core menu item appears in the
-/// window with no macOS change at all (and no hand-written macOS list can drift
-/// from what Android, iOS and the GTK desktop show).
+/// Each native menu is BUILT from this list, so a new core menu item appears in
+/// every window with no per-OS change at all (and no hand-written platform list
+/// can drift from what Android, iOS and the GTK desktop show).
 #[must_use]
 pub fn menu_items() -> Vec<MenuItemPaint> {
     BrowserMenu::new()
@@ -446,15 +472,18 @@ fn refresh_from<E, R>(
     }
 }
 
-/// Install the macOS CONSOLE + NETWORK capture points on `backend`, the twin of
-/// the WebKitGTK backend's `install_debug_capture` and of the iOS edge's.
+/// Install the CONSOLE + NETWORK capture points on `backend`, the twin of the
+/// WebKitGTK backend's `install_debug_capture` and of the iOS edge's.
 ///
-/// # Why macOS injects shims, and what that honestly covers
+/// # Why these edges inject shims, and what that honestly covers
 ///
 /// `WKWebView` exposes NO console callback and NO per-resource load callback (the
 /// WebKitGTK `console-message` / `resource-load-started` signals have no WebKit
-/// API equivalent), so the only page-wide reach a WebKit shell has is INJECTED
-/// JS — the position iOS is already in, with the same answer:
+/// API equivalent), and WebView2's equivalents live behind the DevTools protocol
+/// and `AddWebResourceRequestedFilter("*")`, neither of which is wired (they are
+/// named follow-ons, not silent omissions). So the only page-wide reach these
+/// shells have today is INJECTED JS — the position iOS is already in, with the
+/// same answer:
 ///
 /// * CONSOLE: the SHARED [`console_shim`](werust_core::debug::console_shim), the
 ///   byte-for-byte same string desktop and iOS inject, from ONE place in
@@ -465,7 +494,8 @@ fn refresh_from<E, R>(
 ///   through those APIs — NOT browser-internal subresource loads (`<img>`,
 ///   `<script>`, CSS `url()`) and not the main document itself. That gap is
 ///   recorded rather than papered over, in
-///   `docs/spikes/macos-appkit-window-and-chrome/README.md`.
+///   `docs/spikes/macos-appkit-window-and-chrome/README.md` and
+///   `docs/spikes/windows-win32-window-and-chrome/README.md`.
 ///
 /// Both shims post on the DEDICATED
 /// [`CAPTURE_BRIDGE`](werust_core::debug::CAPTURE_BRIDGE) channel (never the
@@ -504,11 +534,11 @@ mod tests {
 
     #[test]
     fn the_paint_is_the_cores_derivation_verbatim() {
-        // THE acceptance property of this crate: every surface the macOS window
-        // shows reads the SHARED derivation, and nothing is re-derived here. So
-        // for a spread of chrome states, each painted field must EQUAL the core
-        // function that decides it — asserted against the real `werust-core` on
-        // the Ubuntu gate, with no Mac in sight.
+        // THE acceptance property of this crate: every surface a native window
+        // shows reads the SHARED derivation, and nothing is re-derived per edge.
+        // So for a spread of chrome states, each painted field must EQUAL the
+        // core function that decides it — asserted against the real `werust-core`
+        // on the Ubuntu gate, with no Mac and no Windows box in sight.
         let mut states = vec![ChromeState::default()];
         // Loading, mid-pipeline.
         let mut loading = ChromeState::default();
@@ -617,9 +647,9 @@ mod tests {
 
     #[test]
     fn every_exported_class_has_a_colour() {
-        // The macOS face of the GTK edge's no-unstyled-class guard: the core
-        // exports the class NAMES, this edge owns the palette, and a state that
-        // is derived perfectly but has no colour here would paint invisibly.
+        // The native-widget face of the GTK edge's no-unstyled-class guard: the
+        // core exports the class NAMES, this crate owns the palette, and a state
+        // that is derived perfectly but has no colour here would paint invisibly.
         // Driven from the core's aggregate over EVERY exported family
         // (`CssClassFamily::ALL`, kept complete by a compile-time check), never a
         // family list written out here: each family is already exhaustive over its
@@ -649,10 +679,11 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_comes_from_the_shared_core_not_a_macos_list() {
-        // Acceptance: the ⋮ menu's items are the core's `BrowserMenu`, so the
-        // macOS menu shows the SAME version line and Debug entry the GTK, Android
-        // and iOS menus show — and a future core item needs no macOS change.
+    fn the_menu_comes_from_the_shared_core_not_a_platform_list() {
+        // Acceptance: the ⋮ menu's items are the core's `BrowserMenu`, so every
+        // native menu shows the SAME version line and Debug entry the GTK,
+        // Android and iOS menus show — and a future core item needs no per-OS
+        // change.
         let items = menu_items();
         let version = items
             .iter()
@@ -679,8 +710,8 @@ mod tests {
     #[test]
     fn debug_rows_are_the_cores_row_derivation() {
         // The second half of "paints, does not derive": the debug view's row text
-        // and its level/trust classes are the core's, so the macOS Console and
-        // Network tabs read exactly like the GTK ones.
+        // and its level/trust classes are the core's, so the AppKit and Win32
+        // Console and Network tabs read exactly like the GTK ones.
         let capture = DebugCapture::new();
         capture.push_console(
             ConsoleEntry::new(ConsoleLevel::Warn, "deprecated API")
@@ -714,14 +745,14 @@ mod tests {
         assert_eq!(row.size, "1.5 KB");
         assert_eq!(row.url, "ipfs://bafy/pic.png");
         // The trust column speaks the CHROME's vocabulary (ADR-0006), never a
-        // macOS-local label, and wears the chrome's own class + colour.
+        // platform-local label, and wears the chrome's own class + colour.
         assert_eq!(row.trust, "✓ content-verified");
         assert_eq!(row.trust_class, "trust-verified");
         assert_eq!(row.trust_color, class_color("trust-verified").unwrap());
         assert!(TRUST_INDICATOR_CSS_CLASSES.contains(&row.trust_class));
     }
 
-    /// Apply a console update exactly as the AppKit row stack does, so these
+    /// Apply a console update exactly as a native row list does, so these
     /// assertions are about what the real view would show.
     fn apply(view: &mut Vec<String>, update: &TabUpdate<ConsoleRowPaint>) {
         match update {
@@ -739,8 +770,8 @@ mod tests {
 
     #[test]
     fn the_debug_refresh_is_incremental_and_survives_eviction_at_the_cap() {
-        // The refresh drives the core's sequence-anchored `tail_plan`, so the
-        // macOS view inherits the property the GTK view was fixed to have: at the
+        // The refresh drives the core's sequence-anchored `tail_plan`, so every
+        // native view inherits the property the GTK view was fixed to have: at the
         // ring buffer's cap the store's LENGTH stops changing, and a
         // length-anchored view freezes on rows the store already evicted. Driven
         // against the REAL store, with no display.
@@ -807,8 +838,8 @@ mod tests {
     }
 
     /// A `Renderer` that records what was installed on it. Enough of the seam to
-    /// drive [`install_debug_capture`] on the gate: the macOS capture points go
-    /// through the seam precisely so they can be asserted with no WKWebView.
+    /// drive [`install_debug_capture`] on the gate: the capture points go
+    /// through the seam precisely so they can be asserted with no real webview.
     #[derive(Default)]
     struct RecordingRenderer {
         scripts: Vec<String>,
@@ -869,7 +900,7 @@ mod tests {
 
     #[test]
     fn the_capture_points_inject_the_shared_shims_and_route_to_the_shared_store() {
-        // The macOS debug view is only as good as what feeds it. The capture
+        // A native debug view is only as good as what feeds it. The capture
         // points must be the SHARED ones (the same shim strings iOS injects, from
         // one place in the core) on the DEDICATED capture channel — never the
         // provider's trust channel — and a captured message must land in the SAME
@@ -882,11 +913,11 @@ mod tests {
 
         assert!(
             backend.scripts.iter().any(|s| *s == console_shim()),
-            "the SHARED console shim must be injected, not a macOS-local copy"
+            "the SHARED console shim must be injected, not a per-edge copy"
         );
         assert!(
             backend.scripts.iter().any(|s| *s == network_shim()),
-            "the shared network shim must be injected (WKWebView has no resource signal)"
+            "the shared network shim must be injected (neither WKWebView nor a\n             WebResourceRequested-less WebView2 wiring gives a resource signal)"
         );
         assert_eq!(
             backend
@@ -903,7 +934,7 @@ mod tests {
         );
 
         // A real captured console message reaches the store the view renders,
-        // through the core's own parser (no macOS-local parsing).
+        // through the core's own parser (no per-edge parsing).
         backend.post(
             CAPTURE_BRIDGE,
             r#"{"kind":"console","level":"error","message":"boom","source":"ipfs://cid/a.js","line":3}"#,

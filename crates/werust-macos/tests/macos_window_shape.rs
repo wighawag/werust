@@ -62,8 +62,15 @@ fn window() -> String {
     source("crates/werust-macos/src/window.rs")
 }
 
+/// The window's host-independent half.
+///
+/// It landed HERE (`crates/werust-macos/src/paint.rs`) and was EXTRACTED to
+/// `crates/desktop-paint` by task `windows-win32-window-and-chrome`, verbatim and
+/// with its tests, so the Win32 window consumes the one carrier instead of
+/// copying it (and the palette). `werust_macos::paint` still names it, so nothing
+/// about this window changed; this guard follows it to where it now lives.
 fn paint() -> String {
-    source("crates/werust-macos/src/paint.rs")
+    source("crates/desktop-paint/src/lib.rs")
 }
 
 /// `source` with every comment line dropped, so a "does this file mention X"
@@ -291,7 +298,8 @@ fn the_class_names_and_labels_are_never_restated_in_the_window() {
     let paint = paint();
     assert!(
         paint.contains("pub const CLASS_COLORS"),
-        "the edge's stylesheet belongs to the edge"
+        "the edge's stylesheet belongs to the edge (now the SHARED native-widget \
+         edge half, so macOS and Windows cannot disagree about a colour)"
     );
     let paint_code = code_only(&paint);
     let gate = between(
@@ -360,7 +368,7 @@ fn the_debug_row_rules_live_in_the_core_and_both_desktop_views_use_them() {
         "the GTK edge must consume the core's row rules"
     );
 
-    // The macOS view paints from the same ones (through `paint.rs`).
+    // The macOS view paints from the same ones (through the shared carrier).
     let paint = paint();
     for shared in [
         "console_row_text(entry)",

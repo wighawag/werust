@@ -1,0 +1,21 @@
+[package]
+name = "desktop-paint"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The toolkit-free half every NATIVE-WIDGET desktop painter shares: the values a
+# window paints, derived from `werust-core`, plus the palette that gives the
+# core's exported class names a colour. It is the painter's face of what
+# `webview-shared` is for the backends. Extracted (verbatim, tests travelling
+# with it) out of `werust-macos::paint` by task `windows-win32-window-and-chrome`
+# so the Win32 window could not become a second copy of the carrier and a THIRD
+# transcription of the palette.
+[dependencies]
+# The one derivation: every value below is the return value of a core rule.
+werust-core = { path = "../werust-core" }
+# The capture points are installed over the SEAM (`&mut dyn Renderer`), never
+# over a concrete backend, so the Ubuntu gate can drive them against a fake and
+# prove the wiring exists on every edge.
+renderer = { path = "../renderer" }

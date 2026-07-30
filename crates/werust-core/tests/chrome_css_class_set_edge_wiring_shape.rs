@@ -110,10 +110,15 @@ fn the_gtk_painter_toggles_from_the_exported_class_set_not_a_literal_list() {
     }
 }
 
-/// The macOS painter's host-independent half, which the Ubuntu gate DOES compile
-/// (its palette gate lives there).
-fn macos_paint() -> String {
-    source("crates/werust-macos/src/paint.rs")
+/// The NATIVE-WIDGET painter's host-independent half, which the Ubuntu gate DOES
+/// compile (its palette gate lives there).
+///
+/// It landed as `crates/werust-macos/src/paint.rs` and was EXTRACTED to its own
+/// crate by task `windows-win32-window-and-chrome`, so the Win32 window consumes
+/// the one carrier instead of copying it. ONE path here now covers both native
+/// desktop windows, which is the point of the extraction.
+fn shared_paint() -> String {
+    source("crates/desktop-paint/src/lib.rs")
 }
 
 #[test]
@@ -131,9 +136,9 @@ fn both_coverage_gates_iterate_the_family_aggregate_not_a_hand_written_list() {
             desktop_shell(),
         ),
         (
-            "crates/werust-macos/src/paint.rs",
+            "crates/desktop-paint/src/lib.rs",
             "fn every_exported_class_has_a_colour()",
-            macos_paint(),
+            shared_paint(),
         ),
     ] {
         let gate = between(&source_text, gate_fn, "\n    }\n");
@@ -176,7 +181,7 @@ fn the_progress_tooltip_sentence_lives_only_in_the_core() {
     );
     for (edge, text) in [
         ("crates/werust/src/main.rs", desktop_shell()),
-        ("crates/werust-macos/src/paint.rs", macos_paint()),
+        ("crates/desktop-paint/src/lib.rs", shared_paint()),
     ] {
         assert!(
             text.contains("load_progress_tooltip(state, STOP_AFFORDANCE_LABEL)"),

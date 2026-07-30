@@ -1,0 +1,43 @@
+     Running `target\debug\examples\window_smoke.exe`
+profile folder: Some("C:\\Users\\runneradmin\\AppData\\Local\\werust\\WebView2")
+WebView2 Runtime: 150.0.4078.65
+the window opens with the core's own default chrome:
+  ok   the trust indicator shows the core's badge for the default state
+  ok   the trust badge carries the core's EXPLANATION as its tooltip
+  ok   the status line shows the core's status
+  ok   no error banner on a window that has not failed anything
+  ok   no invalid-entry badge on a fresh window
+the ⋮ menu is the shared core's BrowserMenu, item for item:
+       menu: ["werust d7f8d97", "Debug"]
+  ok   the HMENU's titles are the core's item labels, in order
+a hash-VERIFIED ipfs:// page (offline, pinned):
+  ok   the verified load settles
+  ok   the URL bar shows the loaded content-addressed URL
+  ok   the trust indicator paints the core's verdict for the settled load
+  ok   a hash-verified page reads as verified in the window
+  ok   the settled badge's EXPLANATION is the core's, not a stale one
+  ok   the status line still mirrors the core
+  ok   a successful load raises NO banner (progress lived in the URL bar)
+  ok   the URL bar's progress strip is gone once the load settled
+  ok   the page did NOT move or resize across a whole load
+the DURABLE profile (not the engine's %TEMP% default):
+       C:\Users\runneradmin\AppData\Local\werust\WebView2
+  ok   the WebView2 profile really exists under %LOCALAPPDATA%, outside %TEMP%
+the debug view, opened through the core menu's Debug entry:
+  ok   the Debug menu item is enabled and activatable
+  ok   the page's console.log reaches the debug view's Console tab
+  ok   the Debug entry opened the view
+  ok   clearing the shared store empties both tabs
+devtools are the PLATFORM's own (OpenDevToolsWindow):
+  ok   the shell opens Edge's real DevTools window over the live page
+the NEGATIVE CONTROL: bytes that do not hash to their CID:
+  ok   the tampered load FAILS
+  ok   a failed load raises the prominent error banner
+       banner: ⚠ This page failed to load: renderer backend error: ipfs:// content-addressed load failed: block hash mismatch: bytes do not match cid bafkreiaqx3di4a2g7xqwz56yfutcesleck7eb2rk6xbnifoxfdusadhpby
+  ok   the banner carries the core's protocol-named reason
+  ok   a FAILURE is the one state allowed to displace the page
+  ok   a failed load is never reported verified
+closing the debug window drops the slot:
+  ok   closing the debug window clears the slot, so Debug opens a fresh one
+
+window_smoke: PASS

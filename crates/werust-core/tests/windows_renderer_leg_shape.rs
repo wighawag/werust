@@ -71,12 +71,17 @@ const WEBVIEW2_CLIENT_GUID: &str = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}";
 ///
 /// `windows-renderer` joined it with task `windows-webview2-renderer-backend`:
 /// the `#[cfg(windows)]` WebView2 backend itself, which is the whole reason this
-/// leg landed ahead of the shell code. Extending this list is DELIBERATELY not a
-/// one-line workflow edit — the assertions below hold the build steps, the test
-/// steps and the `push` path filter to this ONE list, so a crate cannot join the
-/// leg without also joining the filter that re-runs it.
+/// leg landed ahead of the shell code. `werust-windows` (the Win32 WINDOW over
+/// that backend) and `desktop-paint` (the shared painter half both native desktop
+/// windows consume) joined it with task `windows-win32-window-and-chrome`.
+/// Extending this list is DELIBERATELY not a one-line workflow edit — the
+/// assertions below hold the build steps, the test steps and the `push` path
+/// filter to this ONE list, so a crate cannot join the leg without also joining
+/// the filter that re-runs it.
 const GREEN_ON_WINDOWS: &[&str] = &[
     "windows-renderer",
+    "werust-windows",
+    "desktop-paint",
     "webview-shared",
     "renderer",
     "werust-core",
@@ -353,6 +358,10 @@ fn the_pull_request_filter_stays_narrow_and_push_carries_the_rest() {
     for narrow in [
         "crates/webview-shared/**",
         "crates/windows-origin-probe/**",
+        // The Windows SHELL is as Windows-shaped as its engine: a PR that
+        // touches it should be gated on the leg that is the only place its Win32
+        // half compiles at all.
+        "crates/werust-windows/**",
         ".github/workflows/windows-renderer.yml",
     ] {
         assert!(

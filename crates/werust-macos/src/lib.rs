@@ -21,14 +21,20 @@
 //! desktop-only for months — and a third native window would have minted a fourth
 //! copy.
 //!
-//! The seam between "derive" and "paint" is [`paint`]: one host-independent
-//! module that calls the core's rules and hands the AppKit layer plain values
-//! (strings, booleans, fractions, colours). It compiles and is unit-tested on the
-//! Ubuntu `verify` gate AGAINST THE REAL CORE, so the display half of this window
-//! is covered by an ordinary `cargo test` even though no Mac is present. [`window`]
-//! is then the thin AppKit layer: it assigns those values to `NSTextField`s,
-//! `NSButton`s, an `NSProgressIndicator` and an `NSMenu`, and forwards user
-//! actions to the shell.
+//! The seam between "derive" and "paint" is [`paint`] — the shared
+//! [`desktop_paint`] crate: one host-independent module that calls the core's
+//! rules and hands a native layer plain values (strings, booleans, fractions,
+//! colours). It compiles and is unit-tested on the Ubuntu `verify` gate AGAINST
+//! THE REAL CORE, so the display half of this window is covered by an ordinary
+//! `cargo test` even though no Mac is present. [`window`] is then the thin AppKit
+//! layer: it assigns those values to `NSTextField`s, `NSButton`s, an
+//! `NSProgressIndicator` and an `NSMenu`, and forwards user actions to the shell.
+//!
+//! That module STARTED here, as `werust-macos::paint`. Task
+//! `windows-win32-window-and-chrome` extracted it, verbatim and with its tests,
+//! into `crates/desktop-paint`, because the Win32 window would otherwise have
+//! been its second copy — and a third transcription of the palette. Nothing about
+//! this crate's behaviour changed; `werust_macos::paint` still names it.
 //!
 //! # What compiles where
 //!
@@ -75,7 +81,11 @@
 //! platform-capability matrix (task `macos-parity-column-and-stub-tasks`, which
 //! runs after this so the cells describe what really shipped).
 
-pub mod paint;
+/// The window's host-independent half, now SHARED with the Win32 window
+/// (`crates/desktop-paint`). Re-exported under its original name so every
+/// caller — `window.rs`, `examples/window_smoke.rs` — keeps naming the macOS
+/// window's paint half as it always did.
+pub use desktop_paint as paint;
 
 #[cfg(target_os = "macos")]
 pub mod window;

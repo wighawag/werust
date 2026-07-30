@@ -17,6 +17,12 @@ path = "src/main.rs"
 [dependencies]
 renderer = { path = "../renderer" }
 werust-core = { path = "../werust-core" }
+# The window's HOST-INDEPENDENT half (every painted value, the palette, the menu
+# items, the debug rows, the capture points), CONSUMED rather than owned: it
+# started here and was extracted to `crates/desktop-paint` by task
+# `windows-win32-window-and-chrome` so the Win32 window shares this one carrier
+# instead of copying it. Re-exported as `werust_macos::paint`.
+desktop-paint = { path = "../desktop-paint" }
 # The macOS ENGINE (task `macos-wkwebview-renderer-backend`): the `Renderer`
 # implementation over WKWebView this window hosts. Its own WKWebView half is
 # `#[cfg(target_os = "macos")]`, so on Ubuntu this dependency contributes only

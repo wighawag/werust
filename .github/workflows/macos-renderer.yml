@@ -43,6 +43,11 @@ on:
     paths:
       - "crates/macos-renderer/**"
       - "crates/werust-macos/**"
+      # The SHARED painter half the AppKit window paints from (extracted out of
+      # `werust-macos::paint` by task `windows-win32-window-and-chrome`, so the
+      # Win32 window consumes the one carrier). A change to it changes what this
+      # window shows.
+      - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
       - "crates/renderer/**"
@@ -55,6 +60,7 @@ on:
     paths:
       - "crates/macos-renderer/**"
       - "crates/werust-macos/**"
+      - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
       - "crates/werust-core/**"
@@ -98,8 +104,10 @@ jobs:
         # `webview-shared` is included deliberately: the load lifecycle and the
         # off-thread `ipfs://` boundary were MOVED there out of the WebKitGTK
         # crate, so they must pass on macOS too, not just on the Ubuntu gate.
-        # `werust-macos` brings its paint unit tests and its shape guard.
-        run: cargo test -p macos-renderer -p werust-macos -p macos-origin-probe -p webview-shared
+        # `werust-macos` brings its shape guard, and `desktop-paint` -- the SHARED
+        # painter half it now consumes -- brings the paint unit tests, which must
+        # pass on macOS too and not only on the Ubuntu gate.
+        run: cargo test -p macos-renderer -p werust-macos -p desktop-paint -p macos-origin-probe -p webview-shared
 
       - name: Exercise BOTH trust hooks on a real WKWebView (with a negative control)
         # A backend qualifies on the trust hooks, not on rendering. This loads a

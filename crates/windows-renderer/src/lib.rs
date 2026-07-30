@@ -92,4 +92,4 @@ pub mod pure;
 mod backend;
 
 #[cfg(windows)]
-pub use backend::{OffThreadResolve, Webview2Renderer};
+pub use backend::{os_color_scheme, DevTools, OffThreadResolve, Webview2Renderer};

@@ -3,7 +3,8 @@
 # box and without a CI round trip.
 #
 # The Ubuntu `verify` gate never compiles `crates/windows-renderer/src/backend.rs`
-# (it is `#[cfg(windows)]`), so a typo there would otherwise only surface on the
+# nor `crates/werust-windows/src/{window,chrome,debugview,win32}.rs` (they are
+# `#[cfg(windows)]`), so a typo there would otherwise only surface on the
 # `windows-renderer` CI leg, minutes later. `cargo-xwin` downloads the MSVC CRT +
 # Windows SDK headers/import-libs and drives `clang-cl`/`lld-link`, which is
 # enough to COMPILE the crate for `x86_64-pc-windows-msvc` from here.
@@ -38,7 +39,12 @@ if ! command -v llvm-lib >/dev/null 2>&1; then
   exit 1
 fi
 
+# Both Windows crates: the ENGINE (`windows-renderer`, the WebView2 backend) and
+# the WINDOW (`werust-windows`, the Win32 chrome over it, task
+# `windows-win32-window-and-chrome`) -- including its `window_smoke` example,
+# which is the only place the Win32 layer is executed anywhere.
 exec cargo xwin check \
   -p windows-renderer \
+  -p werust-windows \
   --target x86_64-pc-windows-msvc \
   --tests --examples "$@"

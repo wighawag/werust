@@ -77,9 +77,10 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
 use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, PeekMessageW,
-    RegisterClassW, ShowWindow, TranslateMessage, CW_USEDEFAULT, MSG, PM_REMOVE, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
+    GetWindowLongPtrW, PeekMessageW, RegisterClassW, SetWindowLongPtrW, ShowWindow,
+    TranslateMessage, CW_USEDEFAULT, GWLP_USERDATA, MSG, PM_REMOVE, SW_SHOWNOACTIVATE,
+    WINDOW_EX_STYLE, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 use renderer::{
@@ -425,7 +426,34 @@ pub struct Webview2Renderer {
     pending_scripts: Vec<String>,
     /// The browser -> page response-JS queues the script bridges push into.
     pending_eval: Vec<PendingEval>,
+    /// The live engine, shared with whatever [`DevTools`] handles the shell took
+    /// before boxing this backend behind the seam.
+    dev_tools: Rc<RefCell<Option<ICoreWebView2>>>,
     life: SharedLifecycle,
+}
+
+/// The shell's handle onto the platform's OWN devtools (`OpenDevToolsWindow`).
+///
+/// werust never re-implements devtools: this opens Edge's real DevTools window
+/// over the live page. It is a handle rather than a method because the chrome
+/// acts on a backend that is, by then, behind the `Renderer` seam; see
+/// [`Webview2Renderer::dev_tools`].
+#[derive(Clone, Default)]
+pub struct DevTools {
+    engine: Rc<RefCell<Option<ICoreWebView2>>>,
+}
+
+impl DevTools {
+    /// Open the DevTools window over the live page. `false` when there is no
+    /// engine yet (nothing has been navigated) or the runtime refused, so a
+    /// caller can say so rather than appear to have done nothing.
+    pub fn open(&self) -> bool {
+        let engine = self.engine.borrow();
+        let Some(engine) = engine.as_ref() else {
+            return false;
+        };
+        unsafe { engine.OpenDevToolsWindow() }.is_ok()
+    }
 }
 
 impl Webview2Renderer {
@@ -470,6 +498,7 @@ impl Webview2Renderer {
             bridges: Rc::new(RefCell::new(HashMap::new())),
             pending_scripts: Vec::new(),
             pending_eval: Vec::new(),
+            dev_tools: Rc::new(RefCell::new(None)),
             life,
         })
     }
@@ -482,6 +511,23 @@ impl Webview2Renderer {
     /// 2026 (WebView2Feedback #5495).
     pub fn runtime_version() -> Result<String, RendererError> {
         runtime_version()
+    }
+
+    /// A handle onto the live engine for the SHELL's devtools affordance.
+    ///
+    /// Devtools are the platform's OWN (`OpenDevToolsWindow`), never a werust
+    /// re-implementation, and opening them is a CHROME action -- but by the time
+    /// the chrome exists, this backend has been boxed behind the `Renderer` seam
+    /// and cannot be reached concretely. So the shell takes this handle BEFORE
+    /// boxing (the same move the GTK shell makes with
+    /// `backend.web_view().clone()` for the WebKitGTK inspector) and the COM call
+    /// stays inside this crate, which keeps the window crate free of a WebView2
+    /// dependency.
+    #[must_use]
+    pub fn dev_tools(&self) -> DevTools {
+        DevTools {
+            engine: Rc::clone(&self.dev_tools),
+        }
     }
 
     /// Realise the environment, the controller and the engine now, if they do not
@@ -516,6 +562,15 @@ impl Webview2Renderer {
             let _ = controller.SetIsVisible(true);
         }
 
+        // The container's own window proc keeps the controller's bounds in step
+        // with the container when a SHELL resizes it (WebView2 has no
+        // autoresizing): the controller is BORROWED through this slot, never
+        // owned by it, and `Drop` clears the slot before closing the controller.
+        unsafe {
+            SetWindowLongPtrW(self.container, GWLP_USERDATA, controller.as_raw() as isize);
+        }
+
+        *self.dev_tools.borrow_mut() = Some(webview.clone());
         self.environment = Some(environment);
         self.controller = Some(controller);
         self.webview = Some(webview);
@@ -597,6 +652,15 @@ impl Webview2Renderer {
             // would replace that failure with a document of Edge's own (a
             // different origin) instead of showing nothing.
             let _ = settings.SetIsBuiltInErrorPageEnabled(false);
+            // The `web-inspector` capability's recorded rule, applied to the
+            // third desktop: the platform's OWN devtools are a DEVELOPER surface,
+            // enabled in a debug build and NOT in a release one, so a shipped
+            // binary is not silently inspectable (the same gating the WebKitGTK
+            // `enable-developer-extras`, the iOS `isInspectable` and the Android
+            // `setWebContentsDebuggingEnabled` rows apply). WebView2 defaults this
+            // to TRUE, so leaving it unset would have made Windows the one
+            // platform that ignores the rule.
+            let _ = settings.SetAreDevToolsEnabled(cfg!(debug_assertions));
             // `docs/adr/0009`: FOLLOW the OS, never force dark. AUTO is documented
             // to track the OS setting, so this row is the one-liner ADR-0011's
             // mapping predicted -- no portal read, no registry read. Best-effort:
@@ -859,7 +923,7 @@ impl Webview2Renderer {
     /// and unit-tested on the Ubuntu gate.
     #[must_use]
     pub fn os_color_scheme(&self) -> OsColorScheme {
-        os_color_scheme_from_apps_use_light_theme(apps_use_light_theme())
+        os_color_scheme()
     }
 
     /// Install the native EIP-1193 provider over the seam's script-message
@@ -1058,6 +1122,11 @@ impl Webview2Renderer {
 
 impl Drop for Webview2Renderer {
     fn drop(&mut self) {
+        // Clear the borrowed-controller slot BEFORE closing it, so a `WM_SIZE`
+        // arriving during teardown cannot reach a closed controller.
+        unsafe {
+            SetWindowLongPtrW(self.container, GWLP_USERDATA, 0);
+        }
         if let Some(controller) = self.controller.take() {
             unsafe {
                 let _ = controller.Close();
@@ -1326,6 +1395,28 @@ fn create_container_window() -> Result<HWND, RendererError> {
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
+        // WebView2 has no autoresizing: a controller keeps the bounds it was
+        // given until someone sets new ones. A SHELL that hosts this container in
+        // a resizable window would therefore leave the page at the size it had
+        // when the engine was realised -- the Win32 twin of the one engine line
+        // the AppKit window needed (`WKWebView`'s autoresizing mask). Keeping it
+        // HERE, in the container's own window proc, means the page follows its
+        // container for every host, with no per-shell wiring and no seam change.
+        if message == WM_SIZE {
+            let raw = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
+            if raw != 0 {
+                // BORROWED: the renderer owns the reference and clears this slot
+                // before closing the controller, so this must not release it.
+                let controller = std::mem::ManuallyDrop::new(unsafe {
+                    ICoreWebView2Controller::from_raw(raw as *mut c_void)
+                });
+                let mut rect = RECT::default();
+                unsafe {
+                    let _ = GetClientRect(hwnd, &mut rect);
+                    let _ = controller.SetBounds(rect);
+                }
+            }
+        }
         unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
     }
 
@@ -1427,6 +1518,19 @@ fn can_go_forward(webview: &ICoreWebView2) -> bool {
         let mut value = BOOL::default();
         webview.CanGoForward(&mut value).is_ok() && value.as_bool()
     }
+}
+
+/// The OS light/dark preference this machine reports, mapped through the shared
+/// [`OsColorScheme`] rule (`docs/adr/0009`: FOLLOW, never force).
+///
+/// A free function as well as a method because the CHROME must re-read it on
+/// `WM_SETTINGCHANGE`, when it no longer holds the backend (it is behind the
+/// `Renderer` seam by then). The registry read stays HERE, with the rest of the
+/// platform bindings, rather than being copied into the window crate: ONE reader,
+/// one mapping, for the engine and the chrome alike.
+#[must_use]
+pub fn os_color_scheme() -> OsColorScheme {
+    os_color_scheme_from_apps_use_light_theme(apps_use_light_theme())
 }
 
 /// Read `HKCU\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize\AppsUseLightTheme`.

@@ -5,21 +5,28 @@
 //! [`window`](crate::window) read as "set this widget to that value" instead of
 //! as `SendMessageW` ceremony. Nothing here decides anything about browsing,
 //! trust or wording.
+//!
+//! It also holds the ONE platform call behind the DPI seam,
+//! [`window_dpi`](crate::win32::window_dpi): the metrics themselves, and every
+//! sum over them, are [`crate::dpi`]'s, where the Ubuntu gate can test them.
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, InvalidateRect, ANSI_CHARSET, CLIP_DEFAULT_PRECIS,
-    DEFAULT_PITCH, DEFAULT_QUALITY, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT, OUT_DEFAULT_PRECIS,
+    CreateFontW, CreateSolidBrush, DeleteObject, InvalidateRect, ScreenToClient, ANSI_CHARSET,
+    CLIP_DEFAULT_PRECIS, DEFAULT_PITCH, DEFAULT_QUALITY, FF_DONTCARE, FW_NORMAL, HBRUSH, HFONT,
+    OUT_DEFAULT_PRECIS,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible, MoveWindow, SendMessageW,
-    SetWindowTextW, ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_SETFONT,
+    GetClientRect, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsWindowVisible,
+    MoveWindow, SendMessageW, SetWindowTextW, ShowWindow, SW_HIDE, SW_SHOWNOACTIVATE, WM_SETFONT,
 };
 
 use renderer::OsColorScheme;
 
+use crate::dpi::Dpi;
 use crate::paint::Rgb;
 
 /// A NUL-terminated UTF-16 buffer, the only string shape Win32 takes.
@@ -107,6 +114,47 @@ pub fn client_rect(window: HWND) -> RECT {
     rect
 }
 
+/// One control's rectangle in its PARENT's client coordinates — the same space
+/// [`place`] puts it in, which is what makes it comparable with the metrics the
+/// layout was computed from.
+#[must_use]
+pub fn control_rect(parent: HWND, control: HWND) -> RECT {
+    let mut rect = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(control, &mut rect);
+        let mut top_left = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: rect.right,
+            y: rect.bottom,
+        };
+        let _ = ScreenToClient(parent, &mut top_left);
+        let _ = ScreenToClient(parent, &mut bottom_right);
+        RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        }
+    }
+}
+
+/// The scale of the display this WINDOW is on, as Windows reports it.
+///
+/// Per-MONITOR (`GetDpiForWindow`), never the process's system DPI: the whole
+/// point of the `PerMonitorV2` declaration in `app.manifest` is that a window
+/// dragged onto a differently scaled monitor is re-scaled, and a system-DPI read
+/// cannot express that. This is the ONE platform call behind
+/// [`crate::dpi::Dpi`]; everything downstream of it is pure and testable on the
+/// Ubuntu gate.
+#[must_use]
+pub fn window_dpi(window: HWND) -> Dpi {
+    // 0 (an invalid window) is the seam's own fallback to the 96 baseline.
+    Dpi::new(unsafe { GetDpiForWindow(window) })
+}
+
 /// Give a control the window's font (Win32 controls otherwise inherit the
 /// 1980s system font).
 pub fn set_font(control: HWND, font: HFONT) {
@@ -120,13 +168,20 @@ pub fn set_font(control: HWND, font: HFONT) {
     }
 }
 
-/// The UI font: the system's own UI face, at the size Windows uses for chrome.
+/// The UI font: the system's own UI face, at the height the DPI seam computed
+/// for this display ([`crate::dpi::Metrics::font_height`]).
+///
+/// `CreateFontW` fixes the height at CREATION, so this is not a value that can be
+/// adjusted later: a DPI change means a NEW font, pushed to every control with
+/// [`set_font`] and the old one handed to [`release_font`].
 #[must_use]
-pub fn ui_font() -> HFONT {
+pub fn ui_font(height: i32) -> HFONT {
     let face = wide("Segoe UI");
     unsafe {
         CreateFontW(
-            -15,
+            // Negative: Win32's way of asking for a CHARACTER height rather than
+            // a cell height.
+            -height,
             0,
             0,
             0,
@@ -141,6 +196,21 @@ pub fn ui_font() -> HFONT {
             u32::from(DEFAULT_PITCH.0 | FF_DONTCARE.0),
             PCWSTR(face.as_ptr()),
         )
+    }
+}
+
+/// Release a font this window created, which is the same `DeleteObject` path
+/// [`Theme::release`] takes for its brushes.
+///
+/// A DPI change creates a NEW `HFONT` (the height cannot be changed in place), so
+/// without this every drag between two differently scaled monitors would leak one
+/// GDI object.
+pub fn release_font(font: HFONT) {
+    if font.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = DeleteObject(font.into());
     }
 }
 

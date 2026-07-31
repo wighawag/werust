@@ -7,6 +7,14 @@
 //! assignment block, which is what keeps a stale badge from surviving a
 //! transition.
 //!
+//! **Every pixel comes from the DPI seam.** The rectangles below are laid out in
+//! the pixels of the display the window is CURRENTLY on, taken from
+//! [`crate::dpi::Metrics`] at the window's `GetDpiForWindow` reading. Nothing
+//! here is a raw 96-DPI number: `app.manifest` declares `PerMonitorV2`, which
+//! promises Windows that this process scales itself, and this is the file that
+//! kept drawing a doll's-house chrome on a 200% display while WebView2 drew the
+//! page correctly (task `windows-chrome-must-scale-with-the-display-dpi`).
+//!
 //! **Only a FAILURE moves the page.** [`Chrome::relayout`] gives the page window
 //! everything between the fixed toolbar and the fixed status line, minus the
 //! error banner's strip when (and only when) the banner is up. In-flight progress
@@ -23,28 +31,11 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, HMENU};
 
+use crate::dpi::{Dpi, Metrics};
 use crate::paint::ChromePaint;
 use crate::win32::{
     client_rect, colorref, enable, is_visible, place, redraw, set_text, show, wide, window_text,
 };
-
-/// The toolbar strip's height.
-pub const TOOLBAR_HEIGHT: i32 = 40;
-/// The error banner's height (a failure is the one state allowed to take it).
-pub const BANNER_HEIGHT: i32 = 44;
-/// The status line's height.
-pub const STATUS_HEIGHT: i32 = 22;
-/// The gap around chrome items.
-pub const MARGIN: i32 = 8;
-/// A nav button's width.
-pub const BUTTON_WIDTH: i32 = 36;
-/// The trust indicator's width (it carries a whole phrase, not a glyph).
-pub const TRUST_WIDTH: i32 = 210;
-/// The invalid-entry badge's width.
-pub const BADGE_WIDTH: i32 = 110;
-/// The URL bar's progress strip: a few pixels along its bottom edge, INSIDE the
-/// bar, so it takes no height from the page.
-pub const PROGRESS_HEIGHT: i32 = 3;
 
 /// `PBM_SETPOS`, the progress bar's position message.
 const PBM_SETPOS: u32 = 0x0400 + 2;
@@ -117,9 +108,42 @@ pub struct Chrome {
     /// carrier's invalid colour, while the typed text is KEPT for the user to
     /// fix).
     pub url_invalid: Cell<bool>,
+    /// The scale of the display this window is on, as `GetDpiForWindow` last
+    /// reported it. Held rather than re-read per rectangle so ONE layout pass
+    /// cannot mix two scales, and refreshed on `WM_DPICHANGED`.
+    pub dpi: Cell<u32>,
 }
 
 impl Chrome {
+    /// Every metric this chrome draws with, at the current display's scale.
+    ///
+    /// The ONE seam between the design (96 DPI) and the pixels: nothing in this
+    /// file computes a size any other way.
+    #[must_use]
+    pub fn metrics(&self) -> Metrics {
+        Metrics::at(Dpi::new(self.dpi.get()))
+    }
+
+    /// Every control this window owns, so a font push (or any other sweep over
+    /// the chrome) cannot silently miss one — a control left on the old `HFONT`
+    /// after a DPI change is precisely the visible half of this defect.
+    #[must_use]
+    pub fn controls(&self) -> [HWND; 11] {
+        [
+            self.back,
+            self.forward,
+            self.reload,
+            self.stop,
+            self.menu_button,
+            self.url_edit,
+            self.progress,
+            self.invalid_badge,
+            self.trust,
+            self.error_banner,
+            self.status,
+        ]
+    }
+
     /// Paint one [`ChromePaint`] into the widgets.
     ///
     /// Straight-line assignment: no rule is evaluated here, and every value is a
@@ -216,69 +240,81 @@ impl Chrome {
     /// bottom, the page window taking everything between. Called on open, on
     /// every resize, and whenever the banner or badge appears/disappears.
     pub fn relayout(&self) {
+        let metrics = self.metrics();
         let rect = client_rect(self.window);
         let width = rect.right - rect.left;
         let height = rect.bottom - rect.top;
         let banner_height = if self.banner_visible.get() {
-            BANNER_HEIGHT
+            metrics.banner_height
         } else {
             0
         };
 
         place(
             self.error_banner,
-            MARGIN,
-            TOOLBAR_HEIGHT + 6,
-            width - 2 * MARGIN,
-            banner_height - 12,
+            metrics.margin,
+            metrics.toolbar_height + metrics.scale(6),
+            width - 2 * metrics.margin,
+            banner_height - metrics.scale(12),
         );
         // ONLY the error banner may change the page's geometry.
-        let page_top = TOOLBAR_HEIGHT + banner_height;
-        let page_height = height - page_top - STATUS_HEIGHT;
+        let page_top = metrics.toolbar_height + banner_height;
+        let page_height = height - page_top - metrics.status_height;
         place(self.page, 0, page_top, width, page_height);
         place(
             self.status,
-            MARGIN,
-            height - STATUS_HEIGHT + 3,
-            width - 2 * MARGIN,
-            STATUS_HEIGHT - 6,
+            metrics.margin,
+            height - metrics.status_height + metrics.scale(3),
+            width - 2 * metrics.margin,
+            metrics.status_height - metrics.scale(6),
         );
 
         // The toolbar's own row, left to right: the nav controls, then the URL
         // bar taking the slack, then (optionally) the invalid badge, the trust
         // indicator and the ⋮ menu pinned to the right.
-        let row_y = 6;
-        let row_height = TOOLBAR_HEIGHT - 12;
-        let mut x = MARGIN;
+        let row_y = metrics.row_y;
+        let row_height = metrics.row_height;
+        let mut x = metrics.margin;
         for control in [self.back, self.forward, self.reload, self.stop] {
-            place(control, x, row_y, BUTTON_WIDTH, row_height);
-            x += BUTTON_WIDTH + 2;
+            place(control, x, row_y, metrics.button_width, row_height);
+            x += metrics.button_width + metrics.scale(2);
         }
         let badge_width = if self.badge_visible.get() {
-            BADGE_WIDTH + 6
+            metrics.badge_width + metrics.scale(6)
         } else {
             0
         };
-        let right = width - MARGIN - BUTTON_WIDTH - TRUST_WIDTH - badge_width - 12;
-        let url_width = (right - x - 6).max(60);
+        let right = width
+            - metrics.margin
+            - metrics.button_width
+            - metrics.trust_width
+            - badge_width
+            - metrics.scale(12);
+        let url_width = (right - x - metrics.scale(6)).max(metrics.min_url_width);
         place(self.url_edit, x, row_y, url_width, row_height);
         // INSIDE the URL bar, along its bottom edge: the progress strip takes no
         // height of its own and therefore cannot move the page.
         place(
             self.progress,
-            x + 2,
-            row_y + row_height - PROGRESS_HEIGHT - 2,
-            url_width - 4,
-            PROGRESS_HEIGHT,
+            x + metrics.scale(2),
+            row_y + row_height - metrics.progress_height - metrics.scale(2),
+            url_width - metrics.scale(4),
+            metrics.progress_height,
         );
-        let mut x = x + url_width + 6;
+        let mut x = x + url_width + metrics.scale(6);
         if self.badge_visible.get() {
-            place(self.invalid_badge, x, row_y, BADGE_WIDTH, row_height);
-            x += BADGE_WIDTH + 6;
+            place(
+                self.invalid_badge,
+                x,
+                row_y,
+                metrics.badge_width,
+                row_height,
+            );
+            x += metrics.badge_width + metrics.scale(6);
         }
-        place(self.trust, x, row_y, TRUST_WIDTH, row_height);
-        x += TRUST_WIDTH + 6;
-        place(self.menu_button, x, row_y, BUTTON_WIDTH, row_height);
+        place(self.trust, x, row_y, metrics.trust_width, row_height);
+        x += metrics.trust_width + metrics.scale(6);
+        place(self.menu_button, x, row_y, metrics.button_width, row_height);
     }
 
     /// Register a control with the tooltip control, so it can carry text later.

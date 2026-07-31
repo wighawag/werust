@@ -55,6 +55,10 @@ windows = { version = "0.62", features = [
     # The title bar is drawn by the system: `DWMWA_USE_IMMERSIVE_DARK_MODE` is
     # how it follows the same OS setting.
     "Win32_Graphics_Dwm",
+    # `GetDpiForWindow`: `app.manifest` declares `PerMonitorV2`, so Windows
+    # scales NOTHING for this process and the chrome must scale itself from the
+    # DPI of the monitor its window is on (`src/dpi.rs`).
+    "Win32_UI_HiDpi",
     # `AttachConsole`: a GUI-subsystem binary has no console, so a run started
     # FROM a terminal borrows that terminal's (`src/startup.rs`). werust never
     # allocates one.

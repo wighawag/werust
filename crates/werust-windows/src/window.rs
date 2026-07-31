@@ -49,7 +49,7 @@ use std::rc::Rc;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
-use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HBRUSH, HDC};
+use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HBRUSH, HDC, HFONT};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     InitCommonControlsEx, SetWindowTheme, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES,
@@ -65,24 +65,20 @@ use werust_core::debug::DebugCapture;
 use werust_core::menu::MENU_ITEM_DEBUG;
 use werust_core::BrowserShell;
 
-use crate::chrome::{Chrome, MARGIN, PBM_SETBARCOLOR, PBM_SETRANGE32};
+use crate::chrome::{Chrome, PBM_SETBARCOLOR, PBM_SETRANGE32};
 use crate::debugview::{
     add_tab, current_tab, DebugTab, DebugWindow, NETWORK_TRUST_COLUMN, TAB_CONSOLE, TAB_NETWORK,
 };
+use crate::dpi::{Metrics, DEFAULT_HEIGHT, DEFAULT_WIDTH};
 use crate::paint::{
     console_refresh, install_debug_capture, menu_items, network_refresh, ChromePaint,
     MenuItemPaint, INVALID_ENTRY_COLOR, LOAD_PROGRESS_COLOR,
 };
 use crate::win32::{
-    client_rect, colorref, is_visible, place, set_font, show, ui_font, wide, window_text, Theme,
+    client_rect, colorref, control_rect, is_visible, place, release_font, set_font, show, ui_font,
+    wide, window_dpi, window_text, Theme,
 };
 
-/// The window's initial size.
-const DEFAULT_WIDTH: i32 = 1024;
-const DEFAULT_HEIGHT: i32 = 768;
-/// The debug view's initial size.
-const DEBUG_WIDTH: i32 = 940;
-const DEBUG_HEIGHT: i32 = 480;
 /// The chrome pump cadence, in milliseconds: the same 50ms the GTK and AppKit
 /// shells use.
 const PUMP_INTERVAL_MS: u32 = 50;
@@ -213,6 +209,71 @@ impl Controller {
         // is incremental, so an idle tick over an open view is one sequence
         // comparison.
         self.refresh_debug_view();
+    }
+
+    /// `WM_DPICHANGED`: this window was dragged onto a monitor with a different
+    /// scale (or the user changed the scale of the one it is on).
+    ///
+    /// `app.manifest` declares `PerMonitorV2`, so Windows re-scales NOTHING for
+    /// this process: the whole response is ours. Honour the rect Windows
+    /// SUGGESTS, recreate the font at the new size (a `CreateFontW` height is
+    /// fixed at creation), push it to every control, delete the old one, and
+    /// re-run the layout from the new metrics. Without this the window is
+    /// correct only on the monitor it opened on, which on a laptop-plus-external
+    /// desk is most of the time.
+    fn dpi_changed(&self, window: HWND, wparam: WPARAM, lparam: LPARAM) {
+        // The new scale rides on the message: the low word is the X-axis DPI
+        // (the high word is the Y-axis one, which is the same on every Windows
+        // display). Taking it from here rather than re-reading the window means
+        // the layout below cannot race the move.
+        self.chrome
+            .dpi
+            .set(u32::try_from(wparam.0 & 0xffff).unwrap_or(0));
+        // `lParam` is a RECT: the same window, sized and positioned for the new
+        // scale. Windows asks that it be honoured exactly, and a window that
+        // does not is left straddling the monitor boundary.
+        let suggested = unsafe { *(lparam.0 as *const windows::Win32::Foundation::RECT) };
+        unsafe {
+            let _ = SetWindowPos(
+                window,
+                None,
+                suggested.left,
+                suggested.top,
+                suggested.right - suggested.left,
+                suggested.bottom - suggested.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        self.rescale_font(self.chrome.metrics());
+        self.chrome.relayout();
+    }
+
+    /// Recreate the UI font at `metrics`' height and give it to every control.
+    ///
+    /// The height of an `HFONT` is fixed when it is created, so a DPI change
+    /// needs a NEW one pushed with `WM_SETFONT` ([`set_font`]) rather than an
+    /// adjustment. The old one is deleted AFTER every control has taken the
+    /// replacement — the same `DeleteObject` discipline
+    /// [`Theme::release`](crate::win32::Theme::release) applies to its brushes,
+    /// because a font leaked on every monitor drag is a real GDI leak.
+    fn rescale_font(&self, metrics: Metrics) {
+        let replacement = ui_font(metrics.font_height);
+        if replacement.is_invalid() {
+            return;
+        }
+        let previous = HFONT(self.font.get() as *mut _);
+        self.font.set(replacement.0 as isize);
+        for control in self.chrome.controls() {
+            set_font(control, replacement);
+        }
+        // The debug view, when it is open, wears the same chrome font.
+        if let Some(debug) = self.debug.borrow().as_ref() {
+            for control in debug.controls() {
+                set_font(control, replacement);
+            }
+            relayout_debug_window_of(debug);
+        }
+        release_font(previous);
     }
 
     /// A control's colours at paint time. Win32 asks the PARENT for them, which
@@ -359,6 +420,10 @@ unsafe extern "system" fn wndproc(
             controller.follow_os_color_scheme();
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            controller.dpi_changed(window, wparam, lparam);
+            LRESULT(0)
+        }
         WM_COMMAND => {
             let id = wparam.0 & 0xffff;
             handle_command(&controller, id);
@@ -496,6 +561,26 @@ unsafe extern "system" fn debug_wndproc(
             relayout_debug_window(&controller);
             LRESULT(0)
         }
+        // The debug view is its OWN top-level window and can be dragged to a
+        // differently scaled monitor by itself, so it answers the same message
+        // the browser window does. The FONT is the browser window's (one chrome
+        // font per process), so this half is the suggested rect plus a relayout.
+        WM_DPICHANGED => {
+            let suggested = unsafe { *(lparam.0 as *const windows::Win32::Foundation::RECT) };
+            unsafe {
+                let _ = SetWindowPos(
+                    window,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right - suggested.left,
+                    suggested.bottom - suggested.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            relayout_debug_window(&controller);
+            LRESULT(0)
+        }
         WM_NOTIFY => {
             let header = unsafe { &*(lparam.0 as *const NMHDR) };
             if header.code == NM_CUSTOMDRAW {
@@ -573,31 +658,54 @@ fn debug_custom_draw(controller: &Rc<Controller>, lparam: LPARAM) -> LRESULT {
     LRESULT(CDRF_DODEFAULT)
 }
 
-/// Re-frame the debug view's strips after a resize.
+/// Re-frame the debug view's strips after a resize (or a scale change).
 fn relayout_debug_window(controller: &Rc<Controller>) {
     let debug = controller.debug.borrow();
     let Some(debug) = debug.as_ref() else {
         return;
     };
+    relayout_debug_window_of(debug);
+}
+
+/// The debug view's layout itself, in the pixels of the display IT is on.
+///
+/// It is a separate top-level window, so it takes its own `GetDpiForWindow`
+/// reading rather than the browser window's: the two can sit on monitors with
+/// different scales.
+fn relayout_debug_window_of(debug: &DebugWindow) {
+    let metrics = Metrics::at(window_dpi(debug.window));
     let rect = client_rect(debug.window);
     let width = rect.right - rect.left;
     let height = rect.bottom - rect.top;
-    place(debug.clear, width - MARGIN - 90, MARGIN, 90, 26);
+    place(
+        debug.title,
+        metrics.margin,
+        metrics.margin,
+        metrics.debug_title_width,
+        metrics.debug_title_height,
+    );
+    place(
+        debug.clear,
+        width - metrics.margin - metrics.debug_button_width,
+        metrics.margin,
+        metrics.debug_button_width,
+        metrics.debug_button_height,
+    );
     place(
         debug.tabs,
-        MARGIN,
-        40,
-        width - 2 * MARGIN,
-        height - 40 - MARGIN,
+        metrics.margin,
+        metrics.debug_tabs_top,
+        width - 2 * metrics.margin,
+        height - metrics.debug_tabs_top - metrics.margin,
     );
-    let list_top = 40 + 28;
-    let list_height = height - list_top - MARGIN - 4;
+    let list_top = metrics.debug_tabs_top + metrics.debug_tab_strip;
+    let list_height = height - list_top - metrics.margin - metrics.scale(4);
     for list in [debug.console.list, debug.network.list] {
         place(
             list,
-            MARGIN + 4,
+            metrics.margin + metrics.scale(4),
             list_top,
-            width - 2 * MARGIN - 8,
+            width - 2 * metrics.margin - metrics.scale(8),
             list_height,
         );
     }
@@ -678,6 +786,11 @@ fn build_browser_menu(items: &[MenuItemPaint]) -> HMENU {
 fn build_debug_window(controller: &Rc<Controller>) -> DebugWindow {
     register_class(DEBUG_CLASS, Some(debug_wndproc));
     let font = controller.font.get();
+    // Opened at the BROWSER window's scale (there is no HWND to ask about the
+    // debug view's own monitor until it exists); if Windows puts it on a
+    // differently scaled one it says so with `WM_DPICHANGED`, which this window
+    // answers.
+    let metrics = controller.chrome.metrics();
     let window = unsafe {
         CreateWindowExW(
             WINDOW_EX_STYLE::default(),
@@ -686,8 +799,8 @@ fn build_debug_window(controller: &Rc<Controller>) -> DebugWindow {
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            DEBUG_WIDTH,
-            DEBUG_HEIGHT,
+            metrics.debug_width,
+            metrics.debug_height,
             None,
             None,
             Some(GetModuleHandleW(None).unwrap_or_default().into()),
@@ -708,7 +821,6 @@ fn build_debug_window(controller: &Rc<Controller>) -> DebugWindow {
         0,
         font,
     );
-    place(title, MARGIN, MARGIN, 300, 20);
     let clear = control(
         window,
         w!("BUTTON"),
@@ -742,7 +854,7 @@ fn build_debug_window(controller: &Rc<Controller>) -> DebugWindow {
         0,
         font,
     ));
-    console.add_column(0, "Message", DEBUG_WIDTH - 80);
+    console.add_column(0, "Message", metrics.debug_width - metrics.scale(80));
     let network = DebugTab::new(control(
         window,
         w!("SysListView32"),
@@ -762,19 +874,26 @@ fn build_debug_window(controller: &Rc<Controller>) -> DebugWindow {
     .into_iter()
     .enumerate()
     {
-        network.add_column(i32::try_from(index).unwrap_or(0), title, width);
+        network.add_column(
+            i32::try_from(index).unwrap_or(0),
+            title,
+            metrics.scale(width),
+        );
     }
     // The CONSOLE tab is the one showing first; both lists share one rectangle.
     show(network.list, false);
 
-    DebugWindow {
+    let debug = DebugWindow {
         window,
+        title,
         tabs,
         clear,
         console,
         network,
         selected: Cell::new(TAB_CONSOLE),
-    }
+    };
+    relayout_debug_window_of(&debug);
+    debug
 }
 
 /// The Windows browser window: the product surface, over the shared shell.
@@ -837,7 +956,26 @@ impl BrowserWindow {
         }
         .map_err(|e| RendererError::Backend(format!("CreateWindowExW(werust): {e}")))?;
 
-        let font = ui_font();
+        // Only now that the window EXISTS can Windows say which monitor it is on
+        // and what that monitor's scale is (`GetDpiForWindow` takes an HWND), so
+        // the size above is the 96-DPI design size and this is where it becomes
+        // real pixels. Without it a 200% display opens a half-size window, which
+        // is the same defect as the half-size chrome, one level up.
+        let dpi = window_dpi(window);
+        let metrics = Metrics::at(dpi);
+        unsafe {
+            let _ = SetWindowPos(
+                window,
+                None,
+                0,
+                0,
+                metrics.default_width,
+                metrics.default_height,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+
+        let font = ui_font(metrics.font_height);
         let font_raw = font.0 as isize;
 
         // The live page: the seam hands over an opaque pointer to the backend's
@@ -974,6 +1112,9 @@ impl BrowserWindow {
             error_color: Cell::new(COLORREF(0)),
             error_brush: Cell::new(HBRUSH::default()),
             url_invalid: Cell::new(false),
+            // Every rectangle this chrome draws is scaled from here, and
+            // `WM_DPICHANGED` replaces it.
+            dpi: Cell::new(dpi.raw()),
         };
         chrome.add_tip(trust);
         chrome.add_tip(url_edit);
@@ -1081,6 +1222,51 @@ impl BrowserWindow {
     #[must_use]
     pub fn window(&self) -> HWND {
         self.controller.chrome.window
+    }
+
+    /// The scale of the display this window is on, as Windows reports it
+    /// (`GetDpiForWindow`, per-MONITOR).
+    #[must_use]
+    pub fn dpi(&self) -> u32 {
+        self.controller.chrome.dpi.get()
+    }
+
+    /// The metrics every rectangle in this window was laid out from — the ONE
+    /// seam, at this display's scale.
+    ///
+    /// The smoke compares the REAL widgets against these, which is the only
+    /// run-time check of the DPI work available anywhere: a CI runner has no DPI,
+    /// so at 96 this proves the layout is COMPUTED from the seam, and on a
+    /// human's scaled display the same assertions prove it SCALES.
+    #[must_use]
+    pub fn metrics(&self) -> Metrics {
+        self.controller.chrome.metrics()
+    }
+
+    /// The URL bar (the smoke measures its rectangle).
+    #[must_use]
+    pub fn url_bar(&self) -> HWND {
+        self.controller.chrome.url_edit
+    }
+
+    /// The trust indicator (likewise).
+    #[must_use]
+    pub fn trust(&self) -> HWND {
+        self.controller.chrome.trust
+    }
+
+    /// One control's rectangle in the WINDOW's client coordinates: the same
+    /// space the layout placed it in.
+    #[must_use]
+    pub fn control_rect(&self, control: HWND) -> windows::Win32::Foundation::RECT {
+        control_rect(self.controller.chrome.window, control)
+    }
+
+    /// The page window's rectangle in the window's client coordinates, so the
+    /// smoke can check that the page starts exactly one scaled toolbar down.
+    #[must_use]
+    pub fn page_client_rect(&self) -> windows::Win32::Foundation::RECT {
+        control_rect(self.controller.chrome.window, self.controller.chrome.page)
     }
 
     /// Close the window (and stop the pump).

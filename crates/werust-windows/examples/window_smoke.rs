@@ -17,6 +17,14 @@
 //! hash-MISMATCHING control both come from memory. No gateway, no network, no
 //! signing, no packaging.
 //!
+//! It also MEASURES the chrome's geometry against the DPI seam
+//! (`werust_windows::dpi`), which is the only run-time check of the DPI work
+//! that exists anywhere: a CI runner has no scaled display, so at 96 DPI these
+//! assertions prove the layout is COMPUTED from the seam rather than from
+//! constants, and the SAME assertions run on a human's 150%/200% display prove it
+//! scales. What only a human can judge is listed in
+//! `docs/spikes/windows-chrome-must-scale-with-the-display-dpi/README.md`.
+//!
 //! The window is opened FAR off-screen and never activated, so a CI run shows
 //! nothing and steals no focus.
 //!
@@ -50,6 +58,7 @@ mod windows_smoke {
     use werust_core::ipfs::RedirectSink;
     use werust_core::menu::{BrowserMenu, MENU_ITEM_DEBUG};
     use werust_core::{status_line, trust_indicator, trust_indicator_detail, BrowserShell};
+    use werust_windows::dpi::{Dpi, Metrics};
     use werust_windows::paint::install_debug_capture;
     use werust_windows::window::{BrowserWindow, Placement};
 
@@ -225,6 +234,56 @@ mod windows_smoke {
             !window.invalid_badge_visible(),
             "no invalid-entry badge on a fresh window",
         );
+
+        // The DPI seam, measured off the REAL widgets. `app.manifest` declares
+        // `PerMonitorV2`, so Windows scales nothing for this process and every
+        // rectangle above had to be computed for this display's scale.
+        println!("the chrome is laid out from the DPI seam, at this display's scale:");
+        let dpi = window.dpi();
+        let metrics = Metrics::at(Dpi::new(dpi));
+        println!(
+            "       GetDpiForWindow = {dpi} ({}% of the 96-DPI baseline)",
+            dpi * 100 / 96
+        );
+        check(
+            &mut failures,
+            window.metrics() == metrics,
+            "the window's metrics are the seam's, for the DPI Windows reported",
+        );
+        let page = window.page_client_rect();
+        println!(
+            "       page top: {} (toolbar: {})",
+            page.top, metrics.toolbar_height
+        );
+        check(
+            &mut failures,
+            page.top == metrics.toolbar_height,
+            "the page starts exactly one SCALED toolbar down",
+        );
+        let url = window.control_rect(window.url_bar());
+        check(
+            &mut failures,
+            url.top == metrics.row_y && url.bottom - url.top == metrics.row_height,
+            "the URL bar is exactly the seam's toolbar row, not a 96-DPI constant",
+        );
+        let trust = window.control_rect(window.trust());
+        check(
+            &mut failures,
+            trust.right - trust.left == metrics.trust_width,
+            "the trust indicator is exactly the seam's scaled width",
+        );
+        // Say plainly what this run can and cannot claim.
+        if dpi == 96 {
+            println!(
+                "       NOTE: this display is UNSCALED, so the checks above prove the layout is\n\
+                 \x20      computed from the seam, NOT that it scales. Only a human on a 150%/200%\n\
+                 \x20      display can close that; see the spike README."
+            );
+        } else {
+            println!(
+                "       this display IS scaled, so the checks above also prove the chrome scales"
+            );
+        }
 
         println!("the ⋮ menu is the shared core's BrowserMenu, item for item:");
         let expected: Vec<String> = BrowserMenu::new()

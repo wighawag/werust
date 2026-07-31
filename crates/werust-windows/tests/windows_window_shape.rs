@@ -93,6 +93,51 @@ fn chrome() -> String {
     source("crates/werust-windows/src/chrome.rs")
 }
 
+/// The DPI seam: the chrome's 96-DPI design metrics and the arithmetic that
+/// turns them into pixels for the display the window is on.
+fn dpi_seam() -> String {
+    source("crates/werust-windows/src/dpi.rs")
+}
+
+/// Every integer literal in `body` that does NOT go through the DPI seam.
+///
+/// A raw pixel that survives in a layout is exactly this task's defect (a
+/// control that is subtly misaligned rather than obviously broken), so the
+/// guard scans for them instead of listing the ones it happens to remember.
+/// Literals inside `metrics.scale(…)` are the seam's own arguments and are
+/// removed first; a digit run glued to an identifier (`i32`, `x2`) is not a
+/// pixel.
+fn unscaled_literals(body: &str) -> Vec<String> {
+    let mut stripped = String::new();
+    let mut rest = body;
+    while let Some(start) = rest.find("metrics.scale(") {
+        stripped.push_str(&rest[..start]);
+        let after = &rest[start + "metrics.scale(".len()..];
+        let end = after.find(')').unwrap_or(0);
+        rest = &after[end..];
+    }
+    stripped.push_str(rest);
+
+    let bytes: Vec<char> = stripped.chars().collect();
+    let mut found = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let glued = start > 0 && (bytes[start - 1].is_alphabetic() || bytes[start - 1] == '_');
+        if !glued {
+            found.push(bytes[start..index].iter().collect::<String>());
+        }
+    }
+    found
+}
+
 /// The SHARED carrier both native desktop windows paint from.
 fn paint() -> String {
     source("crates/desktop-paint/src/lib.rs")
@@ -508,7 +553,7 @@ fn progress_lives_in_the_url_bar_and_only_a_failure_moves_the_page() {
     );
     // The page's height depends on the BANNER only -- never on progress.
     assert!(
-        layout.contains("let page_top = TOOLBAR_HEIGHT + banner_height;"),
+        layout.contains("let page_top = metrics.toolbar_height + banner_height;"),
         "only the error banner may change the page's geometry: {layout:?}"
     );
     let banner_height = between(
@@ -517,7 +562,7 @@ fn progress_lives_in_the_url_bar_and_only_a_failure_moves_the_page() {
         ";",
     );
     assert!(
-        banner_height.contains("BANNER_HEIGHT"),
+        banner_height.contains("metrics.banner_height"),
         "the banner takes its strip only when it is visible"
     );
     // And the banner is visible only when the core says a load FAILED.
@@ -670,6 +715,241 @@ fn the_binary_links_as_a_gui_app_and_a_startup_failure_stays_legible() {
     assert!(
         exists("docs/spikes/windows-gui-subsystem-no-console-window/DECISIONS.md"),
         "how a startup failure is surfaced is a recorded decision, not a silent one"
+    );
+}
+
+#[test]
+fn the_chrome_scales_from_one_dpi_seam_and_follows_a_dpi_change() {
+    // The defect this test exists for (task `windows-chrome-must-scale-with-the-display-dpi`,
+    // defect 1 of `work/notes/findings/windows-shell-first-run-on-real-hardware-2026-07-31.md`):
+    // `app.manifest` declares `PerMonitorV2`, which PROMISES Windows that this
+    // process scales ITSELF, and the Win32 half laid every rectangle out in raw
+    // 96-DPI pixels -- so on a 150%/200% display the chrome drew at 66%/50% of
+    // its intended size while WebView2 drew the page correctly. A CI runner has
+    // no DPI and cannot see any of that; what it CAN pin, and what this asserts,
+    // is that every metric comes from ONE seam whose arithmetic the Ubuntu gate
+    // unit-tests, and that a DPI CHANGE is handled.
+
+    // The promise itself stays: reverting the manifest would restore the SIZE by
+    // making Windows bitmap-scale the process, at the cost of a blurry chrome AND
+    // a blurry page.
+    let manifest = source("crates/werust-windows/app.manifest");
+    assert!(
+        manifest.contains("PerMonitorV2"),
+        "the manifest must keep promising per-monitor-v2 awareness; the WINDOW is the half that \
+         has to keep the promise"
+    );
+
+    // The seam is HOST-INDEPENDENT, so its arithmetic compiles and is tested on
+    // the Ubuntu gate rather than only on a Windows box -- the same shape
+    // `profile.rs` has, and the reason this crate is a workspace member at all.
+    let lib = source("crates/werust-windows/src/lib.rs");
+    assert!(
+        lib.contains("pub mod dpi;"),
+        "the DPI seam must be a module of this crate"
+    );
+    assert!(
+        !lib.contains("#[cfg(windows)]\npub mod dpi;"),
+        "the DPI seam must NOT be cfg-gated: the Ubuntu gate is where its arithmetic is tested"
+    );
+    let seam = dpi_seam();
+    assert!(
+        seam.contains("#[cfg(test)]"),
+        "the scaling arithmetic must carry its own unit tests on the Ubuntu gate"
+    );
+
+    // The design metrics live ONCE, at the seam, in their 96-DPI form. A copy
+    // left behind in the Win32 half is a metric that silently stops scaling.
+    for (name, value) in [
+        ("TOOLBAR_HEIGHT", 40),
+        ("BANNER_HEIGHT", 44),
+        ("STATUS_HEIGHT", 22),
+        ("MARGIN", 8),
+        ("BUTTON_WIDTH", 36),
+        ("TRUST_WIDTH", 210),
+        ("BADGE_WIDTH", 110),
+        ("PROGRESS_HEIGHT", 3),
+        ("FONT_HEIGHT", 15),
+        ("DEFAULT_WIDTH", 1024),
+        ("DEFAULT_HEIGHT", 768),
+        ("DEBUG_WIDTH", 940),
+        ("DEBUG_HEIGHT", 480),
+    ] {
+        assert!(
+            seam.contains(&format!("pub const {name}: i32 = {value};")),
+            "`{name}` must be a 96-DPI design metric at the seam"
+        );
+    }
+    for source_file in [
+        "crates/werust-windows/src/chrome.rs",
+        "crates/werust-windows/src/window.rs",
+    ] {
+        let text = code_only(&source(source_file));
+        assert!(
+            !text.contains("const MARGIN") && !text.contains("const DEFAULT_WIDTH"),
+            "{source_file} must consume the seam's metrics, not restate them"
+        );
+    }
+
+    // The DPI itself is read ONCE, per window, through the platform call the
+    // task names -- `GetDpiForWindow`, which is per-MONITOR, not the process's
+    // system DPI.
+    let helpers = source("crates/werust-windows/src/win32.rs");
+    assert!(
+        helpers.contains("GetDpiForWindow("),
+        "the window's scale must come from GetDpiForWindow (per-monitor), through one helper"
+    );
+    assert_eq!(
+        code_only(&win32_half()).matches("GetDpiForWindow(").count(),
+        1,
+        "exactly ONE call site: a second GetDpiForWindow is a second seam"
+    );
+
+    // The LAYOUT: every rectangle is the seam's, and no raw pixel survives.
+    let chrome = chrome();
+    let layout = between(&chrome, "pub fn relayout(&self) {", "\n    }\n");
+    assert!(
+        layout.contains("let metrics = self.metrics();"),
+        "the layout must be computed from the DPI seam: {layout:?}"
+    );
+    for field in [
+        "metrics.toolbar_height",
+        "metrics.banner_height",
+        "metrics.status_height",
+        "metrics.margin",
+        "metrics.button_width",
+        "metrics.trust_width",
+        "metrics.badge_width",
+        "metrics.progress_height",
+        "metrics.row_height",
+    ] {
+        assert!(
+            layout.contains(field),
+            "the layout must take `{field}` from the seam: {layout:?}"
+        );
+    }
+    // `0` (an origin) and `2` (the two-margin multiplier) are not pixels; every
+    // other literal in a layout is one, and must have gone through the seam.
+    let leftovers: Vec<String> = unscaled_literals(layout)
+        .into_iter()
+        .filter(|literal| literal != "0" && literal != "2")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the chrome layout still carries raw 96-DPI pixels {leftovers:?}: every metric must go \
+         through the seam"
+    );
+    let window = window();
+    let debug_layout = between(
+        &window,
+        "fn relayout_debug_window(",
+        "\n/// Register a window class",
+    );
+    let leftovers: Vec<String> = unscaled_literals(debug_layout)
+        .into_iter()
+        .filter(|literal| literal != "0" && literal != "2")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the debug view's layout still carries raw 96-DPI pixels {leftovers:?}"
+    );
+
+    // The FONT: `CreateFontW` fixes a height at creation, so the seam has to be
+    // asked for it -- and the old `-15` may not survive anywhere.
+    assert!(
+        helpers.contains("pub fn ui_font(height: i32) -> HFONT"),
+        "the UI font must be created at the height the seam computed"
+    );
+    let win32 = code_only(&win32_half());
+    assert!(
+        !win32.contains("-15"),
+        "the hard-coded 96-DPI font height must be gone"
+    );
+    assert!(
+        window.contains("ui_font(metrics.font_height)"),
+        "the window must create its font at the scaled height"
+    );
+
+    // The INITIAL window size: a 200% display must not open a half-size window.
+    assert!(
+        window.contains("metrics.default_width") && window.contains("metrics.default_height"),
+        "the initial window size must be DPI-scaled"
+    );
+    assert!(
+        window.contains("metrics.debug_width") && window.contains("metrics.debug_height"),
+        "the debug view's initial size must be DPI-scaled too"
+    );
+
+    // A DPI CHANGE: dragging between monitors of different scale. The suggested
+    // rect Windows sends is honoured, the font is recreated and pushed to every
+    // control, the OLD font is deleted (the crate's brush-cleanup pattern), and
+    // the layout re-runs.
+    assert!(
+        window.contains("WM_DPICHANGED") && window.contains("fn dpi_changed"),
+        "the window must handle WM_DPICHANGED, or it is correct only on the monitor it opened on"
+    );
+    let changed = between(&window, "fn dpi_changed(", "\n    }\n");
+    assert!(
+        changed.contains("SetWindowPos("),
+        "the suggested rect Windows sends must be honoured: {changed:?}"
+    );
+    assert!(
+        changed.contains("self.rescale_font(") && changed.contains("relayout()"),
+        "a DPI change must recreate the font and re-run the layout: {changed:?}"
+    );
+    let rescale = between(&window, "fn rescale_font(", "\n    }\n");
+    assert!(
+        rescale.contains("ui_font(") && rescale.contains("set_font("),
+        "the new font must be pushed to every control with WM_SETFONT: {rescale:?}"
+    );
+    assert!(
+        rescale.contains("release_font("),
+        "the OLD HFONT must be deleted rather than leaked on every DPI change: {rescale:?}"
+    );
+    assert!(
+        helpers.contains("pub fn release_font(") && helpers.contains("DeleteObject(font.into())"),
+        "the font's cleanup must follow the same DeleteObject path the theme's brushes use"
+    );
+    // Every control the window owns takes the new font: a missed one keeps the
+    // old size and is the visible half of this defect.
+    assert!(
+        chrome.contains("pub fn controls(&self)"),
+        "the chrome must name every control it owns, so a font push cannot miss one"
+    );
+
+    // The window SMOKE measures the real widgets against the seam, which is the
+    // only run-time check available anywhere (and, on a 96-DPI runner, still
+    // proves the layout is COMPUTED from the seam rather than from constants).
+    let smoke = source("crates/werust-windows/examples/window_smoke.rs");
+    assert!(
+        smoke.contains("window.dpi()") && smoke.contains("Metrics::at("),
+        "the smoke must compare the real layout against the seam's metrics for the runner's DPI"
+    );
+    for measured in [
+        "window.page_client_rect()",
+        "window.control_rect(",
+        "metrics.toolbar_height",
+        "metrics.row_height",
+        "metrics.trust_width",
+    ] {
+        assert!(
+            smoke.contains(measured),
+            "the smoke must measure `{measured}` off the real window"
+        );
+    }
+
+    // And the honesty: a runner cannot close this one, so the manual steps are
+    // written down at the task's stable spike path.
+    let readme = source("docs/spikes/windows-chrome-must-scale-with-the-display-dpi/README.md");
+    for step in ["100%", "150%", "200%", "cross-monitor drag"] {
+        assert!(
+            readme.contains(step),
+            "the spike README must record the manual step `{step}`"
+        );
+    }
+    assert!(
+        readme.contains("CI cannot"),
+        "the README must say plainly that CI cannot verify this"
     );
 }
 

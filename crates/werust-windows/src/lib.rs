@@ -55,6 +55,18 @@
 //! `docs/spikes/windows-win32-window-and-chrome/README.md`, including the manual
 //! verification steps for everything a CI runner cannot judge.
 //!
+//! # It scales itself, because the manifest promised Windows it would
+//!
+//! `app.manifest` declares `PerMonitorV2`: Windows must NOT bitmap-scale this
+//! process, because it scales itself. [`dpi`] is where it does — one seam holding
+//! the chrome's 96-DPI design metrics and the `MulDiv` arithmetic that turns them
+//! into the pixels of whichever monitor the window is on, fed by ONE
+//! `GetDpiForWindow` read and rebuilt on `WM_DPICHANGED`. The seam is pure and
+//! host-independent, so the Ubuntu gate unit-tests the arithmetic no CI runner
+//! can otherwise reach: a runner has no DPI at all. What only a human on a scaled
+//! display can confirm is listed in
+//! `docs/spikes/windows-chrome-must-scale-with-the-display-dpi/README.md`.
+//!
 //! # The binary is a GUI app
 //!
 //! `src/main.rs` links with `#![cfg_attr(windows, windows_subsystem =
@@ -106,6 +118,12 @@
 /// `werust-macos` names it that: it is where deriving stops and painting starts.
 pub use desktop_paint as paint;
 
+// The chrome's ONE DPI seam. NOT `cfg`-gated, for the same reason `profile` is
+// not: `app.manifest` declares `PerMonitorV2`, so the WINDOW owes Windows its own
+// scaling, and the arithmetic that owes it is pure — so it is compiled and
+// unit-tested on the Ubuntu gate instead of being discovered on a 200% display
+// (task `windows-chrome-must-scale-with-the-display-dpi`).
+pub mod dpi;
 pub mod profile;
 
 #[cfg(windows)]

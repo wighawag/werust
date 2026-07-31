@@ -265,6 +265,8 @@ impl DebugTab {
 pub struct DebugWindow {
     /// The window itself.
     pub window: HWND,
+    /// The title label above the tabs.
+    pub title: HWND,
     /// The tab control.
     pub tabs: HWND,
     /// The CLEAR button.
@@ -277,6 +279,20 @@ pub struct DebugWindow {
 }
 
 impl DebugWindow {
+    /// Every control this view owns, so a font push after a DPI change cannot
+    /// miss one (the chrome's [`controls`](crate::chrome::Chrome::controls) is
+    /// the same list for the browser window).
+    #[must_use]
+    pub fn controls(&self) -> [HWND; 5] {
+        [
+            self.title,
+            self.clear,
+            self.tabs,
+            self.console.list,
+            self.network.list,
+        ]
+    }
+
     /// The tab that owns `list`, if any (the `NM_CUSTOMDRAW` notification
     /// arrives at this window, naming the list it came from).
     #[must_use]

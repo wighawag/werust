@@ -309,6 +309,40 @@ class BrowserActivity : ComponentActivity() {
         webView = WebView(this).apply {
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f)
             settings.javaScriptEnabled = true
+            // WEB STORAGE (task `android-enable-dom-storage-and-guard-web-platform-parity`,
+            // field finding: on `mandalas.eth` `window.localStorage` was `null` on
+            // Android while desktop worked).
+            //
+            // WHY THE DEFAULT IS WRONG HERE: Android's `WebSettings` default for
+            // `domStorageEnabled` is FALSE, because a `WebView` is built for an APP
+            // EMBEDDING a web view — where a page having durable per-origin storage is
+            // an opt-in — not for a BROWSER, where it is table stakes. werust is a
+            // browser, so the default is simply wrong for it. And what the WebView does
+            // with the setting off is not even conformant: `window.localStorage` comes
+            // back `null`, where the web platform allows exactly two answers, a
+            // `Storage` object or a `SecurityError` throw on an opaque origin. That
+            // `null` is also what ruled OUT the obvious suspect — an opaque origin
+            // THROWS, so the `ipfs://` origin mapping was never the cause and was left
+            // alone. The other four edges (WebKitGTK, WKWebView on iOS and macOS,
+            // WebView2) set no storage setting at all because their engines enable it
+            // by default, which is why the gap was Android-only.
+            //
+            // WHY IT IS SAFE HERE: web storage is partitioned by ORIGIN, so enabling it
+            // is only safe while two different sites cannot share an origin. On Android
+            // they cannot: `crates/werust-android/rust/src/origin_map.rs` gives each CID
+            // its OWN subdomain (`https://<cid>.ipfs.werust.invalid`), so storage is
+            // isolated per CONTENT ADDRESS, exactly as it is on the four platforms that
+            // serve real `ipfs://<cid>` origins. Flipping this switch leaks nothing
+            // across sites.
+            //
+            // SCOPE, measured rather than assumed (on-device evidence in
+            // docs/spikes/android-enable-dom-storage-and-guard-web-platform-parity/MEASUREMENTS.md):
+            // this setting governs `localStorage` ONLY. `sessionStorage`, IndexedDB and
+            // cookies already worked without it. Guarded by the source-shape test
+            // crates/werust-core/tests/web_storage_edge_wiring_shape.rs (which runs on
+            // every push) and by the on-device probe `WebStorageTest.kt` (which does
+            // not — there is no CI emulator leg).
+            settings.domStorageEnabled = true
             // COLOR SCHEME follows the OS via the app THEME, not any WebView call
             // here (task webview-follow-os-color-scheme, docs/adr/0009). The System
             // WebView always sets the page's `prefers-color-scheme` from the app

@@ -1160,6 +1160,69 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "web-storage"
+description = "WEB STORAGE as the web platform defines it: `window.localStorage` and `window.sessionStorage` are `Storage` objects, partitioned per ORIGIN, that round-trip a set/get and survive a reload. The platform allows exactly two answers for the property — a `Storage` object, or a `SecurityError` throw on an opaque origin — so returning `null` is non-conformant, which is precisely what Android did. THIS IS THE MATRIX'S FIRST WEB-PLATFORM ROW, and that is the point of adding it: the 24 rows before it are all werust FEATURES (address bar, trust indicator, ENS resolution, debug view), so not one of them asked whether the WEB PLATFORM ITSELF behaves the same on all five edges — which is exactly why the parity guard, whose whole job is to stop a capability shipping on one platform only, could not fire on this bug (ADR-0005's ceiling: it prevents a KNOWN capability from silently shipping one-platform, and cannot discover a capability nobody wrote a row for)."
+# The bug this row exists for (task
+# `android-enable-dom-storage-and-guard-web-platform-parity`, finding
+# work/notes/findings/android-localstorage-is-null-dom-storage-never-enabled-2026-07-31.md):
+# on real hardware, on `mandalas.eth`, `window.localStorage` was `null` on
+# Android while desktop worked. Cause: Android's `WebSettings.domStorageEnabled`
+# defaults to FALSE (a `WebView` is built for an app EMBEDDING a view, not for a
+# browser) and the Android edge never set it. NOT the opaque-origin problem — an
+# opaque origin THROWS `SecurityError`, and the `null` is what ruled that out, so
+# `origin_map.rs` was correctly left alone.
+#
+# EVIDENCE CLASS PER CELL, stated rather than implied, because it differs:
+# * Android: MEASURED on-device, both before and after, by the instrumented probe
+#   crates/werust-android/app/src/androidTest/.../WebStorageTest.kt on an API 36
+#   emulator with System WebView 142 (`Medium_Phone_API_36.1`, 2026-07-31):
+#   `window.localStorage` went from `null` (round-trip `throw:TypeError`) to
+#   `[object Storage]` with a set/get round-trip that SURVIVES a reload of the
+#   same origin. Storage stays partitioned per CONTENT ADDRESS because
+#   `origin_map.rs` gives each CID its own subdomain
+#   (`https://<cid>.ipfs.werust.invalid`), so enabling it leaks nothing across
+#   sites. Measured scope, contradicting the folklore: this setting governs
+#   `localStorage` ONLY — `sessionStorage` was already a working `Storage` object
+#   with it off. Verbatim measurements:
+#   docs/spikes/android-enable-dom-storage-and-guard-web-platform-parity/MEASUREMENTS.md.
+#   Guarded on every push by the source-shape test
+#   crates/werust-core/tests/web_storage_edge_wiring_shape.rs (there is NO CI
+#   emulator leg, so the on-device probe above is a hand-run measurement, not a
+#   gate).
+# * desktop (Linux/WebKitGTK): web storage is ON by default in WebKitGTK
+#   (`enable-html5-local-storage`) and this edge sets no storage setting at all.
+#   The evidence is the FIELD REPORT that motivated the task — the human ran
+#   `mandalas.eth`, which uses `localStorage`, and it worked on desktop while
+#   Android failed — not a probe that read the property back.
+# * macos / windows / ios: WKWebView (macOS and iOS) exposes no DOM-storage
+#   toggle at all and WebView2 inherits Chromium's browser defaults; none of the
+#   three edges touches a storage setting, so the capability is wired by the
+#   engine and nothing in werust disables it. The evidence there is the ENGINE
+#   DEFAULT plus the absence of any edge-side disabling — NOT a probe that read
+#   `window.localStorage` back the way the Android one does. Closing that gap is
+#   the proposed follow-on `matrix-web-platform-rows-are-measured-on-every-edge`,
+#   which would give this row (and its siblings below) the same evidence class on
+#   all five edges.
+#
+# FURTHER WEB-PLATFORM ROWS ARE PROPOSED, NOT FILLED SPECULATIVELY. Adding
+# `web-storage` does not close the ceiling this incident exposed; it opens the
+# category. Three more rows are warranted and are authored as follow-on tasks
+# rather than guessed at here (a row filled with a prediction instead of a
+# measurement is exactly the failure this repo has a recorded-verdict guard for):
+# `matrix-web-platform-row-indexeddb` (measured working on Android already, and
+# unmeasured elsewhere — wallets and dapps depend on it heavily),
+# `matrix-web-platform-row-cookies` (Android measured: first-party cookies work,
+# third-party cookies OFF, recorded as a deliberate privacy position), and
+# `matrix-web-platform-row-service-workers` (the macOS origin probe measured
+# `service_worker: reject:TypeError` on `ipfs://`, so this one may well be a real
+# cross-platform gap rather than a formality).
+desktop = { state = "implemented" }
+macos = { state = "implemented" }
+windows = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "debug-view-console-network"
 description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug entry: a Console tab (level-distinguished rows: level + message + source:line) and a Network tab (method / url / status / mime / size rows, each carrying werust's HONEST per-request trust posture in the trust indicator's SAME vocabulary, ADR-0006), a Clear action driving the shared store's `clear()`, live updates on the existing refresh cadence (no busy loop), READ-ONLY (a typeable REPL stays the native inspector's job). Renders the ONE shared capture store (`debug-capture-console-and-network`); the native F12/remote inspector (`web-inspector`) coexists as the deep devtools."
 # Desktop fills the open-debug-view HOOK the menu task left (`open_debug_view`

@@ -73,3 +73,28 @@ The shim exposes the EIP-1193 event surface (`on`, `removeListener`, `emit` over
 ## Prompt
 
 > Goal: werust's injected `window.ethereum` breaks dapps by RESOLVING `eth_requestAccounts` with `[]`. Dapps write `const [account] = await ethereum.request({method:'eth_requestAccounts'})`, so they take the SUCCESS path with `account === undefined` and believe they are connected to nobody — worse than a clean failure, since every dapp handles "connect failed" and none handles that. In `crates/werust-core/src/provider.rs::answer()`, make `eth_requestAccounts` REJECT with EIP-1193 **4100 Unauthorized** and a legible user-facing message (dapps render `error.message`): werust has no wallet yet, injects a read-only provider, holds no keys, so no account can be authorised. Record why 4100 and not 4001 — 4001 gives smoother dapp UX because many dapps silence it, but the user rejected nothing and this project does not tell the page small lies. Keep `eth_accounts -> []` (that is correct) and add a test asserting the two now differ. Separately, `STUB_CHAIN_ID = "0x1"` unconditionally claims mainnet: source the chain id from the one place werust already knows its chain (the configured RPC/ENS backend, `WERUST_RPC_URL`) rather than a second constant, or if there genuinely is no other chain concept, rename it off `STUB_` and document why the value is correct rather than provisional. Both trust-hook smokes compare against the `werust_core::provider::STUB_CHAIN_ID` SYMBOL, so keep a public symbol and keep both green — they are the qualification evidence on real runners, and the `Renderer` trust-hook bar must not change. Record that the human chose policy (a) (keep injecting and be honest) over (b) (stop squatting `window.ethereum`, announce via EIP-6963 once a real signer exists — deferred, needs an ADR-0001 amendment, tracked separately); implement no part of (b). Finally, the shim has an EIP-1193 event surface but NOTHING native ever calls `emit`, so `connect` is never fired: determine whether that matters for a provider in this state and write the answer down, fixing it only if clearly correct and small.
+
+## Requeue 2026-07-31
+
+CONDUCTOR HANDOFF (2026-07-31, drive-tasks). Gate 2 blocked this CORRECTLY on one concrete, one-line problem. I verified it against your branch before writing this. The provider work itself is good and stands — do NOT redo it, and do NOT revert the rename.
+
+THE PROBLEM. You renamed `STUB_CHAIN_ID` -> `CHAIN_ID` (right call, and the task asked for it). The real smoke now reads it:
+
+    crates/macos-renderer/examples/trust_hooks_smoke.rs:222  werust_core::provider::CHAIN_ID
+
+But `docs/spikes/macos-wkwebview-renderer-backend/typecheck-macos-from-linux.sh` builds a SCRATCH workspace with a hand-written STAND-IN `werust-core`, and at line 530 that stand-in still declares:
+
+    pub const STUB_CHAIN_ID: &str = "0x1";
+
+The harness symlinks the REAL smoke into that scratch workspace and runs `cargo clippy --target aarch64-apple-darwin --all-targets`, so the example will fail to resolve `CHAIN_ID`. The harness is broken by your change, exactly as it was broken once before by the `desktop-paint` extraction.
+
+WHY GATE 1 DID NOT CATCH IT, which is the part worth understanding: `crates/macos-renderer/tests/typecheck_harness_guard.rs` STUBS `cargo` with `exit 0`. The guard proves the harness ASSEMBLES; it cannot prove the assembly COMPILES, so a symbol rename slips straight through a green gate. That limitation is already recorded in `work/notes/observations/macos-typecheck-stand-in-core-drifts-unwatched-2026-07-31.md`.
+
+WHAT TO DO:
+
+1. Rename the constant in the harness's stand-in core (line ~530) to match the real one, so the scratch workspace resolves. One line.
+2. RUN the harness afterwards to prove it works, rather than reasoning about it. That is the whole point of the fix, and the repo has burned a task on this exact class already (`macos-spike-doc-accuracy-and-harness-guard`, item 0, titled "THE HARNESS IS NOW BROKEN").
+3. Correct the PR/spike record: it currently claims both smokes follow the rename automatically. That is true only against the REAL core; against the harness's stand-in it was false, which is precisely how this got through. Say so plainly.
+4. Add ONE line to `macos-typecheck-stand-in-core-drifts-unwatched-2026-07-31.md` recording that this is now the SECOND occurrence of stand-in drift (first: the `desktop-paint` extraction; second: this rename), so the recurrence is visible to whoever decides whether to make the stand-in generated or symbol-checked rather than hand-maintained. Do not build that fix here.
+
+Everything else stands: the 4100 rejection, the message, the `eth_accounts` distinction test, the chain-id re-sourcing, the recorded (a)-over-(b) policy and the `connect`-emission finding. Re-run the gate and re-surface.

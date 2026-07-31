@@ -55,6 +55,23 @@ gh workflow run release.yml --ref work/task-windows-app-manifest-is-malformed-xm
 gh run list --workflow release.yml --limit 1
 ```
 
-Expected: `windows-desktop-app` GREEN, uploading `werust-windows-x86_64-unsigned.zip` (the dry-run path uploads a workflow artifact and publishes no release). Record the run URL here, under a "Dispatched run" heading, when it lands.
+Expected: `windows-desktop-app` GREEN, uploading `werust-windows-x86_64-unsigned.zip` (the dry-run path uploads a workflow artifact and publishes no release).
+
+## Dispatched run (conductor, 2026-07-31) — MEASURED, and it is green
+
+[Run 30626912474](https://github.com/wighawag/werust/actions/runs/30626912474), `release.yml`, `workflow_dispatch` on `main` (the fix having landed there). **All six jobs SUCCESS**, and the job this task exists for is among them:
+
+| job | result |
+| --- | --- |
+| `verify` | success |
+| `goreleaser` | success |
+| `android-apk` | success |
+| `ios-simulator-app` | success |
+| `macos-desktop-app` | success |
+| **`windows-desktop-app`** | **success** |
+
+Artifacts uploaded, including `werust-windows-desktop-app` at **1,986,546 bytes** — the first Windows artifact this project has ever produced. So the manifest is not merely well-formed by two local parsers; `mt.exe` accepted it, `link.exe` embedded it, and the zip exists.
+
+The previous run, [30624906073](https://github.com/wighawag/werust/actions/runs/30624906073), is the recorded failure this task was cut from: the identical pipeline with every other job green and `windows-desktop-app` dead at `LNK1327`. The pair is the before/after, and it is why the well-formedness guard added here is worth its few lines.
 
 What IS established locally without a runner: the manifest parses (two independent parsers, one of them expat), and the full `verify` gate is green.

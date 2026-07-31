@@ -94,7 +94,9 @@ pub fn missing_runtime_error(detail: &str) -> RendererError {
 /// the `HRESULT` (the only thing that can) in a trailing parenthetical.
 ///
 /// So this is a plain [`RendererError::Backend`] that names the operation and
-/// LEADS with `detail`. Honest failure is the product value here (`docs/adr/0005`
+/// then KEEPS `detail` verbatim after a colon — the platform's own text is the
+/// only diagnosis there is, so it ends the sentence rather than being buried
+/// inside one. Honest failure is the product value here (`docs/adr/0005`
 /// on silent no-ops, the fail-closed load path): an error that confidently
 /// misdiagnoses itself is worse than a generic one.
 #[must_use]
@@ -360,9 +362,10 @@ mod tests {
             panic!("an environment refusal must be a backend error, got {error:?}");
         };
         assert!(
-            message.contains("0x8007000D the data is invalid"),
-            "the platform's own detail is the ONLY thing that can diagnose this, so it must lead \
-             rather than trail, got: {message}"
+            message.ends_with("0x8007000D the data is invalid"),
+            "the platform's own detail is the ONLY thing that can diagnose this, so the message \
+             must KEEP it verbatim (after the colon, ending the sentence) rather than bury it in \
+             a parenthetical, got: {message}"
         );
         assert!(
             !message.contains(WEBVIEW2_RUNTIME_DOWNLOAD),

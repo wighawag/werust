@@ -11,6 +11,12 @@ repository.workspace = true
 # build on Windows (and two binaries cannot share the name `werust` in one
 # workspace) — see the crate docs and
 # `docs/spikes/windows-win32-window-and-chrome/DECISIONS.md`.
+# `build.rs` (auto-detected) embeds `app.manifest` into every binary this crate
+# LINKS for the MSVC target: the comctl32 v6 dependency that gives the chrome
+# the platform's current visual style, and per-monitor-v2 DPI awareness. It adds
+# no dependency — the manifest is handed to the linker, not to a resource
+# compiler. Why, and what each declaration costs:
+# docs/spikes/windows-release-packaging-leg/README.md.
 [[bin]]
 name = "werust-windows"
 path = "src/main.rs"

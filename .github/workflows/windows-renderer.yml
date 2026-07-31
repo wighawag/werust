@@ -128,8 +128,12 @@ on:
       - ".github/actions/webview2-runtime-version/**"
       - ".github/workflows/windows-renderer.yml"
   # Pinned EXACTLY by `crates/werust-core/tests/windows_renderer_leg_shape.rs`:
-  # this list is the one the header describes, and neither can move without the
-  # other going red.
+  # no path can join or leave this LIST without that test going red, which is
+  # what makes a widening a decision. The header paragraph above describes the
+  # same list in prose, but no test holds PROSE — keeping the two in step is a
+  # habit, not a guard, so update the header in the same change (task
+  # `windows-release-packaging-leg` softened this comment, which used to claim
+  # "neither can move without the other going red").
   pull_request:
     paths:
       - "crates/windows-renderer/**"
@@ -221,4 +225,11 @@ jobs:
         # on disk. Then a negative control (bytes that do not hash to their CID)
         # must FAIL, raise the error banner and displace the page. Offline and
         # deterministic.
+        #
+        # Since task `windows-release-packaging-leg` this example also LINKS the
+        # application manifest the shipped binary carries (that crate's build
+        # script applies it to bins AND examples on purpose), so the window is
+        # driven under comctl32 v6 rather than 5.82 -- i.e. under the same
+        # configuration a user gets. This step is therefore where a v6 behaviour
+        # difference surfaces, which is exactly where it should.
         run: cargo run -p werust-windows --example window_smoke

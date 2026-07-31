@@ -26,6 +26,11 @@ crates/werust-ios/App/**/*.xcworkspace/xcuserdata/
 # Build output, never committed.
 crates/werust-macos/build/
 
+# Windows packaging output (crates/werust-windows): the release workflow's
+# `windows-desktop-app` job stages `werust-windows.exe` and its unsigned zip
+# here, at the same path a human on Windows would. Build output, never committed.
+crates/werust-windows/build/
+
 # Signing key material. The Android release keystore lives OUTSIDE the repo and
 # reaches CI only as the base64 `ANDROID_KEYSTORE_B64` secret
 # (docs/spikes/android-apk-signing/README.md); this is the safety net for a

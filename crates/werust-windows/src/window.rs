@@ -52,8 +52,9 @@ use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_D
 use windows::Win32::Graphics::Gdi::{SetBkColor, SetTextColor, HBRUSH, HDC};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS,
-    ICC_TAB_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR, NMLVCUSTOMDRAW,
+    InitCommonControlsEx, SetWindowTheme, ICC_BAR_CLASSES, ICC_LISTVIEW_CLASSES,
+    ICC_PROGRESS_CLASS, ICC_TAB_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
+    NMLVCUSTOMDRAW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F12, VK_RETURN};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
@@ -893,6 +894,17 @@ impl BrowserWindow {
             font_raw,
         );
         unsafe {
+            // VISUAL STYLES WOULD SWALLOW THE SHARED COLOUR, so this ONE control
+            // opts out of them. `PBM_SETBARCOLOR` "has no effect" once visual
+            // styles are enabled (Microsoft's documented remark on that
+            // message), and since `windows-release-packaging-leg` embedded the
+            // comctl32 v6 manifest they ARE enabled — so without this line the
+            // strip would quietly become the theme's colour instead of the
+            // palette's blue, on the one edge where nothing can notice: the
+            // shared palette is asserted against the GTK stylesheet, not against
+            // pixels a runner cannot see. Passing empty strings is the
+            // documented way to detach a control from the theme.
+            let _ = SetWindowTheme(progress, w!(""), w!(""));
             SendMessageW(progress, PBM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(100)));
             // The URL bar's progress fill, in the SHARED palette's colour — the
             // same blue the GTK edge's `entry > progress` rule paints.

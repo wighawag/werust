@@ -1,0 +1,5 @@
+# The packaged `werust-windows.exe` will open a console window beside the browser (2026-07-31)
+
+Noticed while packaging the Windows artifact (`windows-release-packaging-leg`). `crates/werust-windows/src/main.rs` carries no `#![windows_subsystem = "windows"]`, so the binary is a CONSOLE subsystem app: double-clicking the exe from Explorer (which is exactly what the new `werust-windows-x86_64-unsigned.zip` invites a user to do) should pop a black console window behind the browser window, and it stays for the session. It also prints the startup banner there, which is useful when a developer runs it from a terminal.
+
+Not fixed here, deliberately: it is a user-visible default outside this task's criteria, and the obvious form — `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`, so a release build is windowed and a `cargo run` still prints its banner — is a decision about what `--release` means for a developer, not a packaging step. Unverified: nobody has run the packaged exe from Explorer yet, so "should pop a console" is inference from the missing attribute.

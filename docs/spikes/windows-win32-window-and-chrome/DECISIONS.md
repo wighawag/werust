@@ -54,6 +54,8 @@ The sibling task recorded one engine line changed for the same reason ("the `WKW
 
 **The honest consequence:** the chrome looks dated on Windows 11 until the manifest lands. That is a REAL user-visible gap, so it is named here, in the README's "what awaits real hardware", and in the follow-on task `windows-release-packaging-leg` rather than left to be discovered.
 
+**UPDATE (2026-07-31, `windows-release-packaging-leg`): the manifest has landed, and one sentence of this decision was wrong.** `crates/werust-windows/app.manifest` now carries the comctl32 v6 dependency (and per-monitor-v2 DPI awareness), embedded by `crates/werust-windows/build.rs` through the MSVC linker rather than a resource compiler; the reasoning is in [that task's record](../windows-release-packaging-leg/README.md). Two corrections to what is written above and in §6: the v6 dependency does NOT make system-drawn push BUTTONs follow dark mode — that has no public API at all and needs an undocumented uxtheme path (`work/notes/findings/win32-common-controls-dark-mode-needs-more-than-a-v6-manifest-2026-07-31.md`), so the light-buttons-in-dark-mode gap survives the manifest and now has its own task; and the switch to v6 silently disables `PBM_SETBARCOLOR`, so the URL bar's progress strip had to opt that one control out of theming to keep the shared palette's colour. `TOOL_INFO_V2_SIZE` in `chrome.rs` needs no change: it is the size BOTH versions accept, which is exactly why it was chosen.
+
 ## 5. The trust EXPLANATION is a real tooltip control, and the smoke reads it back
 
 **Chosen:** one `tooltips_class32` per window carries the trust indicator's explanation and the URL bar's progress sentence; the smoke asserts the explanation by sending `TTM_GETTEXT` and comparing with `trust_indicator_detail`.
@@ -68,7 +70,7 @@ The sibling task recorded one engine line changed for the same reason ("the `WKW
 
 **Why:** AppKit propagates the effective appearance into every control, so the macOS window follows the OS by NOT acting; Win32 hands an owner-drawn `STATIC` no appearance at all. Following the OS therefore REQUIRES a read here. Doing it through the engine's existing reader (rather than a second `RegGetValueW` in the window crate) keeps one source: the engine follows the OS via `PREFERRED_COLOR_SCHEME_AUTO` and the chrome follows the same signal. `NoPreference` paints LIGHT, because the shared rule says werust never guesses dark.
 
-**Known limit, stated:** push BUTTONs are system-drawn and, without a v6 manifest, do not honour dark mode. So a dark-mode window has dark chrome surfaces and light buttons until decision 4's manifest lands. Recorded rather than hidden.
+**Known limit, stated:** push BUTTONs are system-drawn and do not honour dark mode, so a dark-mode window has dark chrome surfaces and light buttons. Recorded rather than hidden. (This originally read "without a v6 manifest", i.e. that decision 4's manifest would fix it. It does not — see the UPDATE under decision 4; the gap outlived the manifest and is now `work/tasks/backlog/windows-chrome-dark-mode-for-common-controls.md`, which is where the `follow-os-color-scheme` parity cell points.)
 
 ## 7. The Win32 constants the `windows` crate does not generate are spelled once
 

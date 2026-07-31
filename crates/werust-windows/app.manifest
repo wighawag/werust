@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  werust's Win32 application manifest (task `windows-release-packaging-leg`).
+
+  It is EMBEDDED into every binary this crate produces by `build.rs`, which hands
+  it to the MSVC linker as `/MANIFEST:EMBED /MANIFESTINPUT:<this file>`. Decisions
+  (including why that mechanism rather than a resource compiler):
+  docs/spikes/windows-release-packaging-leg/README.md.
+
+  It carries exactly two declarations, both of which the window has been waiting
+  for since `windows-win32-window-and-chrome` deliberately shipped without a
+  manifest (that spike's DECISIONS.md, section 4):
+
+  1. THE COMMON-CONTROLS v6 DEPENDENCY. Windows ships comctl32 5.82 AND 6; a
+     process gets 6 only by asking for it here. Without it every control draws
+     in the pre-Vista style. The identity below is Microsoft's documented one
+     (name + version + publicKeyToken + language) -- a wrong token silently
+     leaves the process on 5.82 rather than failing, which is why the shape test
+     pins all three.
+
+     What it does NOT buy: dark mode. Standard Win32 controls do not follow the
+     OS light/dark setting on the strength of this manifest; that needs the
+     undocumented uxtheme path or owner-drawn controls, so the chrome's push
+     BUTTONs stay light in dark mode and the `follow-os-color-scheme` parity cell
+     stays `stubbed`. Ground truth + sources:
+     work/notes/findings/win32-common-controls-dark-mode-needs-more-than-a-v6-manifest-2026-07-31.md.
+
+  2. PER-MONITOR-V2 DPI AWARENESS. Without it Windows bitmap-scales the whole
+     process on a 150%/200% display (blurry chrome AND a blurry page). Both
+     spellings are present because they are read by different Windows versions:
+     `<dpiAwareness>` is Windows 10 1607+ and wins where it is understood, and
+     `<dpiAware>` is the pre-1607 fallback (Microsoft's own documented pairing,
+     "Setting the default DPI awareness for a process"). `true/pm` is per-monitor
+     v1, the closest thing that older Windows can express.
+
+     The consequence the by-hand check must judge: `crates/werust-windows/src/chrome.rs`
+     lays its rectangles out in RAW pixels, so a DPI-aware process draws the
+     chrome at 100% metrics on a 200% display -- crisp, but small -- where an
+     unaware one drew it blurry at the right apparent size. The PAGE is the half
+     that unambiguously improves. Recorded at
+     work/notes/observations/windows-chrome-is-raw-pixels-under-per-monitor-v2-2026-07-31.md.
+
+  There is deliberately NO <trustInfo>/<requestedExecutionLevel> here: the MSVC
+  linker adds the default `asInvoker` fragment when it embeds this, which is what
+  werust wants (a browser must never ask for elevation).
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    The side-by-side identity of the application itself. Its `version` is a
+    four-part Win32 assembly version, NOT werust's version: werust's ONE version
+    is `werust_core::version()`, resolved from the release tag by
+    crates/werust-core/build.rs and compiled into the binary. Wiring this field
+    to it would mint the second version source this repo keeps removing -- and
+    could not represent it anyway (`0.2.9-3-gabc1234` is not `n.n.n.n`).
+  -->
+  <assemblyIdentity
+      type="win32"
+      name="wighawag.werust.werust-windows"
+      version="1.0.0.0"
+      processorArchitecture="*"
+  />
+  <description>werust, a from-scratch web browser for a post-trusted-server web.</description>
+
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+</assembly>

@@ -380,16 +380,25 @@ description = "Follow the OS light/dark setting so `prefers-color-scheme` and UA
 # registry read, mapped by the SAME shared `renderer::OsColorScheme` rule every
 # other edge uses (`NoPreference` paints LIGHT — werust never guesses dark), and
 # re-reads it on `WM_SETTINGCHANGE`.
-# What is MISSING is the application MANIFEST. Without a comctl32 v6 dependency
-# the chrome draws in the pre-Vista style and its system-drawn push BUTTONs do not
-# follow dark mode at all, so a dark-mode Windows shows dark chrome surfaces with
-# LIGHT buttons — a user-visible ADR-0009 shortfall that no code change inside the
-# window can close (task `windows-release-packaging-leg` says exactly that, and
-# owns the manifest plus the by-hand re-check a runner cannot do; this cell links
-# there rather than forking a second manifest task). `implemented` with the
-# shortfall written into this comment was the alternative and is rejected on the
-# `macos` column's precedent: a partly-wired capability is `stubbed`, not green
-# with a caveat (work/notes/observations/windows-parity-column-decisions-2026-07-31.md).
+# What is MISSING is dark mode on the chrome's system-drawn push BUTTONs: a
+# dark-mode Windows shows dark chrome surfaces with LIGHT buttons. `implemented`
+# with the shortfall written into this comment was the alternative and is rejected
+# on the `macos` column's precedent: a partly-wired capability is `stubbed`, not
+# green with a caveat
+# (work/notes/observations/windows-parity-column-decisions-2026-07-31.md).
+# CORRECTED 2026-07-31 (task `windows-release-packaging-leg`). This cell used to
+# say the missing piece was the application MANIFEST and pointed at the packaging
+# task as the fix. The manifest has now landed (comctl32 v6 + per-monitor-v2 DPI
+# awareness, embedded into the shipped exe) and it does NOT close this row: a v6
+# dependency buys VISUAL STYLES, while dark mode for standard Win32 controls has
+# no public API at all — it is uxtheme functions exported by ORDINAL plus
+# per-class `SetWindowTheme(…, "DarkMode_Explorer")`, and even that is partial.
+# Sources and what each surface really does:
+# work/notes/findings/win32-common-controls-dark-mode-needs-more-than-a-v6-manifest-2026-07-31.md.
+# So the cell stays `stubbed` (flipping it on the manifest alone is exactly what
+# the packaging task's own criterion forbade) and now links to the task that would
+# actually close it, which must first CHOOSE between the ordinal path and
+# owner-drawing five buttons from the shared palette.
 # The live-switch half is separately unwitnessed on every desktop edge:
 # `WM_SETTINGCHANGE` never fires on CI, so "the chrome follows when the user flips
 # dark mode" is asserted structurally (the reader, the handler, the shared rule),
@@ -397,7 +406,7 @@ description = "Follow the OS light/dark setting so `prefers-color-scheme` and UA
 # docs/spikes/windows-win32-window-and-chrome/README.md.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
-windows = { state = "stubbed", task = "windows-release-packaging-leg" }
+windows = { state = "stubbed", task = "windows-chrome-dark-mode-for-common-controls" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 

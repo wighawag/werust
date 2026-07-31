@@ -41,7 +41,16 @@ Signing and notarization are a deliberate FOLLOW-ON, the macOS analogue of the l
 
 On Windows, `cargo run -p werust-windows [url]` opens the Win32 window over the Edge **WebView2** backend: the same URL bar, nav controls, trust indicator, error banner, in-URL-bar load progress, ⋮ menu and Console/Network debug view the GTK and AppKit shells have, painted from the SAME `werust-core` derivation (and the same shared `desktop-paint` palette the macOS window uses). It is a separate binary because `werust` itself is bound to GTK/WebKitGTK. It needs the **Microsoft Edge WebView2 Runtime**, which ships with Windows 11 and is present on most Windows 10 machines; without it werust exits with a message naming the runtime and pointing at its download rather than crashing. `ipfs://` pages get a REAL `ipfs://<cid>` tuple origin here, measured on a Windows runner rather than assumed. What CI proves about it, what still awaits a human on a Windows box, and the manual verification steps are in [`docs/spikes/windows-win32-window-and-chrome/README.md`](docs/spikes/windows-win32-window-and-chrome/README.md).
 
-There is **no Windows release artifact yet**: nothing is signed, nothing is packaged, there is no installer and no `.zip` on a Release, so the only way to run it today is to build it from source as above. The chrome is also classic-styled and not DPI-aware until the application manifest lands with that packaging work (task `windows-release-packaging-leg`).
+### The Windows release artifact (`werust-windows.exe`, UNSIGNED)
+
+Every tagged release attaches `werust-windows-x86_64-unsigned.zip`: one self-contained `werust-windows.exe` built for `x86_64-pc-windows-msvc`, which statically links the WebView2 loader so nothing has to travel beside it. The version it reports in the ⋮ menu is the tag it was cut from. There is **no installer**: unzip it anywhere and run it.
+
+Two things to know before you download it.
+
+- **It is unsigned, so SmartScreen will interrupt the first run.** No code-signing certificate is involved, so Windows shows "Windows protected your PC". Click **More info**, then **Run anyway**. (If the zip was downloaded with a browser, Windows may also mark the extracted exe as blocked: right-click it, **Properties**, tick **Unblock**.) Signing is a deliberate FOLLOW-ON, the Windows analogue of the landed `android-apk-signing` leg, and when it comes it should copy that leg's pattern: gate on a secrets-presence flag, no-op gracefully without it, name the artifacts honestly. Until then this build is for developers and early testers, not for general distribution.
+- **It needs the Microsoft Edge WebView2 Runtime**, which renders every page. It ships with Windows 11 and is on most Windows 10 machines, but werust cannot promise it is there; if it is missing, werust exits with a message naming the runtime and pointing at its download rather than crashing. The runtime is a free Microsoft download ("Evergreen Standalone Installer").
+
+The exe carries an application manifest (comctl32 v6 visual styles, per-monitor-v2 DPI awareness). What that changes, what it deliberately does not fix, and what still awaits a human on a Windows box: [`docs/spikes/windows-release-packaging-leg/README.md`](docs/spikes/windows-release-packaging-leg/README.md).
 
 ### Private Ethereum RPC endpoint (`WERUST_RPC_URL`)
 

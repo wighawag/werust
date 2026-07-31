@@ -57,6 +57,13 @@
 //!     describe`), folded into the monotonic integer Android sequences updates
 //!     on, with a placeholder that keeps an untagged local build working (task
 //!     `android-apk-version-from-the-release-tag`).
+//! 11. The WINDOWS desktop leg (task `windows-release-packaging-leg`,
+//!     `docs/adr/0011`'s Windows split, sub-task 5) builds `werust-windows` in
+//!     release for `x86_64-pc-windows-msvc` on `windows-latest` and attaches an
+//!     UNSIGNED zip of the one self-contained `.exe`, as a SIBLING job decoupled
+//!     from every other leg — with the application MANIFEST (comctl32 v6 +
+//!     per-monitor-v2 DPI awareness) embedded by the MSVC linker at build time,
+//!     and no second version source anywhere.
 //!
 //! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
 //! never runs Gradle, never reads a secret's value, and performs no I/O beyond
@@ -514,7 +521,13 @@ fn every_rust_compiling_leg_injects_the_tag_version_into_the_build() {
     // Asserted on the job's `env:` MAPPING (not a substring sweep) so the
     // variable really is exported to every step of the leg, which is what makes
     // the cargo invocation — wherever it lives, GoReleaser's or Gradle's — see it.
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
+    for leg in [
+        "goreleaser",
+        "android-apk",
+        "ios-simulator-app",
+        MACOS_LEG,
+        WINDOWS_LEG,
+    ] {
         let j = job(leg);
         let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
             panic!(
@@ -574,7 +587,13 @@ fn every_rust_compiling_leg_passes_the_rpc_endpoint_secret_through() {
     // passes identically on either path. What it pins: the injection
     // EXPRESSION references the secret, and no leg hardcodes a literal
     // endpoint URL (a private RPC URL must never be committed).
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
+    for leg in [
+        "goreleaser",
+        "android-apk",
+        "ios-simulator-app",
+        MACOS_LEG,
+        WINDOWS_LEG,
+    ] {
         let j = job(leg);
         let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
             panic!(
@@ -641,7 +660,13 @@ fn dry_run_snapshots_and_uploads_artifacts_without_publishing() {
     );
 
     // Every leg uploads workflow artifacts on the dry-run.
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
+    for leg in [
+        "goreleaser",
+        "android-apk",
+        "ios-simulator-app",
+        MACOS_LEG,
+        WINDOWS_LEG,
+    ] {
         let j = job(leg);
         assert!(
             contains_substr(&j, "actions/upload-artifact"),
@@ -651,7 +676,7 @@ fn dry_run_snapshots_and_uploads_artifacts_without_publishing() {
 
     // Every non-GoReleaser leg attaches its artifact to the Release with
     // `gh release upload` on a tag (GoReleaser publishes its own).
-    for leg in ["android-apk", "ios-simulator-app", MACOS_LEG] {
+    for leg in ["android-apk", "ios-simulator-app", MACOS_LEG, WINDOWS_LEG] {
         let j = job(leg);
         assert!(
             contains_substr(&j, "gh release upload"),
@@ -715,7 +740,7 @@ fn the_one_step_mentioning(job: &Value, needle: &str) -> Value {
     assert_eq!(
         found.len(),
         1,
-        "expected EXACTLY one step of the android-apk leg to mention {needle:?}; found {}",
+        "expected EXACTLY one step of this leg to mention {needle:?}; found {}",
         found.len()
     );
     found.into_iter().next().unwrap()
@@ -1722,5 +1747,388 @@ fn the_resolved_version_reaches_the_cross_compiled_core_too_not_just_the_manifes
         task_body.contains("werustVersion"),
         "the cross-compile task must take the resolved version as a declared @Input, or a \
          version change leaves an UP-TO-DATE task shipping a stale core"
+    );
+}
+
+// --- Criterion 11: the Windows desktop packaging leg (task `windows-release-packaging-leg`) ---
+//
+// The FIFTH release leg, and the last sub-task of `docs/adr/0011`'s Windows
+// split: `windows-win32-window-and-chrome` shipped a window a person can use,
+// and nothing yet handed it to them. This leg builds `werust-windows` in release
+// for `x86_64-pc-windows-msvc` on the `windows-latest` runner the two existing
+// Windows legs already use, and attaches a zip of the one self-contained `.exe`
+// to the tagged Release beside the desktop Linux binary, the Android APK, the
+// iOS Simulator `.app` and the macOS `.app`.
+//
+// A SIBLING of `windows-renderer.yml`'s job rather than an extension of it: that
+// leg COMPILES AND EXERCISES the Windows crates on every relevant push, and this
+// one PACKAGES them on a tag. It carries the same decoupling every other release
+// leg carries (`needs: verify` only), so no platform can withhold another
+// platform's artifact.
+//
+// What is genuinely NEW here versus the macOS twin is the application MANIFEST.
+// The window deliberately shipped without one
+// (`docs/spikes/windows-win32-window-and-chrome/DECISIONS.md` §4), because
+// embedding a Win32 manifest is a BUILD-TIME concern, and two user-visible
+// consequences were parked on this task: classic-styled chrome (no comctl32 v6)
+// and a DPI-unaware process. The manifest lands here, embedded by the MSVC
+// linker, and the assertions below pin its two declarations plus the mechanism.
+//
+// Pinned HERE, in the pure-Rust gate, exactly like the rest of this file: the
+// assertions parse the workflow YAML and read the manifest, the build script and
+// the check script as text, so they need no Windows, no MSVC toolchain and no
+// network. What they CANNOT judge is how any of it LOOKS, which is why the
+// by-hand items stay named in
+// `docs/spikes/windows-win32-window-and-chrome/README.md`.
+// Decisions: docs/spikes/windows-release-packaging-leg/README.md.
+
+/// The Windows desktop leg's job key in `release.yml`.
+const WINDOWS_LEG: &str = "windows-desktop-app";
+
+/// The one target this leg ships. `*-pc-windows-msvc` statically links
+/// `WebView2LoaderStatic.lib`, which is what makes a SINGLE-exe zip possible at
+/// all (`docs/adr/0011` finding 6); the `-gnu` target would have to ship
+/// `WebView2Loader.dll` beside it.
+const WINDOWS_TARGET: &str = "x86_64-pc-windows-msvc";
+
+/// The shipped binary, and the only entry in the zip.
+const WINDOWS_EXE: &str = "werust-windows.exe";
+
+/// The attached asset. NAMED unsigned, the Android/macOS honest-naming
+/// precedent, so nothing on the Release page implies a signature it lacks.
+const WINDOWS_ZIP: &str = "werust-windows-x86_64-unsigned.zip";
+
+/// The application manifest the chrome was waiting for: comctl32 v6 (visual
+/// styles) and per-monitor-v2 DPI awareness.
+const WINDOWS_APP_MANIFEST: &str = "crates/werust-windows/app.manifest";
+
+/// The build script that EMBEDS it, by handing the MSVC linker the manifest as
+/// an input to embed (the recorded mechanism; see the spike README, decision 1).
+const WINDOWS_BUILD_SCRIPT: &str = "crates/werust-windows/build.rs";
+
+/// The BUILD-leg acceptance check the job runs on the built `.exe` and its zip:
+/// the Windows twin of `check-apk-abis.sh` / `check-app-bundle.sh` /
+/// `check-macos-app-bundle.sh`, and the place the "the manifest is really
+/// embedded" and "the exe carries the ONE version" assertions actually EXECUTE
+/// (neither can run in this Linux gate, which has no `.exe`).
+const WINDOWS_ARTIFACT_CHECK: &str =
+    "docs/spikes/windows-release-packaging-leg/check-windows-artifact.sh";
+
+#[test]
+fn windows_desktop_leg_is_a_decoupled_sibling_on_the_windows_latest_runner() {
+    // Criterion 4: the existing `windows-latest` runner shape (the one
+    // `windows-renderer.yml` and `windows-origin-probe.yml` already use, so no
+    // new runner class), and decoupled in BOTH directions.
+    let j = job(WINDOWS_LEG);
+    assert_eq!(
+        j.get("runs-on").and_then(Value::as_str),
+        Some("windows-latest"),
+        "the Windows desktop leg MUST run on the existing `windows-latest` runner shape (the MSVC \
+         toolchain and the Windows SDK are Windows-only)"
+    );
+    let needs = strings_of(
+        j.get("needs")
+            .unwrap_or_else(|| panic!("the `{WINDOWS_LEG}` job must declare `needs:`")),
+    );
+    assert!(
+        needs.iter().any(|n| n == "verify"),
+        "the `{WINDOWS_LEG}` leg must `needs: verify` (gated on a green tree, like every leg); \
+         got {needs:?}"
+    );
+    for sibling in ["goreleaser", "ios-simulator-app", "android-apk", MACOS_LEG] {
+        assert!(
+            !needs.iter().any(|n| n == sibling),
+            "the `{WINDOWS_LEG}` leg must NOT `needs: {sibling}`: it is a SIBLING leg, so no other \
+             platform's failure may withhold the Windows artifact; got {needs:?}"
+        );
+    }
+    // Decoupled means the Release may not exist yet on a tag, so this leg
+    // guarantees its EXISTENCE the same idempotent way every other leg does.
+    assert!(
+        contains_substr(&j, "gh release create"),
+        "the `{WINDOWS_LEG}` leg must idempotently `gh release create` on a tag (a \
+         Release-EXISTENCE guarantee, since it waits on no other leg)"
+    );
+}
+
+#[test]
+fn windows_desktop_leg_builds_the_msvc_target_and_checks_the_shipped_exe() {
+    // Criterion 1: the release binary for the one shipped triple, zipped, with
+    // the artifact CHECKED on the runner rather than assumed.
+    let j = job(WINDOWS_LEG);
+    let values = minting_values_of(&j).join("\n");
+    assert!(
+        values.contains("-p werust-windows"),
+        "the `{WINDOWS_LEG}` leg must build the WINDOW crate (`-p werust-windows`), not the \
+         GTK-bound `werust` binary, which cannot build on Windows at all"
+    );
+    assert!(
+        values.contains(WINDOWS_TARGET),
+        "the `{WINDOWS_LEG}` leg must build for `{WINDOWS_TARGET}` (the triple whose static \
+         WebView2 loader makes a single-exe zip possible)"
+    );
+    assert!(
+        values.contains("--release"),
+        "the shipped binary must be a RELEASE build (a debug build also leaves devtools enabled, \
+         which every platform's `web-inspector` row gates on `debug_assertions`)"
+    );
+    assert!(
+        contains_substr(&j, WINDOWS_ARTIFACT_CHECK),
+        "the `{WINDOWS_LEG}` leg must RUN the BUILD-leg check `{WINDOWS_ARTIFACT_CHECK}` over what \
+         it built (the Windows twin of check-apk-abis.sh / check-macos-app-bundle.sh)"
+    );
+    // The asset that travels is the ZIP, and it is named for what it is.
+    for step in ["gh release upload", "actions/upload-artifact"] {
+        let s = the_one_step_mentioning(&j, step);
+        assert!(
+            contains_substr(&s, WINDOWS_ZIP),
+            "the `{step}` step must carry `{WINDOWS_ZIP}` (a bare `.exe` is not what this leg \
+             attaches, and the name must say UNSIGNED)"
+        );
+    }
+
+    // The check itself must assert the two things only a Windows runner can see:
+    // that the manifest is really IN the shipped exe, and that the zip really
+    // contains the exe.
+    let check = read_repo_file(WINDOWS_ARTIFACT_CHECK);
+    for needle in [
+        "Microsoft.Windows.Common-Controls",
+        "PerMonitorV2",
+        WINDOWS_EXE,
+    ] {
+        assert!(
+            check.contains(needle),
+            "{WINDOWS_ARTIFACT_CHECK} must assert `{needle}` is present in what the leg built"
+        );
+    }
+}
+
+#[test]
+fn the_windows_app_manifest_declares_visual_styles_and_per_monitor_v2() {
+    // Criterion 2, the half of this task that is NOT packaging plumbing. Both
+    // declarations are user-visible and neither can be checked by any runner:
+    //
+    //   * comctl32 v6 -- without the dependency the process links comctl32 5.82
+    //     and every control draws in the pre-Vista style
+    //     (`docs/spikes/windows-win32-window-and-chrome/DECISIONS.md` §4).
+    //   * PerMonitorV2 -- without it Windows bitmap-scales the whole process on
+    //     a 150%/200% display.
+    let manifest = read_repo_file(WINDOWS_APP_MANIFEST);
+    for declaration in [
+        // The comctl32 v6 dependency, by its documented identity: the name, the
+        // version and the public key token are ALL part of it, and a wrong one
+        // silently leaves the app on 5.82.
+        "Microsoft.Windows.Common-Controls",
+        "6.0.0.0",
+        "6595b64144ccf1df",
+        // Per-monitor-v2 DPI awareness.
+        "dpiAwareness",
+        "PerMonitorV2",
+    ] {
+        assert!(
+            manifest.contains(declaration),
+            "{WINDOWS_APP_MANIFEST} must declare `{declaration}`"
+        );
+    }
+    // `<dpiAwareness>` is Windows 10 1607+; older Windows ignores it and reads
+    // `<dpiAware>` instead, so both are declared (Microsoft's own documented
+    // pairing). Without the fallback a Windows 10 1511 machine is DPI-UNAWARE.
+    assert!(
+        manifest.contains("dpiAware>") && manifest.contains("true/pm"),
+        "{WINDOWS_APP_MANIFEST} must ALSO carry the legacy `<dpiAware>true/pm</dpiAware>` \
+         fallback, which is what a pre-1607 Windows 10 reads"
+    );
+    // A manifest is XML that the LINKER parses: a malformed one fails the build
+    // on the runner, so keep the shape assertion honest about the envelope too.
+    assert!(
+        manifest.contains("urn:schemas-microsoft-com:asm.v1") && manifest.contains("</assembly>"),
+        "{WINDOWS_APP_MANIFEST} must be a well-formed side-by-side assembly manifest"
+    );
+}
+
+#[test]
+fn the_windows_manifest_is_embedded_by_the_linker_for_the_binaries_that_run() {
+    // Criterion 2's other half: the MECHANISM, recorded and pinned. The manifest
+    // is handed to the MSVC linker (`/MANIFEST:EMBED` + `/MANIFESTINPUT:`) from
+    // the crate's build script, which is what makes it a RESOURCE inside the
+    // shipped `.exe` rather than a loose file beside it.
+    let build = read_repo_file(WINDOWS_BUILD_SCRIPT);
+    for flag in ["/MANIFEST:EMBED", "/MANIFESTINPUT:"] {
+        assert!(
+            build.contains(flag),
+            "{WINDOWS_BUILD_SCRIPT} must pass `{flag}` to the MSVC linker (the recorded embedding \
+             mechanism)"
+        );
+    }
+    // Gated on the MSVC target: these are link.exe flags, and a build script that
+    // emitted them unconditionally would break every non-Windows build of this
+    // workspace member -- which the Ubuntu `verify` gate compiles on every run.
+    assert!(
+        build.contains("CARGO_CFG_TARGET_ENV") && build.contains("msvc"),
+        "{WINDOWS_BUILD_SCRIPT} must emit the linker flags ONLY for the MSVC target (the Ubuntu \
+         gate builds this crate too)"
+    );
+    assert!(
+        build.contains("rerun-if-changed"),
+        "{WINDOWS_BUILD_SCRIPT} must declare `rerun-if-changed` for the manifest, or an edit to it \
+         would not re-link"
+    );
+    // BOTH kinds of binary this crate produces get it: the shipped `werust-windows.exe`
+    // AND the `window_smoke` example, which is the ONLY place this window is
+    // executed anywhere. A manifest that applied to the product but not to the
+    // smoke would ship a comctl32 version no test had ever run under.
+    for scope in ["rustc-link-arg-bins", "rustc-link-arg-examples"] {
+        assert!(
+            build.contains(scope),
+            "{WINDOWS_BUILD_SCRIPT} must apply the manifest via `{scope}`, so the CI smoke runs in \
+             the SAME configuration the release ships"
+        );
+    }
+}
+
+#[test]
+fn the_windows_progress_bar_keeps_the_shared_palette_under_visual_styles() {
+    // The one behaviour change the comctl32 v6 manifest FORCES in the window, and
+    // the reason it is pinned in the release-plumbing file rather than left to be
+    // discovered: `PBM_SETBARCOLOR` "has no effect" once visual styles are
+    // enabled (Microsoft's own documented remark), so the moment this task's
+    // manifest lands, the URL bar's in-flight progress strip would silently stop
+    // being the SHARED palette's blue and start being whatever the theme paints.
+    //
+    // That is exactly the cross-edge colour drift `desktop-paint`'s
+    // `gtk_stylesheet_agreement` test exists to prevent, arriving through a
+    // packaging change instead of a code change. The window therefore opts THAT
+    // ONE control out of theming (`SetWindowTheme(progress, "", "")`), which is
+    // the documented way to keep a custom bar colour.
+    let window = read_repo_file("crates/werust-windows/src/window.rs");
+    assert!(
+        window.contains("SetWindowTheme("),
+        "the window must opt the progress bar out of visual styles, or the comctl32 v6 manifest \
+         silently drops the shared palette's LOAD_PROGRESS_COLOR"
+    );
+    assert!(
+        window.contains("PBM_SETBARCOLOR"),
+        "the progress bar must still be given the shared palette's colour"
+    );
+}
+
+#[test]
+fn windows_desktop_leg_is_deliberately_unsigned() {
+    // Criterion 6 / the task's "unsigned, deliberately": no code signing and no
+    // installer anywhere in this leg (both need a certificate and are a separate
+    // follow-on, the Windows analogue of `android-apk-signing`). Pinned as an
+    // ABSENCE so a later "just sign it here" edit has to come with the
+    // secrets-presence-flag pattern the Android leg established.
+    let j = job(WINDOWS_LEG);
+    for tool in [
+        "signtool",
+        "Set-AuthenticodeSignature",
+        "New-SelfSignedCertificate",
+        "makeappx",
+        "candle",
+        "light",
+    ] {
+        assert!(
+            !contains_substr(&j, tool),
+            "the `{WINDOWS_LEG}` leg must contain NO `{tool}` step (unsigned and uninstallered by \
+             design; signing is a follow-on that must copy the Android secrets-presence-flag \
+             pattern)"
+        );
+    }
+    // Honest naming, the Android precedent (`app-debug-unsigned.apk`).
+    assert!(
+        contains_substr(&j, "unsigned"),
+        "the `{WINDOWS_LEG}` leg's artifact must be NAMED unsigned, so the Release page never \
+         implies a signature it does not carry"
+    );
+}
+
+#[test]
+fn the_windows_leg_mints_no_second_version_source() {
+    // Criterion 3. The leg's ONLY version input is the job-level
+    // `WERUST_VERSION` the shared loop above already pins, compiled into the exe
+    // by `crates/werust-core/build.rs`. Nothing here stamps a version anywhere
+    // else: the zip's NAME carries none (so it cannot disagree with the ⋮ menu),
+    // and no resource is re-derived in PowerShell.
+    //
+    // Scoped to the values that could MINT one (`run` code, `with:`/`env:`
+    // values) rather than to the whole job, exactly as the Android guard is, so
+    // an explanatory comment may still say the words.
+    let j = job(WINDOWS_LEG);
+    let values = minting_values_of(&j);
+    for second_source in ["git describe", "github.run_number", "github.sha"] {
+        if let Some(offender) = values.iter().find(|v| v.contains(second_source)) {
+            panic!(
+                "the `{WINDOWS_LEG}` leg must not derive a version from `{second_source}`: the \
+                 version comes from `WERUST_VERSION`, resolved once by werust-core's build.rs, so \
+                 the shipped exe and the ⋮ menu cannot disagree. Found it in a run/with/env \
+                 VALUE:\n{offender}"
+            );
+        }
+    }
+    // And the artifact check PROVES it on the runner: the built exe must contain
+    // the exact string the compiled core reports, which is the Windows twin of
+    // the macOS `CFBundleVersion` equality check.
+    let check = read_repo_file(WINDOWS_ARTIFACT_CHECK);
+    assert!(
+        check.contains(VERSION_EXAMPLE),
+        "{WINDOWS_ARTIFACT_CHECK} must read the expected version from the ONE source by running \
+         the `werust-core` `{VERSION_EXAMPLE}` example, exactly as the macOS check does"
+    );
+}
+
+#[test]
+fn readme_states_the_windows_artifact_is_unsigned_needs_webview2_and_names_the_follow_on() {
+    // Criterion 6. Two facts a person must meet BEFORE the download, not after:
+    // an unsigned exe makes SmartScreen interrupt the first run, and the browser
+    // does not render at all without the WebView2 Runtime (`docs/adr/0011`
+    // finding 6: "no installer ever needed" is not a promise werust can make).
+    let readme = read_repo_file("README.md");
+    assert!(
+        readme.contains(WINDOWS_ZIP),
+        "the README must name the Windows release artifact (`{WINDOWS_ZIP}`)"
+    );
+    assert!(
+        readme.contains("unsigned"),
+        "the README must state plainly that the Windows artifact is UNSIGNED"
+    );
+    assert!(
+        readme.contains("SmartScreen"),
+        "the README must say what an unsigned download DOES on a real machine (SmartScreen \
+         interrupts it), not merely that it is unsigned"
+    );
+    assert!(
+        readme.contains("More info") && readme.contains("Run anyway"),
+        "the README must give the actual click-path through the SmartScreen prompt (More info -> \
+         Run anyway), or it documents a wall without its door"
+    );
+    assert!(
+        readme.contains("WebView2 Runtime"),
+        "the README must name the RUNTIME DEPENDENCY the artifact needs (the Edge WebView2 \
+         Runtime)"
+    );
+    assert!(
+        readme.contains("android-apk-signing"),
+        "the README must NAME the signing follow-on by pointing at the precedent it will copy \
+         (the landed `android-apk-signing` leg)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_windows_artifact_check_is_executable() {
+    // Kept in step with its three siblings, so a human on a unix box can run it
+    // by path against a downloaded artifact. The Windows JOB deliberately does
+    // not depend on this bit (it invokes the script as an argument to `bash`,
+    // because a Windows checkout has no POSIX executable bit to lose).
+    use std::os::unix::fs::PermissionsExt;
+    let path = repo_root().join(WINDOWS_ARTIFACT_CHECK);
+    let mode = std::fs::metadata(&path)
+        .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+        .permissions()
+        .mode();
+    assert!(
+        mode & 0o111 != 0,
+        "{WINDOWS_ARTIFACT_CHECK} must be executable (the release workflow runs it by path)"
     );
 }

@@ -19,7 +19,7 @@ name: release
 #                            Release, so all artifacts are validated end-to-end
 #                            without cutting a release.
 #
-# Four build jobs mirror wezig's shape, all gated ONLY by `verify` (the
+# Five build jobs mirror wezig's shape, all gated ONLY by `verify` (the
 # pure-Rust gate) so a tag can never ship a red tree, and so every platform leg
 # is DECOUPLED from the others (one platform's build failure cannot withhold
 # another platform's artifact):
@@ -27,6 +27,7 @@ name: release
 #   verify -> android-apk (Linux, SDK+NDK)
 #   verify -> ios-simulator-app (macos-14)
 #   verify -> macos-desktop-app (macos-14, universal unsigned `Werust.app`)
+#   verify -> windows-desktop-app (windows-latest, unsigned `werust-windows.exe` zip)
 #
 # THE macOS DESKTOP ARTIFACT IS UNSIGNED, DELIBERATELY. `macos-desktop-app`
 # attaches a universal (`x86_64` + `arm64`) `Werust.app` with NO code signature
@@ -37,6 +38,20 @@ name: release
 # second one. The zip is named `-unsigned` for that reason, and the README says
 # how to open it. Decisions:
 # docs/spikes/macos-release-packaging-leg/README.md.
+#
+# THE WINDOWS DESKTOP ARTIFACT IS UNSIGNED AND UNINSTALLERED, DELIBERATELY, AND
+# IT NEEDS THE WebView2 RUNTIME. `windows-desktop-app` attaches a zip holding one
+# self-contained `werust-windows.exe` with NO code signature and NO installer:
+# both need a code-signing certificate and are a separate follow-on, the Windows
+# analogue of the Android release-signing path above (and of the macOS
+# notarization gap). When that follow-on comes it must copy the Android pattern
+# (a secrets-PRESENCE env flag, a graceful no-op without it, honest artifact
+# naming) rather than invent a third one. The zip is named `-unsigned` for that
+# reason; SmartScreen WILL interrupt the first run, and the README says so and
+# gives the click-path. The Edge WebView2 Runtime is a RUNTIME dependency that
+# werust cannot promise is present (`docs/adr/0011` finding 6), so the README
+# names that too. Decisions:
+# docs/spikes/windows-release-packaging-leg/README.md.
 #
 # THE RELEASED VERSION REACHES THE COMPILED CODE. Every leg that compiles Rust
 # exports `WERUST_VERSION` from the tag ref name; `crates/werust-core/build.rs`
@@ -540,3 +555,131 @@ jobs:
         with:
           name: werust-macos-desktop-app
           path: crates/werust-macos/build/Werust-macos-universal-unsigned.app.zip
+
+  # The WINDOWS DESKTOP leg (task `windows-release-packaging-leg`,
+  # `docs/adr/0011-webview2-for-windows.md`'s Windows split, sub-task 5): build
+  # the Win32 shell in release for `x86_64-pc-windows-msvc` and attach a zip of
+  # the one self-contained `.exe` to the Release (tag) or upload it as a workflow
+  # artifact (dry-run).
+  #
+  # ONE FILE IN THE ZIP, and that is a property of the target, not a shortcut:
+  # `*-pc-windows-msvc` statically links `WebView2LoaderStatic.lib`, so nothing
+  # has to travel beside the binary (`docs/adr/0011` finding 6 — the `-gnu`
+  # target would need `WebView2Loader.dll` shipped alongside). What the exe still
+  # needs at RUN time is the WebView2 Runtime itself; see the header.
+  #
+  # A SIBLING of the `windows-renderer.yml` leg, not an extension of it: that leg
+  # COMPILES and EXERCISES the Windows crates (including the window smoke) on
+  # every relevant push, and this one PACKAGES them on a tag. Like every other
+  # release leg it is DECOUPLED (`needs: verify` only), so on a tag the Release
+  # may not exist yet when it runs and the attach step idempotently
+  # `gh release create`s it first (a Release-EXISTENCE guarantee, not a
+  # dependency on another leg).
+  #
+  # UNSIGNED: see the header. Nothing here runs `signtool` or builds an installer.
+  windows-desktop-app:
+    needs: verify
+    runs-on: windows-latest
+    env:
+      # The released version, compiled INTO the exe: `crates/werust-core/build.rs`
+      # resolves it and the ⋮ menu inside the window reports it. Nothing else in
+      # this leg stamps a version anywhere — the zip's name deliberately carries
+      # none — so there is no second source to disagree with it. Same
+      # tag-or-empty rule as every other leg.
+      WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      # Optional private RPC endpoint (same secret pass-through as every other
+      # leg; empty -> public default).
+      WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
+    steps:
+      - name: Check the tree out byte-identically (no CRLF rewrite)
+        # The same first step `windows-renderer.yml` takes, for the same reason:
+        # Git for Windows defaults to `core.autocrlf=true`, and this repo's
+        # source-shape tests PARSE committed text. Must run BEFORE the checkout.
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+        with:
+          # Tags + history, so `build.rs`'s `git describe` fallback resolves a real
+          # version on the dry-run path (where WERUST_VERSION is empty) — which is
+          # the version the artifact check then expects to find inside the exe.
+          fetch-depth: 0
+
+      - name: Record what this run built on
+        # The ONE shared registry read, the same step both other Windows legs
+        # use. The WebView2 Runtime is EVERGREEN and is this artifact's RUNTIME
+        # dependency, so the release log records the version the build machine
+        # had rather than leaving it unstated.
+        uses: ./.github/actions/webview2-runtime-version
+
+      - name: Install the Windows Rust target
+        run: rustup target add x86_64-pc-windows-msvc
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-windows-desktop-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-windows-desktop-cargo-
+
+      - name: Build werust-windows (release, x86_64-pc-windows-msvc)
+        # Package-SCOPED, never a bare workspace build: `werust` and
+        # `webview-renderer` bind gtk4/webkit6 through pkg-config and are measured
+        # RED on a Windows runner (docs/spikes/windows-renderer-ci-leg/README.md).
+        # The crate's build script embeds the application manifest into this exe
+        # (comctl32 v6 + per-monitor-v2 DPI awareness) by handing it to the MSVC
+        # linker; the check below proves it really landed.
+        run: cargo build -p werust-windows --release --target x86_64-pc-windows-msvc
+
+      - name: "BUILD-leg check: a real exe, with the manifest embedded, at the released version"
+        # Where criteria 1-3 actually EXECUTE. Deliberately NOT in the pure-Rust
+        # verify gate, which has no `.exe` to look inside: the gate pins the
+        # workflow's SHAPE (crates/werust-core/tests/release_plumbing_shape.rs)
+        # and this pins the ARTIFACT. `bash` rather than pwsh so it reads as the
+        # twin of the Android/iOS/macOS BUILD-leg checks it is modelled on, and so
+        # it can be exercised from Linux.
+        shell: bash
+        # Invoked as an ARGUMENT to bash rather than by path: on a Windows
+        # checkout the POSIX executable bit is not a real file attribute, so
+        # `./script.sh` would rely on Git Bash's shebang heuristic. The other
+        # three BUILD-leg checks run on unix runners and can be executed directly.
+        run: bash docs/spikes/windows-release-packaging-leg/check-windows-artifact.sh
+
+      - name: Zip the exe (unsigned)
+        # PowerShell, because `zip` is not on a Windows runner's PATH and
+        # `Compress-Archive` is the platform's own. The name says UNSIGNED: the
+        # Android/macOS honest-naming precedent, so nothing on the Release page
+        # implies a signature the artifact does not carry.
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path crates/werust-windows/build | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/werust-windows.exe crates/werust-windows/build/
+          Compress-Archive -Force `
+            -Path crates/werust-windows/build/werust-windows.exe `
+            -DestinationPath crates/werust-windows/build/werust-windows-x86_64-unsigned.zip
+
+      - name: "BUILD-leg check: the zip really carries the exe"
+        shell: bash
+        run: bash docs/spikes/windows-release-packaging-leg/check-windows-artifact.sh --zip crates/werust-windows/build/werust-windows-x86_64-unsigned.zip
+
+      # TAG PATH: attach the zip to the Release, idempotently ensuring the
+      # Release exists first (`|| true` swallows the "already exists" error when
+      # another leg got there first).
+      - name: Attach the Windows zip to the Release (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" crates/werust-windows/build/werust-windows-x86_64-unsigned.zip --clobber
+
+      # DRY-RUN PATH: upload the zip as a workflow artifact, publish nothing.
+      - name: Upload the Windows zip (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: werust-windows-desktop-app
+          path: crates/werust-windows/build/werust-windows-x86_64-unsigned.zip

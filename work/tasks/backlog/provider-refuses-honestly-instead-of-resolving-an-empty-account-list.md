@@ -3,6 +3,7 @@ title: "`eth_requestAccounts` must REJECT rather than resolve `[]`, so a dapp sh
 slug: provider-refuses-honestly-instead-of-resolving-an-empty-account-list
 blockedBy: []
 covers: []
+needsAnswers: true
 ---
 
 ## What to build

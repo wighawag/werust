@@ -1085,7 +1085,8 @@ pub fn network_entry(
 }
 
 /// The stable, lower-kebab wire name of a [`TrustPosture`]: the SAME names the
-/// mobile chrome JSON (`ffi_json`) and the desktop trust indicator use.
+/// mobile chrome JSON ([`chrome_json`](crate::chrome_json), which calls this) and
+/// the desktop trust indicator use.
 ///
 /// Lifted here so the debug view's Network tab reuses the trust indicator's
 /// vocabulary EXACTLY rather than minting a second set of labels for the same

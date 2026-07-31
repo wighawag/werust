@@ -1,6 +1,7 @@
 package com.github.wighawag.werust
 
 import android.annotation.SuppressLint
+import android.app.AlertDialog
 import android.content.pm.ApplicationInfo
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
@@ -33,6 +34,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import kotlin.math.roundToInt
 
 /**
  * The Android OS edge: a real `Activity` with a URL bar and
@@ -250,8 +252,10 @@ class BrowserActivity : ComponentActivity() {
         // shown ONLY when the last entry was invalid (field finding D). Starts
         // hidden; when shown it pairs with the URL bar's text rendered invalid (a
         // red underline). The SAME surface desktop shows, from the same chrome fact.
+        // Its WORDING is the core's `invalid_entry_badge_text`, painted in
+        // [refreshChrome], not a Kotlin literal here (that literal existed, and its
+        // iOS twin was set once at build and never refreshed at all).
         invalidBadge = TextView(this).apply {
-            text = "⛔ invalid URL"
             setTextColor(0xFFC01C28.toInt())
             gravity = Gravity.CENTER_VERTICAL
             visibility = View.GONE
@@ -330,8 +334,31 @@ class BrowserActivity : ComponentActivity() {
 
         // The trust indicator, at the footer next to the status: painted from the
         // core's posture (the ACTUAL load path), the SAME four states desktop shows.
-        trust = TextView(this).apply { text = "⚠ unverified origin"; gravity = Gravity.END }
-        status = TextView(this).apply { text = "idle"; gravity = Gravity.START }
+        //
+        // The initial text of both labels is the core's OWN derivation for the
+        // starting chrome, never a Kotlin literal that happens to match it: a
+        // hard-coded "⚠ unverified origin" here would be one more hand-written twin
+        // of `trust_indicator`, which is precisely what task
+        // `mobile-chrome-presentation-from-one-derivation` removed from this edge.
+        // Every later repaint comes from [refreshChrome].
+        val initialChrome = core.chrome()
+        trust = TextView(this).apply {
+            text = initialChrome.trustIndicator
+            gravity = Gravity.END
+            // The trust EXPLANATION on a platform with no hover: the badge carries
+            // the core's `trust_indicator_detail` as its accessibility description
+            // (TalkBack reads what the posture MEANS, not just its glyph) and a TAP
+            // shows the same sentence in a dialog. Both are set in [refreshChrome]
+            // from the same one derivation; the tap affordance is wired once here.
+            contentDescription = initialChrome.trustIndicatorDetail
+            isClickable = true
+            isFocusable = true
+            setOnClickListener { showTrustExplanation() }
+        }
+        status = TextView(this).apply {
+            text = initialChrome.statusLine
+            gravity = Gravity.START
+        }
         val footer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             addView(status, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
@@ -518,6 +545,43 @@ class BrowserActivity : ComponentActivity() {
         debugBackCallback.isEnabled = false
     }
 
+    /**
+     * Show what the current trust posture MEANS: the core's
+     * `trust_indicator_detail`, titled with the badge it explains.
+     *
+     * This is the trust EXPLANATION on a platform with no hover. Desktop shows it
+     * as the badge's tooltip; for months neither mobile edge showed it AT ALL,
+     * because each had hand-written its own `trustIndicator()` twin and simply
+     * never wrote a `trustIndicatorDetail()` to go with it (`docs/adr/0011`,
+     * `docs/adr/0006`: for a browser whose thesis is an honest, legible trust
+     * posture, a badge with no explanation on the two platforms most users are on
+     * is a real gap). Reading the sentence from the chrome means Android now shows
+     * exactly what desktop shows, and a future rewording lands on both at once.
+     *
+     * TWO affordances, both from the same one field: this TAP (an explicit user
+     * gesture, no hover needed) and the badge's accessibility description set in
+     * [refreshChrome] (TalkBack reads the meaning, not the glyph). The framework
+     * `AlertDialog` keeps the edge framework-only (the single androidx dependency
+     * stays the back-dispatcher one), and the dismiss button is the PLATFORM's
+     * localized OK rather than a string minted here.
+     *
+     * It reads the PAINTED badge rather than calling the core again: a chrome read
+     * takes the native session lock, which on the UI thread can wait behind an
+     * in-flight `ipfs://` retrieval (the ANR guard,
+     * `work/notes/observations/mobile-chrome-reads-still-take-the-session-lock-2026-07-29.md`).
+     * The badge and its description were both set by the last [refreshChrome] from
+     * ONE chrome snapshot, so they cannot disagree with each other.
+     */
+    private fun showTrustExplanation() {
+        val detail = trust.contentDescription?.toString().orEmpty()
+        if (detail.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle(trust.text)
+            .setMessage(detail)
+            .setPositiveButton(android.R.string.ok, null)
+            .show()
+    }
+
     /** After driving the core, apply any pending load to the WebView and repaint. */
     private fun afterCoreAction() {
         syncPendingLoad()
@@ -539,8 +603,8 @@ class BrowserActivity : ComponentActivity() {
         // typed text for the user to fix. Toggled from the orthogonal `invalidEntry`
         // fact — distinct from the trust indicator and the load-error banner. The
         // SAME rule desktop applies, from the same chrome fact.
-        if (chrome.invalidEntryVisible()) {
-            invalidBadge.text = chrome.invalidEntryBadge()
+        if (chrome.invalidEntryBadgeVisible) {
+            invalidBadge.text = chrome.invalidEntryBadgeText
             invalidBadge.visibility = View.VISIBLE
             urlBar.setTextColor(0xFFC01C28.toInt())
             urlBar.paintFlags = urlBar.paintFlags or Paint.UNDERLINE_TEXT_FLAG
@@ -557,10 +621,15 @@ class BrowserActivity : ComponentActivity() {
         forwardButton.isEnabled = chrome.canGoForward
         stopButton.isEnabled = chrome.loading
         reloadButton.isEnabled = !chrome.loading
-        status.text = chrome.statusLine()
+        status.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
-        // matching desktop; the seam-default no-op is gone.
-        trust.text = chrome.trustIndicator()
+        // matching desktop; the seam-default no-op is gone. Its EXPLANATION (the
+        // core's `trust_indicator_detail`, which used to reach desktop only) rides
+        // along as the badge's accessibility description, and the tap affordance
+        // wired in `onCreate` shows the same sentence: the platform-appropriate
+        // stand-in for desktop's hover tooltip.
+        trust.text = chrome.trustIndicator
+        trust.contentDescription = chrome.trustIndicatorDetail
         // The LOAD-PROGRESS line: its progress advances with the real pipeline phase
         // while a load is in flight (including the pre-content name-resolution
         // window, where the backend has not started yet), and it goes INVISIBLE —
@@ -571,22 +640,26 @@ class BrowserActivity : ComponentActivity() {
         // the footer status line (and this line's content description). Driven by
         // this existing refresh, so no new timer / poll / tight loop (the Android
         // ANR guard is not regressed).
-        loadingProgress.progress = chrome.loadProgressPercent()
-        loadingProgress.contentDescription = chrome.loadProgressHint()
+        //
+        // The core hands over its progress FRACTION (0.0-1.0, the one shared unit);
+        // scaling it onto this widget's own 0-100 range is the only arithmetic left
+        // here, and it reads the bar's own `max` rather than restating 100.
+        loadingProgress.progress = (chrome.loadProgressFraction * loadingProgress.max).roundToInt()
+        loadingProgress.contentDescription = chrome.loadProgressHint
         loadingProgress.visibility =
-            if (chrome.loadProgressVisible()) View.VISIBLE else View.INVISIBLE
+            if (chrome.loadProgressVisible) View.VISIBLE else View.INVISIBLE
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
         // otherwise. The SAME rule desktop applies, from the same chrome fact.
-        if (chrome.errorBannerVisible()) {
-            errorBanner.text = chrome.errorBanner()
+        if (chrome.errorBannerVisible) {
+            errorBanner.text = chrome.errorBannerText
             // A TRANSIENT/timeout failure (retryable) is a softer amber banner; a
             // hard failure is the prominent red one (task
             // `clearer-loading-and-error-indicator`). The SAME distinction desktop
             // shows, from the core's `retryable` fact.
             errorBanner.setBackgroundColor(
-                if (chrome.errorIsRetryable()) 0xFFB5820A.toInt() else 0xFFC01C28.toInt()
+                if (chrome.retryable) 0xFFB5820A.toInt() else 0xFFC01C28.toInt()
             )
             errorBanner.visibility = View.VISIBLE
         } else {

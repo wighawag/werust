@@ -695,11 +695,20 @@ impl ChromeState {
 // which is a presentation fact, not a toolkit call. The stylesheet that gives
 // each one a colour stays in the edge that has a stylesheet.
 //
-// The Kotlin (`WerustCore.kt`) and Swift (`WerustCore.swift`) twins are NOT
-// collapsed onto these yet: that is the follow-up task
-// `mobile-chrome-presentation-from-one-derivation`, whose open question is
-// whether a non-Rust edge consumes this derivation over the FFI or through an
-// extended chrome JSON.
+// The Kotlin (`WerustCore.kt`) and Swift (`WerustCore.swift`) twins ARE
+// collapsed onto these now (task `mobile-chrome-presentation-from-one-derivation`,
+// which answered the open question in favour of an extended chrome JSON over
+// per-field FFI calls): a non-Rust edge consumes this derivation through
+// [`chrome_json`] below, which carries every string these rules return on the
+// document both mobile edges already decode each refresh. So this IS the only
+// copy (three languages became one), and adding a rule here reaches every edge
+// with no per-platform change.
+//
+// Nothing outside this block may re-implement one of these: the desktop painters
+// go through `desktop-paint` (Rust) and the mobile edges through the chrome JSON
+// (Kotlin/Swift), and a guard on each
+// (`tests/chrome_css_class_set_edge_wiring_shape.rs`,
+// `tests/mobile_chrome_presentation_shape.rs`) reds the gate if a twin returns.
 
 /// Whether there is a load to indicate at all: a backend load in flight
 /// ([`ChromeState::is_loading`]) **or** a pinned pre-content resolution step (a
@@ -1149,6 +1158,112 @@ const _CSS_CLASS_FAMILY_ALL_IS_EVERY_FAMILY_IN_SLOT_ORDER: () = {
         i += 1;
     }
 };
+
+/// The chrome as the JSON document a NON-RUST edge paints from: the [`ChromeState`]
+/// FACTS plus every string the presentation rules above DERIVE from them.
+///
+/// The shape (stable, pinned whole by
+/// `the_chrome_json_document_is_exactly_the_facts_plus_the_derived_fields`):
+///
+/// ```json
+/// {
+///   "url": "", "loadState": "idle", "loading": false, "loadStep": "idle",
+///   "canGoBack": false, "canGoForward": false, "trustPosture": "unverified-origin",
+///   "error": null, "failureKind": null, "retryable": false, "invalidEntry": null,
+///   "statusLine": "idle", "trustIndicator": "⚠ unverified origin",
+///   "trustIndicatorDetail": "…", "errorBannerVisible": false, "errorBannerText": "",
+///   "invalidEntryBadgeVisible": false, "invalidEntryBadgeText": "",
+///   "loadProgressVisible": false, "loadProgressFraction": 0.0, "loadProgressHint": ""
+/// }
+/// ```
+///
+/// # Why the derived strings ride the chrome JSON
+///
+/// This is the CARRIER for the two mobile edges, the counterpart of
+/// `desktop_paint::ChromePaint` for the native-widget desktop
+/// windows: Kotlin and Swift cannot call these `pub fn`s, so before this landed
+/// each had written its OWN `statusLine()` / `trustIndicator()` / `errorBanner()`
+/// / `invalidEntryBadge()` / `loadProgress*()` twin: one rule set in three
+/// languages, which had already DRIFTED (the trust EXPLANATION,
+/// [`trust_indicator_detail`], shipped desktop-only for months; the load-progress
+/// unit was a fraction in Rust and Swift but a percent in Kotlin). Carrying the
+/// derived strings HERE lets each mobile edge read a field instead of running a
+/// `when`/`switch`, with no new FFI surface: both edges already decode this exact
+/// document on every chrome refresh. The rejected alternative (exposing each rule
+/// over the FFI and calling it per field) is recorded, with the measured cost of
+/// this one, at
+/// `docs/spikes/mobile-chrome-presentation-from-one-derivation/DECISIONS.md`.
+///
+/// It is a CARRIER, not a second derivation: every derived field below is the
+/// return value of one of the `pub fn`s above, and
+/// `the_chrome_json_carries_the_derivation_verbatim_for_every_chrome_shape`
+/// asserts exactly that across every shape of [`ChromeState`] a rule can branch
+/// on. Nothing here decides anything.
+///
+/// # Vocabulary
+///
+/// Every enum FACT keeps the one wire spelling the rest of the system speaks
+/// ([`LoadStep::wire_name`], [`FailureKind::wire_name`] and
+/// [`trust_posture_wire_name`](crate::debug::trust_posture_wire_name), the very
+/// names the debug view's Network tab uses, `docs/adr/0006`), so mobile never
+/// reads a second spelling of a posture or a phase. The derived fields are named
+/// after the RULES that produce them (`statusLine` is [`status_line`],
+/// `trustIndicatorDetail` is [`trust_indicator_detail`], …), so an edge field and
+/// a core function can be matched by name.
+///
+/// # Layering
+///
+/// COLOUR is not here, deliberately: the `*_css_class` rules are exported for the
+/// painters that have a stylesheet (GTK) or a palette (`desktop-paint`), and the
+/// mobile edges pick their own native colours off the same FACTS the classes
+/// branch on (`retryable`, `trustPosture`), the same split that keeps the GTK
+/// stylesheet in the GTK edge.
+#[must_use]
+pub fn chrome_json(state: &ChromeState) -> String {
+    serde_json::json!({
+        // --- The FACTS: `ChromeState`, in the wire vocabulary. ---
+        "url": state.url_text,
+        "loadState": load_state_wire_name(state.load_state),
+        "loading": state.is_loading(),
+        "loadStep": state.load_step().wire_name(),
+        "canGoBack": state.can_go_back,
+        "canGoForward": state.can_go_forward,
+        "trustPosture": crate::debug::trust_posture_wire_name(state.trust_posture),
+        "error": state.last_error,
+        "failureKind": state.failure_kind().map(FailureKind::wire_name),
+        "retryable": state.failure_is_retryable(),
+        "invalidEntry": state.invalid_entry,
+        // --- The DERIVATION: the presentation rules above, verbatim. ---
+        "statusLine": status_line(state),
+        "trustIndicator": trust_indicator(state),
+        "trustIndicatorDetail": trust_indicator_detail(state),
+        "errorBannerVisible": error_banner_visible(state),
+        "errorBannerText": error_banner_text(state),
+        "invalidEntryBadgeVisible": invalid_entry_badge_visible(state),
+        "invalidEntryBadgeText": invalid_entry_badge_text(state),
+        "loadProgressVisible": load_progress_visible(state),
+        "loadProgressFraction": load_progress_fraction(state),
+        "loadProgressHint": load_progress_hint(state),
+    })
+    .to_string()
+}
+
+/// The stable, lower-case wire name of a [`LoadState`] for [`chrome_json`].
+///
+/// Private, and the only fact name decided here rather than beside its type: the
+/// other three (`LoadStep`, `FailureKind`, `TrustPosture`) own their `wire_name`
+/// already, while [`LoadState`] lives in the `renderer` seam crate, which has no
+/// wire concern of its own. The names are unchanged from the pre-collapse mobile
+/// encoders.
+fn load_state_wire_name(state: LoadState) -> &'static str {
+    match state {
+        LoadState::Idle => "idle",
+        LoadState::Started => "started",
+        LoadState::Committed => "committed",
+        LoadState::Finished => "finished",
+        LoadState::Failed => "failed",
+    }
+}
 
 /// The browser shell: the seam-driven logic behind the window.
 ///
@@ -5979,6 +6094,159 @@ mod tests {
                 "`{class}` is not a plain CSS class name"
             );
         }
+    }
+
+    #[test]
+    fn the_chrome_json_carries_the_derivation_verbatim_for_every_chrome_shape() {
+        // THE acceptance property of the mobile carrier (task
+        // `mobile-chrome-presentation-from-one-derivation`): the chrome JSON is a
+        // CARRIER of this crate's derivation, never a second one. So for EVERY
+        // shape of `ChromeState` a rule can branch on, each derived field must
+        // EQUAL the core function that decides it, which is what lets Kotlin and
+        // Swift delete their `statusLine()` / `trustIndicator()` /
+        // `errorBanner()` / `invalidEntryBadge()` / `loadProgress*()` twins and
+        // read a field instead.
+        //
+        // The drive is the same cartesian product the CSS-class test uses
+        // (`every_chrome_state_shape`), exhaustive BY CONSTRUCTION over every enum
+        // axis, so a fifth trust posture or a sixth pipeline step cannot land with
+        // a carrier that silently stopped agreeing with the rule.
+        for state in every_chrome_state_shape() {
+            let json = chrome_json(&state);
+            let doc: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON {json}: {e}"));
+            let derived: Vec<(&str, serde_json::Value)> = vec![
+                ("statusLine", status_line(&state).into()),
+                ("trustIndicator", trust_indicator(&state).into()),
+                (
+                    "trustIndicatorDetail",
+                    trust_indicator_detail(&state).into(),
+                ),
+                ("errorBannerVisible", error_banner_visible(&state).into()),
+                ("errorBannerText", error_banner_text(&state).into()),
+                (
+                    "invalidEntryBadgeVisible",
+                    invalid_entry_badge_visible(&state).into(),
+                ),
+                (
+                    "invalidEntryBadgeText",
+                    invalid_entry_badge_text(&state).into(),
+                ),
+                ("loadProgressVisible", load_progress_visible(&state).into()),
+                (
+                    "loadProgressFraction",
+                    load_progress_fraction(&state).into(),
+                ),
+                ("loadProgressHint", load_progress_hint(&state).into()),
+            ];
+            for (field, expected) in derived {
+                assert_eq!(
+                    doc[field], expected,
+                    "`{field}` must be the core's own derivation for {state:?}: {json}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_chrome_json_keeps_the_facts_in_the_existing_shared_wire_vocabulary() {
+        // The carrier ADDS the derived strings; it does not re-mean or re-spell
+        // the FACTS the two mobile edges already decode. Each enum fact keeps the
+        // one wire spelling the rest of the system speaks: `LoadStep::wire_name`,
+        // `FailureKind::wire_name` and `debug::trust_posture_wire_name` (the very
+        // names the debug view's Network tab uses, ADR-0006), so no second
+        // spelling is minted for mobile.
+        for state in every_chrome_state_shape() {
+            let json = chrome_json(&state);
+            let doc: serde_json::Value =
+                serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON {json}: {e}"));
+            assert_eq!(doc["url"], serde_json::json!(state.url_text));
+            assert_eq!(doc["loading"], serde_json::json!(state.is_loading()));
+            assert_eq!(
+                doc["loadStep"],
+                serde_json::json!(state.load_step().wire_name())
+            );
+            assert_eq!(
+                doc["trustPosture"],
+                serde_json::json!(crate::debug::trust_posture_wire_name(state.trust_posture))
+            );
+            assert_eq!(doc["canGoBack"], serde_json::json!(state.can_go_back));
+            assert_eq!(doc["canGoForward"], serde_json::json!(state.can_go_forward));
+            assert_eq!(doc["error"], serde_json::json!(state.last_error));
+            assert_eq!(
+                doc["failureKind"],
+                serde_json::json!(state.failure_kind().map(FailureKind::wire_name))
+            );
+            assert_eq!(
+                doc["retryable"],
+                serde_json::json!(state.failure_is_retryable())
+            );
+            assert_eq!(doc["invalidEntry"], serde_json::json!(state.invalid_entry));
+        }
+    }
+
+    #[test]
+    fn the_chrome_json_document_is_exactly_the_facts_plus_the_derived_fields() {
+        // The wire SHAPE, pinned whole: an idle default chrome encodes to exactly
+        // this document. Two things this catches that the per-field tests above do
+        // not: a field QUIETLY DROPPED (a mobile edge would then paint a default),
+        // and a field quietly ADDED under a second spelling of something the
+        // vocabulary already names. Asserted on the parsed value rather than the
+        // string, because JSON object order is not a contract (both edges decode
+        // with a real parser) while the key set and every value are.
+        let doc: serde_json::Value = serde_json::from_str(&chrome_json(&ChromeState::default()))
+            .expect("the chrome JSON is valid JSON");
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                // The FACTS (unchanged from the pre-collapse wire form).
+                "url": "",
+                "loadState": "idle",
+                "loading": false,
+                "loadStep": "idle",
+                "canGoBack": false,
+                "canGoForward": false,
+                "trustPosture": "unverified-origin",
+                "error": null,
+                "failureKind": null,
+                "retryable": false,
+                "invalidEntry": null,
+                // The DERIVED strings, named after the core rules that produce them.
+                "statusLine": "idle",
+                "trustIndicator": "⚠ unverified origin",
+                "trustIndicatorDetail": trust_indicator_detail(&ChromeState::default()),
+                "errorBannerVisible": false,
+                "errorBannerText": "",
+                "invalidEntryBadgeVisible": false,
+                "invalidEntryBadgeText": "",
+                "loadProgressVisible": false,
+                "loadProgressFraction": 0.0,
+                "loadProgressHint": "",
+            })
+        );
+    }
+
+    #[test]
+    fn the_chrome_json_stays_valid_when_a_reason_or_a_url_carries_json_punctuation() {
+        // A URL or a protocol-named reason with a quote/backslash/newline must not
+        // break the document, since it rides into the DERIVED strings too (the banner
+        // text embeds the reason verbatim), so the escaping has to survive both
+        // the fact and its derivation.
+        let state = ChromeState {
+            url_text: "https://x/\"a\\b".into(),
+            load_state: LoadState::Failed,
+            last_error: Some("bad \"quote\"\nline".into()),
+            ..ChromeState::default()
+        };
+        let json = chrome_json(&state);
+        let doc: serde_json::Value =
+            serde_json::from_str(&json).unwrap_or_else(|e| panic!("invalid JSON {json}: {e}"));
+        assert_eq!(doc["url"], serde_json::json!("https://x/\"a\\b"));
+        assert_eq!(doc["error"], serde_json::json!("bad \"quote\"\nline"));
+        assert_eq!(
+            doc["errorBannerText"],
+            serde_json::json!(error_banner_text(&state))
+        );
     }
 
     #[test]

@@ -312,10 +312,14 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # the SAME loading-wins rule over the posture from the SAME `loading` fact —
 # desktop `trust_indicator`/`_detail`/`_css_class` in werust-core (painted by
 # crates/werust/src/main.rs),
-# and the mobile `Chrome.trustIndicator()` (Kotlin WerustCore.kt, Swift
-# WerustCore.swift) reading the `loading` field of the chrome JSON — so the prior
-# page's trust posture never lingers while a new, possibly differently-trusted
-# page loads.
+# and the mobile `Chrome.trustIndicator` field (Kotlin WerustCore.kt, Swift
+# WerustCore.swift), which is the core's `trust_indicator` CARRIED on the chrome
+# JSON, so the prior page's trust posture never lingers while a new, possibly
+# differently-trusted page loads. Both mobile edges used to RE-DERIVE that badge
+# from the `loading` + `trustPosture` facts in Kotlin/Swift; task
+# `mobile-chrome-presentation-from-one-derivation` collapsed those twins onto the
+# one shared derivation, so a fifth posture now reaches every platform with no
+# per-edge change (and cannot fall through a mobile `else` to "unverified").
 # macOS paints the indicator from the SAME derivation, never a second one: the
 # label, its tooltip and its colour come from `trust_indicator` /
 # `_detail` / `_css_class` through the shared `desktop-paint` snapshot (unit-tested
@@ -325,6 +329,53 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # the real `NSTextField`, a fresh window showed the core's badge with the core's
 # ADR-0006 explanation as its tooltip, a hash-verified `ipfs://` page read as
 # verified, and the tampered control was never reported verified.
+desktop = { state = "implemented" }
+macos = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "trust-explanation"
+description = "EXPLAIN what the current trust posture MEANS, not just which badge it is: the sentence behind `✓ verified` / `◈ name via trusted RPC` / `◇ content verified, mutable name` / `⚠ unverified origin` (and the neutral in-flight state, which asserts no trust at all), reachable on every platform in a way that platform actually affords."
+# The sentence is ONE core rule, `trust_indicator_detail` (werust-core), beside
+# the badge rule it explains. `docs/adr/0001` makes the trust posture a product
+# surface and `docs/adr/0006` makes it a two-axis one, so a badge the user cannot
+# interrogate is only half the capability: "content verified, mutable name" means
+# nothing without the sentence saying the controller can repoint the name.
+#
+# THIS ROW IS NEW BECAUSE THE CAPABILITY WAS SILENTLY DESKTOP-ONLY. The
+# `trust-indicator` row above was `implemented` on all four contexts and stayed
+# honest about the BADGE, while the explanation existed only where a hover tooltip
+# does: the two mobile edges had hand-written `trustIndicator()` twins and had
+# simply never written a `trustIndicatorDetail()` to go with them, for months. It
+# is split out rather than folded into `trust-indicator` precisely so that gap can
+# never hide inside a row that is green for the badge (task
+# `mobile-chrome-presentation-from-one-derivation`,
+# docs/spikes/mobile-chrome-presentation-from-one-derivation/DECISIONS.md).
+#
+# Per platform, all four from that ONE rule:
+# * desktop: the GTK trust badge's TOOLTIP (`set_tooltip_text(trust_indicator_detail(state))`,
+#   crates/werust/src/main.rs).
+# * macos: the AppKit badge's tooltip, from the shared `desktop-paint` snapshot's
+#   `trust_detail` (crates/werust-macos/src/window.rs); read back out of the real
+#   NSTextField on a macos-14 runner (run 30572253620, the `trust-indicator` row's
+#   measurement, which asserted the badge carried the core's ADR-0006 explanation
+#   as its tooltip).
+# * ios/android: a hover tooltip is not available and would not be discoverable if
+#   it were, so each edge surfaces the SAME sentence TWICE over, from the
+#   `trustIndicatorDetail` field the chrome JSON now carries: as the badge's
+#   accessibility description (Android `contentDescription`, iOS
+#   `accessibilityLabel`; a screen-reader user previously heard a glyph and three
+#   words) and behind a TAP on the badge, which shows it in the platform's standard
+#   alert titled with the badge (BrowserActivity.kt `showTrustExplanation`,
+#   WKWebViewShellController.swift `showTrustExplanation`).
+# HONEST LIMIT: the two mobile surfaces are wired in Kotlin/Swift, which this
+# repo's pure-Rust gate never compiles. What the gate DOES enforce is that the
+# sentence reaches both edges from the one derivation and that both really wire it
+# to an accessibility description and a tap
+# (crates/werust-core/tests/mobile_chrome_presentation_shape.rs); that a real
+# device shows the alert is checked by the mobile CI legs building/launching the
+# edges, not by an on-device assertion.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
 ios = { state = "implemented" }
@@ -373,10 +424,12 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 # taxonomy, e.g. "IPNS record did not verify: …"); each chrome raises a
 # high-contrast banner from the SAME fact: desktop `error_banner_visible` /
 # `error_banner_text` in werust-core (painted by crates/werust/src/main.rs as a
-# red banner under the toolbar), and the mobile `Chrome.errorBannerVisible()` / `errorBanner()`
-# (Kotlin WerustCore.kt + a banner in BrowserActivity.kt; Swift WerustCore.swift +
-# a banner in WKWebViewShellController.swift) reading the chrome JSON `error`
-# field. The subtle footer status remains too, but a failure is now unmissable.
+# red banner under the toolbar), and the mobile `Chrome.errorBannerVisible` /
+# `errorBannerText` FIELDS (Kotlin WerustCore.kt + a banner in BrowserActivity.kt;
+# Swift WerustCore.swift + a banner in WKWebViewShellController.swift), which are
+# the core's `error_banner_visible` / `_text` carried on the chrome JSON (task
+# `mobile-chrome-presentation-from-one-derivation`; the edges used to re-derive
+# them from the `error` field). The subtle footer status remains too, but a failure is now unmissable.
 # Task prominent-load-failure-and-ipns-resolution-diagnosis.
 # macOS raises the banner from the SAME `error_banner_visible` / `_text` /
 # `_css_class` facts, in a strip between the toolbar and the page — the ONE state
@@ -395,11 +448,15 @@ description = "Surface a LIVE loading-progress indicator tied to the real resolu
 # The step is the core's `ChromeState::load_step` (`werust-core`), driven by the
 # ACTUAL lifecycle: the ENS/IPNS resolution stages in `BrowserShell::navigate_ens_name`
 # then the backend's Started/Committed load state (`refresh_chrome`). Every edge
-# names the SAME step from the SAME fact: desktop `status_line` in werust-core,
+# names the SAME step from the SAME rule: desktop `status_line` in werust-core,
 # painted by crates/werust/src/main.rs ("loading… — <step>"), and the mobile
-# `Chrome.statusLine()` reading the chrome JSON `loadStep` field (Kotlin
-# WerustCore.kt, Swift WerustCore.swift), exactly as the trust indicator reads the
-# shared `loading`/`trustPosture` facts. Loading stays ORTHOGONAL to the trust
+# `Chrome.statusLine` / `loadProgressFraction` / `loadProgressHint` FIELDS (Kotlin
+# WerustCore.kt, Swift WerustCore.swift), which are that same `status_line` /
+# `load_progress_*` derivation carried on the chrome JSON. The mobile edges used
+# to re-derive the step hint and the progress from the `loadStep` fact, in two
+# different UNITS at that (a fraction on iOS, a percent on Android), until task
+# `mobile-chrome-presentation-from-one-derivation` collapsed them onto the one
+# fraction. Loading stays ORTHOGONAL to the trust
 # posture. Task clearer-loading-and-error-indicator.
 # macOS shows the same step in the status line and, additionally, an
 # `NSProgressIndicator` fed by `load_progress_visible` / `_fraction` / `_hint`
@@ -428,12 +485,16 @@ description = "Route a scheme-less URL-bar entry consistently: a bare `.eth` -> 
 # chrome fact, exactly as the trust indicator / error banner are: desktop
 # `invalid_entry_badge_visible`/`_text` in werust-core + the
 # `invalid-url-badge`/`url-invalid` CSS in crates/werust/src/main.rs; the mobile
-# edges carry the `invalidEntry`
-# field in the chrome JSON (both `ffi_json` twins) and paint the badge +
-# red-underline from it — Android `Chrome.invalidEntryVisible()`/`invalidEntryBadge()`
-# (WerustCore.kt) + the badge/underline in BrowserActivity.kt, iOS
-# `Chrome.invalidEntryVisible()`/`invalidEntryBadge()` (WerustCore.swift) + the
-# badge/underline in WKWebViewShellController.swift. The iOS edge's former
+# edges carry the `invalidEntry` fact AND the derived
+# `invalidEntryBadgeVisible`/`invalidEntryBadgeText` on the chrome JSON (encoded
+# ONCE by `werust_core::chrome_json`) and paint the badge + red-underline from
+# them: Android `Chrome.invalidEntryBadgeVisible`/`invalidEntryBadgeText`
+# (WerustCore.kt) + the badge/underline in BrowserActivity.kt, iOS the same two
+# fields (WerustCore.swift) + the badge/underline in WKWebViewShellController.swift.
+# The iOS badge's WORDING used to be a Swift literal set once at build and never
+# refreshed from the rule (it agreed by transcription); task
+# `mobile-chrome-presentation-from-one-derivation` painted it from the derivation
+# like everywhere else. The iOS edge's former
 # edge-level `normalizeURL` (which prepended `https://` before the core saw the
 # entry, pre-empting the core classifier) is GONE — those three edges pass the RAW
 # typed text so the ONE core rule decides. Task
@@ -513,8 +574,10 @@ description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an 
 # `error_banner_text` / `error_banner_css_class` in werust-core (painted by
 # crates/werust/src/main.rs: a softer amber "timed out — reload to retry" vs the
 # red "failed to load"), and the
-# mobile `Chrome.errorBanner()` / `errorIsRetryable()` reading the chrome JSON
-# `retryable` field (Kotlin WerustCore.kt, Swift WerustCore.swift). Error stays
+# mobile `Chrome.errorBannerText` field (the core's `error_banner_text`, carried
+# on the chrome JSON) plus the `retryable` FACT for the banner's colour, which
+# stays an edge choice because neither mobile edge has a stylesheet or a palette
+# (Kotlin WerustCore.kt, Swift WerustCore.swift). Error stays
 # ORTHOGONAL to the trust posture. Task clearer-loading-and-error-indicator.
 # macOS reads the SAME two fields (`error_banner_text` + `_css_class`) through the
 # shared paint snapshot and colours the banner from the class's palette entry, so

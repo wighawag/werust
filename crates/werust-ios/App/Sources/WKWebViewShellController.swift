@@ -133,7 +133,12 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        invalidBadge.text = "⛔ invalid URL"
+        // No text here: the badge's wording is the core's `invalid_entry_badge_text`,
+        // painted in `refreshChrome()` like every other derived string. It USED to
+        // be this Swift literal, set once at build and never refreshed: a
+        // hand-written twin of the core rule that happened to agree, which would
+        // have silently kept the old wording on iOS alone the first time the badge
+        // was reworded (task `mobile-chrome-presentation-from-one-derivation`).
         invalidBadge.font = .systemFont(ofSize: 13)
         invalidBadge.textColor = UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
         invalidBadge.setContentHuggingPriority(.required, for: .horizontal)
@@ -272,19 +277,37 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // collection live on an OS light<->dark toggle, so the follow is automatic.
         webView.overrideUserInterfaceStyle = .unspecified
 
-        statusLabel.text = "idle"
         statusLabel.font = .systemFont(ofSize: 13)
         statusLabel.textColor = .secondaryLabel
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
         // The trust indicator, at the footer next to the status: painted from the
         // core's posture (the ACTUAL load path), the SAME four states desktop shows.
-        trustLabel.text = "⚠ unverified origin"
+        //
+        // The initial text of both labels is the core's OWN derivation for the
+        // starting chrome, never a Swift literal that happens to match it: a
+        // hard-coded "⚠ unverified origin" here would be one more hand-written twin
+        // of `trust_indicator`, which is precisely what task
+        // `mobile-chrome-presentation-from-one-derivation` removed from this edge.
+        // Every later repaint comes from `refreshChrome()`.
+        let initialChrome = core.chrome()
+        statusLabel.text = initialChrome.statusLine
+        trustLabel.text = initialChrome.trustIndicator
         trustLabel.font = .systemFont(ofSize: 13)
         trustLabel.textColor = .secondaryLabel
         trustLabel.textAlignment = .right
         trustLabel.setContentHuggingPriority(.required, for: .horizontal)
         trustLabel.translatesAutoresizingMaskIntoConstraints = false
+        // The trust EXPLANATION on a platform with no hover: the badge carries the
+        // core's `trust_indicator_detail` as its accessibility label (VoiceOver
+        // reads what the posture MEANS, not just its glyph) and a TAP shows the
+        // same sentence in an alert. Both are set in `refreshChrome()` from the
+        // same one derivation; the tap affordance is wired once here.
+        trustLabel.isUserInteractionEnabled = true
+        trustLabel.isAccessibilityElement = true
+        trustLabel.accessibilityLabel = initialChrome.trustIndicatorDetail
+        trustLabel.addGestureRecognizer(
+            UITapGestureRecognizer(target: self, action: #selector(showTrustExplanation)))
 
         // The prominent error banner: white-on-red, wrapping (a long protocol-named
         // reason stays legible), hidden until a load fails.
@@ -379,8 +402,9 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // typed text for the user to fix. Toggled from the orthogonal `invalidEntry`
         // fact — distinct from the trust indicator and the load-error banner. The
         // SAME rule desktop/Android apply, from the same chrome fact.
-        invalidBadge.isHidden = !chrome.invalidEntryVisible()
-        if chrome.invalidEntryVisible() {
+        invalidBadge.isHidden = !chrome.invalidEntryBadgeVisible
+        invalidBadge.text = chrome.invalidEntryBadgeText
+        if chrome.invalidEntryBadgeVisible {
             urlField.textColor = UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
             if let text = urlField.text {
                 urlField.attributedText = NSAttributedString(
@@ -401,10 +425,15 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         forwardButton.isEnabled = chrome.canGoForward
         stopButton.isEnabled = chrome.loading
         reloadButton.isEnabled = !chrome.loading
-        statusLabel.text = chrome.statusLine()
+        statusLabel.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
-        // matching desktop; the seam-default no-op is gone.
-        trustLabel.text = chrome.trustIndicator()
+        // matching desktop; the seam-default no-op is gone. Its EXPLANATION (the
+        // core's `trust_indicator_detail`, which used to reach desktop only) rides
+        // along as the badge's accessibility label, and the tap affordance wired in
+        // `layoutChrome()` shows the same sentence: the platform-appropriate
+        // stand-in for desktop's hover tooltip.
+        trustLabel.text = chrome.trustIndicator
+        trustLabel.accessibilityLabel = chrome.trustIndicatorDetail
         // The LOAD-PROGRESS line: its fraction advances with the real pipeline
         // phase while a load is in flight (including the pre-content name-resolution
         // window, where the backend has not started yet), and it fades out once the
@@ -414,21 +443,24 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // button, enabled exactly while a load is in flight; the phase NAME is in
         // the footer status line (and this line's accessibility label). Driven by
         // this existing refresh, so no new timer / poll / tight loop.
-        let progressVisible = chrome.loadProgressVisible()
-        loadingProgress.setProgress(chrome.loadProgressFraction(), animated: progressVisible)
+        //
+        // The core hands over its progress FRACTION on the 0.0-1.0 scale
+        // `UIProgressView` already uses, so only the numeric type is narrowed here.
+        let progressVisible = chrome.loadProgressVisible
+        loadingProgress.setProgress(Float(chrome.loadProgressFraction), animated: progressVisible)
         loadingProgress.alpha = progressVisible ? 1 : 0
-        loadingProgress.accessibilityLabel = progressVisible ? chrome.loadProgressHint() : nil
+        loadingProgress.accessibilityLabel = progressVisible ? chrome.loadProgressHint : nil
         // The PROMINENT error banner: shown ONLY on a failed load, carrying the
         // accurate protocol-named reason across the top of the view so the user
         // cannot miss why nothing rendered (the fail-closed honesty fix). Hidden
         // otherwise. The SAME rule desktop/Android apply, from the same chrome fact.
-        errorBanner.isHidden = !chrome.errorBannerVisible()
-        errorBanner.text = chrome.errorBanner()
+        errorBanner.isHidden = !chrome.errorBannerVisible
+        errorBanner.text = chrome.errorBannerText
         // A TRANSIENT/timeout failure (retryable) is a softer amber banner; a hard
         // failure is the prominent red one (task
         // `clearer-loading-and-error-indicator`). The SAME distinction desktop
         // shows, from the core's `retryable` fact.
-        errorBanner.backgroundColor = chrome.errorIsRetryable()
+        errorBanner.backgroundColor = chrome.retryable
             ? UIColor(red: 0.71, green: 0.51, blue: 0.04, alpha: 1.0)
             : UIColor(red: 0.75, green: 0.11, blue: 0.16, alpha: 1.0)
         // The open IN-APP DEBUG VIEW refreshes on this SAME existing
@@ -479,6 +511,34 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         controller.modalPresentationStyle = .fullScreen
         debugViewController = controller
         present(controller, animated: true)
+    }
+
+    /// Show what the current trust posture MEANS: the core's
+    /// `trust_indicator_detail`, titled with the badge it explains.
+    ///
+    /// This is the trust EXPLANATION on a platform with no hover. Desktop shows it
+    /// as the badge's tooltip; for months neither mobile edge showed it AT ALL,
+    /// because each had hand-written its own `trustIndicator()` twin and simply
+    /// never wrote a `trustIndicatorDetail()` to go with it (`docs/adr/0011`,
+    /// `docs/adr/0006`: for a browser whose thesis is an honest, legible trust
+    /// posture, a badge with no explanation on the two platforms most users are on
+    /// is a real gap). Reading the sentence from the chrome means iOS now shows
+    /// exactly what desktop shows, and a future rewording lands on both at once.
+    ///
+    /// TWO affordances, both from the same one field: this TAP (an explicit user
+    /// gesture, no hover needed) and the badge's accessibility label set in
+    /// ``refreshChrome()`` (VoiceOver reads the meaning, not the glyph).
+    ///
+    /// It reads the PAINTED badge rather than calling the core again: a chrome read
+    /// crosses the C-ABI into the session, and the label + its accessibility text
+    /// were both set by the last ``refreshChrome()`` from ONE chrome snapshot, so
+    /// they cannot disagree with each other.
+    @objc private func showTrustExplanation() {
+        guard let detail = trustLabel.accessibilityLabel, !detail.isEmpty else { return }
+        let alert = UIAlertController(
+            title: trustLabel.text, message: detail, preferredStyle: .alert)
+        alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+        present(alert, animated: true)
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------
@@ -894,7 +954,7 @@ final class DebugViewController: UIViewController, UITableViewDataSource {
 
     /// The per-request trust label of a network row: the mobile trust
     /// indicator's glyph for the posture (`✓` / `◈` / `◇` / `⚠`, the SAME four
-    /// `Chrome.trustIndicator()` paints) plus the core's wire name the debug
+    /// `Chrome.trustIndicator` carries) plus the core's wire name the debug
     /// JSON carries, never a new label minted for the debug view (ADR-0006).
     /// TOTAL and fail-closed: an unrecognised posture renders as the unverified
     /// one, never verbatim (a verbatim render could smuggle a minted label into

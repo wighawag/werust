@@ -54,6 +54,9 @@
 
 use std::path::{Path, PathBuf};
 
+use renderer::TrustPosture;
+use werust_core::{trust_indicator, ChromeState};
+
 /// Read a source file relative to the repo root. `CARGO_MANIFEST_DIR` is
 /// `crates/werust-core`, so the root is two levels up.
 fn source(relative: &str) -> String {
@@ -180,9 +183,10 @@ fn the_network_tab_reuses_the_mobile_trust_indicators_vocabulary_never_a_new_lab
     // Criterion 2: the Network tab's per-request trust renders the core's wire
     // names (`content-verified` / `unverified-origin` / `name-via-trusted-rpc`
     // / `mutable-name`, which the debug JSON's `trust` field already carries)
-    // with the SAME glyphs the mobile trust indicator paints in
-    // `Chrome.trustIndicator()`. No new trust label is minted for the debug
-    // view (ADR-0006; the desktop view's Decision 4, which this mirrors).
+    // with the SAME glyphs the trust indicator paints (the core's
+    // `trust_indicator`, which both mobile edges now carry as `Chrome`'s
+    // `trustIndicator` field). No new trust label is minted for the debug view
+    // (ADR-0006; the desktop view's Decision 4, which this mirrors).
     for (name, view) in [("Android", android_debug_view()), ("iOS", ios_debug_view())] {
         assert!(
             view.contains("networkTrustLabel"),
@@ -208,17 +212,33 @@ fn the_network_tab_reuses_the_mobile_trust_indicators_vocabulary_never_a_new_lab
         }
     }
 
-    // The glyphs really are the MOBILE trust indicator's own: both bindings'
-    // `trustIndicator()` paint the same four from the same postures, so the
-    // Network tab can never speak a vocabulary the indicator does not own.
-    for (name, binding) in [("Android", android_binding()), ("iOS", ios_binding())] {
-        let indicator = between(&binding, "content-verified", "unverified origin");
-        for glyph in ["✓", "◈", "◇", "⚠"] {
-            assert!(
-                binding.contains(glyph) && indicator.contains(glyph),
-                "{name}'s trust indicator must paint the `{glyph}` glyph the Network tab reuses"
-            );
-        }
+    // The glyphs really are the TRUST INDICATOR's own, checked against the rule
+    // itself rather than against a copy of it: every glyph the Network tab reuses
+    // must appear in what `werust_core::trust_indicator` produces over
+    // `TrustPosture::ALL`, so the tab can never speak a vocabulary the indicator
+    // does not own.
+    //
+    // This assertion used to read the glyphs out of each mobile BINDING's own
+    // `trustIndicator()` twin. Those twins are gone (task
+    // `mobile-chrome-presentation-from-one-derivation`): the badge is derived once
+    // in the core and carried to both edges on the chrome JSON, so the core is
+    // where the vocabulary now lives, and asserting against the derivation is
+    // strictly stronger than asserting against a transcription of it.
+    let painted: String = TrustPosture::ALL
+        .iter()
+        .map(|posture| {
+            trust_indicator(&ChromeState {
+                trust_posture: *posture,
+                ..ChromeState::default()
+            })
+        })
+        .collect();
+    for glyph in ["✓", "◈", "◇", "⚠"] {
+        assert!(
+            painted.contains(glyph),
+            "the shared trust indicator must paint the `{glyph}` glyph the Network tab reuses; \
+             it paints: {painted:?}"
+        );
     }
 }
 

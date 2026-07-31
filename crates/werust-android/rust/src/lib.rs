@@ -36,7 +36,6 @@
 //! chrome exactly as the desktop pump folds WebKitGTK's signals.
 
 mod backend;
-mod ffi_json;
 mod origin_map;
 
 pub use backend::{AndroidBackend, AndroidHandle};
@@ -310,9 +309,19 @@ impl CoreSession {
 
     /// The current [`ChromeState`] as a JSON object, the wire form Kotlin reads
     /// across JNI (a single string return is the simplest robust JNI marshalling).
+    ///
+    /// The document is encoded by the SHARED core
+    /// ([`werust_core::chrome_json`]), not here: it carries the chrome FACTS plus
+    /// every string the core's presentation rules DERIVE from them (the status
+    /// line, the trust badge + its explanation, the banner text, the badge text,
+    /// the progress fraction + hint), so the Kotlin edge reads a field instead of
+    /// re-deriving the rule (task
+    /// `mobile-chrome-presentation-from-one-derivation`). It used to be encoded by
+    /// a local `ffi_json` module that was a byte-for-byte twin of the iOS one:
+    /// the same duplication one level down.
     #[must_use]
     pub fn chrome_json(&self) -> String {
-        ffi_json::chrome_to_json(self.shell.chrome())
+        werust_core::chrome_json(self.shell.chrome())
     }
 
     /// The shared bounded CONSOLE + NETWORK capture store behind the in-app debug

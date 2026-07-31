@@ -313,6 +313,34 @@ class WerustCore : AutoCloseable {
     /**
      * The chrome the Activity paints, decoded from the core's JSON wire form.
      * Every field is the core's truth; the Activity holds none of this logic.
+     *
+     * TWO HALVES, both decided in `werust-core`:
+     *
+     * * the FACTS ([url], [loading], [loadStep], [trustPosture], [error],
+     *   [failureKind], [retryable], [invalidEntry], …): what the chrome IS;
+     * * the DERIVATION ([statusLine], [trustIndicator], [trustIndicatorDetail],
+     *   [errorBannerText], [invalidEntryBadgeText], [loadProgressFraction], …):
+     *   what the chrome SHOWS, each field the return value of the core rule of
+     *   the same name (`status_line`, `trust_indicator`, `trust_indicator_detail`,
+     *   `error_banner_text`, `invalid_entry_badge_text`, `load_progress_fraction`,
+     *   …).
+     *
+     * This class used to RE-DERIVE the second half in Kotlin (`statusLine()`,
+     * `trustIndicator()`, `errorBanner()`, `invalidEntryBadge()`,
+     * `loadProgress*()`), a hand-written twin of the Rust originals: one rule set
+     * in three languages, which had already drifted. the trust EXPLANATION
+     * ([trustIndicatorDetail]) existed only on desktop, and the load-progress unit
+     * was a fraction in Rust and Swift but a PERCENT here. It now reads a field
+     * instead of running a `when` (task
+     * `mobile-chrome-presentation-from-one-derivation`, `docs/adr/0011`), so a new
+     * trust posture or pipeline phase reaches Android with no Kotlin change at
+     * all.
+     *
+     * Adding a display rule here is therefore a REGRESSION, not a feature: the
+     * rule belongs in `werust-core` beside its siblings, where every edge gets it
+     * (a source-shape guard,
+     * `crates/werust-core/tests/mobile_chrome_presentation_shape.rs`, reds the
+     * gate if a twin comes back).
      */
     data class Chrome(
         val url: String,
@@ -326,168 +354,69 @@ class WerustCore : AutoCloseable {
         val failureKind: String?,
         val retryable: Boolean,
         val invalidEntry: String?,
-    ) {
         /**
-         * The one-line status the Activity shows: a failure wins, else a loading
+         * The one-line status shown in the footer: a failure wins, else a loading
          * indicator that NAMES the real pipeline step (resolving name / fetching
          * record / fetching content / rendering) so a slow load reads as working,
-         * not frozen, else idle. The step hint is the core's `loadStep` (driven by
-         * the actual lifecycle), the SAME fact desktop reads (task
-         * `clearer-loading-and-error-indicator`).
+         * not frozen, else idle. The core's `status_line`.
          */
-        fun statusLine(): String = when {
-            error != null -> "failed: $error"
-            loading -> {
-                val hint = loadStepHint()
-                if (hint.isEmpty()) "loading…" else "loading… — $hint"
-            }
-            else -> "idle"
-        }
-
+        val statusLine: String,
         /**
-         * The short human-readable hint for the current pipeline step, or empty for
-         * no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile status
-         * text matches desktop.
+         * The short trust-indicator badge: the core's `trust_indicator`, painted
+         * from the posture of the ACTUAL load path (never the URL), and a NEUTRAL
+         * loading state while a load is in flight so the previous page's trust
+         * never lingers into a new one.
          */
-        fun loadStepHint(): String = when (loadStep) {
-            "resolving-name" -> "resolving name"
-            "fetching-record" -> "fetching record"
-            "fetching-content" -> "fetching content"
-            "rendering" -> "rendering"
-            else -> ""
-        }
-
+        val trustIndicator: String,
         /**
-         * The short trust-indicator badge the Activity paints from the core's
-         * posture (the ACTUAL load path, not the URL) — the SAME states the
-         * desktop chrome shows. Never labels a name-resolved or mutable page
-         * "verified" (only a direct `ipfs://<cid>` earns that).
-         *
-         * While a load is IN FLIGHT (`loading`) the indicator is a NEUTRAL loading
-         * state that WINS over the posture, making NO trust claim — the
-         * trust-honesty fix (task `chrome-loading-state-resets-trust-indicator`):
-         * on navigation to a possibly differently-trusted page, the indicator must
-         * not keep asserting the previous page's (or a not-yet-proven) trust while
-         * the new page loads; the real posture appears only once the load settles.
-         * The SAME loading-wins rule the desktop chrome applies, from the SAME
-         * `loading` fact.
+         * The longer EXPLANATION of what the current [trustIndicator] means: the
+         * core's `trust_indicator_detail`, the same sentence the desktop badge
+         * shows on hover. Mobile has no hover, so the Activity surfaces it as the
+         * badge's accessibility description plus a tap affordance (task
+         * `mobile-chrome-presentation-from-one-derivation`). For months this text
+         * reached desktop only, which is exactly the drift the collapse closes.
          */
-        fun trustIndicator(): String = when {
-            loading -> "⋯ loading…"
-            trustPosture == "content-verified" -> "✓ verified"
-            trustPosture == "name-via-trusted-rpc" -> "◈ name via trusted RPC"
-            trustPosture == "mutable-name" -> "◇ content verified, mutable name"
-            else -> "⚠ unverified origin"
-        }
-
+        val trustIndicatorDetail: String,
         /**
-         * Whether there is a load to indicate at all: a backend load in flight
-         * (`loading`) OR a pinned pre-content resolution step (a non-idle
-         * `loadStep`). The second half matters: while the core resolves an ENS/IPNS
-         * name the backend has not started its load yet, so `loading` is false
-         * during EXACTLY the long `ronan.eth` freeze window the old banner sat out.
-         * `loadStep` is idle on every settled/failed chrome, so this can never
-         * linger after a load ends.
-         *
-         * A passive view update driven by the existing chrome-refresh pump (NOT a
-         * new timer / poll / tight loop), so the Android ANR guard is not
-         * regressed. The IN-FLIGHT counterpart of [errorBannerVisible] (which
-         * fires on a FAILED load); the two are mutually exclusive. The SAME rule
-         * desktop/iOS apply, from the SAME chrome-JSON facts (task
-         * `loading-progress-in-the-url-bar-not-a-banner`).
+         * Whether the PROMINENT in-view error banner shows: exactly when the last
+         * load failed. The core's `error_banner_visible`.
          */
-        fun loadProgressVisible(): Boolean = loading || loadStep != "idle"
-
+        val errorBannerVisible: Boolean,
         /**
-         * The progress the URL-bar progress line paints, in PERCENT (0-100, the
-         * `ProgressBar` scale): `0` on a settled chrome (painting nothing at all),
-         * else a value that ADVANCES with the real pipeline phase so a slow load
-         * reads as working rather than frozen.
-         *
-         * The steps are deliberately monotonic and never reach 100: the phases are
-         * milestones on the actual lifecycle, not a byte-accurate measurement, so
-         * the line must not claim a load is done while it is still running. A load
-         * in flight with no phase yet still shows a small sliver, so "something
-         * started" is visible immediately. The SAME mapping desktop and iOS apply,
-         * from the SAME `loadStep` fact.
+         * The error banner's text: the accurate, protocol-named reason, framed as
+         * a retryable timeout or a hard failure. The core's `error_banner_text`
+         * (empty when the banner is hidden).
          */
-        fun loadProgressPercent(): Int = when {
-            !loadProgressVisible() -> 0
-            loadStep == "resolving-name" -> 25
-            loadStep == "fetching-record" -> 45
-            loadStep == "fetching-content" -> 70
-            loadStep == "rendering" -> 90
-            else -> 10
-        }
-
+        val errorBannerText: String,
         /**
-         * The phase NAME behind the current progress (for the progress line's
-         * content description): the existing `LoadStep` hint vocabulary verbatim
-         * ("resolving name", "fetching record", …), so the URL bar, the footer
-         * status line and the debug Network tab cannot disagree about which phase a
-         * slow load is stuck in. A generic "loading" covers a load in flight with no
-         * phase known yet; empty on a settled chrome. The SAME mapping desktop/iOS
-         * apply.
+         * Whether the small "invalid URL" badge shows: exactly when the last
+         * URL-bar entry was INVALID (a garbage entry that did not navigate). The
+         * core's `invalid_entry_badge_visible`.
          */
-        fun loadProgressHint(): String = when {
-            !loadProgressVisible() -> ""
-            loadStepHint().isEmpty() -> "loading"
-            else -> loadStepHint()
-        }
-
+        val invalidEntryBadgeVisible: Boolean,
+        /** The invalid-entry badge's text; the core's `invalid_entry_badge_text`. */
+        val invalidEntryBadgeText: String,
         /**
-         * Whether the PROMINENT in-view error banner should be shown: exactly when
-         * the last load failed (`error` is set). The whole point of fail-closed is
-         * that the user UNDERSTANDS why nothing rendered; the subtle footer status
-         * was "not easily seen" (a real `ronan.eth` IPNS failure was missed), so a
-         * failed load ALSO raises a high-contrast banner the user cannot miss. The
-         * SAME rule desktop applies, from the SAME chrome-JSON fact.
+         * Whether there is a load to indicate at all: a backend load in flight OR
+         * a pinned pre-content resolution step (the long `ronan.eth` window where
+         * the backend has not started yet). The core's `load_progress_visible`.
          */
-        fun errorBannerVisible(): Boolean = error != null
-
+        val loadProgressVisible: Boolean,
         /**
-         * The PROMINENT error-banner text for a failed load: the accurate,
-         * protocol-named reason drawn straight from `error` (the resolver/decoder
-         * taxonomy — e.g. "IPNS record did not verify: …"), never a generic
-         * "failed". Empty when there is no failure (the banner is hidden then).
+         * The load-progress FRACTION, 0.0-1.0: the core's
+         * `load_progress_fraction`, in the core's unit. The `ProgressBar`'s 0-100
+         * scale is applied where the widget is painted, so this stays the one
+         * shared number (it was a hand-converted percent here before, the only
+         * unit fork among the three copies).
          */
-        fun errorBanner(): String = when {
-            error == null -> ""
-            // A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a
-            // hard failure: a softer "timed out — reload to retry" (the Reload
-            // button IS the retry — a failed ENS load re-resolves), while a hard
-            // failure keeps the prominent "failed to load" wording + its
-            // protocol-named reason. The distinction is the core's `retryable`
-            // (task `clearer-loading-and-error-indicator`), the SAME fact desktop
-            // reads, so the two never disagree.
-            retryable -> "⏳ This page timed out — reload to retry: $error"
-            else -> "⚠ This page failed to load: $error"
-        }
-
+        val loadProgressFraction: Double,
         /**
-         * Whether the surfaced failure is RETRYABLE (a transient timeout a reload
-         * may fix), so the Activity can show a retry affordance. `false` for a hard
-         * failure or when nothing failed. The core's `retryable` fact, matching
-         * desktop.
+         * The phase NAME behind the current progress, for the progress line's
+         * content description: the core's `load_progress_hint`, the `LoadStep`
+         * hint vocabulary verbatim.
          */
-        fun errorIsRetryable(): Boolean = error != null && retryable
-
-        /**
-         * Whether the small "invalid URL" BADGE should be shown: exactly when the
-         * last URL-bar entry was INVALID (a scheme-less garbage entry that did not
-         * navigate). A pure read of the orthogonal `invalidEntry` fact — distinct
-         * from a load error (`error`) — so the Activity paints the badge + the
-         * red-underlined URL bar from the SAME chrome-JSON fact desktop uses (field
-         * finding D, task `scheme-less-entry-https-fallback-and-keep-bar-on-error`).
-         */
-        fun invalidEntryVisible(): Boolean = invalidEntry != null
-
-        /**
-         * The small "invalid URL" badge text for an invalid entry, empty otherwise
-         * (the badge is hidden then). Matches desktop's badge wording.
-         */
-        fun invalidEntryBadge(): String = if (invalidEntry != null) "⛔ invalid URL" else ""
-
+        val loadProgressHint: String,
+    ) {
         companion object {
             fun fromJson(json: String): Chrome {
                 val o = JSONObject(json)
@@ -503,6 +432,20 @@ class WerustCore : AutoCloseable {
                     failureKind = if (o.isNull("failureKind")) null else o.optString("failureKind"),
                     retryable = o.optBoolean("retryable", false),
                     invalidEntry = if (o.isNull("invalidEntry")) null else o.getString("invalidEntry"),
+                    // The DERIVED half. Each default is the EMPTY/absent value, never
+                    // a Kotlin copy of the core's wording: a document that somehow
+                    // lacked a derived field must show nothing rather than a second,
+                    // drifting spelling of it.
+                    statusLine = o.optString("statusLine", ""),
+                    trustIndicator = o.optString("trustIndicator", ""),
+                    trustIndicatorDetail = o.optString("trustIndicatorDetail", ""),
+                    errorBannerVisible = o.optBoolean("errorBannerVisible", false),
+                    errorBannerText = o.optString("errorBannerText", ""),
+                    invalidEntryBadgeVisible = o.optBoolean("invalidEntryBadgeVisible", false),
+                    invalidEntryBadgeText = o.optString("invalidEntryBadgeText", ""),
+                    loadProgressVisible = o.optBoolean("loadProgressVisible", false),
+                    loadProgressFraction = o.optDouble("loadProgressFraction", 0.0),
+                    loadProgressHint = o.optString("loadProgressHint", ""),
                 )
             }
         }

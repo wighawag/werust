@@ -377,7 +377,7 @@ class DebugView(
         /**
          * The per-request trust label of a network row: the mobile trust
          * indicator's glyph for the posture (`✓` / `◈` / `◇` / `⚠`, the SAME
-         * four `Chrome.trustIndicator()` paints) plus the core's wire name the
+         * four `Chrome.trustIndicator` carries) plus the core's wire name the
          * debug JSON carries, never a new label minted for the debug view
          * (ADR-0006). TOTAL and fail-closed: an unrecognised posture renders as
          * the unverified one, never verbatim (a verbatim render could smuggle a

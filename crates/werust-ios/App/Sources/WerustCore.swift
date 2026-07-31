@@ -358,6 +358,33 @@ final class WerustCore {
 
     /// The chrome the controller paints, decoded from the core's JSON wire form.
     /// Every field is the core's truth; the controller holds none of this logic.
+    ///
+    /// TWO HALVES, both decided in `werust-core`:
+    ///
+    /// * the FACTS (`url`, `loading`, `loadStep`, `trustPosture`, `error`,
+    ///   `failureKind`, `retryable`, `invalidEntry`, …): what the chrome IS;
+    /// * the DERIVATION (`statusLine`, `trustIndicator`, `trustIndicatorDetail`,
+    ///   `errorBannerText`, `invalidEntryBadgeText`, `loadProgressFraction`, …):
+    ///   what the chrome SHOWS, each the return value of the core rule of the same
+    ///   name (`status_line`, `trust_indicator`, `trust_indicator_detail`,
+    ///   `error_banner_text`, `invalid_entry_badge_text`, `load_progress_fraction`,
+    ///   …).
+    ///
+    /// This struct used to RE-DERIVE the second half in Swift (`statusLine()`,
+    /// `trustIndicator()`, `errorBanner()`, `invalidEntryBadge()`,
+    /// `loadProgress*()`), a hand-written twin of the Rust originals: one rule
+    /// set in three languages, which had already drifted. the trust EXPLANATION
+    /// (`trustIndicatorDetail`) existed only on desktop. It now reads a field
+    /// instead of running a `switch` (task
+    /// `mobile-chrome-presentation-from-one-derivation`, `docs/adr/0011`), so a
+    /// new trust posture or pipeline phase reaches iOS with no Swift change at
+    /// all.
+    ///
+    /// Adding a display rule here is therefore a REGRESSION, not a feature: the
+    /// rule belongs in `werust-core` beside its siblings, where every edge gets it
+    /// (a source-shape guard,
+    /// `crates/werust-core/tests/mobile_chrome_presentation_shape.rs`, reds the
+    /// gate if a twin comes back).
     struct Chrome {
         let url: String
         let loadState: String
@@ -371,153 +398,61 @@ final class WerustCore {
         let retryable: Bool
         let invalidEntry: String?
 
+        /// The one-line status shown in the footer: the core's `status_line` (a
+        /// failure wins, else a loading indicator NAMING the real pipeline step,
+        /// else idle).
+        let statusLine: String
+        /// The short trust-indicator badge: the core's `trust_indicator`, from the
+        /// posture of the ACTUAL load path, neutral while a load is in flight.
+        let trustIndicator: String
+        /// The longer EXPLANATION of what the current `trustIndicator` means: the
+        /// core's `trust_indicator_detail`, the same sentence desktop shows on
+        /// hover. iOS has no hover, so the controller surfaces it as the badge's
+        /// accessibility label plus a tap affordance (task
+        /// `mobile-chrome-presentation-from-one-derivation`). For months this text
+        /// reached desktop only, which is exactly the drift the collapse closes.
+        let trustIndicatorDetail: String
+        /// Whether the PROMINENT in-view error banner shows: the core's
+        /// `error_banner_visible` (exactly when the last load failed).
+        let errorBannerVisible: Bool
+        /// The banner's text: the core's `error_banner_text`, i.e. the accurate,
+        /// protocol-named reason, framed as a retryable timeout or a hard failure.
+        let errorBannerText: String
+        /// Whether the small "invalid URL" badge shows: the core's
+        /// `invalid_entry_badge_visible`.
+        let invalidEntryBadgeVisible: Bool
+        /// The invalid-entry badge's text: the core's `invalid_entry_badge_text`.
+        let invalidEntryBadgeText: String
+        /// Whether there is a load to indicate at all: the core's
+        /// `load_progress_visible` (a backend load in flight OR a pinned
+        /// pre-content resolution step).
+        let loadProgressVisible: Bool
+        /// The load-progress FRACTION, 0.0-1.0: the core's
+        /// `load_progress_fraction`, in the core's unit (`UIProgressView` takes a
+        /// `Float` on the same 0-1 scale, so only the numeric type is narrowed).
+        let loadProgressFraction: Double
+        /// The phase NAME behind the current progress, for the progress line's
+        /// accessibility label: the core's `load_progress_hint`.
+        let loadProgressHint: String
+
+        /// The FAIL-SOFT fallback for an unreadable/absent document (a freed
+        /// session, a null C string): the facts read as an idle chrome and every
+        /// DERIVED string is EMPTY.
+        ///
+        /// Empty rather than a Swift copy of the core's wording, deliberately: a
+        /// second spelling of "⚠ unverified origin" here would be a new twin of the
+        /// very rule this type stopped re-deriving. Showing nothing is also the
+        /// honest claim when the chrome could not be read at all: a trust badge
+        /// must never be asserted from a fallback (`docs/adr/0006`).
         static let idle = Chrome(
             url: "", loadState: "idle", loading: false, loadStep: "idle",
             canGoBack: false, canGoForward: false,
             trustPosture: "unverified-origin", error: nil,
-            failureKind: nil, retryable: false, invalidEntry: nil)
-
-        /// The one-line status the controller shows: a failure wins, else a loading
-        /// indicator that NAMES the real pipeline step (resolving name / fetching
-        /// record / fetching content / rendering) so a slow load reads as working,
-        /// not frozen, else idle. The step hint is the core's `loadStep` (driven by
-        /// the actual lifecycle), the SAME fact desktop reads (task
-        /// `clearer-loading-and-error-indicator`).
-        func statusLine() -> String {
-            if let error = error { return "failed: \(error)" }
-            guard loading else { return "idle" }
-            let hint = loadStepHint()
-            return hint.isEmpty ? "loading…" : "loading… — \(hint)"
-        }
-
-        /// The short human-readable hint for the current pipeline step, or empty
-        /// for no step (idle). Mirrors the core's `LoadStep::hint`, so the mobile
-        /// status text matches desktop.
-        func loadStepHint() -> String {
-            switch loadStep {
-            case "resolving-name": return "resolving name"
-            case "fetching-record": return "fetching record"
-            case "fetching-content": return "fetching content"
-            case "rendering": return "rendering"
-            default: return ""
-            }
-        }
-
-        /// The short trust-indicator badge the controller paints from the core's
-        /// posture (the ACTUAL load path, not the URL) — the SAME states the
-        /// desktop chrome shows. Never labels a name-resolved or mutable page
-        /// "verified" (only a direct `ipfs://<cid>` earns that).
-        ///
-        /// While a load is IN FLIGHT (`loading`) the indicator is a NEUTRAL loading
-        /// state that WINS over the posture, making NO trust claim — the
-        /// trust-honesty fix (task `chrome-loading-state-resets-trust-indicator`):
-        /// on navigation to a possibly differently-trusted page, the indicator must
-        /// not keep asserting the previous page's (or a not-yet-proven) trust while
-        /// the new page loads; the real posture appears only once the load settles.
-        /// The SAME loading-wins rule the desktop chrome applies, from the SAME
-        /// `loading` fact.
-        func trustIndicator() -> String {
-            if loading { return "⋯ loading…" }
-            switch trustPosture {
-            case "content-verified": return "✓ verified"
-            case "name-via-trusted-rpc": return "◈ name via trusted RPC"
-            case "mutable-name": return "◇ content verified, mutable name"
-            default: return "⚠ unverified origin"
-            }
-        }
-
-        /// Whether the PROMINENT in-view error banner should be shown: exactly when
-        /// the last load failed (`error` is set). The whole point of fail-closed is
-        /// that the user UNDERSTANDS why nothing rendered; the subtle footer status
-        /// was "not easily seen" (a real `ronan.eth` IPNS failure was missed), so a
-        /// failed load ALSO raises a high-contrast banner the user cannot miss. The
-        /// SAME rule desktop/Android apply, from the SAME chrome-JSON fact.
-        func errorBannerVisible() -> Bool { error != nil }
-
-        /// Whether there is a load to indicate at all: a backend load in flight
-        /// (`loading`) OR a pinned pre-content resolution step (a non-idle
-        /// `loadStep`). The second half matters: while the core resolves an
-        /// ENS/IPNS name the backend has not started its load yet, so `loading` is
-        /// false during EXACTLY the long `ronan.eth` freeze window the old banner
-        /// sat out. `loadStep` is idle on every settled/failed chrome, so this can
-        /// never linger after a load ends.
-        ///
-        /// A passive view update driven by the existing chrome-refresh pump (NOT a
-        /// new timer / poll / tight loop). The IN-FLIGHT counterpart of
-        /// `errorBannerVisible()` (which fires on a FAILED load); the two are
-        /// mutually exclusive. The SAME rule desktop/Android apply, from the SAME
-        /// chrome-JSON facts (task
-        /// `loading-progress-in-the-url-bar-not-a-banner`).
-        func loadProgressVisible() -> Bool { loading || loadStep != "idle" }
-
-        /// The progress fraction the URL-bar progress line paints: `0` on a settled
-        /// chrome (painting nothing at all), else a value that ADVANCES with the
-        /// real pipeline phase so a slow load reads as working rather than frozen.
-        ///
-        /// The fractions are deliberately monotonic and never reach `1`: the phases
-        /// are milestones on the actual lifecycle, not a byte-accurate measurement,
-        /// so the line must not claim a load is done while it is still running. A
-        /// load in flight with no phase yet still shows a small sliver, so
-        /// "something started" is visible immediately. The SAME mapping desktop and
-        /// Android apply, from the SAME `loadStep` fact.
-        func loadProgressFraction() -> Float {
-            guard loadProgressVisible() else { return 0 }
-            switch loadStep {
-            case "resolving-name": return 0.25
-            case "fetching-record": return 0.45
-            case "fetching-content": return 0.7
-            case "rendering": return 0.9
-            default: return 0.1
-            }
-        }
-
-        /// The phase NAME behind the current progress (for the progress line's
-        /// accessibility label): the existing `LoadStep` hint vocabulary verbatim
-        /// ("resolving name", "fetching record", …), so the URL bar, the footer
-        /// status line and the debug Network tab cannot disagree about which phase a
-        /// slow load is stuck in. A generic "loading" covers a load in flight with
-        /// no phase known yet; empty on a settled chrome. The SAME mapping
-        /// desktop/Android apply.
-        func loadProgressHint() -> String {
-            guard loadProgressVisible() else { return "" }
-            let hint = loadStepHint()
-            return hint.isEmpty ? "loading" : hint
-        }
-
-        /// The PROMINENT error-banner text for a failed load: the accurate,
-        /// protocol-named reason drawn straight from `error` (the resolver/decoder
-        /// taxonomy — e.g. "IPNS record did not verify: …"), never a generic
-        /// "failed". Empty when there is no failure (the banner is hidden then).
-        func errorBanner() -> String {
-            guard let error = error else { return "" }
-            // A TRANSIENT/timeout failure (retryable) is surfaced DISTINCTLY from a
-            // hard failure: a softer "timed out — reload to retry" (the Reload
-            // button IS the retry — a failed ENS load re-resolves), while a hard
-            // failure keeps the prominent "failed to load" wording + its
-            // protocol-named reason. The distinction is the core's `retryable`
-            // (task `clearer-loading-and-error-indicator`), the SAME fact desktop
-            // reads, so the two never disagree.
-            if retryable { return "⏳ This page timed out — reload to retry: \(error)" }
-            return "⚠ This page failed to load: \(error)"
-        }
-
-        /// Whether the surfaced failure is RETRYABLE (a transient timeout a reload
-        /// may fix), so the controller can show a retry affordance. `false` for a
-        /// hard failure or when nothing failed. The core's `retryable` fact,
-        /// matching desktop.
-        func errorIsRetryable() -> Bool { error != nil && retryable }
-
-        /// Whether the small "invalid URL" BADGE should be shown: exactly when the
-        /// last URL-bar entry was INVALID (a scheme-less garbage entry that did not
-        /// navigate). A pure read of the orthogonal `invalidEntry` fact — distinct
-        /// from a load error (`error`) — so the controller paints the badge + the
-        /// red-underlined URL bar from the SAME chrome-JSON fact desktop uses (field
-        /// finding D, task `scheme-less-entry-https-fallback-and-keep-bar-on-error`).
-        func invalidEntryVisible() -> Bool { invalidEntry != nil }
-
-        /// The small "invalid URL" badge text for an invalid entry, empty otherwise
-        /// (the badge is hidden then). Matches desktop's badge wording.
-        func invalidEntryBadge() -> String { invalidEntry != nil ? "⛔ invalid URL" : "" }
+            failureKind: nil, retryable: false, invalidEntry: nil,
+            statusLine: "", trustIndicator: "", trustIndicatorDetail: "",
+            errorBannerVisible: false, errorBannerText: "",
+            invalidEntryBadgeVisible: false, invalidEntryBadgeText: "",
+            loadProgressVisible: false, loadProgressFraction: 0, loadProgressHint: "")
 
         static func fromJSON(_ json: String) -> Chrome {
             guard let data = json.data(using: .utf8),
@@ -534,7 +469,21 @@ final class WerustCore {
                 error: o["error"] as? String,
                 failureKind: o["failureKind"] as? String,
                 retryable: o["retryable"] as? Bool ?? false,
-                invalidEntry: o["invalidEntry"] as? String)
+                invalidEntry: o["invalidEntry"] as? String,
+                // The DERIVED half. Each default is the EMPTY/absent value, never a
+                // Swift copy of the core's wording, for the same reason `.idle` is
+                // empty: a document that somehow lacked a derived field must show
+                // nothing rather than a second, drifting spelling of it.
+                statusLine: o["statusLine"] as? String ?? "",
+                trustIndicator: o["trustIndicator"] as? String ?? "",
+                trustIndicatorDetail: o["trustIndicatorDetail"] as? String ?? "",
+                errorBannerVisible: o["errorBannerVisible"] as? Bool ?? false,
+                errorBannerText: o["errorBannerText"] as? String ?? "",
+                invalidEntryBadgeVisible: o["invalidEntryBadgeVisible"] as? Bool ?? false,
+                invalidEntryBadgeText: o["invalidEntryBadgeText"] as? String ?? "",
+                loadProgressVisible: o["loadProgressVisible"] as? Bool ?? false,
+                loadProgressFraction: o["loadProgressFraction"] as? Double ?? 0,
+                loadProgressHint: o["loadProgressHint"] as? String ?? "")
         }
     }
 }

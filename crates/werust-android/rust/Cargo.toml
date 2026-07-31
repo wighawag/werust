@@ -13,7 +13,7 @@ name = "werust_mobile"
 # cdylib: the `libwerust_mobile.so` the APK carries and Kotlin loads via
 # System.loadLibrary. staticlib: the `.a` for anyone who wants to statically
 # link the core. rlib: so the host `cargo test` in the verify gate can exercise
-# the JVM-free logic (CoreSession/AndroidBackend/ffi_json) without the JNI layer.
+# the JVM-free logic (CoreSession/AndroidBackend/origin_map) without the JNI layer.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]

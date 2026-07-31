@@ -15,7 +15,7 @@ name = "werust_mobile"
 # (an iOS Simulator app has no runtime `dlopen` of a `.dylib` without signing,
 # so the Rust core is linked STATICALLY — the wezig-parity shape). rlib: so the
 # host `cargo test` in the verify gate can exercise the ObjC-free logic
-# (CoreSession/IosBackend/ffi_json) without the C-ABI/UIKit layer.
+# (CoreSession/IosBackend) without the C-ABI/UIKit layer.
 crate-type = ["staticlib", "rlib"]
 
 [dependencies]

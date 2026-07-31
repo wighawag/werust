@@ -34,7 +34,11 @@ plugins {
 //
 // Every lookup is failure-TOLERANT: a local untagged build must still succeed on
 // a placeholder, because a dev APK with a placeholder version is a far better
-// outcome than a dev build that fails.
+// outcome than a dev build that fails. That tolerance stops at the RELEASE path:
+// when CI injected `WERUST_VERSION` from a tag and it folds to no `versionCode`
+// (`v0.3.0-rc1`), the build FAILS instead, because a placeholder on a signed
+// release APK is the unsequenceable artifact this whole block exists to prevent
+// (task `android-release-tag-that-is-not-a-triple-must-not-ship-versioncode-1`).
 //
 // Decisions (the `major * 10000 + minor * 100 + patch` fold, the rejected CI
 // run number, and why the resolution is mirrored here instead of shelling out to
@@ -54,6 +58,20 @@ val devPlaceholderVersionCode = 1
 
 /** The `versionName` of last resort, when no version source resolves at all. */
 val devPlaceholderVersionName = "0.0.0"
+
+/**
+ * The version CI INJECTED from the release tag, trimmed, or `null` when
+ * `WERUST_VERSION` is unset or blank. This is the DEV-versus-RELEASE
+ * distinction, and everything tolerant below is keyed on it.
+ *
+ * It is deliberately NOT the shape of the resolved string: the other two sources
+ * (`git describe`, the workspace Cargo version) are dev sources by construction,
+ * so only the PRESENCE of this variable says "CI is cutting a release from a
+ * tag" — the one condition under which a placeholder version would be shipped to
+ * users rather than sitting on a developer's device (task
+ * `android-release-tag-that-is-not-a-triple-must-not-ship-versioncode-1`).
+ */
+val injectedReleaseVersion: String? = System.getenv("WERUST_VERSION")?.trim()?.takeIf { it.isNotEmpty() }
 
 /**
  * `git describe --tags --always` at the workspace root, or `null` when git is
@@ -120,7 +138,7 @@ fun stripTagPrefix(version: String): String =
  * never disagree even when it is stale.
  */
 fun resolveWerustVersion(): String? {
-    val resolved = listOf(System.getenv("WERUST_VERSION"), gitDescribe(), cargoWorkspaceVersion())
+    val resolved = listOf(injectedReleaseVersion, gitDescribe(), cargoWorkspaceVersion())
         .firstOrNull { !it.isNullOrBlank() }
         ?.trim()
         ?: return null
@@ -171,11 +189,42 @@ val resolvedWerustVersion: String? = resolveWerustVersion()
 val werustVersionName: String = resolvedWerustVersion ?: devPlaceholderVersionName
 
 /**
- * The integer Android sequences updates on. A folded release triple, else the
- * dev placeholder — which also covers the `0.0.0` placeholder name (no source
- * resolved at all), so the manifest never carries `versionCode = 0`.
+ * The integer Android sequences updates on. A folded release triple, else — on a
+ * DEV build only — the placeholder, which also covers the `0.0.0` placeholder
+ * name (no source resolved at all), so the manifest never carries
+ * `versionCode = 0`.
+ *
+ * The tolerance is keyed on dev-versus-release, NOT on the shape of the string.
+ * `.github/workflows/release.yml` triggers on `tags: [v*]`, so `v0.3.0-rc1` is
+ * an acceptable release tag: it resolves a correct `versionName` but folds to no
+ * `versionCode`, and a placeholder there would attach a SIGNED release APK
+ * carrying `versionCode = 1` — unsequenceable, un-updatable, indistinguishable
+ * from every dev build, i.e. exactly the bug the version mapping exists to
+ * remove. So an INJECTED version that cannot be folded fails the build loudly,
+ * the same treatment decision 5 gives a component that would collide, while a
+ * build with no injected version keeps today's tolerant placeholder so a local
+ * `./gradlew :app:assembleDebug` still builds and installs.
+ *
+ * Sequencing pre-release tags instead of rejecting them is a product decision
+ * this deliberately does NOT make; see decision 8 in
+ * docs/spikes/android-apk-signing/README.md.
  */
-val werustVersionCode: Int = versionCodeOf(werustVersionName)?.takeIf { it > 0 } ?: devPlaceholderVersionCode
+val werustVersionCode: Int = versionCodeOf(werustVersionName)?.takeIf { it > 0 } ?: run {
+    if (injectedReleaseVersion != null) {
+        throw GradleException(
+            "WERUST_VERSION=$injectedReleaseVersion cannot be folded into a versionCode, so this " +
+                "release APK could not be sequenced as an update: Android orders updates by a " +
+                "strictly increasing INTEGER versionCode, and only a clean major.minor.patch " +
+                "triple (optionally `v`-prefixed, minor and patch each <= 99) folds into one via " +
+                "`major * 10000 + minor * 100 + patch`. Falling back to the dev placeholder " +
+                "($devPlaceholderVersionCode) would ship a signed release no device could ever " +
+                "offer as an update. Tag a clean triple (e.g. `v0.3.0`); sequencing a " +
+                "pre-release tag such as `v0.3.0-rc1` is deliberately NOT designed — see " +
+                "decision 8 in docs/spikes/android-apk-signing/README.md.",
+        )
+    }
+    devPlaceholderVersionCode
+}
 
 android {
     namespace = "com.github.wighawag.werust"

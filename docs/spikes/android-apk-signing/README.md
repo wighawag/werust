@@ -115,6 +115,28 @@ cd crates/werust-android && ./gradlew :app:assembleRelease
 
 **What it touches:** the app module's Gradle build only. On CI the value is byte-identical to what the job already exported (`WERUST_VERSION` from the tag), so the release path is unchanged; the difference shows only in incremental LOCAL builds.
 
+### 8. A RELEASE tag that folds to no `versionCode` FAILS the build; sequencing pre-release tags is deliberately not designed
+
+**Chosen:** the placeholder fallback is keyed on **dev-versus-release**, not on the shape of the version string. When `WERUST_VERSION` is INJECTED (CI is cutting a release from a tag) and it does not fold to a valid `versionCode`, the build throws a `GradleException` naming the version, why it cannot be sequenced and the accepted shape. When it is absent (a local build), the tolerant placeholder is unchanged.
+
+**Why:** `.github/workflows/release.yml` triggers on `tags: [v*]`, so `v0.3.0-rc1` is an acceptable release tag today. On it, `versionName` resolves correctly to `0.3.0-rc1` but `versionCodeOf()` returns null, and the fallback then attached a **signed release APK carrying `versionCode = 1`**: unsequenceable, un-updatable, indistinguishable from every placeholder dev build — precisely the bug decision 4 exists to remove, reachable through the front door, and the exact opposite of what decision 5 already does for an out-of-range component. Decision 5's own argument applies unchanged: a loud red release job is recoverable in minutes; a published APK with a wrong `versionCode` is not recoverable at all. Keying on the injected variable rather than on the string is what keeps the two cases apart — the other two version sources (`git describe`, the workspace Cargo version) are dev sources by construction, so their non-triple shapes must stay tolerated.
+
+**Alternatives considered:** *fail on any non-triple, dev builds included* — rejected: it breaks every local `./gradlew :app:assembleDebug` in a checkout (a `git describe` version is never a clean triple), and a dev APK that will not build is worse than one with a placeholder version. *Keep the tolerant fallback and catch it in review* — rejected: the artifact is produced by CI on a tag push, so there is no review between the tag and the published APK.
+
+**The pre-release mapping is deliberately NOT designed here.** The alternative to rejecting `v0.3.0-rc1` is a mapping that can SEQUENCE it — reserving a digit for the pre-release, the way many Android projects fold `rc1` into a code just below the final release. That is a **product** decision about whether this project ever cuts pre-release tags at all, not a build detail, so it is abstained from rather than invented. If it is ever wanted, these are the things that would have to be decided:
+
+- **Whether pre-release tags are cut at all**, and whether they publish a *release* APK to users or only a workflow artifact. If the latter, the correct fix is the trigger/publication rule, not the mapping.
+- **The ordering rule**, i.e. that `0.3.0-rc1 < 0.3.0`, which means reserving digits *below* each release rather than above (e.g. `patch * 100 + preRelease`, with the final release taking the top of the band). Reserving them above would make an `rc` outrank the release it precedes.
+- **How much of the mapping's headroom to spend on it**, which interacts with decision 5's ≤ 99 limit and with decision 4's one-way constraint: a released `versionCode` can never be lowered, so widening for pre-releases can only ever shift codes *upward*, and every already-published code must keep its meaning.
+- **The pre-release grammar accepted** (`-rc1` only, or the full semver pre-release field `-alpha.2`, `-beta`), since the fold has to be total over whatever the tag trigger admits — or the same loud failure returns for the shapes it does not cover.
+
+**What it touches:** the app module's Gradle build and the `android-apk` release leg's tag path. It is a new ERROR path, but it can only fire on a tag whose APK would be unshippable anyway, and never on a dev build (no injected version → the placeholder path, exactly as before). It does not change the trigger in `release.yml`: a `v*` pre-release tag still starts the workflow, and the desktop/iOS legs still build — only the Android leg refuses, loudly, at the point where an unsequenceable APK would be minted.
+
+Two consequences worth stating plainly, because both are user-visible and neither is obvious from the rule:
+
+- **An EMPTY `WERUST_VERSION` is the dev path, not a release.** The workflow sets `WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}`, so on the `workflow_dispatch` dry run the variable is present but empty. Presence is therefore tested after trimming to non-empty, and the dry run keeps falling through to `git describe` + the placeholder exactly as before. A dry run that failed because it is not a tag would be absurd.
+- **A hand-set `WERUST_VERSION` that is not a triple now fails a LOCAL build too** (`WERUST_VERSION=vendor-build ./gradlew :app:assembleDebug` used to produce the placeholder; it now fails with the same message). That is the rule doing its job rather than a side effect: the variable's meaning is "this is the released version", so an operator who sets it by hand is asking for exactly the artifact the guard protects. The dev path is *not setting it*, which is what a plain `./gradlew :app:assembleDebug` does.
+
 ## What was verified locally
 
 Run against the real SDK/NDK before landing (not part of the pure-Rust gate):
@@ -130,10 +152,19 @@ For the version mapping (task `android-apk-version-from-the-release-tag`), again
 | `WERUST_VERSION=v0.3.0` (the tag path) | `300` | `0.3.0` |
 | `WERUST_VERSION=v0.2.9` | `209` | `0.2.9` |
 | `WERUST_VERSION=1.0.0` | `10000` | `1.0.0` |
-| `WERUST_VERSION=vendor-build` (an operator's named build) | `1` (placeholder) | `vendor-build` |
 | unset, in a checkout (the local dev path) | `1` (placeholder) | `0.2.9-91-ga94c477` |
 | unset, with git unavailable (`GIT_DIR=/nonexistent`) | `209` | `0.2.9` (the workspace Cargo version, the same last resort `build.rs` uses) |
 | `WERUST_VERSION=0.100.0` | build FAILS loudly (decision 5) | — |
+
+Re-run after decision 8 landed (Gradle 9.4.1, reading `defaultConfig` back out of the evaluated project), which is where the last three rows CHANGED — an injected version that folds to nothing no longer takes the placeholder:
+
+| environment | `versionCode` | `versionName` |
+| --- | --- | --- |
+| `WERUST_VERSION=v0.3.0` / `v0.2.9` / `1.0.0` | `300` / `209` / `10000` | `0.3.0` / `0.2.9` / `1.0.0` (unchanged) |
+| `WERUST_VERSION=v0.3.0-rc1` (a pre-release tag) | build FAILS loudly (decision 8) | — |
+| `WERUST_VERSION=vendor-build` (an operator's named build) | build FAILS loudly (decision 8; used to be the placeholder) | — |
+| `WERUST_VERSION=` (empty — the CI dry-run path) | `1` (placeholder) | `0.2.9-106-gf15aca7` |
+| unset (the local dev path) | `1` (placeholder) | `0.2.9-106-gf15aca7` |
 
 And end-to-end, reading the fields back out of a REAL `./gradlew :app:assembleDebug` APK with `aapt2 dump badging` (plus `strings` on the `libwerust_mobile.so` it packages, to check the core agrees):
 

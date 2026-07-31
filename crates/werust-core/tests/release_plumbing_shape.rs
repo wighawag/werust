@@ -1405,6 +1405,23 @@ fn android_version_code_folds_the_semver_triple_into_one_monotonic_integer() {
     );
 }
 
+/// The Gradle text that BINDS `werustVersionCode`: everything between its
+/// declaration and the `android { }` extension it feeds. The dev-versus-release
+/// branch lives here, so the assertions below can talk about that ONE decision
+/// site instead of sweeping the whole file (where the word `GradleException`
+/// also appears for the NDK lookup and the ≤ 99 collision guard).
+fn version_code_binding(gradle: &str) -> String {
+    let after = gradle
+        .split_once("val werustVersionCode")
+        .unwrap_or_else(|| panic!("{ANDROID_APP_GRADLE} must bind `werustVersionCode`"))
+        .1;
+    after
+        .split_once("android {")
+        .expect("the `android { }` extension follows the version block")
+        .0
+        .to_string()
+}
+
 #[test]
 fn a_local_untagged_android_build_keeps_working_on_a_placeholder() {
     // A local `./gradlew :app:assembleDebug` with no tag, no `WERUST_VERSION` and
@@ -1419,9 +1436,9 @@ fn a_local_untagged_android_build_keeps_working_on_a_placeholder() {
          build (named, so the fallback is visible)"
     );
     assert!(
-        gradle.contains("?: devPlaceholderVersionCode"),
-        "the resolved versionCode must FALL BACK to the placeholder when the version is absent or \
-         is not a clean triple, never fail the build"
+        version_code_binding(&gradle).contains("devPlaceholderVersionCode"),
+        "the resolved versionCode must FALL BACK to the placeholder when no version was INJECTED \
+         (the dev path), never fail an untagged local build"
     );
     assert!(
         gradle.contains("catch"),
@@ -1431,24 +1448,200 @@ fn a_local_untagged_android_build_keeps_working_on_a_placeholder() {
 }
 
 #[test]
+fn an_injected_release_version_that_cannot_be_sequenced_fails_the_apk_build() {
+    // Task `android-release-tag-that-is-not-a-triple-must-not-ship-versioncode-1`.
+    //
+    // `release.yml` triggers on `tags: [v*]`, so `v0.3.0-rc1` is an acceptable
+    // release tag today. It is not a clean triple, so it folds to no
+    // `versionCode` — and the placeholder fallback above would then attach a
+    // SIGNED release APK carrying `versionCode = 1`: unsequenceable,
+    // un-updatable, indistinguishable from every dev build. That is precisely the
+    // bug `android-apk-version-from-the-release-tag` existed to remove, reachable
+    // through the front door, and the OPPOSITE of what decision 5 already does
+    // for an out-of-range component (a loud `GradleException`).
+    //
+    // So the tolerance is keyed on DEV-versus-RELEASE, not on the shape of the
+    // string: the placeholder is right for a build with no injected version and
+    // wrong for one CI resolved from a tag. `WERUST_VERSION`'s PRESENCE is the
+    // only thing that says "a release is being cut" — the other two sources
+    // (`git describe`, the workspace Cargo version) are dev sources by
+    // construction.
+    let gradle = read_repo_file(ANDROID_APP_GRADLE);
+
+    // The distinction has to be NAMED, and read from the injected variable.
+    assert!(
+        gradle.contains("val injectedReleaseVersion"),
+        "{ANDROID_APP_GRADLE} must name the dev-versus-release distinction \
+         (`injectedReleaseVersion`), so the failure path keys on WHICH BUILD this is rather than \
+         on the shape of the resolved string"
+    );
+    let injected = gradle_assignment(&gradle, "val injectedReleaseVersion: String?");
+    assert!(
+        injected.contains("System.getenv(\"WERUST_VERSION\")"),
+        "`injectedReleaseVersion` must come from the PRESENCE of `WERUST_VERSION` (the variable \
+         the `android-apk` job sets only on a tag), not from the resolved version — `git \
+         describe` and the Cargo fallback are dev sources; got {injected:?}"
+    );
+
+    // The failure itself, at the one binding that decides the shipped code.
+    let binding = version_code_binding(&gradle);
+    assert!(
+        binding.contains("injectedReleaseVersion != null"),
+        "the versionCode binding must BRANCH on whether a version was injected: fail for a \
+         release, placeholder for a dev build; got:\n{binding}"
+    );
+    assert!(
+        binding.contains("throw GradleException"),
+        "an injected version that folds to no versionCode must FAIL the build loudly (the same \
+         treatment decision 5 gives an out-of-range component), never ship the placeholder; \
+         got:\n{binding}"
+    );
+
+    // The message has to be actionable: WHICH version, WHY it cannot be
+    // sequenced, and WHAT shape would work. A bare "invalid version" on a red
+    // release job costs the reader the whole investigation.
+    assert!(
+        binding.contains("$injectedReleaseVersion"),
+        "the failure message must NAME the offending version (interpolate \
+         `injectedReleaseVersion`); got:\n{binding}"
+    );
+    assert!(
+        binding.contains("sequence"),
+        "the failure message must say WHY it fails (it cannot be SEQUENCED as an update); \
+         got:\n{binding}"
+    );
+    assert!(
+        binding.contains("major.minor.patch"),
+        "the failure message must state the ACCEPTED shape (a clean `major.minor.patch` triple); \
+         got:\n{binding}"
+    );
+}
+
+#[test]
+fn the_pre_release_sequencing_mapping_is_recorded_as_deliberately_undesigned() {
+    // The alternative to failing is a mapping that CAN sequence a pre-release tag
+    // (reserving a digit for `rc1`, the way many Android projects do). That is a
+    // product decision about whether this project ever cuts pre-release tags at
+    // all, so it is deliberately NOT invented here — and "we did not decide this"
+    // is only useful if it is written down next to the decisions it abstains
+    // from, together with what would have to be settled if it is ever wanted.
+    let decisions = read_repo_file(ANDROID_DECISIONS);
+    assert!(
+        decisions.contains("pre-release"),
+        "{ANDROID_DECISIONS} must record what happens to a PRE-RELEASE tag (`v0.3.0-rc1`), since \
+         `release.yml`'s `v*` trigger accepts one"
+    );
+    assert!(
+        decisions.contains("rc1"),
+        "{ANDROID_DECISIONS} must name the concrete case (an `rc1` tag), not just the category"
+    );
+    assert!(
+        decisions.to_lowercase().contains("not designed")
+            || decisions.to_lowercase().contains("undesigned"),
+        "{ANDROID_DECISIONS} must say the pre-release sequencing mapping is deliberately NOT \
+         designed here (an abstention is a decision, and an unrecorded one reads as an oversight)"
+    );
+}
+
+/// Every value of `job` that could actually MINT something: each step's `run`
+/// script (with whole-line shell comments dropped, per [`shell_code_of`]) and
+/// every scalar under a `with:` or `env:` mapping, step-level and job-level.
+///
+/// Deliberately NOT "every string in the job". A step `name:` and an explanatory
+/// comment are DOCUMENTATION, and this repo's whole habit is a comment that
+/// explains WHY next to the thing it explains; a guard that reds the gate
+/// because the word it forbids appears in prose punishes the documentation
+/// instead of the defect. Only these three carry values the runner executes or
+/// hands to a tool, so they are where a second source could actually be minted.
+fn minting_values_of(job: &Value) -> Vec<String> {
+    /// The scalars under a node's `with:` / `env:` mappings.
+    fn handed_values(v: &Value) -> Vec<String> {
+        ["env", "with"]
+            .iter()
+            .filter_map(|key| v.get(key))
+            .flat_map(strings_of)
+            .collect()
+    }
+
+    let mut out = handed_values(job);
+    for step in job_steps(job) {
+        out.extend(handed_values(&step));
+        if let Some(run) = step.get("run").and_then(Value::as_str) {
+            out.push(shell_code_of(run));
+        }
+    }
+    out
+}
+
+#[test]
 fn the_android_leg_mints_no_second_version_source_in_the_workflow() {
     // The workflow's ONLY version input stays the job-level `WERUST_VERSION` the
     // shared loop above already pins. A version computed in the JOB (a run
     // number, a `git describe`, a hand-written versionCode passed as a Gradle
     // property) would be the second source that makes the APK manifest and the ⋮
     // menu disagree.
+    //
+    // Scoped to the values that could MINT one (`run` code, `with:`/`env:`
+    // values) rather than to the whole job, so an explanatory comment or a step
+    // name may say the words without reding the gate for a non-defect.
     let j = job("android-apk");
+    let values = minting_values_of(&j);
     for second_source in [
         "git describe",
         "github.run_number",
         "versionCode",
         "versionName",
     ] {
+        if let Some(offender) = values.iter().find(|v| v.contains(second_source)) {
+            panic!(
+                "the `android-apk` leg must not derive a version from `{second_source}`: the \
+                 version comes from `WERUST_VERSION`, resolved once, so the APK manifest and the \
+                 ⋮ menu cannot disagree. Found it in a run/with/env VALUE:\n{offender}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_second_version_source_guard_reads_values_not_comments() {
+    // The guard above is only worth having if it still has TEETH after being
+    // narrowed, so both halves are pinned here against synthetic jobs — the
+    // cheapest way to prove a NEGATIVE assertion is actually load-bearing rather
+    // than vacuously true.
+    let minting: Value = serde_yaml::from_str(
+        r#"
+steps:
+  - name: Build the APK
+    run: |
+      ./gradlew :app:assembleDebug -PversionCode="$(git describe --tags)"
+"#,
+    )
+    .expect("synthetic job YAML");
+    let minted = minting_values_of(&minting).join("\n");
+    for second_source in ["versionCode", "git describe"] {
         assert!(
-            !contains_substr(&j, second_source),
-            "the `android-apk` leg must not derive a version from `{second_source}`: the version \
-             comes from `WERUST_VERSION`, resolved once, so the APK manifest and the ⋮ menu \
-             cannot disagree"
+            minted.contains(second_source),
+            "the guard must still CATCH `{second_source}` in a `run:` value; got:\n{minted}"
+        );
+    }
+
+    let documented: Value = serde_yaml::from_str(
+        r#"
+steps:
+  - name: Build the APK (versionCode comes from Gradle, not from here)
+    # The versionName is resolved by build.gradle.kts from WERUST_VERSION.
+    run: |
+      # Not `git describe` here: that would mint a second version source.
+      ./gradlew :app:assembleDebug
+"#,
+    )
+    .expect("synthetic job YAML");
+    let documented_values = minting_values_of(&documented).join("\n");
+    for second_source in ["versionCode", "versionName", "git describe"] {
+        assert!(
+            !documented_values.contains(second_source),
+            "the guard must NOT fire on `{second_source}` in a step name, a YAML comment or a \
+             shell comment (documentation is not a second source); got:\n{documented_values}"
         );
     }
 }

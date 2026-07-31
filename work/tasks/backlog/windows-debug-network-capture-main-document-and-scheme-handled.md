@@ -21,6 +21,8 @@ Constraints that matter more than the wiring:
 - **Do not silently widen the macOS edge.** `install_debug_capture` lives in the SHARED `crates/desktop-paint` and the AppKit window consumes it. The Windows-specific capture points hang off the Windows backend; if any part is genuinely shared, keep `desktop-paint` a CARRIER (no new derivation) and say what you moved. macOS has the analogous gap with different platform hooks and owns it via `macos-debug-network-capture-main-document-and-scheme-handled` — do not fix it here by accident, and do not leave the macOS edge worse than it was.
 - **Say honestly what the chosen reach does and does not see.** If the wildcard filter really does see `<img>`/`<script>`/CSS `url()` on Windows, that is a REAL difference from macOS/iOS (whose subresource limit is accepted by the spec's Out of Scope) and belongs in the matrix row and the spike, not left implied. If it does not, record what it misses.
 
+> DRIFT NOTE (conductor, 2026-07-31, from a Gate-2 nit on `windows-parity-column-and-stub-tasks`). While you are in `crates/werust-windows/src/debugview.rs`, correct its doc comment: line ~8 says real Chrome DevTools are "one menu entry away" on Windows, while the capability matrix says — correctly, and deliberately — that the Windows menu carries NO devtools entry (F12 is the reach). The matrix is the accurate one. It is two words in a file this task already opens, and leaving it means the next reader believes a menu entry exists that does not.
+
 ## Acceptance criteria
 
 - [ ] After a load on Windows, the debug view's Network tab shows a MAIN-DOCUMENT row carrying the load's own two-axis trust posture (the same posture the chrome's trust indicator shows for that load), and it can never contradict the indicator.

@@ -320,3 +320,176 @@ impl LoadLifecycle {
 /// is built around exactly that constraint — only a `Send` VALUE crosses to the
 /// worker, and the lifecycle is mutated back on the marshalling thread.
 pub type SharedLifecycle = Rc<RefCell<LoadLifecycle>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // These are the LoadLifecycle STATE-MACHINE tests, and they live here beside
+    // the code they cover. They were written in `webview-renderer` (where this
+    // state machine started) and stayed there when the machine itself MOVED, so
+    // the shared crate shipped its central guarantee untested on any platform
+    // that is not Linux: `cargo test -p webview-shared` on the macOS runner ran
+    // the off-thread and URL-rule tests and nothing about the lifecycle at all.
+    // Moved by task `macos-spike-doc-accuracy-and-harness-guard` so the crate's
+    // guarantees travel WITH it, which is the whole point of a shared crate.
+    // Nothing about them changed: they drive `LoadLifecycle` directly and never
+    // touched GTK.
+
+    #[test]
+    fn a_same_document_url_change_emits_url_changed_without_a_load_transition() {
+        // Acceptance (desktop SPA tracking, headless): a same-document URL change
+        // (the WebKitGTK `notify::uri` / WKWebView `URL` KVO a backend observes for
+        // an SPA `pushState`) updates the current URL and emits a DISTINCT
+        // `LoadEvent::UrlChanged`, WITHOUT moving the load state or resetting the
+        // trust posture — the document (and its established verified/ENS posture)
+        // is unchanged. This pins the pure lifecycle behaviour that wiring drives,
+        // display-free (the platform signal itself needs a display).
+        let mut life = LoadLifecycle::default();
+        // A verified ENS load has settled on the root.
+        life.begin("ipfs://bafyroot/");
+        life.mark_ens_origin();
+        life.mark_content_verified();
+        life.commit("ipfs://bafyroot/");
+        life.finish("ipfs://bafyroot/");
+        let _ = life.poll(); // Started
+        let _ = life.poll(); // Committed
+        let _ = life.poll(); // Finished
+        assert_eq!(life.state(), LoadState::Finished);
+        assert_eq!(life.posture(), TrustPosture::NameViaTrustedRpc);
+
+        // A SPA client-side nav to a sub-path of the SAME document: only a URL
+        // change, no load. It emits `UrlChanged` and updates the current URL.
+        life.url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(
+            life.poll(),
+            Some(LoadEvent::UrlChanged {
+                url: "ipfs://bafyroot/portfolio".into()
+            })
+        );
+        assert_eq!(
+            life.current_url(),
+            Some("ipfs://bafyroot/portfolio"),
+            "the same-document URL change updates the reported URL"
+        );
+        // The load state and the posture are UNCHANGED: not a fresh load.
+        assert_eq!(life.state(), LoadState::Finished);
+        assert_eq!(
+            life.posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "a same-document nav within a verified site keeps its posture"
+        );
+
+        // A URL notification that merely echoes the CURRENT URL emits nothing (a
+        // real load's optimistic `begin` already set it), so no spurious event.
+        life.url_changed("ipfs://bafyroot/portfolio");
+        assert_eq!(life.poll(), None, "an unchanged URI emits no event");
+    }
+
+    #[test]
+    fn an_ens_resolved_load_reports_the_name_via_trusted_rpc_posture_and_does_not_leak() {
+        // Acceptance: the name-via-trusted-RPC posture tracks the ACTUAL load path
+        // (a load whose CID came from an ENS resolution over the trusted RPC), set
+        // via `mark_name_via_trusted_rpc` exactly as the front-door path calls it.
+        // It is a distinct middle state (never "verified"), and it does NOT leak
+        // onto a later plain served load: a fresh `begin` resets it.
+        let life: SharedLifecycle = Rc::new(RefCell::new(LoadLifecycle::default()));
+
+        // A bare `.eth` load: begin resets to untrusted, THEN the front door
+        // resolves the name over the trusted RPC, feeds the CID into the verified
+        // ipfs path, and marks the load name-via-trusted-RPC.
+        life.borrow_mut().begin("ronan.eth");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "begin resets: a `.eth`-looking URL is not trusted until it actually resolves"
+        );
+        life.borrow_mut().mark_name_via_trusted_rpc();
+        life.borrow_mut().commit("ronan.eth");
+        life.borrow_mut().finish("ronan.eth");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "a real ENS trusted-RPC resolution surfaces the name-via-trusted-RPC posture"
+        );
+        // Honesty: this is NOT content-verified, so it is never labelled verified.
+        assert!(!life.borrow().posture().is_content_verified());
+
+        // A later plain served load: begin resets the posture; no hook runs. The
+        // name-via-trusted-RPC posture does not leak onto it.
+        life.borrow_mut().begin("https://example.com/");
+        life.borrow_mut().commit("https://example.com/");
+        life.borrow_mut().finish("https://example.com/");
+        assert_eq!(
+            life.borrow().posture(),
+            TrustPosture::UnverifiedOrigin,
+            "the name-via-trusted-RPC posture does not leak onto a later plain served load"
+        );
+    }
+
+    #[test]
+    fn the_ens_origin_flag_redirects_the_scheme_handlers_verified_mark_and_does_not_leak() {
+        // The load-bearing posture-clash mechanism the front door owns: the
+        // `ipfs://` scheme handler calls `mark_content_verified` UNCONDITIONALLY;
+        // an ENS-originated load (flagged via `mark_ens_origin`, exactly as the
+        // front door does after starting the `ipfs://<cid>` load) must surface
+        // `NameViaTrustedRpc` from that SAME unconditional mark, while a plain
+        // ipfs load surfaces plain `ContentVerified` — and neither leaks onto a
+        // later load (a fresh `begin` clears the flag).
+        let mut life = LoadLifecycle::default();
+
+        // An ENS-originated verified load: begin, flag ENS, THEN the scheme
+        // handler's unconditional verified mark redirects to the ENS posture.
+        life.begin("ipfs://bafyenscid/index.html");
+        assert!(!life.is_ens_origin(), "begin resets the flag");
+        life.mark_ens_origin();
+        assert!(life.is_ens_origin());
+        life.mark_content_verified(); // the scheme handler's UNCONDITIONAL mark
+        assert_eq!(
+            life.posture(),
+            TrustPosture::NameViaTrustedRpc,
+            "the ENS-origin flag makes the scheme handler's mark surface the ENS posture"
+        );
+        assert!(
+            !life.posture().is_content_verified(),
+            "never labelled verified"
+        );
+
+        // A later PLAIN ipfs load: begin clears the ENS flag, so the SAME
+        // unconditional verified mark surfaces plain content-verified — the ENS
+        // posture does not leak.
+        life.begin("ipfs://bafyplaincid/index.html");
+        assert!(!life.is_ens_origin(), "a fresh begin clears the ENS flag");
+        life.mark_content_verified();
+        assert_eq!(
+            life.posture(),
+            TrustPosture::ContentVerified,
+            "a plain ipfs load is plain content-verified, not the ENS posture"
+        );
+
+        // A later plain served load (no verified mark) is untrusted.
+        life.begin("https://example.com/");
+        assert_eq!(life.posture(), TrustPosture::UnverifiedOrigin);
+    }
+
+    #[test]
+    fn an_ens_flagged_load_that_fails_verification_is_never_marked() {
+        // Fail-closed at the lifecycle: an ENS-flagged load whose bytes never
+        // verify (the scheme handler returns an error and never calls
+        // `mark_content_verified`) stays untrusted — the ENS flag alone claims
+        // NOTHING.
+        let mut life = LoadLifecycle::default();
+        life.begin("ipfs://bafyenscid/");
+        life.mark_ens_origin();
+        // No verified mark: the load failed verification.
+        life.fail(
+            "ipfs://bafyenscid/",
+            "ipfs:// content-addressed load failed: hash mismatch",
+        );
+        assert_eq!(
+            life.posture(),
+            TrustPosture::UnverifiedOrigin,
+            "an ENS-flagged load that never verified is never reported trusted"
+        );
+    }
+}

@@ -1234,6 +1234,31 @@ fn readme_states_the_macos_artifact_is_unsigned_and_how_to_open_it() {
         "the README must give the quarantine-clearing command (how to actually OPEN an unsigned \
          `.app`)"
     );
+    // And the instruction a reader tries FIRST must be one that still works on a
+    // CURRENT macOS. Sequoia (15) REMOVED right-click -> Open as a Gatekeeper
+    // bypass for an unsigned app; the surviving GUI path is System Settings ->
+    // Privacy & Security -> Open Anyway. Leading with the withdrawn flow promises
+    // behaviour the platform took away, so it must not come first.
+    let open_anyway = readme.find("Open Anyway").expect(
+        "the README must give the Sequoia-era GUI path (Privacy & Security -> Open Anyway)",
+    );
+    assert!(
+        readme.contains("Privacy & Security"),
+        "the README must name where that GUI path lives (System Settings -> Privacy & Security)"
+    );
+    if let Some(right_click) = readme.find("right-click") {
+        assert!(
+            open_anyway < right_click,
+            "the README must LEAD with the path that works on a current macOS (Open Anyway); \
+             right-click -> Open was removed as a Gatekeeper bypass for unsigned apps in \
+             macOS 15 (Sequoia) and may only appear afterwards, labelled as the older path"
+        );
+        assert!(
+            readme[right_click..].contains("Sequoia") || readme[..right_click].contains("Sequoia"),
+            "if the README keeps the right-click path it must say which macOS versions it \
+             still applies to (pre-Sequoia)"
+        );
+    }
     assert!(
         readme.contains("android-apk-signing"),
         "the README must NAME the signing follow-on by pointing at the precedent it will copy \

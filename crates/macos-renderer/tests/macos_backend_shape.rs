@@ -656,3 +656,39 @@ fn the_verification_honesty_is_recorded() {
         "the iOS parity caveat must point at the macOS measurement that addresses it"
     );
 }
+
+#[test]
+fn the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger() {
+    // A doc that promises a trigger the workflow does not have is worse than no
+    // doc at all: the README tells a reader the leg re-runs on a pull request
+    // that changes "the backend, the probe or the recorded verdict", so a PR that
+    // re-records `expected.json` after a deliberate re-decision would be reviewed
+    // believing WebKit had just been re-measured against it. The recorded verdict
+    // lives in this spike directory, so the `pull_request` path filter must cover
+    // it -- the claim and the trigger are held to each other HERE, because prose
+    // and YAML drift apart silently.
+    let readme = source("docs/spikes/macos-wkwebview-renderer-backend/README.md");
+    assert!(
+        readme.contains("the backend, the probe or the recorded verdict changes"),
+        "the README must state when the leg runs; if that sentence changes, change \
+         this test and the workflow's path filter with it"
+    );
+    let workflow = source(".github/workflows/macos-renderer.yml");
+    let pull_request = between(&workflow, "  pull_request:", "\npermissions:");
+    for claimed in [
+        // "the backend"
+        "crates/macos-renderer/**",
+        "crates/werust-macos/**",
+        // "the probe"
+        "crates/macos-origin-probe/**",
+        // "the recorded verdict" -- `expected.json` and the run it was stamped
+        // from, which live beside this README.
+        "docs/spikes/macos-wkwebview-renderer-backend/**",
+    ] {
+        assert!(
+            pull_request.contains(claimed),
+            "the `pull_request` path filter must cover `{claimed}`: the spike README \
+             claims a PR touching it re-runs the leg"
+        );
+    }
+}

@@ -29,8 +29,10 @@ Every tagged release attaches `Werust-macos-universal-unsigned.app.zip`: a `Weru
 
 It is **unsigned and unnotarized** (no Apple Developer account is involved), so Gatekeeper refuses a plain double-click the first time. Open it either way:
 
-- right-click (or Control-click) `Werust.app`, choose **Open**, then **Open** again in the dialog; or
-- clear the quarantine flag first: `xattr -d com.apple.quarantine /path/to/Werust.app`.
+- double-click `Werust.app` once and let it be blocked, then open **System Settings -> Privacy & Security**, find the message naming `Werust.app` near the bottom, and click **Open Anyway**; or
+- clear the quarantine flag first: `xattr -d com.apple.quarantine /path/to/Werust.app` (this one works on every macOS version, including from a terminal over ssh).
+
+On **macOS 14 (Sonoma) and older** there is a third way: right-click (or Control-click) `Werust.app`, choose **Open**, then **Open** again in the dialog. **macOS 15 (Sequoia) removed that bypass** for apps that are not signed and notarized, so on a current Mac it silently does nothing useful and the two options above are the ones that work.
 
 Signing and notarization are a deliberate FOLLOW-ON, the macOS analogue of the landed `android-apk-signing` leg, and when it comes it should copy that leg's pattern: gate on a secrets-presence flag, no-op gracefully without it, name the artifacts honestly. Until then this build is for developers and early testers, not for general distribution. Decisions and what still awaits a human on a Mac: [`docs/spikes/macos-release-packaging-leg/README.md`](docs/spikes/macos-release-packaging-leg/README.md).
 

@@ -56,6 +56,13 @@ on:
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
       - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"
+  # DELIBERATELY IDENTICAL to the push filter above (GitHub Actions has no
+  # anchors, so it is duplicated rather than shared). The docs paths are the
+  # load-bearing addition: the RECORDED VERDICT (`expected.json` and the verbatim
+  # run it is stamped from) lives in the spike directory, and re-recording it
+  # after a deliberate re-decision is exactly the pull request that most needs
+  # WebKit re-measured against it. Leaving it out also let a PR merge without the
+  # leg and then red `main`, which is the worst place to learn.
   pull_request:
     paths:
       - "crates/macos-renderer/**"
@@ -63,7 +70,11 @@ on:
       - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
+      - "crates/renderer/**"
       - "crates/werust-core/**"
+      - "crates/fetcher/**"
+      - "docs/spikes/macos-wkwebview-renderer-backend/**"
+      - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"
 
 permissions:

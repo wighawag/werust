@@ -13,7 +13,8 @@
 # WHAT THE STAND-IN CORE DOES AND DOES NOT PROVE: `werust-core` is swapped for a
 # tiny API-compatible fake here (see THE ONE OBSTACLE below), so this check
 # proves the AppKit/objc2 wiring, NOT that the window agrees with the real core's
-# signatures. That agreement is proven where it belongs: `paint.rs` -- the ONLY
+# signatures. That agreement is proven where it belongs: `crates/desktop-paint`
+# -- the shared painter carrier `werust_macos::paint` re-exports, and the ONLY
 # place `werust-macos` touches the chrome derivation -- compiles and is
 # unit-tested against the REAL `werust-core` on every Ubuntu `verify` run, and
 # the window reads plain `paint` structs. Keep it that way: a window that starts
@@ -22,9 +23,11 @@
 # THE ONE OBSTACLE: `fetcher` -> `ureq` -> `rustls` -> `ring`, whose build script
 # compiles C and fails for an Apple target on Linux ("no such file
 # bits/libc-header-start.h"). So this script builds a scratch workspace OUTSIDE
-# the repo that symlinks the REAL macOS sources but swaps `werust-core`,
-# `fetcher` and `webview-shared` for tiny API-compatible stand-ins. That is enough
-# to type-check every `objc2` call, every `define_class!` block and every seam
+# the repo that symlinks the REAL macOS sources but swaps `werust-core` and
+# `fetcher` for tiny API-compatible stand-ins. The two toolkit-free SHARED crates
+# (`webview-shared` for the backend, `desktop-paint` for the window) are checked
+# as their REAL source, merely re-pointed at those stand-ins. That is enough to
+# type-check every `objc2` call, every `define_class!` block and every seam
 # signature, which is what the SDK-free check is for.
 #
 # WHAT IT IS NOT: a build. It does not link against AppKit/WebKit and it cannot
@@ -42,17 +45,66 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 SCRATCH="${SCRATCH_DIR:-${TMPDIR:-/tmp}/werust-macos-typecheck}"
 
+# Absolute, symlink-resolved path for a location that need not exist yet: walk up
+# to the deepest EXISTING ancestor, resolve THAT, and re-append the rest. (Plain
+# `cd "$dir" && pwd -P` cannot resolve a directory this script has not created.)
+absolute_path() {
+  local path="$1" tail="" parent
+  case "$path" in /*) ;; *) path="$PWD/$path" ;; esac
+  while [ ! -d "$path" ]; do
+    tail="/$(basename "$path")$tail"
+    parent="$(dirname "$path")"
+    [ "$parent" = "$path" ] && break
+    path="$parent"
+  done
+  printf '%s\n' "$(cd "$path" && pwd -P)$tail"
+}
+
+# THE GUARD ON THE `rm -rf` BELOW. This script rebuilds its scratch workspace
+# from nothing on every run, so it deletes that directory first -- and the
+# directory is CALLER-supplied via `SCRATCH_DIR`. The default is safe; an
+# exported or mistyped `SCRATCH_DIR` pointing at a working directory is not, and
+# a committed harness must not eat a directory on a typo. So the delete only ever
+# happens strictly BELOW a temp root; anything else refuses with a message rather
+# than deleting. Why an allowlist (and what it costs an operator who wanted a
+# scratch disk elsewhere):
+# `docs/spikes/macos-spike-doc-accuracy-and-harness-guard/DECISIONS.md`, choice 1.
+# The refusal is exercised on the ordinary Ubuntu gate by
+# `crates/macos-renderer/tests/typecheck_harness_guard.rs`.
+SCRATCH="$(absolute_path "$SCRATCH")"
+under_a_temp_root=false
+for root in "${TMPDIR:-/tmp}" /tmp /var/tmp; do
+  [ -d "$root" ] || continue
+  root="$(cd "$root" && pwd -P)"
+  case "$SCRATCH" in "$root"/?*) under_a_temp_root=true ;; esac
+done
+
+if [ "$under_a_temp_root" != true ]; then
+  cat >&2 <<EOF
+REFUSING to delete SCRATCH_DIR: $SCRATCH
+
+This harness rebuilds its scratch workspace on every run, so it would "rm -rf"
+that directory first. It does that only strictly below a temp root -- one of
+${TMPDIR:-/tmp}, /tmp or /var/tmp -- never in a working directory, so a mistyped
+or left-over exported SCRATCH_DIR cannot delete your files.
+
+Unset SCRATCH_DIR to use the default (${TMPDIR:-/tmp}/werust-macos-typecheck),
+or point it at a path under a temp root.
+EOF
+  exit 1
+fi
+
 if ! rustup target list --installed | grep -q '^aarch64-apple-darwin$'; then
   echo "installing the aarch64-apple-darwin std..." >&2
   rustup target add aarch64-apple-darwin
 fi
 
 rm -rf "$SCRATCH"
-mkdir -p "$SCRATCH"/{src,examples,fake-core/src,fake-fetcher/src,fake-shared,window}
+mkdir -p "$SCRATCH"/{src,examples,fake-core/src,fake-fetcher/src,fake-shared,fake-paint,window}
 
 cat > "$SCRATCH/Cargo.toml" <<EOF
 [workspace]
-members = ["fake-core", "fake-fetcher", "fake-shared", "window"]
+members = ["fake-core", "fake-fetcher", "fake-shared", "fake-paint", "window"]
 
 [package]
 name = "werust-macos-typecheck"
@@ -419,6 +471,10 @@ pub fn load_progress_fraction(_state: &ChromeState) -> f64 {
 pub fn load_progress_hint(_state: &ChromeState) -> &'static str {
     ""
 }
+pub const STOP_AFFORDANCE_LABEL: &str = "";
+pub fn load_progress_tooltip(_state: &ChromeState, _stop_label: &str) -> Option<String> {
+    None
+}
 
 pub struct BrowserShell {
     chrome: ChromeState,
@@ -508,6 +564,23 @@ fetcher = { path = "../fake-fetcher" }
 EOF
 ln -sfn "$REPO/crates/webview-shared/src" "$SCRATCH/fake-shared/src"
 
+# `desktop-paint` gets the SAME treatment as `webview-shared`, and for the same
+# reason: it is the window's REAL, toolkit-free painter carrier (extracted out of
+# `werust-macos::paint` by task `windows-win32-window-and-chrome` so the Win32
+# window shares one carrier), so it is checked as its real source with only its
+# `werust-core` re-pointed at the stand-in. Depending on the repo crate directly
+# would drag the REAL core -- and therefore `ring` -- back into the graph.
+cat > "$SCRATCH/fake-paint/Cargo.toml" <<EOF
+[package]
+name = "desktop-paint"
+version = "0.2.9"
+edition = "2021"
+[dependencies]
+renderer = { path = "$REPO/crates/renderer" }
+werust-core = { path = "../fake-core" }
+EOF
+ln -sfn "$REPO/crates/desktop-paint/src" "$SCRATCH/fake-paint/src"
+
 # The REAL macOS sources, by symlink, so this always checks what is committed.
 ln -sf "$REPO/crates/macos-renderer/src/backend.rs" "$SCRATCH/src/backend.rs"
 ln -sf "$REPO/crates/macos-renderer/src/pure.rs" "$SCRATCH/src/pure.rs"
@@ -523,9 +596,10 @@ EOF
 
 # The WINDOW crate (`crates/werust-macos`): the same treatment, as a member of
 # the same scratch workspace so it links against the REAL `macos-renderer`
-# sources above. Its `paint.rs` is symlinked in too even though the Ubuntu gate
-# already compiles it -- the point here is that the AppKit half agrees with the
-# paint half, which is only checkable when both are present.
+# sources above. The shared painter (`desktop-paint`, re-exported as
+# `werust_macos::paint`) is wired in too even though the Ubuntu gate already
+# compiles it -- the point here is that the AppKit half agrees with the paint
+# half, which is only checkable when both are present.
 cat > "$SCRATCH/window/Cargo.toml" <<EOF
 [package]
 name = "werust-macos"
@@ -543,6 +617,7 @@ path = "examples/window_smoke.rs"
 [dependencies]
 renderer = { path = "$REPO/crates/renderer" }
 werust-core = { path = "../fake-core" }
+desktop-paint = { path = "../fake-paint" }
 macos-renderer = { path = "..", package = "werust-macos-typecheck" }
 
 [dev-dependencies]
@@ -558,7 +633,6 @@ sed -n "/^\[target\.'cfg(target_os = \"macos\")'\.dependencies\]/,\$p" \
 
 mkdir -p "$SCRATCH/window/src" "$SCRATCH/window/examples"
 ln -sf "$REPO/crates/werust-macos/src/lib.rs" "$SCRATCH/window/src/lib.rs"
-ln -sf "$REPO/crates/werust-macos/src/paint.rs" "$SCRATCH/window/src/paint.rs"
 ln -sf "$REPO/crates/werust-macos/src/window.rs" "$SCRATCH/window/src/window.rs"
 ln -sf "$REPO/crates/werust-macos/examples/window_smoke.rs" \
   "$SCRATCH/window/examples/window_smoke.rs"

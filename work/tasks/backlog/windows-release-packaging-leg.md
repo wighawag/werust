@@ -20,6 +20,8 @@ Build `werust-windows` for `x86_64-pc-windows-msvc` on the `windows-latest` runn
 
 Add the manifest (an `embed-resource`-style build script, or the linker's `/MANIFEST` inputs — pick one and record why), then RE-CHECK the two consequences above by hand on a real Windows box and update that spike's list, because CI cannot judge either.
 
+**The visual-styles half is a tracked PARITY GAP, so this task also owns a matrix cell.** `windows-parity-column-and-stub-tasks` had to mark `follow-os-color-scheme`'s `windows` cell `stubbed` and point it HERE, because the light-buttons-in-dark-mode behaviour is a user-visible ADR-0009 shortfall no code in the window can close and the manifest is the fix — see `work/notes/observations/windows-parity-column-decisions-2026-07-31.md` (decision 1) for why a second manifest task was NOT cut instead. So when the manifest lands and the by-hand check confirms the chrome follows dark mode, flip that cell to `implemented` in the same change, naming what proves it.
+
 **Unsigned, deliberately.** No code signing, no installer: those need a certificate and are a separate follow-on, the Windows analogue of `android-apk-signing` (and of the macOS notarization gap). An unsigned zip means SmartScreen will warn on first run; say so in the README rather than pretending the artifact is ready for general distribution. If you add a signing path later, follow the Android precedent: gate on a secrets-presence env flag, graceful no-op without it, honest artifact naming.
 
 **The WebView2 Runtime is a RUNTIME DEPENDENCY, and the artifact must say so.** It ships with Windows 11 and is on most Windows 10 machines, but "no installer ever needed" is not a promise werust can make (`docs/adr/0011` finding 6). The engine already fails honestly, naming the runtime and pointing at the download; the release notes / README must name it too, so a user meets that fact before the download rather than after.
@@ -44,6 +46,7 @@ ADR sizing: 2 to 4 person-days.
 - [ ] The workflow shape is pinned by a `release_plumbing_shape.rs`-style test; network-isolated.
 - [ ] The README states the artifact is UNSIGNED (and what SmartScreen will do), and that the WebView2 Runtime is required, and names the signing follow-on.
 - [ ] `docs/spikes/windows-win32-window-and-chrome/README.md`'s "what awaits real Windows hardware" list is updated for the two items the manifest closes — by MANUAL check on a real box, not by assertion.
+- [ ] Once that manual check confirms the chrome follows dark mode, the `follow-os-color-scheme` row's `windows` cell in `docs/platform-capability-matrix.toml` flips from `stubbed` to `implemented`, naming what proves it; the parity guard stays green with no weakening. (If the check does NOT confirm it, the cell stays `stubbed` and says what is still wrong — do not flip it on the manifest alone.)
 
 ## Prompt
 

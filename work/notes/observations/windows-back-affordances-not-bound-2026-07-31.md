@@ -1,0 +1,7 @@
+# Windows: the keyboard/mouse and swipe Back affordances are not bound (2026-07-31)
+
+Noticed while filling the `windows` column of `docs/platform-capability-matrix.toml` (task `windows-parity-column-and-stub-tasks`): the Win32 window binds nothing for the Back affordances a Windows user expects beside the on-screen `◀` button. Its URL-bar subclass handles exactly `VK_RETURN` and `VK_F12`, and a grep across `crates/werust-windows` and `crates/windows-renderer` finds no `Alt+Left`, no `VK_BROWSER_BACK`, no `WM_APPCOMMAND` (which is how the multimedia Back key and the mouse's fourth button arrive), and no `XBUTTON` handling. Whatever the page itself does with those keys is WebView2's own behaviour, not werust's, and only when the page has the focus.
+
+Likewise `IsSwipeNavigationEnabled` (WebView2's touch / precision-touchpad swipe-to-navigate) is never touched, so it sits at whatever the evergreen runtime defaults to. Nothing in this repo has measured which that is on a real machine.
+
+Not fixed here (out of this task's matrix-and-stub-tasks scope). Recorded because the new `system-back-navigates-history` cell marks Windows `n-a` — Windows genuinely has no OS-level system Back routed to the app, and nothing exits the app when Back is unhandled — and points at this note as the place its platform analogues live, so "n-a" is not read as "Alt+Left and the swipe work". Same shape as the iOS and macOS notes on the WebKit back gesture.

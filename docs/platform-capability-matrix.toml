@@ -2,8 +2,9 @@
 # the `verify`-enforced parity guard; see docs/adr/0005-platform-capability-parity-guard.md).
 #
 # WHY THIS FILE EXISTS: werust ships several contexts (`desktop` = the Linux
-# WebKitGTK shell, `macos` = the AppKit + WKWebView shell, iOS WKWebView,
-# Android System WebView), each an OS edge over the shared
+# WebKitGTK shell, `macos` = the AppKit + WKWebView shell, `windows` = the Win32
+# + WebView2 shell, iOS WKWebView, Android System WebView), each an OS edge over
+# the shared
 # `werust-core` seams. A cross-cutting user-facing CAPABILITY (address bar,
 # back/forward, `ipfs://` render, ENS `.eth` resolution, EIP-1193 provider,
 # trust indicator) can silently ship on ONE platform only when a seam method is
@@ -36,12 +37,13 @@
 
 # The shipped contexts. Adding one here forces a cell in every capability row.
 #
-# `desktop` is the LINUX GTK/WebKitGTK shell specifically (the name predates a
-# second desktop edge; `macos` sits beside it rather than under it). A rename to
-# `linux` would touch this file, the guard's expected list, ADR-0005 and the
-# pending `windows` column, so it is left to a human: see
+# `desktop` is the LINUX GTK/WebKitGTK shell specifically (the name predates the
+# other desktop edges; `macos` and `windows` sit BESIDE it rather than under it,
+# and there are now three desktops). A rename to `linux` would touch this file,
+# the guard's expected list, ADR-0005 and all three desktop columns, so it is
+# left to a human: see
 # work/notes/observations/desktop-platform-key-now-means-linux-only-2026-07-31.md.
-platforms = ["desktop", "macos", "ios", "android"]
+platforms = ["desktop", "macos", "windows", "ios", "android"]
 
 # ---------------------------------------------------------------------------
 # Capabilities, seeded with CURRENT REALITY (2026-07-23). The guard passes today
@@ -60,8 +62,18 @@ description = "URL bar: type/commit a URL, reflect the current URL in the chrome
 # WIDGET on a macos-14 runner by `crates/werust-macos/examples/window_smoke.rs`
 # (run 30572253620): after a hash-verified load the bar holds the loaded
 # content-addressed URL. Task `macos-appkit-window-and-chrome`.
+# Windows: the Win32 `EDIT` URL bar paints `ChromeState::url_text` through the
+# SAME shared `desktop-paint` snapshot the AppKit bar reads (`SetWindowTextW`,
+# only when the text changed, so the caret never jumps) and commits the RAW typed
+# text to `BrowserShell::navigate` (the URL bar's `SetWindowSubclass`, which
+# exists because a Win32 `EDIT` swallows Enter), over `Webview2Renderer`'s
+# `navigate` + `current_url`. READ BACK OUT OF THE REAL WIDGET on a
+# `windows-latest` runner by `crates/werust-windows/examples/window_smoke.rs`
+# (run 30589670305): after a hash-verified load the bar holds the loaded
+# content-addressed URL. Task `windows-win32-window-and-chrome`.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -90,8 +102,20 @@ description = "Track a SAME-DOCUMENT (SPA client-side) URL change — a SvelteKi
 # observation COMPILES and registers on macOS (macos-renderer CI leg), but no CI
 # step performs a `pushState`, so the macOS evidence is compilation + the
 # source-shape guard over the shared rule, not a driven SPA navigation.
+# Windows observes WebView2's own same-document signal and feeds the same shared
+# rule: the backend's `add_SourceChanged` handler treats `IsNewDocument == FALSE`
+# as the same-document change and drives `LoadLifecycle::url_changed`, which is a
+# no-op when the URL already matches a real load — so only a genuine
+# same-document change surfaces `UrlChanged`, moving neither the load state nor
+# the posture. It COMPILES and LINKS on the Windows leg and is held by the
+# backend's source-shape guard, and the origin probe separately measured that
+# `history.pushState` SUCCEEDS on a registered `ipfs://` origin here; but no CI
+# step drives a `pushState` THROUGH this backend, so the Windows evidence is
+# compilation + the shape guard over the shared rule, not an observed SPA
+# navigation (docs/spikes/windows-webview2-renderer-backend/README.md).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -104,8 +128,15 @@ description = "Session history: go_back / go_forward and their availability."
 # `WKWebView`'s own back-forward list, and the AppKit ◀ / ▶ buttons take their
 # enabled state from `ChromeState::can_go_back` / `_forward` through the shared
 # paint snapshot — the same one fact the on-screen control everywhere else reads.
+# Windows: `Webview2Renderer` implements go_back/go_forward/can_go_* over
+# WebView2's own history, and the toolbar's ◀ / ▶ buttons take their enabled
+# state from `ChromeState::can_go_back` / `_forward` through the shared paint
+# snapshot (`EnableWindow`) — the same one fact the on-screen control everywhere
+# else reads. Wired and shape-guarded; nothing in the CI run pressed Back
+# (docs/spikes/windows-win32-window-and-chrome/README.md).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -146,8 +177,11 @@ description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back t
 # its own enablement (`allowsBackForwardNavigationGestures`), noted as a separate
 # signal in work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md
 # rather than folded into this row.
+# Windows is `n-a` for the same reason the other two desktops are: nothing at the
+# OS level routes a Back to the app and nothing exits it when Back is unhandled.
 desktop = { state = "n-a", reason = "a GTK desktop window has no OS-level system Back button/gesture the app must handle; desktop Back is the on-screen control (capability `back-forward`)" }
 macos = { state = "n-a", reason = "a macOS window has no OS-level system Back button/gesture the app must handle (nothing routes Back to the app, and nothing exits it); macOS Back is the on-screen control, capability `back-forward`. Its platform analogue is the WKWebView two-finger swipe-back gesture, a distinct affordance with its own enablement (`allowsBackForwardNavigationGestures`), tracked separately in work/notes/observations/macos-swipe-back-gesture-not-enabled-2026-07-31.md" }
+windows = { state = "n-a", reason = "a Win32 desktop window has no OS-level system Back button/gesture the app must handle (nothing routes Back to the app, and nothing exits it); Windows Back is the on-screen control, capability `back-forward`. Its platform analogues are keyboard/mouse Back (Alt+Left, the `VK_BROWSER_BACK` key) and WebView2's own touch/precision-touchpad swipe navigation, distinct affordances werust binds nothing for and leaves at the runtime default, tracked separately in work/notes/observations/windows-back-affordances-not-bound-2026-07-31.md" }
 ios = { state = "n-a", reason = "iOS has no hardware/system Back button delivered to the app; its platform analogue is the WKWebView edge-swipe back gesture, a distinct affordance tracked separately (see work/notes/observations/ios-edge-swipe-back-gesture-not-enabled-2026-07-26.md)" }
 android = { state = "implemented" }
 
@@ -161,8 +195,15 @@ description = "Bare `.eth` URL-bar entry resolved namehash -> resolver -> conten
 # resolver -> contenthash path. Same basis as the iOS/Android cells (the shared
 # core, exercised by its own tests on every gate); no macOS CI step resolves a
 # real name, because the macos-14 smokes are deliberately offline.
+# Windows adds NOTHING here and needs to: the Win32 URL bar hands the raw entry
+# to the same `BrowserShell`, which owns the RPC provider and the namehash ->
+# resolver -> contenthash path. Same basis as the macOS/iOS/Android cells (the
+# shared core, exercised by its own tests on every gate, and on the Windows leg
+# too since it runs the `werust-core` suite there); no Windows CI step resolves a
+# real name, because the `windows-latest` smokes are deliberately offline.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -187,8 +228,26 @@ description = "Intercept `ipfs://<cid>` and render hash-verified content through
 # sibling `macos-origin-probe` measured that a handler-served document really
 # gets an `ipfs://<cid>` tuple origin, with its own negative control failing in
 # the same process (docs/spikes/macos-wkwebview-renderer-backend/README.md).
+# Windows is the edge where this is REGISTERED, not merely intercepted:
+# `ICoreWebView2CustomSchemeRegistration` with `HasAuthorityComponent` +
+# `TreatAsSecure` (both pinned as constants and asserted on the Ubuntu gate), so a
+# page gets the real tuple origin `ipfs://<cid>` — MEASURED by
+# `crates/windows-origin-probe` with a negative control that reproduced the
+# Android opaque-origin failure verbatim (ADR-0011 Amendment 2,
+# docs/spikes/windows-ipfs-origin-probe-on-ci/README.md). The load path itself is
+# the SAME `werust_core::ipfs::resolve_ipfs_request` + verifying `fetcher` route
+# every other edge uses, across the shared ADR-0008 off-thread boundary
+# (`webview-shared`), behind a real WebView2 `GetDeferral`. MEASURED on a
+# `windows-latest` runner twice over: the engine's `trust_hooks_smoke` (run
+# 30585224388) loaded a pinned in-memory page through the production verifying
+# route, reported `TrustPosture::ContentVerified`, and saw the page report its own
+# origin as `ipfs://bafkrei…` with `isSecureContext: true`, while the negative
+# control (bytes that do not hash to their CID) ended `Failed` /
+# `UnverifiedOrigin`; the window smoke (run 30589670305) repeated both in the real
+# window. Task `windows-webview2-renderer-backend`.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -227,8 +286,22 @@ description = "User-choosable IPFS retrieval backend: pick the default trustless
 # macOS evidence is the registration + the shared core's own tests, not a driven
 # settings page (docs/spikes/macos-wkwebview-renderer-backend/README.md, "the
 # `werust://settings` internal page ... wired but not driven").
+# Windows pays the same registration-ordering price macOS does, for the same kind
+# of reason, and pays it in the same place: `Webview2Renderer::install_ipfs`
+# builds its `TrustlessGatewayCarRetriever` from the persisted
+# `retrieval::active_gateway_endpoint()` and registers the `werust` scheme beside
+# `ipfs` (routing to `retrieval::apply_settings_request`) BEFORE the first
+# navigation — WebView2 fixes the SET of custom scheme names at ENVIRONMENT
+# creation and makes it immutable for the browser-process lifetime, which is why
+# the environment is created lazily and why a registration that arrives late is
+# refused loudly on stderr rather than silently swallowed. The selector, the
+# persistence and the page are the shared core, unchanged. HONEST LIMIT: nothing
+# has LOADED `werust://settings` on Windows — the `windows-latest` smokes drive
+# `ipfs://` only — so the Windows evidence is the registration + the shared core's
+# own tests, not a driven settings page.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -254,8 +327,18 @@ description = "Inject the native EIP-1193 provider into pages via the script-mes
 # `window.ethereum` as an object and `request({ method: 'eth_chainId' })` resolved
 # to `0x1`, which can only happen if the page -> native -> page round trip
 # completed. Keyless and read-only, like every other edge.
+# Windows: `Webview2Renderer::install_provider` injects the SAME
+# `werust_core::provider` shim at document start and registers the
+# `PROVIDER_BRIDGE` channel over WebView2's `WebMessageReceived` /
+# `PostWebMessageAsString`, with a thin adapter script giving the SHARED,
+# unmodified shim the channel shape it posts to. MEASURED on a `windows-latest`
+# runner (run 30585224388): the page reported `window.ethereum` as an object and
+# `request({ method: 'eth_chainId' })` resolved to `0x1`, which can only happen if
+# the page -> native -> page round trip completed. Keyless and read-only, like
+# every other edge.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -289,8 +372,32 @@ description = "Follow the OS light/dark setting so `prefers-color-scheme` and UA
 # HONEST LIMIT: no CI runner has a display, so nobody has yet WATCHED the chrome
 # and a `prefers-color-scheme` page follow a live Light/Dark switch — that is
 # manual step 8 of docs/spikes/macos-appkit-window-and-chrome/README.md.
+# Windows is `stubbed`, and the gap is in the CHROME, not the page. What IS wired:
+# the ENGINE follows the OS natively (`SetPreferredColorScheme(…AUTO)` on the
+# WebView2 profile, best-effort on an older runtime), so a page's
+# `prefers-color-scheme` and its UA-styled controls match the OS and werust forces
+# nothing; and the WINDOW reads the OS setting through the engine crate's ONE
+# registry read, mapped by the SAME shared `renderer::OsColorScheme` rule every
+# other edge uses (`NoPreference` paints LIGHT — werust never guesses dark), and
+# re-reads it on `WM_SETTINGCHANGE`.
+# What is MISSING is the application MANIFEST. Without a comctl32 v6 dependency
+# the chrome draws in the pre-Vista style and its system-drawn push BUTTONs do not
+# follow dark mode at all, so a dark-mode Windows shows dark chrome surfaces with
+# LIGHT buttons — a user-visible ADR-0009 shortfall that no code change inside the
+# window can close (task `windows-release-packaging-leg` says exactly that, and
+# owns the manifest plus the by-hand re-check a runner cannot do; this cell links
+# there rather than forking a second manifest task). `implemented` with the
+# shortfall written into this comment was the alternative and is rejected on the
+# `macos` column's precedent: a partly-wired capability is `stubbed`, not green
+# with a caveat (work/notes/observations/windows-parity-column-decisions-2026-07-31.md).
+# The live-switch half is separately unwitnessed on every desktop edge:
+# `WM_SETTINGCHANGE` never fires on CI, so "the chrome follows when the user flips
+# dark mode" is asserted structurally (the reader, the handler, the shared rule),
+# and watching it is manual step 9 of
+# docs/spikes/windows-win32-window-and-chrome/README.md.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "stubbed", task = "windows-release-packaging-leg" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -329,8 +436,19 @@ description = "Surface the load's trust posture (content-verified / name-via-tru
 # the real `NSTextField`, a fresh window showed the core's badge with the core's
 # ADR-0006 explanation as its tooltip, a hash-verified `ipfs://` page read as
 # verified, and the tampered control was never reported verified.
+# Windows paints the indicator from the SAME derivation, never a second one: the
+# text, its tooltip and its colour come from `trust_indicator` / `_detail` /
+# `_css_class` through the shared `desktop-paint` snapshot (unit-tested against the
+# real core on the Ubuntu gate across seven chrome states, including the neutral
+# loading state that wins over any posture), and the Win32 layer only assigns them
+# — the badge is a `STATIC` whose colour is set in `WM_CTLCOLORSTATIC` from the
+# class's palette entry, and a core class with no colour there reds the Ubuntu
+# gate. MEASURED on a `windows-latest` runner (run 30589670305): read back out of
+# the real `STATIC`, a hash-verified `ipfs://` page read as verified and the
+# tampered negative control was never reported verified.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -367,6 +485,15 @@ description = "EXPLAIN what the current trust posture MEANS, not just which badg
 #   NSTextField on a macos-14 runner (run 30572253620, the `trust-indicator` row's
 #   measurement, which asserted the badge carried the core's ADR-0006 explanation
 #   as its tooltip).
+# * windows: the Win32 badge's REAL TOOLTIP, from the same shared `desktop-paint`
+#   snapshot's `trust_detail` (crates/werust-windows/src/chrome.rs); read back off
+#   the real tooltip control on a `windows-latest` runner (run 30589670305). That
+#   assertion EARNED its keep before it was ever green: the first dispatch failed
+#   exactly the two checks that read the explanation back, because `TTM_ADDTOOL`
+#   was passed the comctl32 version-6 structure size while werust links 5.82, so
+#   the control rejected the `cbSize` and added NO tool at all — a trust badge with
+#   no explanation, on the very surface that already shipped desktop-only for
+#   months. A test that read a snapshot it already trusted would have passed.
 # * ios/android: a hover tooltip is not available and would not be discoverable if
 #   it were, so each edge surfaces the SAME sentence TWICE over, from the
 #   `trustIndicatorDetail` field the chrome JSON now carries: in the platform's
@@ -392,6 +519,7 @@ description = "EXPLAIN what the current trust posture MEANS, not just which badg
 # edges, not by an on-device assertion.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -420,8 +548,19 @@ description = "WARN, at the prominence a fail-closed failure gets, when a MUTABL
 # The pin the warning rests on is ADVISORY only: it never steers a load and never
 # upgrades a posture, so an unblessed name is byte-for-byte the pre-TOFU chrome on
 # every platform.
+# Windows is `implemented` on exactly the basis this row's comment already names:
+# the loudest state is PURE DERIVATION carried by `desktop_paint::ChromePaint`, so
+# the Win32 window paints it with no per-edge change (the badge's text, tooltip and
+# colour, and the failure-class banner), and its one per-edge cost — a colour for
+# the class — is forced by the shared palette's `every_exported_class_has_a_colour`
+# on the Ubuntu gate. The pin store behind it is the shared `werust_core::pins` the
+# `BrowserShell` owns, constructed the same way on every edge. No Windows CI step
+# drives a blessed name to a new CID, so the evidence is the shared derivation's
+# own tests plus the failure-class painting measured on the runner (the error
+# banner and the badge colour, run 30589670305), not an observed warning.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -461,8 +600,21 @@ description = "Let the user RECORD (bless) a MUTABLE name's current CID as the v
 #   `mutable-name-change-warning` row above is honestly `implemented` for macOS
 #   (the warning needs no affordance and reaches it through the same snapshot).
 #   Task `macos-trust-surface-bless-affordance`.
+# * windows: the SAME missing wire macOS has, on a different toolkit. The Win32
+#   trust indicator is a plain `STATIC` label with a tooltip
+#   (crates/werust-windows/src/chrome.rs) and no click target, so there is nowhere
+#   to put the action; the three values it would paint are already on the shared
+#   `desktop_paint::ChromePaint` (`trust_pin_action_visible` / `_label` /
+#   `trust_pin_detail`) that this window already reads. So this is a missing WIRE,
+#   not a missing platform — which is why it is `stubbed` rather than `n-a`, and
+#   why the sibling `mutable-name-change-warning` row above is honestly
+#   `implemented` for Windows (the warning needs no affordance and reaches it
+#   through the same snapshot). Task `windows-trust-surface-bless-affordance`,
+#   whose body says plainly that macOS has the same gap and that whichever lands
+#   second must not fork the rule.
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "macos-trust-surface-bless-affordance" }
+windows = { state = "stubbed", task = "windows-trust-surface-bless-affordance" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -497,8 +649,22 @@ description = "The platform's OWN full web inspector (WebKit/Chrome devtools: a 
 # and the debug view (`debug-view-console-network`) is read-only by design and is
 # no substitute for the REPL this row names. Task
 # `macos-web-inspector-safari-devtools`.
+# Windows reaches the PLATFORM's own inspector, like the three edges above and
+# unlike macOS: `crates/windows-renderer` gates `AreDevToolsEnabled` on a debug
+# build and hands the shell a `DevTools` handle taken before the backend is boxed,
+# and the window opens Edge's real DevTools window over the live page with
+# `OpenDevToolsWindow`. The REACH is F12, the same key the GTK shell binds: with
+# the focus in the PAGE, WebView2's own F12 handling opens it; with the focus in
+# the CHROME the page never sees the keystroke, so the URL bar's subclass forwards
+# it as the window's own command. There is no ⋮ menu entry, deliberately — those
+# items are the shared `werust_core::menu::BrowserMenu` and adding one would change
+# every platform's menu. MEASURED on a `windows-latest` runner (run 30589670305,
+# check 8): `OpenDevToolsWindow` opened Edge's real DevTools over the live page in
+# a debug build, and a release build no longer enables them. Task
+# `windows-win32-window-and-chrome`.
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "macos-web-inspector-safari-devtools" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -529,8 +695,15 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 # `error_banner_visible` / `error_banner_text` pair, so no edge gained a second
 # banner to decide between; the reasoning is recorded at
 # docs/spikes/ipns-tofu-pin-and-warn-on-change/DECISIONS.md (decision 3).
+# Windows raises the banner from the SAME `error_banner_visible` / `_text` /
+# `_css_class` facts, in a strip between the toolbar and the page — the ONE state
+# allowed to displace the page window. MEASURED on a `windows-latest` runner (run
+# 30589670305): the negative control's hash mismatch raised the banner carrying
+# the core's protocol-named reason verbatim ("… block hash mismatch: bytes do not
+# match cid bafkrei…"), the page area SHRANK, and a successful load raised none.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -558,8 +731,17 @@ description = "Surface a LIVE loading-progress indicator tied to the real resolu
 # mid-pipeline by its Ubuntu unit tests. MEASURED on a macos-14 runner (run
 # 30572253620): the page view's frame was compared before and after a whole load
 # and did not move or resize.
+# Windows shows the same step in the status line and, additionally, a
+# `msctls_progress32` fed by `load_progress_visible` / `_fraction` / `_tooltip`
+# INSIDE the URL bar's rectangle (the same rule the AppKit window follows, task
+# `loading-progress-in-the-url-bar-not-a-banner`), so progress never takes height
+# from the page. Both come from the shared paint snapshot and are driven
+# mid-pipeline by its Ubuntu unit tests. MEASURED on a `windows-latest` runner (run
+# 30589670305): `GetWindowRect` on the page window is byte-identical before and
+# after a whole navigation, and the strip is gone once the load settles.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -599,8 +781,17 @@ description = "Route a scheme-less URL-bar entry consistently: a bare `.eth` -> 
 # (badge text, colour, the field keeping the typed text) and by the source-shape
 # guard; no CI step TYPES into the real URL bar, so the runtime half is manual
 # step 5 of docs/spikes/macos-appkit-window-and-chrome/README.md.
+# Windows is the same shape: Enter in the URL bar hands the RAW typed text to the
+# core (no edge-level `https://` prepend, the mistake the iOS edge had to unlearn),
+# and the badge plus the field's red text are painted from the same two chrome
+# fields through the shared `desktop-paint` snapshot (`WM_CTLCOLOREDIT` for the
+# field's colour). HONEST LIMIT: the invalid-entry surface is checked by the Ubuntu
+# paint unit tests and by the source-shape guard; no CI step TYPES into the real
+# URL bar, so the runtime half is manual step 5 of
+# docs/spikes/windows-win32-window-and-chrome/README.md.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -650,8 +841,19 @@ description = "A `target=\"_blank\"` link / `window.open(url)` (a new-window req
 # LIMIT: compiled and shape-guarded, but no CI step CLICKS a `_blank` link on
 # macOS — that is manual step 9 of
 # docs/spikes/macos-appkit-window-and-chrome/README.md.
+# Windows: the ENGINE owns it, so the window neither opens a second window nor
+# re-decides the rule (asserted by
+# `crates/werust-windows/tests/windows_window_shape.rs`).
+# `Webview2Renderer` handles `add_NewWindowRequested`, routes the target through
+# the SAME shared `renderer::new_window_action`, loads it into the existing view
+# through the normal load path (so an `ipfs://` `_blank` target still hits the
+# hash-verified, origin-registered handler) and marks the request handled, so
+# WebView2 creates no second window. HONEST LIMIT: compiled, linked and
+# shape-guarded, but no CI step CLICKS a `_blank` link on Windows — that is manual
+# step 12 of docs/spikes/windows-win32-window-and-chrome/README.md.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -676,8 +878,16 @@ description = "Distinguish a TRANSIENT/timeout load failure (retryable, with an 
 # a timeout reads amber ("reload to retry") and a hard failure red with its reason
 # kept verbatim. Both branches are driven by the Ubuntu paint unit tests, and a
 # core class with no colour in this edge's palette reds that gate.
+# Windows reads the SAME two fields (`error_banner_text` + `_css_class`) through
+# the shared paint snapshot and fills the banner in the class's palette colour, so
+# a timeout reads amber ("reload to retry") and a hard failure red with its reason
+# kept verbatim. Both branches are driven by the Ubuntu paint unit tests (the same
+# ones that cover the AppKit window, since the carrier is shared), the hard branch
+# was additionally measured on the runner by the negative control, and a core class
+# with no colour in the shared palette reds that gate.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -711,8 +921,17 @@ description = "Resolve a NOT-FOUND path under an `ipfs://` site per the SITE's o
 # docs/spikes/ipfs-web-redirects-and-404-fallback-support/DECISIONS.md. The 3xx
 # half is its OWN capability row below (`ipfs-redirects-3xx-navigation`) because it
 # is a NAVIGATION, not a served response.
+# Windows answers the status on the platform response too: WebView2's
+# `CreateWebResourceResponse` takes a real status code, so the backend's response
+# sink builds it from `SchemeResponse::status` (with the matching reason phrase),
+# the Win32 twin of the iOS `HTTPURLResponse` / macOS `NSHTTPURLResponse` answer,
+# so a site's own 404 page renders as the not-found it is. The decision and the
+# rule grammar are the shared core, unchanged, and no Windows CI step loads a
+# `_redirects` fixture, so the Windows evidence is the status-carrying response
+# plus the core's own tests (which the Windows leg also runs).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -761,8 +980,17 @@ description = "A GENERAL browser menu (the \u22ee menu every browser has, struct
 # not-built-yet notice. MEASURED on a macos-14 runner (run 30572253620): the real
 # `NSMenu`'s titles were the core's labels, in order, and activating Debug opened
 # the view.
+# Windows renders the core's `BrowserMenu` as a ⋮ `HMENU` at the end of the
+# toolbar, by ITERATING it exactly as the other edges do: an `info` item disabled,
+# an `action` item dispatched by its stable id, the version from the one shared
+# `werust_core::version()`. The Debug entry really opens the view here (see
+# `debug-view-console-network`), not a not-built-yet notice. MEASURED on a
+# `windows-latest` runner (run 30589670305): the real `HMENU`'s titles were the
+# core's labels, in order (`["werust b312f31", "Debug"]`, version line first), and
+# activating Debug opened the view.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -800,8 +1028,17 @@ description = "Follow a site's `_redirects` 3xx rule (301/302/303/307/308, IPIP-
 # the main-frame check stay current. Like the row above, the rules are the shared
 # core and no macOS CI step loads a `_redirects` fixture: wired and pumped, not yet
 # driven by a real 3xx site.
+# Windows owns the sink the way desktop and macOS do:
+# `Webview2Renderer::install_ipfs` RETURNS the `RedirectSink` its handler pushes
+# into, and `werust_windows::window::run` hands that same sink to the shell via
+# `with_redirect_sink`; the window's pump drains it, which is also what feeds
+# `RedirectSink::note_navigation` the new top-level URL, so the per-chain bound and
+# the main-frame check stay current. Like the row above, the rules are the shared
+# core and no Windows CI step loads a `_redirects` fixture: wired and pumped, not
+# yet driven by a real 3xx site.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -885,8 +1122,31 @@ description = "CAPTURE the page's console messages and network requests into wer
 #                WebKit for `<img>`/`<script>`/CSS `url()` — stays accepted by the
 #                spec's Out of Scope.) Task
 #                `macos-debug-network-capture-main-document-and-scheme-handled`.
+#   * windows  — the SAME split macOS has, on the same shared code, for the same
+#                reason. CONSOLE is real and measured: the window installs
+#                `desktop_paint::install_debug_capture`, which registers the
+#                dedicated `CAPTURE_BRIDGE` channel (never the provider's trust
+#                channel) and injects the SHARED `console_shim`, the byte-for-byte
+#                string desktop, macOS and iOS inject; `window_smoke` watched a
+#                page's own `console.log` travel page -> shim -> channel -> shared
+#                store -> a rendered list-view row on a `windows-latest` runner
+#                (run 30589670305). NETWORK is where Windows falls SHORT of what
+#                this row names: the only network capture point is the best-effort
+#                `network_shim` (`fetch`/`XHR` the PAGE makes), so there is NO
+#                main-document entry mirroring the load's own posture and no row
+#                for the `ipfs://`/`werust://` requests the scheme handler itself
+#                serves. Unlike a platform limit, WebView2 CAN reach both — through
+#                `AddWebResourceRequestedFilter("*")` or the DevTools protocol, and
+#                the backend already OWNS a per-scheme `WebResourceRequested`
+#                handler that sees every intercepted request — so both spike
+#                READMEs name them as deliberately unwired follow-ons rather than
+#                impossibilities. The cell is therefore `stubbed`, not a quiet
+#                `implemented` over a partial reach. (The subresource limit macOS
+#                and iOS also have stays accepted by the spec's Out of Scope.) Task
+#                `windows-debug-network-capture-main-document-and-scheme-handled`.
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "macos-debug-network-capture-main-document-and-scheme-handled" }
+windows = { state = "stubbed", task = "windows-debug-network-capture-main-document-and-scheme-handled" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
 
@@ -936,7 +1196,21 @@ description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug
 # a fresh one. What the tabs can SHOW is bounded by the capture points above, so
 # the macOS Network tab is honestly thinner than desktop's until the stubbed row
 # above lands.
+# The Windows cell (task `windows-win32-window-and-chrome`): the ⋮ Debug entry
+# opens a SEPARATE debug window with a `SysTabControl32` of the Console and Network
+# tabs over the SAME shared `DebugCapture` store, rows built by the core's row
+# derivation (`console_row_text`, `network_*`, including the trust column in the
+# chrome's exact vocabulary) into two `SysListView32`s coloured by `NM_CUSTOMDRAW`,
+# refreshed INCREMENTALLY via the core's `tail_plan` on the EXISTING chrome pump
+# (no new timer), read-only, with Clear driving the shared `clear()`. MEASURED on a
+# `windows-latest` runner (run 30589670305): a page's `console.log` appeared as a
+# row, clearing the shared store emptied both tabs on the next tick, and closing the
+# window let a later Debug open a fresh one. Two honest limits: what the tabs can
+# SHOW is bounded by the capture points above, so the Windows Network tab is
+# thinner than desktop's until the stubbed row above lands; and the ROW COLOURS are
+# a claim about pixels no runner judged (docs/spikes/windows-win32-window-and-chrome/README.md).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
+windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }

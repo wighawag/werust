@@ -354,8 +354,14 @@ description = "EXPLAIN what the current trust posture MEANS, not just which badg
 # docs/spikes/mobile-chrome-presentation-from-one-derivation/DECISIONS.md).
 #
 # Per platform, all four from that ONE rule:
-# * desktop: the GTK trust badge's TOOLTIP (`set_tooltip_text(trust_indicator_detail(state))`,
-#   crates/werust/src/main.rs).
+# * desktop: the GTK trust badge carries the sentence BOTH ways
+#   (crates/werust/src/main.rs). As its hover TOOLTIP
+#   (`set_tooltip_text(trust_indicator_detail(state))`), and — since
+#   `ipns-tofu-pin-and-warn-on-change` turned the badge from a plain `Label` into
+#   a `MenuButton` opening a `Popover` to hold the bless action — as the first
+#   line INSIDE that popover, in full, so the explanation is readable and not only
+#   hover-discoverable. Before that task the tooltip was the only desktop surface
+#   for it.
 # * macos: the AppKit badge's tooltip, from the shared `desktop-paint` snapshot's
 #   `trust_detail` (crates/werust-macos/src/window.rs); read back out of the real
 #   NSTextField on a macos-14 runner (run 30572253620, the `trust-indicator` row's
@@ -434,10 +440,13 @@ description = "Let the user RECORD (bless) a MUTABLE name's current CID as the v
 #   UI thread, since blessing writes a file), so the ANR fix is not regressed.
 #   Guarded by crates/werust-core/tests/mobile_chrome_presentation_shape.rs; the
 #   Kotlin/Swift halves are never compiled by this repo's pure-Rust gate.
-# * macos: the one edge with NO surface to put the action in: the AppKit trust
-#   indicator is a plain `NSTextField` label (crates/werust-macos/src/window.rs)
-#   with no click target, where every other edge already had a popover/alert to
-#   extend. The three values it would paint are already on the shared
+# * macos: the one edge left with NO surface to put the action in: the AppKit
+#   trust indicator is a plain `NSTextField` label (crates/werust-macos/src/window.rs)
+#   with no click target. Android and iOS extended the explanation alert they
+#   already had; the GTK popover above was BUILT by this same task (the badge was
+#   a plain `Label` with a hover tooltip before it), so macOS is the remaining
+#   edge, not the only one that ever needed one built. The three values it would
+#   paint are already on the shared
 #   `desktop_paint::ChromePaint` (`trust_pin_action_visible` / `_label` /
 #   `trust_pin_detail`), so this is a missing WIRE, not a missing platform, which
 #   is why it is `stubbed` rather than `n-a`, and why the sibling

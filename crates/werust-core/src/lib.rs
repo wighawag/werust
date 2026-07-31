@@ -1636,9 +1636,12 @@ pub struct BrowserShell {
     /// MUTABLE names (task `ipns-tofu-pin-and-warn-on-change`,
     /// `docs/adr/0006`'s mutability axis).
     ///
-    /// Loaded ONCE per shell (a launch) rather than per load, so the paint path
-    /// never touches the filesystem, and re-saved only when the user actually
-    /// blesses something ([`bless_current_name`](BrowserShell::bless_current_name)).
+    /// A READ-THROUGH CACHE of the store, so the paint path never touches the
+    /// filesystem: read once at launch, and REPLACED by the re-read store every
+    /// time the user blesses something
+    /// ([`bless_current_name`](BrowserShell::bless_current_name)). It is a cache
+    /// and not the truth, because another window may be writing the same file
+    /// (see [`pin_store`](BrowserShell::pin_store)); the file is the truth.
     /// The shell holds it for the same reason it holds the chrome: it is the one
     /// place that knows BOTH the name the user typed and the CID it resolved to.
     ///
@@ -1646,15 +1649,87 @@ pub struct BrowserShell {
     /// load path, no verification and no posture reads it, so an empty store
     /// (a fresh install, or an unreadable file) is exactly the pre-TOFU browser.
     pins: crate::pins::TrustedNamePins,
-    /// WHERE the pin store is read from and written back to, or `None` to use the
-    /// [`retrieval`](crate::retrieval) settings directory (production).
+    /// WHERE the pin store is read from and written back to: the settings
+    /// directory in production, a scratch directory in a test that opts in, and
+    /// NOWHERE inside this crate's own test binary. See [`PinStoreLocation`].
+    pin_store: PinStoreLocation,
+}
+
+/// WHERE a [`BrowserShell`]'s trusted name pins are read from and written back
+/// to: the ONE place that answers "which `pins.json`, if any".
+///
+/// Three states rather than an `Option<PathBuf>`, because "no directory was
+/// given" means two different things and conflating them is the hermeticity hole
+/// this type exists to close: production wants the real settings directory, and
+/// a test wants NO store at all. Owning `load`/`save` here also means a FUTURE
+/// mutation (a "forget this pin" action, say) cannot re-introduce the wholesale
+/// rewrite [`bless_current_name`](BrowserShell::bless_current_name) was fixed of,
+/// by forgetting to re-read. Task `pin-store-read-modify-write-and-test-isolation`
+/// (`docs/spikes/pin-store-read-modify-write-and-test-isolation/DECISIONS.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PinStoreLocation {
+    /// The [`retrieval`](crate::retrieval) settings directory: `pins.json` beside
+    /// `retrieval.json`, under the same
+    /// [`WERUST_SETTINGS_DIR`](crate::retrieval::SETTINGS_DIR_ENV) lever (one
+    /// mechanism, `pins`' settled decision 2). The production default.
+    Settings,
+    /// A SPECIFIC directory ([`with_pins_dir`](BrowserShell::with_pins_dir)): the
+    /// shell-level twin of
+    /// [`TrustedNamePins::load_from`](crate::pins::TrustedNamePins::load_from),
+    /// so a test drives the WHOLE bless -> persist -> re-resolve -> warn loop
+    /// against its own scratch directory, touching neither the real store nor
+    /// process-global env.
+    Dir(std::path::PathBuf),
+    /// NO durable store: nothing is read, nothing is written. A bless still holds
+    /// for THIS session (the chrome updates) and simply reports itself
+    /// unpersisted, exactly as it does when there is no settings directory.
     ///
-    /// The explicit-directory seam, the shell-level twin of
-    /// [`TrustedNamePins::load_from`](crate::pins::TrustedNamePins::load_from):
-    /// a test points the WHOLE bless -> persist -> re-resolve -> warn loop at its
-    /// own scratch directory (via [`with_pins_dir`](BrowserShell::with_pins_dir))
-    /// so it never touches the real store and never mutates process-global env.
-    pins_dir: Option<std::path::PathBuf>,
+    /// This is the DEFAULT inside `werust_core`'s own test binary (see
+    /// [`PinStoreLocation::default`]): a core test that has not asked for a store
+    /// must not read the DEVELOPER's blessed names, or a machine where
+    /// `ronan.eth` happens to be blessed would flip a TOFU axis inside a fixture
+    /// and red an unrelated chrome assertion, reproducing nowhere else. It is the
+    /// read-side twin of the work contract's shared-write rule.
+    Ephemeral,
+}
+
+impl Default for PinStoreLocation {
+    fn default() -> Self {
+        if cfg!(test) {
+            Self::Ephemeral
+        } else {
+            Self::Settings
+        }
+    }
+}
+
+impl PinStoreLocation {
+    /// Re-read the store from disk, or `None` when there is nothing durable to
+    /// read (an [`Ephemeral`](PinStoreLocation::Ephemeral) shell, or
+    /// [`Settings`](PinStoreLocation::Settings) with no settings directory on
+    /// this system).
+    ///
+    /// `None` is deliberately distinct from "an empty store": a caller that has
+    /// pins in memory keeps them rather than dropping them on the floor, because
+    /// there is no file whose contents could have superseded them.
+    fn load(&self) -> Option<crate::pins::TrustedNamePins> {
+        match self {
+            Self::Settings => crate::retrieval::settings_dir()
+                .map(|dir| crate::pins::TrustedNamePins::load_from(&dir)),
+            Self::Dir(dir) => Some(crate::pins::TrustedNamePins::load_from(dir)),
+            Self::Ephemeral => None,
+        }
+    }
+
+    /// Persist `pins` here, reporting whether it reached disk. Always `false` for
+    /// [`Ephemeral`](PinStoreLocation::Ephemeral), which has nowhere to write.
+    fn save(&self, pins: &crate::pins::TrustedNamePins) -> bool {
+        match self {
+            Self::Settings => pins.save(),
+            Self::Dir(dir) => pins.save_to(dir),
+            Self::Ephemeral => false,
+        }
+    }
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -1730,6 +1805,10 @@ impl BrowserShell {
         provider: Box<dyn EthereumProvider>,
         ipns_source: Box<dyn IpnsRecordSource>,
     ) -> Self {
+        // WHERE the pins live: the settings directory in production, and NOTHING
+        // inside this crate's own test binary, so no core test can read the
+        // developer's blessed names (see `PinStoreLocation::Ephemeral`).
+        let pin_store = PinStoreLocation::default();
         let mut shell = Self {
             renderer,
             chrome: ChromeState::default(),
@@ -1743,10 +1822,11 @@ impl BrowserShell {
             back_skip: Vec::new(),
             back_skip_issued: None,
             debug: crate::debug::DebugCapture::new(),
-            // The blessed CIDs, read once per launch. A missing/unreadable store
-            // is simply empty, which is the pre-TOFU browser (fail-safe).
-            pins: crate::pins::TrustedNamePins::load(),
-            pins_dir: None,
+            // The blessed CIDs, read once per launch (and re-read on every bless).
+            // A missing/unreadable store is simply empty, which is the pre-TOFU
+            // browser (fail-safe).
+            pins: pin_store.load().unwrap_or_default(),
+            pin_store,
         };
         shell.refresh_chrome();
         shell
@@ -1755,8 +1835,8 @@ impl BrowserShell {
     /// Point the trust-on-first-use pin store at a SPECIFIC directory instead of
     /// the [`retrieval`](crate::retrieval) settings directory, re-reading it.
     ///
-    /// The shell-level explicit-directory seam (see
-    /// [`pins_dir`](BrowserShell::pins_dir)): a test drives the whole
+    /// The shell-level explicit-directory seam (the shell's private
+    /// `PinStoreLocation`): a test drives the whole
     /// bless -> persist -> re-resolve -> warn loop against its own scratch
     /// directory, so it never touches the real `pins.json` (the shared-write rule)
     /// and never mutates process-global env. Production leaves it unset; an edge
@@ -1765,8 +1845,8 @@ impl BrowserShell {
     /// moves `retrieval.json` and `pins.json` together (one mechanism).
     #[must_use]
     pub fn with_pins_dir(mut self, dir: &std::path::Path) -> Self {
-        self.pins = crate::pins::TrustedNamePins::load_from(dir);
-        self.pins_dir = Some(dir.to_path_buf());
+        self.pin_store = PinStoreLocation::Dir(dir.to_path_buf());
+        self.pins = self.pin_store.load().unwrap_or_default();
         self.refresh_chrome();
         self
     }
@@ -1883,6 +1963,16 @@ impl BrowserShell {
     #[cfg(test)]
     fn current_url_for_test(&self) -> Option<String> {
         self.renderer.current_url()
+    }
+
+    /// The trusted name pins this shell is holding, for tests that assert a
+    /// DEFAULT shell (one built without [`with_pins_dir`](BrowserShell::with_pins_dir))
+    /// read nothing at all. Test-only: production reads the pin the current page
+    /// is subject to off [`chrome`](BrowserShell::chrome)'s `mutable_name` axis,
+    /// never the store.
+    #[cfg(test)]
+    fn pins_for_test(&self) -> &crate::pins::TrustedNamePins {
+        &self.pins
     }
 
     /// Navigate to `url` (the URL bar's Enter action), through the seam, routing a
@@ -2242,16 +2332,31 @@ impl BrowserShell {
         let Some(current) = self.chrome.mutable_name.clone() else {
             return false;
         };
-        self.pins.bless(
+        // READ -> MODIFY -> WRITE, per action, against the store on DISK: exactly
+        // the shape the sibling settings store already uses
+        // (`retrieval::apply_settings_request_in`). Saving `self.pins` instead
+        // would rewrite the whole file from the snapshot THIS shell took at its
+        // own launch, silently ERASING every pin another window blessed since --
+        // and two windows is not exotic (a second `werust` launch opens a second
+        // window in the same GTK application, and two VERSIONS are two processes).
+        // That is the one direction of failure a TOFU store cannot have: the user
+        // believes a name is blessed, the pin is gone, and the next resolution to
+        // a different CID warns about nothing.
+        //
+        // With no durable store to re-read, the in-memory pins ARE the truth (no
+        // file could have superseded them), so this session's earlier blesses are
+        // carried rather than dropped.
+        let mut pins = self.pin_store.load().unwrap_or_else(|| self.pins.clone());
+        pins.bless(
             &current.name,
             &current.cid,
             self.chrome.trust_posture,
             crate::pins::now_unix_secs(),
         );
-        let persisted = match &self.pins_dir {
-            Some(dir) => self.pins.save_to(dir),
-            None => self.pins.save(),
-        };
+        let persisted = self.pin_store.save(&pins);
+        // The re-read store (plus this bless) becomes the shell's cache, so a
+        // concurrent writer's pins are visible here from now on too.
+        self.pins = pins;
         // Re-derive the chrome's TOFU axis from the store, so the surface reflects
         // the bless immediately (the action label and the warning both change).
         self.refresh_chrome();
@@ -4231,6 +4336,124 @@ mod tests {
         assert!(
             second.chrome().mutable_name_changed(),
             "the warning is re-derived on the history move, like the name is"
+        );
+    }
+
+    /// The REAL `pins.json`'s bytes, or `None` when the developer has none (or
+    /// there is no settings directory at all): the before/after snapshot a test
+    /// asserts the suite NEVER writes the developer's own pin store with.
+    fn real_pin_store_snapshot() -> Option<Vec<u8>> {
+        crate::pins::pins_file_path().and_then(|path| std::fs::read(path).ok())
+    }
+
+    #[test]
+    fn a_bless_in_one_window_never_erases_a_pin_blessed_in_another() {
+        // Acceptance: a bless is READ-MODIFY-WRITE against the store on disk, not
+        // a wholesale rewrite of the snapshot this shell took at its own launch.
+        // Two windows sharing one directory is not exotic — a second `werust`
+        // launch activates the same GTK application and opens a second window
+        // in-process, and two VERSIONS are simply two processes — so a shell that
+        // saves its own stale snapshot silently DROPS whatever the other one
+        // blessed meanwhile. That is the one direction of failure a TOFU store
+        // cannot have: the user believes the name is blessed, the pin is gone, and
+        // the next resolution to a different CID warns about nothing. The sibling
+        // settings store already does it right (`retrieval`'s
+        // `apply_settings_request_in` is load -> mutate -> save per action).
+        let scratch = PinScratchDir::new("two-windows");
+        let (ch_a, _) = ipfs_contenthash_fixture(b"the site behind a.eth");
+        let (ch_b, _) = ipfs_contenthash_fixture(b"the site behind b.eth");
+
+        // BOTH windows are constructed BEFORE either blesses, so each holds the
+        // same (empty) snapshot: exactly the two-window situation.
+        let (mut window_a, handle_a) = shell_with_provider_and_pins(
+            vec![Ok(address_word(&[0x11u8; 20])), Ok(abi_bytes_return(&ch_a))],
+            &scratch.path,
+        );
+        let (mut window_b, handle_b) = shell_with_provider_and_pins(
+            vec![Ok(address_word(&[0x22u8; 20])), Ok(abi_bytes_return(&ch_b))],
+            &scratch.path,
+        );
+
+        load_eth_name(&mut window_a, &handle_a, "a.eth");
+        assert!(window_a.bless_current_name());
+        let cid_a = window_a
+            .chrome()
+            .mutable_name
+            .as_ref()
+            .expect("a name-resolved page carries the TOFU axis")
+            .cid
+            .clone();
+
+        load_eth_name(&mut window_b, &handle_b, "b.eth");
+        assert!(window_b.bless_current_name());
+        let cid_b = window_b
+            .chrome()
+            .mutable_name
+            .as_ref()
+            .expect("a name-resolved page carries the TOFU axis")
+            .cid
+            .clone();
+
+        // BOTH pins survive: the second writer merged into what it found on disk.
+        let on_disk = crate::pins::TrustedNamePins::load_from(&scratch.path);
+        assert_eq!(
+            on_disk.len(),
+            2,
+            "the second window's bless must not erase the first window's pin"
+        );
+        assert_eq!(on_disk.get("a.eth").map(|p| p.cid.clone()), Some(cid_a));
+        assert_eq!(on_disk.get("b.eth").map(|p| p.cid.clone()), Some(cid_b));
+
+        // The merge is visible to the writer itself, so its NEXT bless cannot
+        // re-drop what it just merged in.
+        assert_eq!(window_b.pins_for_test().len(), 2);
+    }
+
+    #[test]
+    fn a_test_shell_starts_from_an_empty_store_and_never_touches_the_real_pins_json() {
+        // Acceptance (hermeticity — the READ-side twin of the work contract's
+        // shared-write rule): a shell built WITHOUT `with_pins_dir` inside this
+        // crate's test binary reads NO store at all. Reading the real one would
+        // mean every core test sees whatever the DEVELOPER has blessed in their
+        // own build, so a machine where `ronan.eth` is blessed could flip a TOFU
+        // axis inside a fixture and red an unrelated chrome assertion — a failure
+        // that reproduces on one machine and nowhere else.
+        let real_before = real_pin_store_snapshot();
+
+        let (contenthash, _) = ipfs_contenthash_fixture(b"a fixture site");
+        let (mut shell, handle) = shell_with_provider(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+        load_eth_name(&mut shell, &handle, "ronan.eth");
+
+        assert!(
+            shell.pins_for_test().is_empty(),
+            "a default test shell reads no pin store"
+        );
+        let axis = shell
+            .chrome()
+            .mutable_name
+            .as_ref()
+            .expect("a name-resolved page carries the TOFU axis");
+        assert!(
+            !axis.is_blessed(),
+            "whatever the developer blessed locally must not reach a fixture"
+        );
+        assert!(!shell.chrome().mutable_name_changed());
+
+        // And the bless has nowhere DURABLE to go: it holds for this session and
+        // is reported unpersisted, rather than being written into the developer's
+        // real store.
+        assert!(trust_pin_action_visible(shell.chrome()));
+        assert!(
+            !shell.bless_current_name(),
+            "a test shell has no durable store to record into"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the REAL pin store is untouched by this suite"
         );
     }
 

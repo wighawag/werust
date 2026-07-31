@@ -466,6 +466,13 @@ mod tests {
         }
     }
 
+    /// The REAL `pins.json`'s bytes, or `None` when the developer has none (or
+    /// there is no settings directory at all): the before/after snapshot a test
+    /// asserts the suite never writes the developer's own pin store with.
+    fn real_pin_store_snapshot() -> Option<Vec<u8>> {
+        pins_file_path().and_then(|path| std::fs::read(path).ok())
+    }
+
     #[test]
     fn a_blessed_name_persists_across_launches_in_the_isolated_store() {
         // Acceptance: the pin (name -> CID + timestamp + posture) persists across
@@ -499,14 +506,21 @@ mod tests {
     #[test]
     fn the_pin_store_writes_only_under_its_own_directory_and_beside_retrieval_json() {
         // The shared-write rule, asserted rather than assumed: a save touches the
-        // scratch dir and nothing else, and the REAL store is untouched (this test
-        // never resolves the real settings dir at all, it drives the
-        // directory-taking core). And the file sits BESIDE `retrieval.json` (one
-        // mechanism, settled decision 2), which is what `pins_file_path` promises.
+        // scratch dir and nothing else, and the REAL store is untouched — which is
+        // ASSERTED here (a before/after snapshot of the real `pins.json`), not
+        // merely argued from "this test drives the directory-taking core". And the
+        // file sits BESIDE `retrieval.json` (one mechanism, settled decision 2),
+        // which is what `pins_file_path` promises.
+        let real_before = real_pin_store_snapshot();
         let scratch = ScratchDir::new("isolation");
         let mut pins = TrustedNamePins::default();
         pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
         assert!(pins.save_to(&scratch.path));
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
 
         let written: Vec<String> = std::fs::read_dir(&scratch.path)
             .expect("the scratch dir exists")

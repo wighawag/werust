@@ -56,13 +56,26 @@ on:
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
       - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"
-  # DELIBERATELY IDENTICAL to the push filter above (GitHub Actions has no
-  # anchors, so it is duplicated rather than shared). The docs paths are the
-  # load-bearing addition: the RECORDED VERDICT (`expected.json` and the verbatim
-  # run it is stamped from) lives in the spike directory, and re-recording it
-  # after a deliberate re-decision is exactly the pull request that most needs
-  # WebKit re-measured against it. Leaving it out also let a PR merge without the
-  # leg and then red `main`, which is the worst place to learn.
+  # NARROWER than the push filter above, deliberately. The SPIKE DOCS paths are
+  # the one addition (task `macos-spike-doc-accuracy-and-harness-guard`, item 2):
+  # the RECORDED VERDICT -- `expected.json` and the verbatim run it is stamped
+  # from -- lives in the spike directory, so re-recording it after a deliberate
+  # re-decision is exactly the pull request that most needs WebKit re-measured
+  # against it, which is what the header above PROMISES happens. That claim and
+  # this list are held together by
+  # `the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger`
+  # in `crates/macos-renderer/tests/macos_backend_shape.rs`.
+  #
+  # What stays PUSH-ONLY, and why: `crates/renderer/**` and `crates/fetcher/**`
+  # are the wider DEPENDENCY surface. A change to them can break this leg, but
+  # gating every such pull request on `macos-14` minutes is the exact cost the
+  # sibling `windows-renderer.yml` header states and refuses (pinned by
+  # `crates/werust-core/tests/windows_renderer_leg_shape.rs`). Watching them on
+  # `push` to `main` finds the breakage minutes after it merges, on a leg that
+  # gates nothing, and `workflow_dispatch` covers the deliberate case.
+  # `crates/werust-core/**` remains here, as it has since this leg landed; whether
+  # it should is an open question the human has flagged about this leg, and
+  # answering it is a decision of its own, not a side effect of a docs fix.
   pull_request:
     paths:
       - "crates/macos-renderer/**"
@@ -70,9 +83,7 @@ on:
       - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
-      - "crates/renderer/**"
       - "crates/werust-core/**"
-      - "crates/fetcher/**"
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
       - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"

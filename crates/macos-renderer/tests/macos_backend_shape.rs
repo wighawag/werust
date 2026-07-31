@@ -691,4 +691,32 @@ fn the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger() {
              claims a PR touching it re-runs the leg"
         );
     }
+    // And no FURTHER than that. Making the claim true is not licence to widen the
+    // trigger: the wider DEPENDENCY surface stays on `push` to `main`, so a
+    // `renderer` or `fetcher` pull request is not gated on `macos-14` minutes.
+    // That is the trade-off the sibling `windows-renderer.yml` states in its
+    // header and pins in `crates/werust-core/tests/windows_renderer_leg_shape.rs`;
+    // this leg's version of the pin lives here, so broadening it has to change a
+    // test and a comment rather than slip in.
+    //
+    // The `push` half is matched on whole list ENTRIES, because the comment above
+    // the filter names these two paths in prose and a substring search would
+    // happily read the explanation as the trigger.
+    let push = between(&workflow, "  push:", "  pull_request:");
+    for dependency_only in ["crates/renderer/**", "crates/fetcher/**"] {
+        assert!(
+            !pull_request.contains(dependency_only),
+            "the `pull_request` filter must NOT carry `{dependency_only}`: it is the wider \
+             dependency surface, watched on `push` to `main` instead. Adding it gates ordinary \
+             core work on a cross-platform runner -- the exact cost under review on this leg"
+        );
+        // ...but what the PR filter gives up must still be caught post-merge, or
+        // the narrowness is a hole rather than a trade.
+        assert!(
+            push.lines()
+                .any(|line| line.trim() == format!("- \"{dependency_only}\"")),
+            "`{dependency_only}` must stay on the `push` filter: it is what the narrow \
+             `pull_request` filter relies on to be caught minutes after a merge instead"
+        );
+    }
 }

@@ -44,6 +44,15 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     private let menuButton = UIButton(type: .system)
     private let statusLabel = UILabel()
     private let trustLabel = UILabel()
+    /// The trust surface's TRUST-ON-FIRST-USE lines and action, cached from the
+    /// last ``refreshChrome()`` so ``showTrustExplanation()`` can build the surface
+    /// from ONE chrome snapshot (the badge beside them came from the same one), the
+    /// same reason the explanation itself is read off the painted label rather than
+    /// re-read across the C-ABI. All three are the core's derivation, carried on
+    /// the chrome JSON; this edge only holds onto them between a paint and a tap.
+    private var trustPinDetailText: String = ""
+    private var trustPinActionOffered: Bool = false
+    private var trustPinActionLabelText: String = ""
     /// The small "invalid URL" badge next to the URL bar, shown ONLY when the last
     /// entry was INVALID (a scheme-less garbage entry that did not navigate). Paired
     /// with the URL-bar text rendered invalid (red underline), it surfaces the
@@ -434,6 +443,14 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // stand-in for desktop's hover tooltip.
         trustLabel.text = chrome.trustIndicator
         trustLabel.accessibilityLabel = chrome.trustIndicatorDetail
+        // The trust surface's TRUST-ON-FIRST-USE section, cached off this ONE
+        // painted snapshot so the tap handler needs no second chrome read (which
+        // would cross the C-ABI into the session again and could disagree with the
+        // badge beside it). Every string is the core's derivation: this edge
+        // decides neither the wording nor whether the action is offered.
+        trustPinDetailText = chrome.trustPinDetail
+        trustPinActionOffered = chrome.trustPinActionVisible
+        trustPinActionLabelText = chrome.trustPinActionLabel
         // The LOAD-PROGRESS line: its fraction advances with the real pipeline
         // phase while a load is in flight (including the pre-content name-resolution
         // window, where the backend has not started yet), and it fades out once the
@@ -535,8 +552,24 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// they cannot disagree with each other.
     @objc private func showTrustExplanation() {
         guard let detail = trustLabel.accessibilityLabel, !detail.isEmpty else { return }
+        // The TRUST-ON-FIRST-USE section of the same surface (task
+        // `ipns-tofu-pin-and-warn-on-change`): what this MUTABLE name resolves to
+        // now, what the user blessed for it, and (when there is something new to
+        // record) the bless action. The bless is reached FROM the trust indicator
+        // by an explicit tap, never a first-visit prompt, which is why it lives
+        // here rather than in an alert of its own. Every string is the core's, read
+        // off the last painted snapshot.
+        let message =
+            trustPinDetailText.isEmpty ? detail : "\(detail)\n\n\(trustPinDetailText)"
         let alert = UIAlertController(
-            title: trustLabel.text, message: detail, preferredStyle: .alert)
+            title: trustLabel.text, message: message, preferredStyle: .alert)
+        if trustPinActionOffered {
+            alert.addAction(
+                UIAlertAction(title: trustPinActionLabelText, style: .default) { [weak self] _ in
+                    self?.core.blessName()
+                    self?.afterCoreAction()
+                })
+        }
         alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
         present(alert, animated: true)
     }

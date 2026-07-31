@@ -47,6 +47,18 @@ final class WerustCore {
     /// Stop the in-flight load.
     func stop() { werust_ios_stop(handle) }
 
+    /// BLESS the current page's MUTABLE name at the CID it resolves to right now:
+    /// the trust surface's "trust this content" action (trust-on-first-use, task
+    /// `ipns-tofu-pin-and-warn-on-change`). A later resolution to a DIFFERENT CID
+    /// is then warned about.
+    ///
+    /// Whether there is anything to bless (and what the button says) is decided
+    /// by the core and carried on the chrome (`Chrome.trustPinActionVisible` /
+    /// `Chrome.trustPinActionLabel`); this only dispatches the action. Returns
+    /// whether the pin was DURABLY recorded (it holds for this session either way).
+    @discardableResult
+    func blessName() -> Bool { werust_ios_bless_name(handle) }
+
     /// The URL (if any) the core has committed to but the platform `WKWebView`
     /// has not yet loaded. `nil` means "nothing pending".
     func takePendingLoad() -> String? {
@@ -397,6 +409,18 @@ final class WerustCore {
         let failureKind: String?
         let retryable: Bool
         let invalidEntry: String?
+        /// The MUTABLE name this page resolved through (`ronan.eth`), or nil when
+        /// the page is not a name-resolved load at all. The identity a
+        /// trust-on-first-use pin is keyed on.
+        let mutableName: String?
+        /// The CID `mutableName` resolves to on THIS load, or nil.
+        let mutableNameCid: String?
+        /// The CID the user BLESSED for `mutableName`, or nil if never blessed.
+        let blessedCid: String?
+        /// Whether the blessed name now points to DIFFERENT content: the
+        /// trust-on-first-use warning, the LOUDEST settled chrome state. The core's
+        /// `ChromeState::mutable_name_changed`.
+        let nameChanged: Bool
 
         /// The one-line status shown in the footer: the core's `status_line` (a
         /// failure wins, else a loading indicator NAMING the real pipeline step,
@@ -434,6 +458,19 @@ final class WerustCore {
         /// The phase NAME behind the current progress, for the progress line's
         /// accessibility label: the core's `load_progress_hint`.
         let loadProgressHint: String
+        /// Whether the trust surface should offer the BLESS action: the core's
+        /// `trust_pin_action_visible`. An AFFORDANCE inside the surface the user
+        /// opened by tapping the badge, never a first-visit prompt.
+        let trustPinActionVisible: Bool
+        /// The BLESS action's label: the core's `trust_pin_action_label` (empty when
+        /// the action is not offered). Two wordings, because a first-use bless and
+        /// accepting a CHANGE are materially different decisions.
+        let trustPinActionLabel: String
+        /// The trust surface's trust-on-first-use body: the core's
+        /// `trust_pin_detail`: the mutable name, the CID it resolves to now, and
+        /// what (if anything) was blessed for it. Empty when there is no mutable
+        /// name.
+        let trustPinDetail: String
 
         /// The FAIL-SOFT fallback for an unreadable/absent document (a freed
         /// session, a null C string): the facts read as an idle chrome and every
@@ -449,10 +486,12 @@ final class WerustCore {
             canGoBack: false, canGoForward: false,
             trustPosture: "unverified-origin", error: nil,
             failureKind: nil, retryable: false, invalidEntry: nil,
+            mutableName: nil, mutableNameCid: nil, blessedCid: nil, nameChanged: false,
             statusLine: "", trustIndicator: "", trustIndicatorDetail: "",
             errorBannerVisible: false, errorBannerText: "",
             invalidEntryBadgeVisible: false, invalidEntryBadgeText: "",
-            loadProgressVisible: false, loadProgressFraction: 0, loadProgressHint: "")
+            loadProgressVisible: false, loadProgressFraction: 0, loadProgressHint: "",
+            trustPinActionVisible: false, trustPinActionLabel: "", trustPinDetail: "")
 
         static func fromJSON(_ json: String) -> Chrome {
             guard let data = json.data(using: .utf8),
@@ -470,6 +509,10 @@ final class WerustCore {
                 failureKind: o["failureKind"] as? String,
                 retryable: o["retryable"] as? Bool ?? false,
                 invalidEntry: o["invalidEntry"] as? String,
+                mutableName: o["mutableName"] as? String,
+                mutableNameCid: o["mutableNameCid"] as? String,
+                blessedCid: o["blessedCid"] as? String,
+                nameChanged: o["nameChanged"] as? Bool ?? false,
                 // The DERIVED half. Each default is the EMPTY/absent value, never a
                 // Swift copy of the core's wording, for the same reason `.idle` is
                 // empty: a document that somehow lacked a derived field must show
@@ -483,7 +526,10 @@ final class WerustCore {
                 invalidEntryBadgeText: o["invalidEntryBadgeText"] as? String ?? "",
                 loadProgressVisible: o["loadProgressVisible"] as? Bool ?? false,
                 loadProgressFraction: o["loadProgressFraction"] as? Double ?? 0,
-                loadProgressHint: o["loadProgressHint"] as? String ?? "")
+                loadProgressHint: o["loadProgressHint"] as? String ?? "",
+                trustPinActionVisible: o["trustPinActionVisible"] as? Bool ?? false,
+                trustPinActionLabel: o["trustPinActionLabel"] as? String ?? "",
+                trustPinDetail: o["trustPinDetail"] as? String ?? "")
         }
     }
 }

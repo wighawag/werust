@@ -167,6 +167,17 @@ impl CoreSession {
         self.shell.stop();
     }
 
+    /// BLESS the current page's mutable name at the CID it resolves to right now
+    /// (trust-on-first-use, task `ipns-tofu-pin-and-warn-on-change`).
+    ///
+    /// The Swift trust surface's "trust this content" action, dispatched into the
+    /// SHARED [`BrowserShell::bless_current_name`](werust_core::BrowserShell::bless_current_name),
+    /// so the pin store, its wire form and the warning rule are the desktop ones,
+    /// not a mobile twin. Returns whether the pin was durably recorded.
+    pub fn bless_current_name(&mut self) -> bool {
+        self.shell.bless_current_name()
+    }
+
     /// The URL (if any) the core has committed to but the platform `WKWebView`
     /// has not yet loaded. Swift drains this after driving the session and calls
     /// `WKWebView.load` with it.
@@ -766,6 +777,20 @@ mod ffi {
         if let Some(s) = session_mut(session) {
             s.stop();
         }
+    }
+
+    /// BLESS the current page's mutable name (trust-on-first-use): the Swift trust
+    /// surface's "trust this content" action. Returns whether the pin was durably
+    /// recorded; the chrome is refreshed either way, so the caller simply repaints
+    /// (task `ipns-tofu-pin-and-warn-on-change`).
+    ///
+    /// # Safety
+    /// `session` is a live handle from `werust_ios_session_new`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_bless_name(session: *mut CoreSession) -> bool {
+        session_mut(session)
+            .map(CoreSession::bless_current_name)
+            .unwrap_or(false)
     }
 
     /// The URL the core has committed to but the `WKWebView` has not yet loaded,

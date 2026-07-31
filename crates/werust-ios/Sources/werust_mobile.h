@@ -60,6 +60,14 @@ void werust_ios_go_forward(WerustCoreSession *session);
 bool werust_ios_reload(WerustCoreSession *session);
 void werust_ios_stop(WerustCoreSession *session);
 
+/* BLESS the current page's MUTABLE name at the CID it resolves to right now: the
+ * trust surface's "trust this content" action (trust-on-first-use, task
+ * ipns-tofu-pin-and-warn-on-change). A later resolution to a DIFFERENT CID is
+ * then warned about. Returns whether the pin was DURABLY recorded (it holds for
+ * this session either way); the chrome is refreshed regardless, so Swift simply
+ * repaints. */
+bool werust_ios_bless_name(WerustCoreSession *session);
+
 /* The URL the core committed to but the WKWebView has not yet loaded, as a heap
  * C string (free with werust_ios_string_free), or NULL if nothing is pending.
  * Swift drains this after driving the core and calls WKWebView.load with it. */

@@ -42,9 +42,10 @@
 use std::path::{Path, PathBuf};
 
 use renderer::{LoadState, TrustPosture};
+use werust_core::pins::{MutableNameTrust, TrustedNamePin};
 use werust_core::{
     invalid_entry_badge_text, load_progress_hint, trust_indicator, trust_indicator_detail,
-    ChromeState, LoadStep,
+    trust_pin_action_label, ChromeState, LoadStep,
 };
 
 /// Read a source file relative to the repo root. `CARGO_MANIFEST_DIR` is
@@ -92,6 +93,11 @@ const FACT_FIELDS: &[&str] = &[
     "failureKind",
     "retryable",
     "invalidEntry",
+    // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`).
+    "mutableName",
+    "mutableNameCid",
+    "blessedCid",
+    "nameChanged",
 ];
 
 /// The DERIVED half of the carrier.
@@ -106,6 +112,11 @@ const DERIVED_FIELDS: &[&str] = &[
     "loadProgressVisible",
     "loadProgressFraction",
     "loadProgressHint",
+    // The trust surface's TOFU section: whether the bless is offered, what the
+    // action says, and the body naming the name + CIDs.
+    "trustPinActionVisible",
+    "trustPinActionLabel",
+    "trustPinDetail",
 ];
 
 /// The source with COMMENTS removed and every STRING LITERAL collected.
@@ -199,6 +210,35 @@ fn every_derived_string() -> Vec<String> {
             ..ChromeState::default()
         };
         produced.push(load_progress_hint(&state).to_string());
+    }
+    // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`): the
+    // badge + explanation of a blessed-then-CHANGED name, and BOTH wordings of the
+    // bless action. Driven from the core, like the postures above, so a reworded
+    // action joins this forbidden list without anyone remembering to.
+    let pin = TrustedNamePin {
+        name: "ronan.eth".into(),
+        cid: "bafyblessed".into(),
+        blessed_at: 1_800_000_000,
+        posture: TrustPosture::NameViaTrustedRpc,
+    };
+    for (cid, blessed) in [
+        ("bafyblessed", None),
+        ("bafychanged", Some(pin.clone())),
+        ("bafyblessed", Some(pin)),
+    ] {
+        let state = ChromeState {
+            load_state: LoadState::Finished,
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            mutable_name: Some(MutableNameTrust {
+                name: "ronan.eth".into(),
+                cid: cid.into(),
+                blessed,
+            }),
+            ..ChromeState::default()
+        };
+        produced.push(trust_indicator(&state).to_string());
+        produced.push(trust_indicator_detail(&state).to_string());
+        produced.push(trust_pin_action_label(&state).to_string());
     }
     produced.push(
         invalid_entry_badge_text(&ChromeState {
@@ -388,6 +428,80 @@ fn both_mobile_edges_surface_the_trust_explanation() {
         swift.contains("UIAlertController("),
         "the iOS tap must actually show the explanation"
     );
+}
+
+#[test]
+fn both_mobile_edges_offer_the_tofu_bless_from_the_trust_surface() {
+    // Acceptance (task `ipns-tofu-pin-and-warn-on-change`, the settled UX): the
+    // BLESS is an EXPLICIT user action reached FROM the trust indicator, never a
+    // first-visit prompt. Mobile already opens a trust surface on a badge TAP
+    // (the explanation alert), so the TOFU section belongs in THAT surface: the
+    // core's `trust_pin_detail` line, plus the action shown exactly when the core
+    // says `trust_pin_action_visible`, labelled with the core's own
+    // `trust_pin_action_label` and dispatched into the SHARED
+    // `BrowserShell::bless_current_name` over the FFI.
+    //
+    // A source-shape guard for the same reason its siblings are: the wiring is
+    // Kotlin and Swift, which this repo's pure-Rust gate never compiles, and an
+    // edge that decided for itself whether to offer the action (or minted its own
+    // button wording) would be exactly the twin the collapse removed.
+    let (kotlin, _) = scan(&source(KOTLIN_PAINTER));
+    assert!(
+        kotlin.contains("trustPinActionOffered = chrome.trustPinActionVisible")
+            && kotlin.contains("trustPinActionLabelText = chrome.trustPinActionLabel")
+            && kotlin.contains("trustPinDetailText = chrome.trustPinDetail"),
+        "the Android trust surface must take all three TOFU values from the carrier"
+    );
+    assert!(
+        kotlin.contains("if (trustPinActionOffered)"),
+        "the Android bless action must be offered exactly when the CORE says so"
+    );
+    assert!(
+        kotlin.contains("setNeutralButton(trustPinActionLabelText)"),
+        "the Android bless button must wear the core's label, not one minted here"
+    );
+    assert!(
+        kotlin.contains("driveCore { core.blessName() }"),
+        "blessing writes a file, so it must go through the off-UI-thread dispatch \
+         every session-driving action uses (the ANR guard)"
+    );
+
+    let (swift, _) = scan(&source(SWIFT_PAINTER));
+    assert!(
+        swift.contains("trustPinActionOffered = chrome.trustPinActionVisible")
+            && swift.contains("trustPinActionLabelText = chrome.trustPinActionLabel")
+            && swift.contains("trustPinDetailText = chrome.trustPinDetail"),
+        "the iOS trust surface must take all three TOFU values from the carrier"
+    );
+    assert!(
+        swift.contains("if trustPinActionOffered"),
+        "the iOS bless action must be offered exactly when the CORE says so"
+    );
+    assert!(
+        swift.contains("UIAlertAction(title: trustPinActionLabelText"),
+        "the iOS bless button must wear the core's label, not one minted here"
+    );
+    assert!(
+        swift.contains("self?.core.blessName()"),
+        "the iOS bless must dispatch into the shared core, not a mobile pin store"
+    );
+
+    // And neither mobile crate carries a pin store of its own: both FFI entry
+    // points call the one shared shell action.
+    for path in [
+        "crates/werust-android/rust/src/lib.rs",
+        "crates/werust-ios/rust/src/lib.rs",
+    ] {
+        let (code, _) = scan(&source(path));
+        assert!(
+            code.contains("self.shell.bless_current_name()"),
+            "{path} must bless through the shared shell"
+        );
+        assert!(
+            !code.contains("TrustedNamePins"),
+            "{path} must not open the pin store itself; the shell owns it"
+        );
+    }
 }
 
 #[test]

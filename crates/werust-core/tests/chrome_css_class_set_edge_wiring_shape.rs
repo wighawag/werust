@@ -99,6 +99,7 @@ fn the_gtk_painter_toggles_from_the_exported_class_set_not_a_literal_list() {
         "trust-verified",
         "trust-name-trusted-rpc",
         "trust-mutable-name",
+        "trust-name-changed",
         "trust-unverified",
         "error-banner",
         "error-banner-transient",
@@ -192,6 +193,62 @@ fn the_progress_tooltip_sentence_lives_only_in_the_core() {
             "{edge} still composes the progress sentence itself; it belongs to the core"
         );
     }
+}
+
+#[test]
+fn the_gtk_trust_badge_opens_a_surface_that_offers_the_tofu_bless() {
+    // Acceptance (task `ipns-tofu-pin-and-warn-on-change`, the settled UX): the
+    // BLESS is an EXPLICIT user action reached FROM the trust indicator, never a
+    // first-visit prompt. On GTK that means the badge is a `MenuButton` opening a
+    // popover carrying the posture explanation, the core's TOFU detail line, and
+    // the bless button, whose LABEL and VISIBILITY are the core's decision, not
+    // this painter's.
+    //
+    // A source-shape guard for the same reason the toggle guard above is: driving
+    // the real popover needs a display the `verify` gate may not have, while a
+    // painter that started deciding for itself whether to offer the action (or
+    // minted its own wording) is exactly the drift the one-derivation rule exists
+    // to prevent.
+    let desktop = desktop_shell();
+    for rule in [
+        "trust_pin_action_visible",
+        "trust_pin_action_label",
+        "trust_pin_detail",
+    ] {
+        assert!(
+            desktop.contains(rule),
+            "the desktop shell must consume the core's `{rule}`"
+        );
+    }
+    // The badge really opens a surface (a popover), rather than only carrying a
+    // hover tooltip: a tooltip cannot hold an action.
+    assert!(
+        desktop.contains(".child(&trust)") && desktop.contains("trust_surface"),
+        "the trust badge must sit inside the button that opens the trust surface"
+    );
+    // The paint path takes BOTH the label and the visibility from the core.
+    let refresh = between(
+        &desktop,
+        "fn refresh(&self, state: &ChromeState)",
+        "/// The app stylesheet",
+    );
+    assert!(
+        refresh.contains("trust_pin_action_visible(state)")
+            && refresh.contains("trust_pin_action_label(state)")
+            && refresh.contains("trust_pin_detail(state)"),
+        "the painter must take the bless action's label, visibility and body from \
+         the core, never decide them: {refresh:?}"
+    );
+    // And the click DISPATCHES the shared shell action rather than touching the
+    // pin store itself.
+    assert!(
+        desktop.contains("bless_current_name()"),
+        "the bless button must drive the shared `BrowserShell::bless_current_name`"
+    );
+    assert!(
+        !desktop.contains("TrustedNamePins"),
+        "the edge must not open the pin store itself; the shell owns it"
+    );
 }
 
 #[test]

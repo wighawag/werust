@@ -37,6 +37,7 @@ pub mod ipfs;
 pub mod ipns;
 pub mod menu;
 pub mod name_resolution;
+pub mod pins;
 pub mod provider;
 pub mod redirects;
 pub mod retrieval;
@@ -602,6 +603,30 @@ pub struct ChromeState {
     /// explicit scheme / back / forward / reload), so it never lingers onto a
     /// later page. Loading/error/validity stay orthogonal to trust.
     pub invalid_entry: Option<String>,
+    /// The current page's MUTABLE-NAME identity and its trust-on-first-use state:
+    /// the name, the CID it resolves to on THIS load, and whatever the user has
+    /// BLESSED for that name (task `ipns-tofu-pin-and-warn-on-change`,
+    /// `docs/adr/0006`'s mutability axis). `None` whenever the current page is
+    /// not a name-resolved load at all (a direct `ipfs://<cid>`, an ordinary
+    /// `https://` page, a failed resolution): there is nothing to bless and
+    /// nothing to warn about.
+    ///
+    /// A SEPARATE axis from [`trust_posture`](ChromeState::trust_posture) rather
+    /// than a fifth posture, for the same reason
+    /// [`invalid_entry`](ChromeState::invalid_entry) is separate from
+    /// [`last_error`](ChromeState::last_error): the posture is the seam's truth
+    /// about how THIS load's bytes and name were learned (a
+    /// [`Renderer::trust_posture`] read), while the pin is a DURABLE user
+    /// decision about a name, read from the [`pins`](crate::pins) store and
+    /// unrelated to any backend. The display rules combine the two (a
+    /// blessed-then-CHANGED name is the LOUDEST state, above every posture), but
+    /// the facts stay apart, so no seam has to learn what a pin is.
+    ///
+    /// FAIL-SAFE: this axis can only make the chrome say MORE. An unblessed name
+    /// (or an unreadable pin store) leaves every other rule exactly as it was
+    /// before, and nothing here participates in deciding what to load or whether
+    /// bytes verified.
+    pub mutable_name: Option<crate::pins::MutableNameTrust>,
 }
 
 impl ChromeState {
@@ -675,6 +700,42 @@ impl ChromeState {
     #[must_use]
     pub fn has_invalid_entry(&self) -> bool {
         self.invalid_entry.is_some()
+    }
+
+    /// The TOFU WARNING condition: the current page's mutable name was BLESSED,
+    /// and it now resolves to a DIFFERENT CID than the one the user trusted.
+    ///
+    /// This is the actionable form of the mutability warning ("this CHANGED
+    /// since you trusted it", not "this could change"), and it is the LOUDEST
+    /// state the chrome has: it wins over every [`TrustPosture`] (including
+    /// [`NameViaTrustedRpc`](TrustPosture::NameViaTrustedRpc)) and raises the
+    /// failure-class banner, because it is the only chrome state that says
+    /// something the user has personally verified is no longer true. It is never
+    /// silently accepted and never a hard block: the user can look and decide.
+    ///
+    /// `false` for an unblessed name, so an unblessed load behaves exactly as it
+    /// did before the pin store existed.
+    #[must_use]
+    pub fn mutable_name_changed(&self) -> bool {
+        self.mutable_name
+            .as_ref()
+            .is_some_and(crate::pins::MutableNameTrust::is_changed)
+    }
+
+    /// Whether the trust surface should offer the BLESS action for this page:
+    /// there is a mutable name, and blessing it would record something new
+    /// (a never-blessed name, or a blessed one that has since changed).
+    ///
+    /// The bless is an EXPLICIT user action reached from the trust indicator, not
+    /// a first-visit prompt (a prompt on first visit trains people to dismiss it,
+    /// and the trust surface is already where the posture is explained), so this
+    /// only says whether the affordance EXISTS, never that anything should pop
+    /// up.
+    #[must_use]
+    pub fn can_bless_name(&self) -> bool {
+        self.mutable_name
+            .as_ref()
+            .is_some_and(crate::pins::MutableNameTrust::is_blessable)
     }
 }
 
@@ -852,9 +913,25 @@ pub fn status_line(state: &ChromeState) -> String {
 /// while a loading/idle chrome hides it. A pure function of [`ChromeState`] so it
 /// is testable without a display; the mobile shells apply the same rule from the
 /// chrome JSON.
+///
+/// # A CHANGED trusted name is failure-class too
+///
+/// The banner is the repo's one "you cannot miss this" surface, and the settled
+/// TOFU decision is that a blessed name resolving to DIFFERENT content gets the
+/// SAME prominence a fail-closed failure does (task
+/// `ipns-tofu-pin-and-warn-on-change`): it is never silently accepted, and never
+/// a hard block. So this rule is "a failure-class state", of which there are now
+/// two: a failed load, or a mutable name that changed since the user trusted it
+/// ([`ChromeState::mutable_name_changed`]). It is deliberately NOT a second
+/// banner surface: a second high-contrast bar would compete with this one for
+/// the slot above the page and each edge would have to decide which wins.
+///
+/// The sibling constraint from `loading-progress-in-the-url-bar-not-a-banner`
+/// still holds and is respected: a FAILURE-class banner may displace the page,
+/// transient in-flight state may not. A changed pin is failure-class.
 #[must_use]
 pub fn error_banner_visible(state: &ChromeState) -> bool {
-    state.last_error.is_some()
+    state.last_error.is_some() || state.mutable_name_changed()
 }
 
 /// The PROMINENT error-banner text for a failed load: a protocol-named,
@@ -874,6 +951,13 @@ pub fn error_banner_visible(state: &ChromeState) -> bool {
 /// reason. The distinction is the core's [`ChromeState::failure_is_retryable`]
 /// (a pure classification of the reason), so the two never disagree with the
 /// footer.
+///
+/// A CHANGED trusted name (the TOFU warning) uses this same banner, with its own
+/// legible sentence naming the name, the day the user trusted it, and both CIDs:
+/// everything needed to decide, since werust deliberately does not decide for the
+/// user. A LOAD failure still wins the banner when both are true: the page in
+/// front of the user did not render at all, which is the more immediate fact
+/// (and the changed-name warning survives on the trust indicator regardless).
 #[must_use]
 pub fn error_banner_text(state: &ChromeState) -> String {
     match &state.last_error {
@@ -881,8 +965,32 @@ pub fn error_banner_text(state: &ChromeState) -> String {
             format!("⏳ This page timed out — reload to retry: {reason}")
         }
         Some(reason) => format!("⚠ This page failed to load: {reason}"),
-        None => String::new(),
+        None => match &state.mutable_name {
+            Some(name) if name.is_changed() => changed_name_banner_text(name),
+            _ => String::new(),
+        },
     }
+}
+
+/// The changed-trusted-name banner sentence: what changed, when it was trusted,
+/// and both CIDs, so the user can look and decide.
+///
+/// Composed once here (not at an edge) for the same reason every other chrome
+/// sentence is, and phrased as the settled decision words it: "this name now
+/// points to different content than the version you trusted on `<date>`".
+fn changed_name_banner_text(name: &crate::pins::MutableNameTrust) -> String {
+    let blessed = name
+        .blessed
+        .as_ref()
+        .expect("a changed name is a blessed name");
+    format!(
+        "⚠ {} now points to different content than the version you trusted on {}: \
+         it resolves to {} now, not {}. Nothing is blocked; look, then re-trust it or leave.",
+        name.name,
+        blessed.blessed_on(),
+        name.cid,
+        blessed.cid,
+    )
 }
 
 /// Every class [`error_banner_css_class`] can return: the error banner's
@@ -901,6 +1009,12 @@ pub const ERROR_BANNER_CSS_CLASSES: &[&str] = &["error-banner", "error-banner-tr
 ///
 /// The complete set of classes this can return is
 /// [`ERROR_BANNER_CSS_CLASSES`]; a painter derives its toggle list from there.
+///
+/// The TOFU changed-trusted-name banner deliberately reuses the HARD severity
+/// (it is not a retryable timeout, and re-loading will not un-change the name),
+/// so it needs no third class and every edge (including the two mobile ones,
+/// which colour from the `retryable` FACT rather than from a class) paints it in
+/// the loudest treatment they already have.
 #[must_use]
 pub fn error_banner_css_class(state: &ChromeState) -> &'static str {
     if state.failure_is_retryable() {
@@ -958,10 +1072,20 @@ pub fn invalid_entry_badge_text(state: &ChromeState) -> &'static str {
 /// (finished/failed/idle). This loading-wins precedence lives at the same display
 /// layer as the two-axis posture precedence, and is applied identically on the
 /// mobile shells (they consult the same `loading` fact from the chrome JSON).
+///
+/// A blessed name that now points to DIFFERENT content is the LOUDEST settled
+/// state and wins over every posture (task `ipns-tofu-pin-and-warn-on-change`):
+/// `MutableName` and `NameViaTrustedRpc` both say the name COULD be repointed,
+/// while this says it WAS, against something the user personally verified. It
+/// must never be flattened into either of them. It still loses to the in-flight
+/// loading state, like every other settled fact: while a load is running werust
+/// asserts nothing at all.
 #[must_use]
 pub fn trust_indicator(state: &ChromeState) -> &'static str {
     if state.is_loading() {
         "⋯ loading…"
+    } else if state.mutable_name_changed() {
+        "⚠ name points to NEW content"
     } else if state.is_content_verified() {
         "✓ verified"
     } else if state.is_name_via_trusted_rpc() {
@@ -979,6 +1103,8 @@ pub fn trust_indicator(state: &ChromeState) -> &'static str {
 pub fn trust_indicator_detail(state: &ChromeState) -> &'static str {
     if state.is_loading() {
         "werust is loading this page and is not yet asserting a trust level for it: the trust indicator shows the real posture only once the load settles."
+    } else if state.mutable_name_changed() {
+        "You TRUSTED this name at a specific version, and it now points to DIFFERENT content. The bytes still hash-verified, so this is not a broken page, it is a CHANGED one: the name's controller repointed it, which may be a normal site update or may not be. werust neither accepts this silently nor blocks it; open this surface to compare the versions, then re-trust the name or leave."
     } else if state.is_content_verified() {
         "This page was content-verified: its bytes were hash-checked against their content identifier on the content-addressed path."
     } else if state.is_name_via_trusted_rpc() {
@@ -1004,6 +1130,7 @@ pub const TRUST_INDICATOR_CSS_CLASSES: &[&str] = &[
     "trust-verified",
     "trust-name-trusted-rpc",
     "trust-mutable-name",
+    "trust-name-changed",
     "trust-unverified",
 ];
 
@@ -1017,6 +1144,8 @@ pub const TRUST_INDICATOR_CSS_CLASSES: &[&str] = &[
 pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
     if state.is_loading() {
         "trust-loading"
+    } else if state.mutable_name_changed() {
+        "trust-name-changed"
     } else if state.is_content_verified() {
         "trust-verified"
     } else if state.is_name_via_trusted_rpc() {
@@ -1025,6 +1154,79 @@ pub fn trust_indicator_css_class(state: &ChromeState) -> &'static str {
         "trust-mutable-name"
     } else {
         "trust-unverified"
+    }
+}
+
+/// Whether the trust surface offers the TOFU BLESS action for the current page:
+/// exactly when the page is a name-resolved load whose name is not already
+/// blessed at this very CID ([`ChromeState::can_bless_name`]).
+///
+/// The BLESS is an EXPLICIT user action reached FROM the trust indicator, never a
+/// first-visit prompt: a prompt on first visit trains people to dismiss it, and
+/// the trust surface is already the place the posture is explained (the settled
+/// UX decision, `docs/spikes/ipns-tofu-pin-and-warn-on-change/DECISIONS.md`). So
+/// the core says only whether the AFFORDANCE exists; every edge already has a
+/// surface behind the badge (a GTK popover, an AppKit tooltip/panel, the mobile
+/// alert both phones show on tap), and this is one more line + one more button in
+/// it. Nothing here pops anything up.
+///
+/// Hidden while a load is in flight, like every other settled trust fact: what
+/// the user would be blessing is not known until the load settles.
+#[must_use]
+pub fn trust_pin_action_visible(state: &ChromeState) -> bool {
+    !state.is_loading() && state.can_bless_name()
+}
+
+/// The label of the trust surface's BLESS action, empty when it is not offered.
+///
+/// Two wordings, because the action means two different things: on a name with no
+/// pin it is the first-use bless ("trust this content"), and on a name that has
+/// CHANGED since it was blessed it is the SSH-host-key "I have looked, and I
+/// accept the new content": the same button, a materially different decision, so
+/// it must not read the same.
+#[must_use]
+pub fn trust_pin_action_label(state: &ChromeState) -> &'static str {
+    if !trust_pin_action_visible(state) {
+        ""
+    } else if state.mutable_name_changed() {
+        "🔒 Trust the NEW content of this name"
+    } else {
+        "🔒 Trust this content"
+    }
+}
+
+/// The body of the trust surface's TOFU section: the name, the CID it resolves to
+/// right now, and what (if anything) the user blessed for it. Empty when the
+/// current page has no mutable name, in which case the surface shows only the
+/// posture explanation it always did.
+///
+/// Composed here rather than at an edge for the same reason
+/// [`trust_indicator_detail`] is: it was written once in the GTK popover and
+/// would otherwise be re-written in AppKit, Kotlin and Swift: the exact drift
+/// that shipped the trust EXPLANATION desktop-only for months (`docs/adr/0011`).
+/// It carries the CIDs verbatim because comparing them is the whole decision the
+/// user is being asked to make.
+#[must_use]
+pub fn trust_pin_detail(state: &ChromeState) -> String {
+    let Some(name) = &state.mutable_name else {
+        return String::new();
+    };
+    let head = format!(
+        "{} is a MUTABLE name: its controller can repoint it at any time.\nIt resolves to {} right now.",
+        name.name, name.cid
+    );
+    match &name.blessed {
+        None => format!("{head}\nYou have not trusted a version of this name yet."),
+        Some(pin) if pin.cid == name.cid => format!(
+            "{head}\nYou trusted exactly this content on {}.",
+            pin.blessed_on()
+        ),
+        Some(pin) => format!(
+            "{head}\nOn {} you trusted {} instead, when werust reported it as “{}”.",
+            pin.blessed_on(),
+            pin.cid,
+            crate::debug::trust_posture_wire_name(pin.posture),
+        ),
     }
 }
 
@@ -1170,10 +1372,12 @@ const _CSS_CLASS_FAMILY_ALL_IS_EVERY_FAMILY_IN_SLOT_ORDER: () = {
 ///   "url": "", "loadState": "idle", "loading": false, "loadStep": "idle",
 ///   "canGoBack": false, "canGoForward": false, "trustPosture": "unverified-origin",
 ///   "error": null, "failureKind": null, "retryable": false, "invalidEntry": null,
+///   "mutableName": null, "mutableNameCid": null, "blessedCid": null, "nameChanged": false,
 ///   "statusLine": "idle", "trustIndicator": "⚠ unverified origin",
 ///   "trustIndicatorDetail": "…", "errorBannerVisible": false, "errorBannerText": "",
 ///   "invalidEntryBadgeVisible": false, "invalidEntryBadgeText": "",
-///   "loadProgressVisible": false, "loadProgressFraction": 0.0, "loadProgressHint": ""
+///   "loadProgressVisible": false, "loadProgressFraction": 0.0, "loadProgressHint": "",
+///   "trustPinActionVisible": false, "trustPinActionLabel": "", "trustPinDetail": ""
 /// }
 /// ```
 ///
@@ -1233,6 +1437,10 @@ pub fn chrome_json(state: &ChromeState) -> String {
         "failureKind": state.failure_kind().map(FailureKind::wire_name),
         "retryable": state.failure_is_retryable(),
         "invalidEntry": state.invalid_entry,
+        "mutableName": state.mutable_name.as_ref().map(|n| n.name.clone()),
+        "mutableNameCid": state.mutable_name.as_ref().map(|n| n.cid.clone()),
+        "blessedCid": state.mutable_name.as_ref().and_then(|n| n.blessed.as_ref()).map(|p| p.cid.clone()),
+        "nameChanged": state.mutable_name_changed(),
         // --- The DERIVATION: the presentation rules above, verbatim. ---
         "statusLine": status_line(state),
         "trustIndicator": trust_indicator(state),
@@ -1244,6 +1452,9 @@ pub fn chrome_json(state: &ChromeState) -> String {
         "loadProgressVisible": load_progress_visible(state),
         "loadProgressFraction": load_progress_fraction(state),
         "loadProgressHint": load_progress_hint(state),
+        "trustPinActionVisible": trust_pin_action_visible(state),
+        "trustPinActionLabel": trust_pin_action_label(state),
+        "trustPinDetail": trust_pin_detail(state),
     })
     .to_string()
 }
@@ -1421,6 +1632,29 @@ pub struct BrowserShell {
     /// capture point simply keeps an empty store, so nothing changes for a caller
     /// that does not use the debug menu at all.
     debug: crate::debug::DebugCapture,
+    /// The trust-on-first-use pin store: the CIDs the user has BLESSED for
+    /// MUTABLE names (task `ipns-tofu-pin-and-warn-on-change`,
+    /// `docs/adr/0006`'s mutability axis).
+    ///
+    /// Loaded ONCE per shell (a launch) rather than per load, so the paint path
+    /// never touches the filesystem, and re-saved only when the user actually
+    /// blesses something ([`bless_current_name`](BrowserShell::bless_current_name)).
+    /// The shell holds it for the same reason it holds the chrome: it is the one
+    /// place that knows BOTH the name the user typed and the CID it resolved to.
+    ///
+    /// ADVISORY ONLY: it feeds [`ChromeState::mutable_name`] and nothing else. No
+    /// load path, no verification and no posture reads it, so an empty store
+    /// (a fresh install, or an unreadable file) is exactly the pre-TOFU browser.
+    pins: crate::pins::TrustedNamePins,
+    /// WHERE the pin store is read from and written back to, or `None` to use the
+    /// [`retrieval`](crate::retrieval) settings directory (production).
+    ///
+    /// The explicit-directory seam, the shell-level twin of
+    /// [`TrustedNamePins::load_from`](crate::pins::TrustedNamePins::load_from):
+    /// a test points the WHOLE bless -> persist -> re-resolve -> warn loop at its
+    /// own scratch directory (via [`with_pins_dir`](BrowserShell::with_pins_dir))
+    /// so it never touches the real store and never mutates process-global env.
+    pins_dir: Option<std::path::PathBuf>,
 }
 
 /// The ENS identity behind an underlying `ipfs://<cid>` load: the `.eth` name to
@@ -1509,9 +1743,32 @@ impl BrowserShell {
             back_skip: Vec::new(),
             back_skip_issued: None,
             debug: crate::debug::DebugCapture::new(),
+            // The blessed CIDs, read once per launch. A missing/unreadable store
+            // is simply empty, which is the pre-TOFU browser (fail-safe).
+            pins: crate::pins::TrustedNamePins::load(),
+            pins_dir: None,
         };
         shell.refresh_chrome();
         shell
+    }
+
+    /// Point the trust-on-first-use pin store at a SPECIFIC directory instead of
+    /// the [`retrieval`](crate::retrieval) settings directory, re-reading it.
+    ///
+    /// The shell-level explicit-directory seam (see
+    /// [`pins_dir`](BrowserShell::pins_dir)): a test drives the whole
+    /// bless -> persist -> re-resolve -> warn loop against its own scratch
+    /// directory, so it never touches the real `pins.json` (the shared-write rule)
+    /// and never mutates process-global env. Production leaves it unset; an edge
+    /// that wants a platform-specific location sets
+    /// [`WERUST_SETTINGS_DIR`](crate::retrieval::SETTINGS_DIR_ENV) instead, which
+    /// moves `retrieval.json` and `pins.json` together (one mechanism).
+    #[must_use]
+    pub fn with_pins_dir(mut self, dir: &std::path::Path) -> Self {
+        self.pins = crate::pins::TrustedNamePins::load_from(dir);
+        self.pins_dir = Some(dir.to_path_buf());
+        self.refresh_chrome();
+        self
     }
 
     /// Share the `_redirects` 3xx [`RedirectSink`](crate::ipfs::RedirectSink) the
@@ -1953,6 +2210,54 @@ impl BrowserShell {
         self.chrome.invalid_entry = Some(entry.to_string());
     }
 
+    /// BLESS the current page's mutable name at the CID it resolves to right now:
+    /// the trust-on-first-use action the trust surface offers (task
+    /// `ipns-tofu-pin-and-warn-on-change`).
+    ///
+    /// This is the ONLY way a pin is ever created: an EXPLICIT user action from
+    /// the trust surface, never a first-visit prompt and never an automatic
+    /// bless-what-you-loaded. Re-blessing a CHANGED name replaces its pin (the
+    /// SSH-host-key model's "I looked at the change and I accept the new
+    /// content"), so the next change is measured against what the user last
+    /// accepted.
+    ///
+    /// The pin records the name, the CID, the moment, and the [`TrustPosture`]
+    /// werust was showing, so a later change can say WHICH trust level was being
+    /// blessed.
+    ///
+    /// Returns whether the pin was DURABLY recorded. It is `false` in three
+    /// distinct-but-uninteresting-to-the-caller cases: there was nothing to bless
+    /// (no mutable name, or the name is already blessed at exactly this CID, both
+    /// of which the edge avoids by only offering the action when
+    /// [`trust_pin_action_visible`] is true), or there is no settings directory /
+    /// the write failed, in which case the bless still holds for THIS session
+    /// (the chrome updates), it simply cannot survive a relaunch. It is never an
+    /// error: a pin store that cannot be written must not break browsing.
+    pub fn bless_current_name(&mut self) -> bool {
+        // ONE gate, the very rule the edge's button visibility is painted from,
+        // so "the button is shown" and "the action does something" cannot drift.
+        if !trust_pin_action_visible(&self.chrome) {
+            return false;
+        }
+        let Some(current) = self.chrome.mutable_name.clone() else {
+            return false;
+        };
+        self.pins.bless(
+            &current.name,
+            &current.cid,
+            self.chrome.trust_posture,
+            crate::pins::now_unix_secs(),
+        );
+        let persisted = match &self.pins_dir {
+            Some(dir) => self.pins.save_to(dir),
+            None => self.pins.save(),
+        };
+        // Re-derive the chrome's TOFU axis from the store, so the surface reflects
+        // the bless immediately (the action label and the warning both change).
+        self.refresh_chrome();
+        persisted
+    }
+
     /// Go one step back in session history, through the seam.
     ///
     /// A no-op when [`ChromeState::can_go_back`] is `false`. Delegates to the
@@ -2144,10 +2449,27 @@ impl BrowserShell {
     /// A non-`ipfs://` (plain served) URL has no root CID, so it never matches —
     /// plain pages are wholly unaffected.
     fn ens_identity_for_url(&self, url: &str) -> Option<(String, bool)> {
+        self.ens_entry_for_url(url)
+            .map(|(display, entry)| (display, entry.mutable))
+    }
+
+    /// [`ens_identity_for_url`](BrowserShell::ens_identity_for_url)'s WHOLE
+    /// answer: the display identity PLUS the site entry behind it (its root name,
+    /// root CID and mutability).
+    ///
+    /// Split out because the TOFU pin needs the two facts the display string
+    /// deliberately hides: the ROOT `.eth` name (the identity a pin is keyed on,
+    /// so `ronan.eth/blog/` and `ronan.eth` share ONE pin) and the ROOT CID (what
+    /// the name resolves to right now). Returning them from the SAME lookup keeps
+    /// one match rule: a pin can never be checked against a different entry than
+    /// the one the URL bar is showing. The entry is CLONED rather than borrowed so
+    /// the caller can go on to `&mut self` the renderer (re-marking the posture
+    /// axes) in the same block.
+    fn ens_entry_for_url(&self, url: &str) -> Option<(String, EnsIdentity)> {
         // 1. Exact normalized-key hit: the entry the user actually resolved.
         let key = crate::ipfs::normalize_ens_page_key(url);
         if let Some(entry) = self.ens_pages.get(&key) {
-            return Some((entry.name.clone(), entry.mutable));
+            return Some((entry.name.clone(), entry.clone()));
         }
         // 2. Root-CID-PREFIX match: ANY `<rootcid>/<path>` of a known ENS site.
         let (root_cid, in_site_path) = crate::ipfs::ipfs_root_cid_and_path(url)?;
@@ -2159,7 +2481,7 @@ impl BrowserShell {
         // (`ronan.eth/<path>`), never the raw CID. `in_site_path` carries its
         // leading `/` (or is empty at the root).
         let display = format!("{}{in_site_path}", entry.root_name);
-        Some((display, entry.mutable))
+        Some((display, entry.clone()))
     }
 
     /// Step further BACK when an IN-FLIGHT Back landed on `url`, a url the
@@ -2439,13 +2761,31 @@ impl BrowserShell {
         let ens_entry = self
             .renderer
             .current_url()
-            .and_then(|url| self.ens_identity_for_url(&url));
-        if let Some((_, mutable)) = &ens_entry {
+            .and_then(|url| self.ens_entry_for_url(&url));
+        if let Some((_, entry)) = &ens_entry {
             self.renderer.mark_ens_origin();
-            if *mutable {
+            if entry.mutable {
                 self.renderer.mark_mutable_name();
             }
         }
+        // The TOFU axis: pair the current entry's MUTABLE NAME with whatever the
+        // user has blessed for it (`docs/adr/0006`'s mutability axis, task
+        // `ipns-tofu-pin-and-warn-on-change`). Derived here, beside the other
+        // per-entry re-derivations, so back / forward / reload onto a known ENS
+        // site re-checks the pin exactly as it re-derives the name: a warning the
+        // user only saw on the first load would be no warning at all.
+        //
+        // EVERY name-resolved entry is checked, `ipfs-ns` as well as `ipns-ns`:
+        // both are controller-repointable per `docs/adr/0006`, so both are
+        // blessable (see the `pins` module's MUTABILITY-AXIS note for why this is
+        // deliberately wider than the `MutableName` POSTURE, which loses to the
+        // louder `NameViaTrustedRpc` on every ENS load today). A page that is not
+        // name-resolved at all has no axis value, so nothing changes for it.
+        let mutable_name = ens_entry.as_ref().and_then(|(_, entry)| {
+            (!entry.root_cid.is_empty() && !entry.root_name.is_empty())
+                .then(|| self.pins.check(&entry.root_name, &entry.root_cid))
+        });
+        self.chrome.mutable_name = mutable_name;
         // The trust posture is the backend's truth about the current load path
         // (content-verified vs served), pulled fresh like the load state so the
         // indicator tracks the page actually shown — including after a scheme
@@ -2463,8 +2803,8 @@ impl BrowserShell {
         // moves onto a plain, non-ENS entry).
         if let Some(name) = &self.url_override {
             self.chrome.url_text = name.clone();
-        } else if let Some((name, _)) = &ens_entry {
-            self.chrome.url_text = name.clone();
+        } else if let Some((display, _)) = &ens_entry {
+            self.chrome.url_text = display.clone();
         } else if let Some(url) = self.renderer.current_url() {
             self.chrome.url_text = url;
         }
@@ -3518,6 +3858,380 @@ mod tests {
         assert!(shell.chrome().is_mutable_name());
         assert!(!shell.chrome().is_content_verified());
         assert!(!shell.chrome().is_name_via_trusted_rpc());
+    }
+
+    // ---- Trust-on-first-use for MUTABLE names (task -------------------------
+    //      `ipns-tofu-pin-and-warn-on-change`, `docs/adr/0006`'s mutability axis).
+
+    /// A unique scratch directory for the TOFU pin store, removed on drop, so the
+    /// whole bless -> persist -> re-resolve -> warn loop runs against ITS OWN
+    /// directory and NEVER the real `pins.json` (the shared-write rule), driven
+    /// through the shell's directory-taking `with_pins_dir` seam, so no test
+    /// mutates the process-global `WERUST_SETTINGS_DIR`.
+    struct PinScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl PinScratchDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "werust-shell-pins-test-{tag}-{pid}-{n}",
+                pid = std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            Self { path }
+        }
+    }
+
+    impl Drop for PinScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// A shell whose ENS front door resolves through a scripted RPC fixture AND
+    /// whose TOFU pin store lives in `pins_dir`: a "launch" of werust with a
+    /// known blessed set, off the live network and off the real store.
+    fn shell_with_provider_and_pins(
+        answers: Vec<Result<Vec<u8>, ProviderError>>,
+        pins_dir: &std::path::Path,
+    ) -> (BrowserShell, BackendHandle) {
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let provider = ScriptedProvider::new(answers);
+        (
+            BrowserShell::with_provider(Box::new(backend), Box::new(provider))
+                .with_pins_dir(pins_dir),
+            handle,
+        )
+    }
+
+    /// Drive a whole `.eth` load to a settled, hash-verified page.
+    fn load_eth_name(shell: &mut BrowserShell, handle: &BackendHandle, name: &str) {
+        shell.navigate(name).expect("the front door handles .eth");
+        handle.serve_via_verified_content_path();
+        settle(shell, handle);
+    }
+
+    #[test]
+    fn an_unblessed_mutable_name_behaves_exactly_as_before_but_offers_the_bless() {
+        // Acceptance (FAIL-SAFE): a name nobody has blessed is UNCHANGED by this
+        // feature: same posture, no banner, no louder badge. The only thing that
+        // is new is that the trust surface OFFERS the bless, which is an
+        // affordance, not a prompt.
+        let scratch = PinScratchDir::new("unblessed");
+        let (contenthash, _uri) = ipfs_contenthash_fixture(b"the site as it is today");
+        let (mut shell, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&contenthash)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut shell, &handle, "ronan.eth");
+
+        let chrome = shell.chrome();
+        assert_eq!(chrome.trust_posture, TrustPosture::NameViaTrustedRpc);
+        assert_eq!(trust_indicator(chrome), "◈ name via trusted RPC");
+        assert_eq!(trust_indicator_css_class(chrome), "trust-name-trusted-rpc");
+        assert!(!chrome.mutable_name_changed());
+        assert!(
+            !error_banner_visible(chrome),
+            "an unblessed name raises no banner"
+        );
+        // But the name IS recognised as blessable, and the surface says what the
+        // user would be blessing.
+        assert!(chrome.can_bless_name());
+        assert!(trust_pin_action_visible(chrome));
+        assert_eq!(trust_pin_action_label(chrome), "🔒 Trust this content");
+        let detail = trust_pin_detail(chrome);
+        assert!(detail.contains("ronan.eth"), "names the name: {detail}");
+        assert!(
+            detail.contains("not trusted a version"),
+            "says nothing is blessed yet: {detail}"
+        );
+        // Nothing has been written: an unblessed browse never touches the store.
+        assert!(!scratch.path.join(crate::pins::PINS_FILE).exists());
+    }
+
+    #[test]
+    fn blessing_a_name_persists_across_launches_and_a_later_change_warns_loudly() {
+        // THE acceptance property, end to end and offline: the user blesses
+        // `ronan.eth` at the CID it resolves to today; a LATER launch resolves the
+        // same name to a DIFFERENT CID and is warned legibly, not silently
+        // accepted, and not hard-blocked.
+        let scratch = PinScratchDir::new("bless-then-change");
+        let (ch_old, _) = ipfs_contenthash_fixture(b"the version the user trusts");
+        let (ch_new, _) = ipfs_contenthash_fixture(b"a DIFFERENT version, published later");
+
+        // --- Launch 1: load the name and BLESS what it points at. ---
+        let (mut first, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_old)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut first, &handle, "ronan.eth");
+        let blessed_cid = first
+            .chrome()
+            .mutable_name
+            .as_ref()
+            .expect("a name-resolved page carries the TOFU axis")
+            .cid
+            .clone();
+        assert!(first.bless_current_name(), "the bless is recorded durably");
+
+        // It is on disk, in the scratch dir ONLY, and the surface now says so.
+        assert!(scratch.path.join(crate::pins::PINS_FILE).is_file());
+        let chrome = first.chrome();
+        assert!(chrome.mutable_name.as_ref().unwrap().is_unchanged());
+        assert!(
+            !trust_pin_action_visible(chrome),
+            "a name already blessed at this very CID has nothing left to record"
+        );
+        assert!(trust_pin_detail(chrome).contains("You trusted exactly this content on"));
+        // Blessing changed NOTHING else: same posture, same badge, no banner.
+        assert_eq!(chrome.trust_posture, TrustPosture::NameViaTrustedRpc);
+        assert!(!error_banner_visible(chrome));
+
+        // --- Launch 2: a fresh shell, same store, the name now resolves elsewhere. ---
+        let (mut second, handle2) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut second, &handle2, "ronan.eth");
+        let chrome = second.chrome();
+
+        // The pin SURVIVED the relaunch, and the change is detected.
+        assert!(chrome.mutable_name_changed());
+        let axis = chrome.mutable_name.as_ref().unwrap();
+        assert_ne!(axis.cid, blessed_cid);
+        assert_eq!(axis.blessed.as_ref().unwrap().cid, blessed_cid);
+
+        // 1. A DISTINCT, LOUDER badge that is neither `MutableName` nor
+        //    `NameViaTrustedRpc`: the change is never flattened into either.
+        let badge = trust_indicator(chrome);
+        let class = trust_indicator_css_class(chrome);
+        assert_eq!(class, "trust-name-changed");
+        assert_ne!(class, "trust-mutable-name");
+        assert_ne!(class, "trust-name-trusted-rpc");
+        assert!(badge.contains("NEW content"), "a legible badge: {badge}");
+        assert!(TRUST_INDICATOR_CSS_CLASSES.contains(&class));
+        // The underlying POSTURE is untouched: the bytes really did verify, and
+        // the pin is a separate axis, not a re-meaning of the seam's truth.
+        assert_eq!(chrome.trust_posture, TrustPosture::NameViaTrustedRpc);
+
+        // 2. The failure-class BANNER, carrying the settled sentence: what
+        //    changed, when it was trusted, and both CIDs to compare.
+        assert!(error_banner_visible(chrome));
+        let banner = error_banner_text(chrome);
+        assert!(banner.contains("ronan.eth"), "{banner}");
+        assert!(
+            banner.contains("points to different content than the version you trusted on"),
+            "the settled wording: {banner}"
+        );
+        assert!(banner.contains(&blessed_cid), "the blessed CID: {banner}");
+        assert!(banner.contains(&axis.cid), "the current CID: {banner}");
+        assert_eq!(
+            error_banner_css_class(chrome),
+            "error-banner",
+            "failure-class prominence, not the softer retryable treatment"
+        );
+
+        // 3. NOT hard-blocked: the page loaded and rendered exactly as it would
+        //    have, and the user is offered the re-trust decision.
+        assert_eq!(chrome.load_state, LoadState::Finished);
+        assert_eq!(chrome.last_error, None);
+        assert!(trust_pin_action_visible(chrome));
+        assert_eq!(
+            trust_pin_action_label(chrome),
+            "🔒 Trust the NEW content of this name",
+            "accepting a CHANGE must not read like a first-use bless"
+        );
+
+        // 4. Re-blessing clears the warning (the SSH-host-key "I looked, and I
+        //    accept"), and the NEW CID is what a later change is measured against.
+        let current_cid = axis.cid.clone();
+        assert!(second.bless_current_name());
+        assert!(!second.chrome().mutable_name_changed());
+        assert!(!error_banner_visible(second.chrome()));
+        assert_eq!(
+            crate::pins::TrustedNamePins::load_from(&scratch.path)
+                .get("ronan.eth")
+                .map(|p| p.cid.clone()),
+            Some(current_cid)
+        );
+    }
+
+    #[test]
+    fn a_mutable_ipns_ns_name_is_blessed_and_warned_exactly_like_an_ens_ipfs_ns_one() {
+        // Acceptance (settled decision 3): BOTH axes' names are
+        // controller-repointable, so both are blessable and both warn identically.
+        // Here the ENS contenthash is an `ipns-ns` POINTER followed through a
+        // client-verified record: the CID can change because the ENS owner
+        // repoints OR because the key holder publishes, and the pin (keyed on the
+        // name the user actually sees) catches both.
+        let scratch = PinScratchDir::new("ipns-ns");
+        let key = IpnsKeyFixture::new();
+        let old_cid = cid_v1_raw_sha256(b"the ipns site the user trusts").expect("cid");
+        let new_cid = cid_v1_raw_sha256(b"what the key holder published later").expect("cid");
+
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::with_provider_and_ipns_source(
+            Box::new(backend),
+            Box::new(ScriptedProvider::new(vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ])),
+            Box::new(PinnedIpnsSource::with_record(
+                &key.name,
+                key.signed_record_for(&old_cid),
+            )),
+        )
+        .with_pins_dir(&scratch.path);
+        load_eth_name(&mut shell, &handle, "mutable.eth");
+        assert_eq!(
+            shell.chrome().mutable_name.as_ref().map(|n| n.cid.clone()),
+            Some(old_cid.clone()),
+            "the axis carries the CID the RECORD currently points at"
+        );
+        assert!(shell.bless_current_name());
+
+        // A later launch: the key holder has published a different target.
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut later = BrowserShell::with_provider_and_ipns_source(
+            Box::new(backend),
+            Box::new(ScriptedProvider::new(vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&key.contenthash)),
+            ])),
+            Box::new(PinnedIpnsSource::with_record(
+                &key.name,
+                key.signed_record_for(&new_cid),
+            )),
+        )
+        .with_pins_dir(&scratch.path);
+        load_eth_name(&mut later, &handle, "mutable.eth");
+
+        assert!(later.chrome().mutable_name_changed());
+        assert_eq!(
+            trust_indicator_css_class(later.chrome()),
+            "trust-name-changed"
+        );
+        assert!(error_banner_text(later.chrome()).contains(&new_cid));
+    }
+
+    #[test]
+    fn the_pin_never_chooses_what_loads_and_never_makes_unverified_bytes_look_verified() {
+        // FAIL-SAFE, the security-relevant half: a pin is ADVISORY. It must not
+        // steer the load back to the blessed CID (that would be a browser showing
+        // stale content it was not asked for), and it must not upgrade a load whose
+        // bytes never hash-verified.
+        let scratch = PinScratchDir::new("advisory");
+        let (ch_old, _) = ipfs_contenthash_fixture(b"blessed version");
+        let (ch_new, new_uri) = ipfs_contenthash_fixture(b"the version served now");
+
+        let (mut first, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_old)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut first, &handle, "ronan.eth");
+        assert!(first.bless_current_name());
+
+        // The name now resolves elsewhere, and the bytes are NOT served through the
+        // verified content path this time.
+        let (mut second, handle2) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        second.navigate("ronan.eth").expect("the front door runs");
+        // The backend was pointed at the FRESHLY RESOLVED CID, never the blessed one.
+        assert_eq!(
+            second.current_url_for_test().as_deref(),
+            Some(new_uri.as_str()),
+            "the pin must not steer the load back to the CID the user blessed"
+        );
+        settle(&mut second, &handle2);
+        // Unverified bytes stay unverified: the pin adds a warning, never trust.
+        assert!(!second.chrome().is_content_verified());
+        assert_ne!(second.chrome().trust_posture, TrustPosture::ContentVerified);
+    }
+
+    #[test]
+    fn a_page_that_is_not_a_name_resolved_load_carries_no_tofu_axis_at_all() {
+        // The axis is `None` for a direct `ipfs://<cid>` and for an ordinary
+        // served page: there is no name to bless and nothing that could change.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("ipfs://bafyplaincid/index.html").unwrap();
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().mutable_name, None);
+        assert!(!shell.chrome().can_bless_name());
+        assert!(!trust_pin_action_visible(shell.chrome()));
+        assert_eq!(trust_pin_detail(shell.chrome()), "");
+        assert!(!shell.bless_current_name(), "nothing to bless");
+
+        shell.navigate("https://example.com/").unwrap();
+        settle(&mut shell, &handle);
+        assert_eq!(shell.chrome().mutable_name, None);
+    }
+
+    #[test]
+    fn the_change_warning_is_re_derived_on_a_history_move_not_only_the_first_load() {
+        // A warning the user sees once and loses on Back would be no warning at
+        // all: the TOFU axis is re-derived beside the `.eth` name itself, off the
+        // SAME entry lookup, so returning to a changed site warns again.
+        let scratch = PinScratchDir::new("history");
+        let (ch_old, _) = ipfs_contenthash_fixture(b"blessed");
+        let (ch_new, _) = ipfs_contenthash_fixture(b"changed");
+
+        let (mut first, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_old)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut first, &handle, "ronan.eth");
+        assert!(first.bless_current_name());
+
+        let (mut second, handle2) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut second, &handle2, "ronan.eth");
+        assert!(second.chrome().mutable_name_changed());
+
+        // Navigate away, then Back onto the changed site: the bar re-derives the
+        // `.eth` name from the entry's CID, and the warning comes back with it.
+        second.navigate("https://example.com/").unwrap();
+        settle(&mut second, &handle2);
+        assert!(!second.chrome().mutable_name_changed());
+        second.go_back();
+        settle(&mut second, &handle2);
+        assert_eq!(second.chrome().url_text, "ronan.eth");
+        assert!(
+            second.chrome().mutable_name_changed(),
+            "the warning is re-derived on the history move, like the name is"
+        );
     }
 
     #[test]
@@ -5880,10 +6594,49 @@ mod tests {
         reasons
     }
 
+    /// Every state of the TOFU MUTABLE-NAME axis a chrome rule can branch on: no
+    /// name-resolved page at all, a name nobody has blessed, a blessed name still
+    /// on its blessed CID, and a blessed name that has CHANGED.
+    ///
+    /// A match over the four cases the axis really has, so it is exhaustive by
+    /// inspection the way the enum axes are by construction: the axis is an
+    /// `Option<MutableNameTrust>` whose inner state is decided by the presence and
+    /// the CID of a pin, and these are all four combinations.
+    fn every_mutable_name_shape() -> Vec<Option<crate::pins::MutableNameTrust>> {
+        let pin = crate::pins::TrustedNamePin {
+            name: "ronan.eth".to_string(),
+            cid: "bafyblessed".to_string(),
+            blessed_at: 1_800_000_000,
+            posture: TrustPosture::NameViaTrustedRpc,
+        };
+        vec![
+            // Not a name-resolved page (a direct `ipfs://<cid>`, an https page).
+            None,
+            // A mutable name nobody has blessed: behaves exactly as before TOFU.
+            Some(crate::pins::MutableNameTrust {
+                name: "ronan.eth".to_string(),
+                cid: "bafyblessed".to_string(),
+                blessed: None,
+            }),
+            // Blessed, and still the blessed content.
+            Some(crate::pins::MutableNameTrust {
+                name: "ronan.eth".to_string(),
+                cid: "bafyblessed".to_string(),
+                blessed: Some(pin.clone()),
+            }),
+            // Blessed, and now pointing somewhere else: the TOFU warning.
+            Some(crate::pins::MutableNameTrust {
+                name: "ronan.eth".to_string(),
+                cid: "bafychanged".to_string(),
+                blessed: Some(pin),
+            }),
+        ]
+    }
+
     /// Every SHAPE of [`ChromeState`] a chrome rule can branch on: the cartesian
     /// product of all its axes (load state x pipeline step x trust posture x
-    /// failure severity x the invalid-entry axis x the history flags x an
-    /// empty/non-empty URL).
+    /// failure severity x the invalid-entry axis x the TOFU mutable-name axis x
+    /// the history flags x an empty/non-empty URL).
     ///
     /// Every ENUM axis is driven EXHAUSTIVELY BY CONSTRUCTION — from
     /// [`LoadState::ALL`], [`LoadStep::ALL`], [`TrustPosture::ALL`] and (through
@@ -5907,19 +6660,22 @@ mod tests {
                 for posture in TrustPosture::ALL {
                     for last_error in failure_reasons.iter().copied() {
                         for invalid_entry in [None, Some("not a url")] {
-                            for can_go_back in [false, true] {
-                                for can_go_forward in [false, true] {
-                                    for url_text in ["", "ipfs://bafy/index.html"] {
-                                        shapes.push(ChromeState {
-                                            url_text: url_text.to_string(),
-                                            load_state,
-                                            load_step,
-                                            trust_posture: posture,
-                                            last_error: last_error.map(str::to_string),
-                                            invalid_entry: invalid_entry.map(str::to_string),
-                                            can_go_back,
-                                            can_go_forward,
-                                        });
+                            for mutable_name in every_mutable_name_shape() {
+                                for can_go_back in [false, true] {
+                                    for can_go_forward in [false, true] {
+                                        for url_text in ["", "ipfs://bafy/index.html"] {
+                                            shapes.push(ChromeState {
+                                                url_text: url_text.to_string(),
+                                                load_state,
+                                                load_step,
+                                                trust_posture: posture,
+                                                last_error: last_error.map(str::to_string),
+                                                invalid_entry: invalid_entry.map(str::to_string),
+                                                mutable_name: mutable_name.clone(),
+                                                can_go_back,
+                                                can_go_forward,
+                                            });
+                                        }
                                     }
                                 }
                             }
@@ -6138,6 +6894,12 @@ mod tests {
                     load_progress_fraction(&state).into(),
                 ),
                 ("loadProgressHint", load_progress_hint(&state).into()),
+                (
+                    "trustPinActionVisible",
+                    trust_pin_action_visible(&state).into(),
+                ),
+                ("trustPinActionLabel", trust_pin_action_label(&state).into()),
+                ("trustPinDetail", trust_pin_detail(&state).into()),
             ];
             for (field, expected) in derived {
                 assert_eq!(
@@ -6211,6 +6973,12 @@ mod tests {
                 "failureKind": null,
                 "retryable": false,
                 "invalidEntry": null,
+                // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`):
+                // absent on a page that is not a name-resolved load at all.
+                "mutableName": null,
+                "mutableNameCid": null,
+                "blessedCid": null,
+                "nameChanged": false,
                 // The DERIVED strings, named after the core rules that produce them.
                 "statusLine": "idle",
                 "trustIndicator": "⚠ unverified origin",
@@ -6222,6 +6990,9 @@ mod tests {
                 "loadProgressVisible": false,
                 "loadProgressFraction": 0.0,
                 "loadProgressHint": "",
+                "trustPinActionVisible": false,
+                "trustPinActionLabel": "",
+                "trustPinDetail": "",
             })
         );
     }

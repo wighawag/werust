@@ -208,6 +208,18 @@ class BrowserActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * The trust surface's TRUST-ON-FIRST-USE lines and action, cached from the
+     * last [refreshChrome] so [showTrustExplanation] can build the surface WITHOUT
+     * a fresh chrome read on the UI thread (which takes the native session lock,
+     * and can wait behind an in-flight `ipfs://` retrieval, the ANR guard). All
+     * three are the core's derivation, carried on the chrome JSON; this edge only
+     * holds onto them between a paint and a tap.
+     */
+    private var trustPinDetailText: String = ""
+    private var trustPinActionOffered: Boolean = false
+    private var trustPinActionLabelText: String = ""
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -575,11 +587,28 @@ class BrowserActivity : ComponentActivity() {
     private fun showTrustExplanation() {
         val detail = trust.contentDescription?.toString().orEmpty()
         if (detail.isEmpty()) return
-        AlertDialog.Builder(this)
+        // The TRUST-ON-FIRST-USE section of the same surface (task
+        // `ipns-tofu-pin-and-warn-on-change`): what this MUTABLE name resolves to
+        // now, what the user blessed for it, and (when there is something new to
+        // record) the bless action. The bless is reached FROM the trust indicator
+        // by an explicit tap, never a first-visit prompt, which is why it lives
+        // here rather than in a dialog of its own. Every string is the core's, read
+        // off the last painted snapshot (never a fresh chrome read, which would
+        // take the native session lock on the UI thread, the ANR guard).
+        val message =
+            if (trustPinDetailText.isEmpty()) detail else "$detail\n\n$trustPinDetailText"
+        val builder = AlertDialog.Builder(this)
             .setTitle(trust.text)
-            .setMessage(detail)
+            .setMessage(message)
             .setPositiveButton(android.R.string.ok, null)
-            .show()
+        if (trustPinActionOffered) {
+            // Blessing writes the pin file, so it goes through the SAME
+            // off-UI-thread dispatch every session-driving action uses.
+            builder.setNeutralButton(trustPinActionLabelText) { _, _ ->
+                driveCore { core.blessName() }
+            }
+        }
+        builder.show()
     }
 
     /** After driving the core, apply any pending load to the WebView and repaint. */
@@ -630,6 +659,13 @@ class BrowserActivity : ComponentActivity() {
         // stand-in for desktop's hover tooltip.
         trust.text = chrome.trustIndicator
         trust.contentDescription = chrome.trustIndicatorDetail
+        // The trust surface's TRUST-ON-FIRST-USE section, cached off this ONE
+        // painted snapshot so the tap handler never takes the native session lock
+        // on the UI thread (the ANR guard). Every string is the core's derivation:
+        // this edge decides neither the wording nor whether the action is offered.
+        trustPinDetailText = chrome.trustPinDetail
+        trustPinActionOffered = chrome.trustPinActionVisible
+        trustPinActionLabelText = chrome.trustPinActionLabel
         // The LOAD-PROGRESS line: its progress advances with the real pipeline phase
         // while a load is in flight (including the pre-content name-resolution
         // window, where the backend has not started yet), and it goes INVISIBLE —

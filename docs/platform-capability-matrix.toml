@@ -382,6 +382,74 @@ ios = { state = "implemented" }
 android = { state = "implemented" }
 
 [[capability]]
+name = "mutable-name-change-warning"
+description = "WARN, at the prominence a fail-closed failure gets, when a MUTABLE name the user personally TRUSTED now resolves to DIFFERENT content: a distinct, louder trust badge (never flattened into `mutable-name` or `name-via-trusted-rpc`, both of which only say the name COULD change) PLUS the high-contrast in-view banner naming the name, the day it was trusted and both CIDs. Never silently accepted, never a hard block \u2014 the user looks and decides."
+# The WARNING half of trust-on-first-use (task `ipns-tofu-pin-and-warn-on-change`,
+# `docs/adr/0006`'s mutability axis). SPLIT from the BLESS row below for exactly
+# the reason `trust-explanation` was split out of `trust-indicator`: an edge that
+# shows the warning but offers no way to record a pin is honest about neither, and
+# a single green row would hide the gap.
+#
+# It is `implemented` everywhere because it is PURE DERIVATION over an orthogonal
+# `ChromeState` axis (`mutable_name`, paired by the shell with the shared
+# `werust_core::pins` store), decided ONCE in the core (`trust_indicator` /
+# `_detail` / `_css_class` gain the loudest `trust-name-changed` state, and
+# `error_banner_visible` / `_text` gain their second failure-class case) and
+# carried to every edge by the SAME two carriers everything else uses: a Rust
+# struct where both sides are Rust (`desktop_paint::ChromePaint`, so the AppKit and
+# Win32 windows paint it with no per-edge change) and the chrome JSON where they
+# are not (`trustIndicator`/`trustIndicatorDetail`/`errorBanner*`, already decoded
+# and painted by Kotlin and Swift each refresh). That is the whole point of
+# `docs/adr/0011`: a new chrome state reaches every platform without touching one.
+# The one per-edge cost is a COLOUR for the new class, which both painters' gates
+# force: the GTK `APP_CSS` rule and the `desktop-paint` palette entry.
+# The pin the warning rests on is ADVISORY only: it never steers a load and never
+# upgrades a posture, so an unblessed name is byte-for-byte the pre-TOFU chrome on
+# every platform.
+desktop = { state = "implemented" }
+macos = { state = "implemented" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
+name = "mutable-name-tofu-bless"
+description = "Let the user RECORD (bless) a MUTABLE name's current CID as the version they trust, from an EXPLICIT action reached off the trust indicator (never a first-visit prompt), persisted across launches in the shared pin store beside the retrieval settings \u2014 the SSH-host-key model applied to names."
+# The ACTION half of trust-on-first-use (task `ipns-tofu-pin-and-warn-on-change`).
+# The pin store, the wire form, the wording of the action and the decision of
+# WHETHER it is offered are all the shared core (`werust_core::pins` +
+# `trust_pin_action_visible` / `_label` / `trust_pin_detail`), so no edge decides
+# anything; what each edge must have is a SURFACE behind the trust badge with a
+# button in it, dispatching the one shared `BrowserShell::bless_current_name`.
+# * desktop: the badge is a GTK `MenuButton` opening a `Popover` carrying the
+#   posture explanation, the core's TOFU detail line and the bless button
+#   (crates/werust/src/main.rs). Guarded by
+#   crates/werust-core/tests/chrome_css_class_set_edge_wiring_shape.rs, which reds
+#   the gate if the painter starts deciding the label or the visibility itself.
+# * ios/android: both already opened a trust surface on a badge TAP (the
+#   explanation alert added by `mobile-chrome-presentation-from-one-derivation`),
+#   so the TOFU section joins THAT surface: the core's `trustPinDetail` line plus
+#   an action shown exactly when `trustPinActionVisible`, titled with
+#   `trustPinActionLabel`, over the new `nativeBlessName` / `werust_ios_bless_name`
+#   FFI into the shared shell. Android dispatches it through `driveCore` (off the
+#   UI thread, since blessing writes a file), so the ANR fix is not regressed.
+#   Guarded by crates/werust-core/tests/mobile_chrome_presentation_shape.rs; the
+#   Kotlin/Swift halves are never compiled by this repo's pure-Rust gate.
+# * macos: the one edge with NO surface to put the action in: the AppKit trust
+#   indicator is a plain `NSTextField` label (crates/werust-macos/src/window.rs)
+#   with no click target, where every other edge already had a popover/alert to
+#   extend. The three values it would paint are already on the shared
+#   `desktop_paint::ChromePaint` (`trust_pin_action_visible` / `_label` /
+#   `trust_pin_detail`), so this is a missing WIRE, not a missing platform, which
+#   is why it is `stubbed` rather than `n-a`, and why the sibling
+#   `mutable-name-change-warning` row above is honestly `implemented` for macOS
+#   (the warning needs no affordance and reaches it through the same snapshot).
+#   Task `macos-trust-surface-bless-affordance`.
+desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "macos-trust-surface-bless-affordance" }
+ios = { state = "implemented" }
+android = { state = "implemented" }
+
+[[capability]]
 name = "web-inspector"
 description = "The platform's OWN full web inspector (WebKit/Chrome devtools: a typeable console REPL + a network view + DOM/sources), reached per-platform, gated on a debug build so a release build is not silently inspectable."
 # Each platform enables its NATIVE inspector (not a custom werust window), at the
@@ -437,6 +505,13 @@ description = "Surface a fail-closed load's reason PROMINENTLY (a high-contrast 
 # 30572253620): the negative control's hash mismatch raised the banner carrying
 # the core's protocol-named reason verbatim ("... block hash mismatch: bytes do
 # not match cid bafkrei…"), and a successful load raised none.
+# This banner is now SHARED with one other failure-class state: a MUTABLE name
+# that changed since the user personally trusted it (row
+# `mutable-name-change-warning`, task `ipns-tofu-pin-and-warn-on-change`). A LOAD
+# failure still wins the text when both are true, and it stays ONE
+# `error_banner_visible` / `error_banner_text` pair, so no edge gained a second
+# banner to decide between; the reasoning is recorded at
+# docs/spikes/ipns-tofu-pin-and-warn-on-change/DECISIONS.md (decision 3).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
 ios = { state = "implemented" }

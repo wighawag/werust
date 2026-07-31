@@ -161,6 +161,17 @@ impl CoreSession {
         self.shell.stop();
     }
 
+    /// BLESS the current page's mutable name at the CID it resolves to right now
+    /// (trust-on-first-use, task `ipns-tofu-pin-and-warn-on-change`).
+    ///
+    /// The Kotlin trust surface's "trust this content" action, dispatched into the
+    /// SHARED [`BrowserShell::bless_current_name`](werust_core::BrowserShell::bless_current_name),
+    /// so the pin store, its wire form and the warning rule are the desktop ones,
+    /// not a mobile twin. Returns whether the pin was durably recorded.
+    pub fn bless_current_name(&mut self) -> bool {
+        self.shell.bless_current_name()
+    }
+
     /// Drain every pending load event off the backend and fold it into the
     /// chrome ([`BrowserShell::pump`](werust_core::BrowserShell::pump)).
     ///
@@ -552,6 +563,12 @@ impl SyncSession {
     /// Stop the in-flight load, under the lock. See [`CoreSession::stop`].
     pub fn stop(&self) {
         self.with(CoreSession::stop);
+    }
+
+    /// Bless the current mutable name, under the lock. See
+    /// [`CoreSession::bless_current_name`].
+    pub fn bless_current_name(&self) -> bool {
+        self.with(CoreSession::bless_current_name)
     }
 
     /// Drain the pending load, under the lock, PUMPING first. See
@@ -1033,6 +1050,23 @@ mod jni_exports {
         handle: jlong,
     ) {
         unsafe { session(handle) }.stop();
+    }
+
+    /// BLESS the current page's mutable name (trust-on-first-use): the Kotlin
+    /// trust surface's "trust this content" action. Returns whether the pin was
+    /// durably recorded; the chrome is refreshed either way, so the caller simply
+    /// repaints (task `ipns-tofu-pin-and-warn-on-change`).
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeBlessName(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) -> jboolean {
+        if unsafe { session(handle) }.bless_current_name() {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     }
 
     #[no_mangle]

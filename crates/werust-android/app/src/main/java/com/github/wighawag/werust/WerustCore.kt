@@ -36,6 +36,19 @@ class WerustCore : AutoCloseable {
     fun stop() = nativeStop(handle)
 
     /**
+     * BLESS the current page's MUTABLE name at the CID it resolves to right now:
+     * the trust surface's "trust this content" action (trust-on-first-use, task
+     * `ipns-tofu-pin-and-warn-on-change`). A later resolution to a DIFFERENT CID
+     * is then warned about.
+     *
+     * Whether there is anything to bless (and what the button says) is decided
+     * by the core and carried on the chrome ([Chrome.trustPinActionVisible] /
+     * [Chrome.trustPinActionLabel]); this only dispatches the action. Returns
+     * whether the pin was DURABLY recorded (it holds for this session either way).
+     */
+    fun blessName(): Boolean = nativeBlessName(handle)
+
+    /**
      * The URL (if any) the core has committed to but the platform `WebView` has
      * not yet loaded. Empty string means "nothing pending".
      */
@@ -355,6 +368,22 @@ class WerustCore : AutoCloseable {
         val retryable: Boolean,
         val invalidEntry: String?,
         /**
+         * The MUTABLE name this page resolved through (`ronan.eth`), or null when
+         * the page is not a name-resolved load at all. The identity a
+         * trust-on-first-use pin is keyed on.
+         */
+        val mutableName: String?,
+        /** The CID [mutableName] resolves to on THIS load, or null. */
+        val mutableNameCid: String?,
+        /** The CID the user BLESSED for [mutableName], or null if never blessed. */
+        val blessedCid: String?,
+        /**
+         * Whether the blessed name now points to DIFFERENT content: the
+         * trust-on-first-use warning, the LOUDEST settled chrome state. The core's
+         * `ChromeState::mutable_name_changed`.
+         */
+        val nameChanged: Boolean,
+        /**
          * The one-line status shown in the footer: a failure wins, else a loading
          * indicator that NAMES the real pipeline step (resolving name / fetching
          * record / fetching content / rendering) so a slow load reads as working,
@@ -416,6 +445,25 @@ class WerustCore : AutoCloseable {
          * hint vocabulary verbatim.
          */
         val loadProgressHint: String,
+        /**
+         * Whether the trust surface should offer the BLESS action: the core's
+         * `trust_pin_action_visible`. An AFFORDANCE inside the surface the user
+         * opened by tapping the badge, never a first-visit prompt.
+         */
+        val trustPinActionVisible: Boolean,
+        /**
+         * The BLESS action's label: the core's `trust_pin_action_label` (empty when
+         * the action is not offered). Two wordings, because a first-use bless and
+         * accepting a CHANGE are materially different decisions.
+         */
+        val trustPinActionLabel: String,
+        /**
+         * The trust surface's trust-on-first-use body: the core's
+         * `trust_pin_detail`: the mutable name, the CID it resolves to now, and
+         * what (if anything) was blessed for it. Empty when there is no mutable
+         * name.
+         */
+        val trustPinDetail: String,
     ) {
         companion object {
             fun fromJson(json: String): Chrome {
@@ -432,6 +480,10 @@ class WerustCore : AutoCloseable {
                     failureKind = if (o.isNull("failureKind")) null else o.optString("failureKind"),
                     retryable = o.optBoolean("retryable", false),
                     invalidEntry = if (o.isNull("invalidEntry")) null else o.getString("invalidEntry"),
+                    mutableName = if (o.isNull("mutableName")) null else o.getString("mutableName"),
+                    mutableNameCid = if (o.isNull("mutableNameCid")) null else o.getString("mutableNameCid"),
+                    blessedCid = if (o.isNull("blessedCid")) null else o.getString("blessedCid"),
+                    nameChanged = o.optBoolean("nameChanged", false),
                     // The DERIVED half. Each default is the EMPTY/absent value, never
                     // a Kotlin copy of the core's wording: a document that somehow
                     // lacked a derived field must show nothing rather than a second,
@@ -446,6 +498,9 @@ class WerustCore : AutoCloseable {
                     loadProgressVisible = o.optBoolean("loadProgressVisible", false),
                     loadProgressFraction = o.optDouble("loadProgressFraction", 0.0),
                     loadProgressHint = o.optString("loadProgressHint", ""),
+                    trustPinActionVisible = o.optBoolean("trustPinActionVisible", false),
+                    trustPinActionLabel = o.optString("trustPinActionLabel", ""),
+                    trustPinDetail = o.optString("trustPinDetail", ""),
                 )
             }
         }
@@ -458,6 +513,7 @@ class WerustCore : AutoCloseable {
     private external fun nativeGoForward(handle: Long)
     private external fun nativeReload(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
+    private external fun nativeBlessName(handle: Long): Boolean
     private external fun nativeTakePendingLoad(handle: Long): String
     private external fun nativeDocumentStartScript(handle: Long): String
     private external fun nativeHandleProviderMessage(handle: Long, name: String, body: String): String

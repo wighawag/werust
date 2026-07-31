@@ -1102,6 +1102,23 @@ pub fn trust_posture_wire_name(posture: TrustPosture) -> &'static str {
     }
 }
 
+/// The inverse of [`trust_posture_wire_name`]: a wire name back to its
+/// [`TrustPosture`], or `None` for a spelling this build does not know.
+///
+/// It lives HERE, beside the encoder, so the one vocabulary has one home: the
+/// TOFU pin store ([`pins`](crate::pins)) PERSISTS a posture and must read it
+/// back, and a private parser over there would be a second table to drift from.
+/// Deliberately total over [`TrustPosture::ALL`] (asserted by
+/// `every_posture_wire_name_round_trips`) and deliberately FALLIBLE: an unknown
+/// spelling in a persisted file is dropped, never silently defaulted to a
+/// posture the user never saw.
+#[must_use]
+pub fn trust_posture_from_wire_name(name: &str) -> Option<TrustPosture> {
+    TrustPosture::ALL
+        .into_iter()
+        .find(|posture| trust_posture_wire_name(*posture) == name)
+}
+
 // ---------------------------------------------------------------------------
 // ROW PRESENTATION: the debug view's display rules.
 //
@@ -2009,6 +2026,25 @@ mod tests {
         assert_eq!(network_size_text(Some(512)), "512 B");
         assert_eq!(network_size_text(Some(1024)), "1.0 KB");
         assert_eq!(network_size_text(Some(1024 * 1024)), "1.0 MB");
+    }
+
+    #[test]
+    fn every_posture_wire_name_round_trips() {
+        // The one posture vocabulary has one home: whatever `trust_posture_wire_name`
+        // writes, `trust_posture_from_wire_name` reads back, for EVERY posture,
+        // driven from `TrustPosture::ALL` (a compile-time check keeps it
+        // complete), so a fifth posture cannot land persistable-but-unreadable in
+        // the TOFU pin store. An unknown spelling stays `None`: a persisted file
+        // from a newer build must be DROPPED, never defaulted to a posture the
+        // user never saw.
+        for posture in TrustPosture::ALL {
+            assert_eq!(
+                trust_posture_from_wire_name(trust_posture_wire_name(posture)),
+                Some(posture)
+            );
+        }
+        assert_eq!(trust_posture_from_wire_name("totally-trusted"), None);
+        assert_eq!(trust_posture_from_wire_name(""), None);
     }
 
     #[test]

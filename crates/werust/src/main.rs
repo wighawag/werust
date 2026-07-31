@@ -58,7 +58,8 @@ use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
     invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip, status_line,
-    trust_indicator, trust_indicator_css_class, trust_indicator_detail, BrowserShell, ChromeState,
+    trust_indicator, trust_indicator_css_class, trust_indicator_detail, trust_pin_action_label,
+    trust_pin_action_visible, trust_pin_detail, BrowserShell, ChromeState,
     ERROR_BANNER_CSS_CLASSES, STOP_AFFORDANCE_LABEL, TRUST_INDICATOR_CSS_CLASSES,
 };
 
@@ -844,6 +845,19 @@ struct Chrome {
     /// (hash-checked on the content-addressed path) or served by an unverified
     /// origin (`docs/adr/0001`: the trust posture is a product surface).
     trust: Label,
+    /// The trust SURFACE's explanation line: the same sentence the badge carries
+    /// as its hover tooltip ([`trust_indicator_detail`]), shown in full inside the
+    /// popover the badge opens, so the explanation is READABLE, not only
+    /// hover-discoverable.
+    trust_detail: Label,
+    /// The trust surface's TRUST-ON-FIRST-USE line ([`trust_pin_detail`]): the
+    /// mutable name, the CID it resolves to now, and what the user blessed for it.
+    /// Hidden on a page with no mutable name.
+    trust_pin_detail: Label,
+    /// The trust surface's BLESS action ([`trust_pin_action_label`]): shown only
+    /// when there is something new to record. An affordance INSIDE the surface the
+    /// user opened, never a prompt (task `ipns-tofu-pin-and-warn-on-change`).
+    trust_pin_button: Button,
     /// The PROMINENT in-view error banner: a high-contrast bar across the top of
     /// the view that appears ONLY when a load failed, carrying the accurate,
     /// protocol-named reason. This is the fail-closed honesty fix — the subtle
@@ -964,20 +978,36 @@ impl Chrome {
                 self.trust.remove_css_class(class);
             }
         }
+        // The TRUST SURFACE behind the badge: the posture explanation in full,
+        // plus the trust-on-first-use section: what this MUTABLE name resolves to
+        // now, what (if anything) the user blessed for it, and the bless action
+        // when there is something new to record. Shown only when the user opens
+        // the surface: the bless is an explicit action reached FROM the indicator,
+        // never a first-visit prompt (task `ipns-tofu-pin-and-warn-on-change`).
+        self.trust_detail.set_text(trust_indicator_detail(state));
+        let pin_detail = trust_pin_detail(state);
+        self.trust_pin_detail.set_visible(!pin_detail.is_empty());
+        self.trust_pin_detail.set_text(&pin_detail);
+        let offer_bless = trust_pin_action_visible(state);
+        self.trust_pin_button.set_visible(offer_bless);
+        self.trust_pin_button
+            .set_label(trust_pin_action_label(state));
     }
 }
 
 /// The app stylesheet: the classes that make the trust-indicator states
 /// visually distinct (a NEUTRAL grey loading badge shown while a load is in
 /// flight, a green content-verified badge, a blue name-via-trusted-RPC badge, a
-/// purple mutable-name badge, an amber unverified-origin one), plus the error
+/// purple mutable-name badge, the error banner's own RED for a blessed name that
+/// now points to DIFFERENT content (the loudest settled state there is), and an
+/// amber unverified-origin one), plus the error
 /// banner, the invalid-URL badge, the URL bar's own load-progress bar (the
 /// `entry > progress` node, painted from the live pipeline phase), the menu info
 /// item, and the debug view's
 /// level-coloured console rows. Kept as one constant next to the classes the
 /// chrome and the debug view toggle (`trust-loading` / `trust-verified` /
-/// `trust-name-trusted-rpc` / `trust-mutable-name` / `trust-unverified`,
-/// `debug-console-*`). The debug view's Network tab REUSES the `trust-*`
+/// `trust-name-trusted-rpc` / `trust-mutable-name` / `trust-name-changed` /
+/// `trust-unverified`, `debug-console-*`). The debug view's Network tab REUSES the `trust-*`
 /// classes for its per-request trust column, so a content-verified request is
 /// the same green the indicator's verified badge is (ADR-0006, one vocabulary).
 const APP_CSS: &str = "\
@@ -985,6 +1015,7 @@ const APP_CSS: &str = "\
 .trust-verified { color: #0a7d28; font-weight: bold; padding: 0 6px; }\
 .trust-name-trusted-rpc { color: #1a5fb4; font-weight: bold; padding: 0 6px; }\
 .trust-mutable-name { color: #6c3fb4; font-weight: bold; padding: 0 6px; }\
+.trust-name-changed { color: #c01c28; font-weight: bold; padding: 0 6px; }\
 .trust-unverified { color: #9a6a00; font-weight: bold; padding: 0 6px; }\
 .error-banner { background-color: #c01c28; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
 .error-banner-transient { background-color: #b5820a; color: #ffffff; font-weight: bold; padding: 10px 12px; }\
@@ -1145,6 +1176,31 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // carries (and the class name is not restated in this painter).
     let trust = Label::new(Some(trust_indicator(&ChromeState::default())));
     trust.add_css_class(trust_indicator_css_class(&ChromeState::default()));
+    // The TRUST SURFACE: clicking the badge opens a small popover explaining the
+    // posture in full and, for a MUTABLE name, showing what it resolves to now,
+    // what the user blessed for it, and the bless action. This is the settled UX
+    // of task `ipns-tofu-pin-and-warn-on-change`: the bless is an EXPLICIT action
+    // reached FROM the trust indicator, never a first-visit prompt (a prompt on
+    // first visit trains people to dismiss it, and this surface is already where
+    // the posture is explained). Every string in it is the shared derivation.
+    let trust_detail = Label::builder().xalign(0.0).wrap(true).build();
+    let trust_pin_detail = Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .selectable(true)
+        .visible(false)
+        .build();
+    let trust_pin_button = Button::builder().visible(false).build();
+    let trust_surface = GtkBox::new(Orientation::Vertical, 8);
+    trust_surface.set_size_request(360, -1);
+    trust_surface.append(&trust_detail);
+    trust_surface.append(&trust_pin_detail);
+    trust_surface.append(&trust_pin_button);
+    let trust_button = MenuButton::builder()
+        .popover(&Popover::builder().child(&trust_surface).build())
+        .child(&trust)
+        .build();
+    trust_button.add_css_class("flat");
 
     // The PROMINENT in-view error banner: a high-contrast red bar across the top
     // of the view, shown ONLY on a failed load (the fail-closed honesty fix). It
@@ -1180,7 +1236,7 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     toolbar.append(&stop);
     toolbar.append(&url_entry);
     toolbar.append(&invalid_badge);
-    toolbar.append(&trust);
+    toolbar.append(&trust_button);
     // The general browser MENU (⋮) sits at the END of the toolbar, where every
     // other browser puts it. Appended after the window exists so the Debug entry
     // can parent its hook's dialog; see below.
@@ -1193,6 +1249,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         stop: stop.clone(),
         status: status.clone(),
         trust: trust.clone(),
+        trust_detail: trust_detail.clone(),
+        trust_pin_detail: trust_pin_detail.clone(),
+        trust_pin_button: trust_pin_button.clone(),
         error_banner: error_banner.clone(),
         invalid_badge: invalid_badge.clone(),
     });
@@ -1271,6 +1330,27 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         let refresh = refresh.clone();
         move |_| {
             shell.borrow_mut().stop();
+            refresh();
+        }
+    });
+    // The TRUST-ON-FIRST-USE bless: record the current mutable name's CID as the
+    // version this user trusts, so a LATER resolution to different content is
+    // warned about (task `ipns-tofu-pin-and-warn-on-change`). The DECISION of
+    // whether there is anything to bless (and what the button says) is the
+    // core's (`Chrome::refresh` paints both from `trust_pin_action_*`); this
+    // handler only drives the shell and repaints, exactly like every control
+    // above. The surface closes afterwards, because the answer to "did that
+    // work?" is the badge and banner behind it, both of which just changed.
+    trust_pin_button.connect_clicked({
+        let shell = shell.clone();
+        let refresh = refresh.clone();
+        move |button| {
+            shell.borrow_mut().bless_current_name();
+            if let Some(popover) = button.ancestor(Popover::static_type()) {
+                if let Ok(popover) = popover.downcast::<Popover>() {
+                    popover.popdown();
+                }
+            }
             refresh();
         }
     });

@@ -78,7 +78,8 @@ use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
     invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip,
     load_progress_visible, status_line, trust_indicator, trust_indicator_css_class,
-    trust_indicator_detail, ChromeState, STOP_AFFORDANCE_LABEL,
+    trust_indicator_detail, trust_pin_action_label, trust_pin_action_visible, trust_pin_detail,
+    ChromeState, STOP_AFFORDANCE_LABEL,
 };
 
 /// A colour, as three 0.0–1.0 components.
@@ -142,6 +143,10 @@ pub const CLASS_COLORS: &[(&str, Rgb)] = &[
     ("trust-verified", rgb(0x0a_7d_28)),
     ("trust-name-trusted-rpc", rgb(0x1a_5f_b4)),
     ("trust-mutable-name", rgb(0x6c_3f_b4)),
+    // A blessed name that now points to DIFFERENT content: the loudest badge
+    // there is, so it wears the error banner's own red rather than a fifth hue
+    // (task `ipns-tofu-pin-and-warn-on-change`).
+    ("trust-name-changed", rgb(0xc0_1c_28)),
     ("trust-unverified", rgb(0x9a_6a_00)),
     // The error banner's severity family (`ERROR_BANNER_CSS_CLASSES`): the FILL.
     ("error-banner", rgb(0xc0_1c_28)),
@@ -231,6 +236,22 @@ pub struct ChromePaint {
     /// cancel hint exactly when there is a backend load Stop can cancel. [`None`]
     /// clears it, so a stale phase never lingers on hover.
     pub progress_tooltip: Option<String>,
+    /// Whether the trust surface should offer the trust-on-first-use BLESS action
+    /// for this page ([`trust_pin_action_visible`]): the page is a name-resolved
+    /// load whose mutable name is not already blessed at this very CID.
+    ///
+    /// An AFFORDANCE, never a prompt: the window shows the action inside the
+    /// surface the user opened from the trust badge, and pops nothing up on its
+    /// own (task `ipns-tofu-pin-and-warn-on-change`).
+    pub trust_pin_action_visible: bool,
+    /// The BLESS action's label ([`trust_pin_action_label`]), empty when it is not
+    /// offered. Two wordings, because a first-use bless and accepting a CHANGE are
+    /// materially different decisions.
+    pub trust_pin_action_label: &'static str,
+    /// The trust surface's TOFU body ([`trust_pin_detail`]): the mutable name, the
+    /// CID it resolves to right now, and what (if anything) the user blessed for
+    /// it. Empty when the page has no mutable name.
+    pub trust_pin_detail: String,
 }
 
 impl ChromePaint {
@@ -271,6 +292,9 @@ impl ChromePaint {
             progress_visible: load_progress_visible(state),
             progress_fraction: load_progress_fraction(state),
             progress_tooltip,
+            trust_pin_action_visible: trust_pin_action_visible(state),
+            trust_pin_action_label: trust_pin_action_label(state),
+            trust_pin_detail: trust_pin_detail(state),
         }
     }
 }
@@ -528,6 +552,7 @@ mod tests {
     use renderer::{LoadEvent, LoadState, RendererError, ViewHandle};
     use werust_core::debug::{ConsoleLevel, CAPTURE_BRIDGE, MAX_CONSOLE_ENTRIES};
     use werust_core::menu::{MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
+    use werust_core::pins::{MutableNameTrust, TrustedNamePin};
     use werust_core::{
         CssClassFamily, LoadStep, ERROR_BANNER_CSS_CLASSES, TRUST_INDICATOR_CSS_CLASSES,
     };
@@ -570,6 +595,33 @@ mod tests {
         invalid.url_text = "not a url".into();
         invalid.invalid_entry = Some("not a url".into());
         states.push(invalid);
+        // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`):
+        // a blessable-but-unblessed name, and a blessed name that has CHANGED (the
+        // loudest settled state there is).
+        let pin = TrustedNamePin {
+            name: "ronan.eth".into(),
+            cid: "bafyblessed".into(),
+            blessed_at: 1_800_000_000,
+            posture: TrustPosture::NameViaTrustedRpc,
+        };
+        let mut blessable = ChromeState::default();
+        blessable.load_state = LoadState::Finished;
+        blessable.trust_posture = TrustPosture::NameViaTrustedRpc;
+        blessable.mutable_name = Some(MutableNameTrust {
+            name: "ronan.eth".into(),
+            cid: "bafyblessed".into(),
+            blessed: None,
+        });
+        states.push(blessable);
+        let mut changed = ChromeState::default();
+        changed.load_state = LoadState::Finished;
+        changed.trust_posture = TrustPosture::NameViaTrustedRpc;
+        changed.mutable_name = Some(MutableNameTrust {
+            name: "ronan.eth".into(),
+            cid: "bafychanged".into(),
+            blessed: Some(pin),
+        });
+        states.push(changed);
 
         for state in &states {
             let paint = ChromePaint::of(state);
@@ -590,6 +642,12 @@ mod tests {
                 load_progress_tooltip(state, STOP_AFFORDANCE_LABEL),
                 "the URL bar's progress sentence is the core's one rule, not a second copy here"
             );
+            assert_eq!(
+                paint.trust_pin_action_visible,
+                trust_pin_action_visible(state)
+            );
+            assert_eq!(paint.trust_pin_action_label, trust_pin_action_label(state));
+            assert_eq!(paint.trust_pin_detail, trust_pin_detail(state));
             assert_eq!(paint.can_go_back, state.can_go_back);
             assert_eq!(paint.can_go_forward, state.can_go_forward);
             assert_eq!(paint.is_loading, state.is_loading());
@@ -643,6 +701,60 @@ mod tests {
         failed.load_state = LoadState::Failed;
         failed.last_error = Some("boom".into());
         assert!(ChromePaint::of(&failed).error_visible);
+    }
+
+    #[test]
+    fn a_changed_trusted_name_paints_the_loudest_badge_and_takes_the_failure_banner() {
+        // Acceptance for the native-widget desktops (task
+        // `ipns-tofu-pin-and-warn-on-change`): a blessed name that now points to
+        // DIFFERENT content is painted at failure-class prominence: its own badge
+        // class (never flattened into the mutable-name or trusted-RPC one), in the
+        // banner's own red, plus the high-contrast banner itself, while an
+        // UNBLESSED name is painted exactly as it was before this feature.
+        let pin = TrustedNamePin {
+            name: "ronan.eth".into(),
+            cid: "bafyblessed".into(),
+            blessed_at: 1_800_000_000,
+            posture: TrustPosture::NameViaTrustedRpc,
+        };
+        let mut changed = ChromeState::default();
+        changed.load_state = LoadState::Finished;
+        changed.trust_posture = TrustPosture::NameViaTrustedRpc;
+        changed.mutable_name = Some(MutableNameTrust {
+            name: "ronan.eth".into(),
+            cid: "bafychanged".into(),
+            blessed: Some(pin),
+        });
+        let paint = ChromePaint::of(&changed);
+        assert_eq!(paint.trust_class, "trust-name-changed");
+        assert_ne!(paint.trust_class, "trust-mutable-name");
+        assert_ne!(paint.trust_class, "trust-name-trusted-rpc");
+        assert_eq!(
+            paint.trust_color,
+            class_color("error-banner").unwrap(),
+            "the loudest badge wears the failure colour, not a fifth hue"
+        );
+        assert!(
+            paint.error_visible,
+            "a changed trusted name is failure-class"
+        );
+        assert!(paint.error_text.contains("ronan.eth"));
+        assert_eq!(paint.error_class, "error-banner");
+        assert!(paint.trust_pin_action_visible);
+        assert!(!paint.trust_pin_action_label.is_empty());
+        assert!(paint.trust_pin_detail.contains("bafychanged"));
+
+        // Unblessed: unchanged chrome, plus the bless AFFORDANCE (not a prompt).
+        let mut unblessed = changed.clone();
+        unblessed.mutable_name = Some(MutableNameTrust {
+            name: "ronan.eth".into(),
+            cid: "bafychanged".into(),
+            blessed: None,
+        });
+        let paint = ChromePaint::of(&unblessed);
+        assert_eq!(paint.trust_class, "trust-name-trusted-rpc");
+        assert!(!paint.error_visible);
+        assert!(paint.trust_pin_action_visible);
     }
 
     #[test]

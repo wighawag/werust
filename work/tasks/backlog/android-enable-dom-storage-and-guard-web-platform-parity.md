@@ -3,6 +3,7 @@ title: "`window.localStorage` is null on Android: enable DOM storage, and give t
 slug: android-enable-dom-storage-and-guard-web-platform-parity
 blockedBy: []
 covers: []
+needsAnswers: true
 ---
 
 ## What to build

@@ -374,10 +374,13 @@ fn decode_one_entity(chars: &[char], amp: usize) -> Option<(String, usize)> {
                 .or_else(|| other.strip_prefix("#X"))
             {
                 u32::from_str_radix(hex, 16).ok()?
-            } else if let Some(dec) = other.strip_prefix('#') {
-                dec.parse::<u32>().ok()?
             } else {
-                return None;
+                // Not `&#x…;`/`&#X…;`, so the only remaining numeric form is
+                // decimal — anything without the `#` is a NAME this subset does
+                // not know, and `?` returns `None` for it (the caller then emits
+                // the entity verbatim).
+                let dec = other.strip_prefix('#')?;
+                dec.parse::<u32>().ok()?
             };
             char::from_u32(code)?.to_string()
         }
@@ -450,6 +453,18 @@ mod tests {
     fn decodes_the_small_entity_set() {
         let toks = SubsetTokenizer::new().tokenize("<p>a &amp; b &lt;c&gt; &#39;q&#39;</p>");
         assert_eq!(names(&toks), vec!["<p>", "#a & b <c> 'q'", "</p>"]);
+    }
+
+    #[test]
+    fn decodes_numeric_entities_and_leaves_the_rest_verbatim() {
+        // Pins every branch of `decode_one_entity`'s numeric tail: hex (both
+        // `&#x…;` and `&#X…;`), decimal, an unrecognized NAME, and a `#` form
+        // whose digits do not parse. Written before that block was rewritten
+        // with `?` (task `pin-the-rust-toolchain-and-fix-the-197-clippy-red-on-main`,
+        // clippy 1.97's `question_mark`), so the rewrite is provably a
+        // simplification and not a behaviour change.
+        let toks = SubsetTokenizer::new().tokenize("<p>&#x41;&#X42;&#67; &copy; &#zz;</p>");
+        assert_eq!(names(&toks), vec!["<p>", "#ABC &copy; &#zz;", "</p>"]);
     }
 
     #[test]

@@ -12,8 +12,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: rustup component add rustfmt clippy
+      - name: Resolve the pinned Rust toolchain
+        # NOT `rustup component add rustfmt clippy` any more, and never again:
+        # that took whatever compiler the runner shipped (1.97.0) while the
+        # local `verify` gate — this repo's actual acceptance bar — was on
+        # 1.91.1, so a change could go green locally and red HERE on a lint the
+        # gate could not see (run 30622910777). `rust-toolchain.toml` at the
+        # workspace root now pins the channel AND the rustfmt/clippy components,
+        # and rustup installs it on the first proxied `cargo`/`rustup target add`
+        # call, so this step only RESOLVES and RECORDS it: a run's verdict is
+        # not a verdict without the compiler that reached it.
+        # `crates/werust-core/tests/toolchain_pin_shape.rs` reds if any leg
+        # re-selects a toolchain.
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
 
       # The verify gate builds the WHOLE workspace, including webview-renderer +
       # the werust desktop binary, which link webkit6/gtk4/glib via pkg-config.

@@ -1,0 +1,3 @@
+# The gtk4-rs 0.11 / webkit6 0.6 blocker is now stale (2026-07-31)
+
+`docs/spikes/renderer-seam-trait-and-webview-backend-navigate/README.md` explains the `gtk4 = "=0.10.0"` / `webkit6 = "=0.5.0"` pin with "the newer `0.11` / `0.6` gtk4-rs line requires rustc >= 1.92 and this repo's toolchain is 1.91.x". As of task `pin-the-rust-toolchain-and-fix-the-197-clippy-red-on-main` the toolchain is pinned at **1.97.0**, so that stated reason no longer holds. Noticed while pinning the toolchain; deliberately NOT acted on (moving the gtk4-rs line is its own change with its own risk, and it has no place inside a fix for a red `main`).

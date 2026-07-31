@@ -48,6 +48,13 @@ jobs:
         # aarch64-apple-ios-sim for the Apple-Silicon macos-14 runner. The build
         # phase also `rustup target add`s it defensively, but do it here too so a
         # target-add failure surfaces as its own step.
+        #
+        # This leg selects NO toolchain: the workspace-root `rust-toolchain.toml`
+        # pins it, and a target is ADDITIVE — rustup installs the pinned
+        # toolchain (if the runner lacks it) and then the target INTO it. Adding
+        # a `rustup component add`/`default`/`override` here would reopen the
+        # CI-vs-local drift that red-ed `main` (run 30622910777);
+        # `crates/werust-core/tests/toolchain_pin_shape.rs` reds if one appears.
         run: rustup target add aarch64-apple-ios-sim
 
       - name: Cache cargo

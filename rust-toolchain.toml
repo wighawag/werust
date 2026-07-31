@@ -1,0 +1,45 @@
+# THE compiler for this repo: one pinned toolchain for the laptop, the `dorfl`
+# acceptance gate and all five CI legs (task
+# `pin-the-rust-toolchain-and-fix-the-197-clippy-red-on-main`).
+#
+# WHY THIS FILE EXISTS. `verify` denies warnings
+# (`cargo clippy --all-targets -- -D warnings`), which is only safe if every
+# runner of that gate compiles with the SAME clippy. It did not: CI took whatever
+# the runner shipped (`rustup component add rustfmt clippy`, 1.97.0) while the
+# development machine — and therefore every local `verify`, which is this repo's
+# acceptance bar — was on 1.91.1. `clippy::question_mark` fires on 1.97 and not
+# on 1.91, so a change went green locally and RED on `main` within the hour,
+# taking every release job to `skipped` (run 30622910777). `rustup` reads this
+# file for every proxied `cargo`/`rustc`/`clippy`/`rustfmt` call made anywhere in
+# the tree, so the gate and CI can no longer disagree about the compiler.
+#
+# WHY 1.97.0 AND NOT `stable`. `stable` is not a pin: it floats, and the whole
+# failure above was two runners resolving a floating channel differently. 1.97.0
+# is the exact version `main` was already being judged against, so pinning to it
+# keeps the strict gate meaningful instead of lowering the bar to whatever this
+# laptop happened to have.
+#
+# BUMPING IS A DELIBERATE ONE-FILE CHANGE — that is the point, and it is what
+# makes `-D warnings` safe: a new Rust release can no longer red the gate for a
+# task that did not cause it. Raise `channel` here when someone is ready to clear
+# the new lints in the same change. The same gate runs inside `release.yml`, so
+# before this pin an unrelated Rust release could have failed a TAG build.
+# Rationale, procedure and the lints 1.97 surfaced:
+# docs/spikes/pin-the-rust-toolchain-and-fix-the-197-clippy-red-on-main/README.md
+# Shape-guarded by crates/werust-core/tests/toolchain_pin_shape.rs.
+
+[toolchain]
+channel = "1.97.0"
+# `verify` runs `cargo fmt --check` and `cargo clippy`, both OPTIONAL rustup
+# components. Declaring them HERE is what lets the workflows drop their
+# `rustup component add rustfmt clippy` step — the very step that was picking the
+# toolchain out from under this pin.
+components = ["rustfmt", "clippy"]
+# Minimal, plus the two components above: nothing here needs `rust-docs` or
+# `rust-analyzer`, and every CI leg pays this download on a cache miss.
+profile = "minimal"
+# NO `targets` key on purpose. The cross-compiling legs (Android, iOS, macOS
+# universal, Windows) each `rustup target add` the ONE triple they need, which
+# rustup installs INTO this pinned toolchain; listing them all here would make
+# every developer and every leg download every std, including the ones they
+# never build.

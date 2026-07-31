@@ -107,8 +107,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        run: rustup component add rustfmt clippy
+      - name: Resolve the pinned Rust toolchain
+        # Same as verify.yml, and for the same reason: the workspace-root
+        # `rust-toolchain.toml` pins the channel + the rustfmt/clippy components,
+        # so nothing here selects a toolchain. It matters DOUBLY on this leg:
+        # this is the `-D warnings` gate a TAG build is blocked on, so before the
+        # pin a Rust release that added one lint could have failed a release of
+        # code nobody had touched.
+        run: |
+          rustup show active-toolchain
+          cargo --version
+          cargo clippy --version
+          cargo fmt --version
 
       # Same as verify.yml: the gate builds the whole workspace (incl. the
       # webkit6/gtk4/glib-linking crates), so the system dev libs must be present
@@ -266,6 +276,10 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Install the Android Rust targets
+        # A target is ADDITIVE: rustup installs it INTO the toolchain
+        # `rust-toolchain.toml` pins (and installs that toolchain first if the
+        # runner has not got it), so this does NOT re-select a compiler. Same for
+        # the iOS/Windows target steps below.
         run: rustup target add aarch64-linux-android x86_64-linux-android
 
       - name: Cache cargo

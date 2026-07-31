@@ -72,13 +72,23 @@ name: release
 #
 # THE ANDROID RELEASE KEY IS AN OPTIONAL SECRET, NEVER A COMMITTED KEYSTORE. The
 # `android-apk` leg attaches a release-SIGNED `app-release.apk` alongside the
-# debug APK when the four `ANDROID_KEYSTORE_*` / `ANDROID_KEY_*` repository
-# secrets are configured, and is a graceful NO-OP when they are not (forks,
-# dry-runs, or before the human creates them) — in which case the debug APK is
-# attached under the honest name `app-debug-unsigned.apk`. The keystore is
-# decoded from the secret into the runner's temp dir and handed to AGP's
-# `signingConfigs.release` through the environment; nothing about the signing
-# identity is committed. Setup + decisions:
+# debug APK when the three `ANDROID_KEYSTORE_B64` / `ANDROID_KEYSTORE_PASSWORD` /
+# `ANDROID_KEY_PASSWORD` repository SECRETS are configured, and is a graceful
+# NO-OP when they are not (forks, dry-runs, or before the human creates them) —
+# in which case the debug APK is attached under the honest name
+# `app-debug-unsigned.apk`. The keystore is decoded from the secret into the
+# runner's temp dir and handed to AGP's `signingConfigs.release` through the
+# environment; nothing about the signing identity is committed. Setup +
+# decisions: docs/spikes/android-apk-signing/README.md.
+#
+# THE KEY ALIAS IS A VARIABLE, NOT A SECRET, AND THAT IS DELIBERATE. An alias is
+# not key material — it is printed in the certificate of every APK the key ever
+# signs — but GitHub redacts a secret's VALUE everywhere it appears in ANY
+# workflow's logs, so holding the alias `werust` as a secret masked the substring
+# `werust` across this whole repo's CI output (`crates/***-android`,
+# `lib***_mobile.so`, `OU=***`). It is therefore read from the optional
+# `vars.ANDROID_KEY_ALIAS` repository variable, defaulting to the alias the
+# documented `keytool` command creates. Decision 9 in
 # docs/spikes/android-apk-signing/README.md.
 #
 # THE RPC ENDPOINT IS AN OPTIONAL SECRET, NEVER A COMMITTED URL. Every leg that
@@ -305,7 +315,7 @@ jobs:
       #
       # A debug-keystore APK installs, but carries no stable release identity, so
       # it cannot be updated in place or fed to any distribution channel. When the
-      # four repository secrets exist, the leg ALSO builds a properly signed
+      # three repository secrets exist, the leg ALSO builds a properly signed
       # `app-release.apk` and attaches it alongside the debug APK. When they do
       # not (a fork, or before the human creates them), every step below is
       # skipped — a graceful no-op, never a hard error — and the debug APK is
@@ -317,7 +327,7 @@ jobs:
       # JAR + v2 APK Signature Scheme), whereas jarsigner can only produce the v1
       # signature, which Android 11+ rejects on its own for a targetSdk-30+ app.
       # See docs/spikes/android-apk-signing/README.md (decision 1) and, in the
-      # same file, the keytool command + the four secrets a human must create.
+      # same file, the keytool command + the secrets a human must create.
       - name: Decode the release keystore (only when the signing secrets exist)
         if: env.ANDROID_SIGNING_CONFIGURED == '1'
         env:
@@ -335,7 +345,13 @@ jobs:
         working-directory: crates/werust-android
         env:
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          # A VARIABLE, not a secret (see the header): an alias is public by
+          # construction, and making it a secret redacted the substring `werust`
+          # from every log in the repo. The literal default is the alias the
+          # documented `keytool` command creates, so the common setup needs no
+          # variable at all; a keystore built with a different alias sets
+          # `vars.ANDROID_KEY_ALIAS` and fails LOUDLY here if it forgets to.
+          ANDROID_KEY_ALIAS: ${{ vars.ANDROID_KEY_ALIAS || 'werust' }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: ./gradlew :app:assembleRelease
 
@@ -352,9 +368,16 @@ jobs:
           docs/spikes/mobile-android-shell-and-static-lib/check-apk-abis.sh "${apk}"
           # Offline signature proof — apksigner ships in the SDK build-tools AGP
           # installed for compileSdk 34. Nothing here touches the network.
+          #
+          # `--verbose` is what makes this a proof of the SIGNATURE SCHEMES and
+          # not just of a certificate: without it apksigner prints the signer
+          # certs alone, so the `Verified using v1/v2/v3 scheme` matrix — the
+          # thing that decides whether Android 11+ will install this APK at all
+          # (decision 1: a v1-only signature is rejected for a targetSdk-30+ app)
+          # — was asserted in the docs but never actually recorded by a release.
           apksigner="$(find "${ANDROID_HOME}/build-tools" -name apksigner | sort -V | tail -n 1)"
           test -n "${apksigner}"
-          "${apksigner}" verify --print-certs "${apk}"
+          "${apksigner}" verify --verbose --print-certs "${apk}"
 
       # NO-SECRETS PATH: the only artifact is the debug-keystore APK, so name it
       # for what it is. Nothing attached to a Release then claims a release

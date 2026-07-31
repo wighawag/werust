@@ -68,7 +68,7 @@
 //! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
 //! never runs Gradle, never reads a secret's value, and performs no I/O beyond
 //! `std::fs::read_to_string`), so it passes identically on a fork with no secrets
-//! configured and on the real repo with all four.
+//! configured and on the real repo with all of them.
 
 use std::path::{Path, PathBuf};
 
@@ -826,8 +826,9 @@ fn android_leg_builds_and_attaches_a_signed_release_apk_when_the_keystore_secret
         "the decode step must read the keystore from `secrets.{KEYSTORE_SECRET}`"
     );
 
-    // The signed build itself: `assembleRelease`, gated, with the alias +
-    // passwords supplied from the secrets IN THAT STEP's env.
+    // The signed build itself: `assembleRelease`, gated, with the passwords
+    // supplied from the secrets IN THAT STEP's env (and the alias from a
+    // variable, asserted separately below).
     let sign = the_one_step_mentioning(&j, ":app:assembleRelease");
     assert!(
         step_if(&sign).contains(SIGNING_FLAG),
@@ -839,11 +840,7 @@ fn android_leg_builds_and_attaches_a_signed_release_apk_when_the_keystore_secret
         .get("env")
         .and_then(Value::as_mapping)
         .expect("the signing step must declare its own `env:` with the keystore credentials");
-    for secret in [
-        "ANDROID_KEYSTORE_PASSWORD",
-        "ANDROID_KEY_ALIAS",
-        "ANDROID_KEY_PASSWORD",
-    ] {
+    for secret in ["ANDROID_KEYSTORE_PASSWORD", "ANDROID_KEY_PASSWORD"] {
         let v = sign_env
             .get(Value::String(secret.into()))
             .and_then(Value::as_str)
@@ -852,6 +849,71 @@ fn android_leg_builds_and_attaches_a_signed_release_apk_when_the_keystore_secret
             v.contains(&format!("secrets.{secret}")),
             "`{secret}` must come from the repository secret of the same name, never a literal; \
              got {v:?}"
+        );
+    }
+
+    // The signature must be proven with the SCHEME MATRIX, not just a cert.
+    // `apksigner verify --print-certs` alone prints the signer certificates; only
+    // `--verbose` prints `Verified using v1/v2/v3 scheme`, which is what decides
+    // whether Android 11+ installs this APK (decision 1: a v1-only signature is
+    // rejected for a targetSdk-30+ app). Without it the release recorded weaker
+    // evidence than the docs claimed.
+    let verify = the_one_step_mentioning(&j, "apksigner");
+    for flag in ["--verbose", "--print-certs"] {
+        assert!(
+            contains_substr(&verify, flag),
+            "the signature check must run `apksigner verify {flag}` so the release log records \
+             the signature SCHEMES, not merely a certificate"
+        );
+    }
+}
+
+/// The key ALIAS is a repository VARIABLE, never a secret.
+///
+/// An alias is not key material: it is printed in the certificate of every APK
+/// the key signs, and `apksigner verify --print-certs` puts it in the public
+/// release log. Holding it as a SECRET is actively harmful, because GitHub
+/// redacts a secret's value everywhere it appears in EVERY workflow's logs — so
+/// the alias `werust` masked that substring across this whole repo's CI output
+/// (`crates/***-android`, `lib***_mobile.so`, `OU=***`), degrading every log in
+/// the project to hide something already public.
+///
+/// Pins the fix so it cannot regress into a secret again. Decision 9 in
+/// docs/spikes/android-apk-signing/README.md.
+#[test]
+fn the_android_key_alias_is_a_variable_and_never_a_secret() {
+    let j = job("android-apk");
+    let sign = the_one_step_mentioning(&j, ":app:assembleRelease");
+    let alias = sign
+        .get("env")
+        .and_then(Value::as_mapping)
+        .and_then(|env| env.get(Value::String("ANDROID_KEY_ALIAS".into())))
+        .and_then(Value::as_str)
+        .expect("the signing step's `env:` must pass `ANDROID_KEY_ALIAS` to Gradle");
+
+    assert!(
+        alias.contains("vars.ANDROID_KEY_ALIAS"),
+        "the key alias must come from the `vars` context (a repository VARIABLE); got {alias:?}"
+    );
+    assert!(
+        !alias.contains("secrets."),
+        "the key alias must NOT be a secret: GitHub redacts a secret's value in every log of the \
+         repo, and an alias is public in the signing certificate anyway; got {alias:?}"
+    );
+    // A default keeps the documented three-secret setup working with no variable
+    // configured at all, so the common path needs nothing extra.
+    assert!(
+        alias.contains("||"),
+        "the alias expression must fall back to a literal default so a repo that follows the \
+         documented keytool command needs no variable; got {alias:?}"
+    );
+
+    // And the whole leg must be free of the alias-as-secret spelling.
+    for step in job_steps(&j) {
+        let blob = strings_of(&step).join("\n");
+        assert!(
+            !blob.contains("secrets.ANDROID_KEY_ALIAS"),
+            "no step may read `secrets.ANDROID_KEY_ALIAS` (it is a variable now); found in:\n{blob}"
         );
     }
 

@@ -249,12 +249,17 @@ android {
     // ---- Release signing (task `android-apk-signing`) --------------------
     //
     // The keystore and its credentials are supplied ONLY through the
-    // environment, by CI, from four repository secrets (`ANDROID_KEYSTORE_B64`
+    // environment, by CI: three repository SECRETS (`ANDROID_KEYSTORE_B64`
     // decoded to a file that `ANDROID_KEYSTORE_PATH` points at, plus
-    // `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_ALIAS` / `ANDROID_KEY_PASSWORD`);
-    // see the `android-apk` job in `.github/workflows/release.yml`. NOTHING about
-    // the signing identity is committed — a release key cannot be regenerated,
-    // so it lives outside the repo.
+    // `ANDROID_KEYSTORE_PASSWORD` / `ANDROID_KEY_PASSWORD` — which are the SAME
+    // password, because a PKCS12 keystore cannot hold two) and the key ALIAS,
+    // which is a repository VARIABLE rather than a secret because it is public
+    // in the signing certificate and a secret's value is redacted from every log
+    // in the repo (decision 9). This side is indifferent to that split: the
+    // transport into the build is the environment either way. See the
+    // `android-apk` job in `.github/workflows/release.yml`. NOTHING about the
+    // signing identity is committed — a release key cannot be regenerated, so it
+    // lives outside the repo.
     //
     // Gated on env PRESENCE, which is what keeps LOCAL dev builds untouched: with
     // no `ANDROID_KEYSTORE_PATH` the `release` signing config is never created,

@@ -13,29 +13,38 @@ Pinned by `crates/werust-core/tests/release_plumbing_shape.rs` (criteria 8 and 1
 
 Generate the release keystore **outside the repo** and keep it safe: it cannot be regenerated (a second `keytool -genkey` makes a DIFFERENT key, and Android will refuse to update an app signed with the old one).
 
+**There is ONE password, not two.** `keytool`'s default keystore type since JDK 9 is PKCS12 (the `.jks` file EXTENSION does not change that; `keytool -list` reports `Keystore type: PKCS12`), and PKCS12 cannot hold a key password distinct from the store password. Passing different ones does not fail, it silently overrides you — `Warning: Different store and key passwords not supported for PKCS12 KeyStores. Ignoring user-specified -keypass value.` — leaving the key protected by the STORE password. So `ANDROID_KEYSTORE_PASSWORD` and `ANDROID_KEY_PASSWORD` must be set to the SAME value; setting them differently surfaces later as an opaque Gradle signing failure on CI rather than as the password mismatch it is. Empty is not an option either: `keytool` requires at least 6 characters.
+
+Omit both password flags so `keytool` PROMPTS (hidden) instead. On a PKCS12 keystore it asks only once, for the store password, plus a confirmation. That keeps the password out of your shell history AND out of the process table, where a command-line `-storepass` is world-readable via `ps` for the lifetime of the process:
+
 ```sh
 keytool -genkey -v -keystore werust-release.jks \
   -alias werust -keyalg RSA -keysize 2048 -validity 10000 \
-  -storepass <storepass> -keypass <keypass> \
   -dname "CN=wighawag, OU=werust, O=wighawag, L=, ST=, C="
+chmod 600 werust-release.jks
 ```
 
-Base64 the keystore (one line, no wrapping):
-
-```sh
-base64 -w0 werust-release.jks
-```
-
-Create four repository secrets at github.com/wighawag/werust → Settings → Secrets and variables → Actions:
+Create three repository secrets at github.com/wighawag/werust → Settings → Secrets and variables → Actions:
 
 | Secret | Value |
 | --- | --- |
-| `ANDROID_KEYSTORE_B64` | the `base64 -w0` output above |
-| `ANDROID_KEYSTORE_PASSWORD` | the `-storepass` used above |
-| `ANDROID_KEY_ALIAS` | `werust` |
-| `ANDROID_KEY_PASSWORD` | the `-keypass` used above |
+| `ANDROID_KEYSTORE_B64` | `base64 -w0 werust-release.jks` (one line, no wrapping) |
+| `ANDROID_KEYSTORE_PASSWORD` | the password entered above |
+| `ANDROID_KEY_PASSWORD` | the SAME password (see the PKCS12 note above) |
+
+The key ALIAS is **not** among them: it is a repository VARIABLE, and an optional one, because the workflow defaults to `werust` — the alias the command above creates. Set `vars.ANDROID_KEY_ALIAS` only if your keystore uses a different alias. Making it a secret is a mistake worth not repeating; see decision 9.
+
+`gh` can do all of it without the password ever becoming a command-line argument (`gh secret set NAME` with no `--body` gives a hidden paste prompt, and the keystore travels over a pipe):
+
+```sh
+gh secret set ANDROID_KEYSTORE_PASSWORD   # paste
+gh secret set ANDROID_KEY_PASSWORD        # paste the same
+base64 -w0 ~/werust-release.jks | gh secret set ANDROID_KEYSTORE_B64
+```
 
 Until those exist, the leg is a **graceful no-op**: it skips every signing step and attaches only the debug APK, renamed `app-debug-unsigned.apk`. Nothing fails.
+
+To VALIDATE the setup without cutting a release, run the workflow by hand (`gh workflow run release.yml`). The signing gate keys on secret PRESENCE, not on the tag, so a dispatch dry run exercises the entire signing path — decode, `assembleRelease`, `apksigner verify` — and publishes nothing. The only difference from a real tag is the version: with no tag the APK takes the dev placeholder `versionCode = 1`.
 
 To reproduce the signed build locally (with a throwaway key, never the real one):
 
@@ -52,6 +61,8 @@ cd crates/werust-android && ./gradlew :app:assembleRelease
 **Chosen:** the CI step only materialises the keystore and sets `ANDROID_KEYSTORE_PATH`; the actual signing is AGP's, via `signingConfigs.release` + `:app:assembleRelease`.
 
 **Why:** the task prescription named BOTH mechanisms (a `jarsigner` + `zipalign` CI step *and* a Gradle `signingConfigs.release` block); they do the same job, so only one can own it. AGP is the correct owner: its release pipeline zipaligns and signs with **apksigner** (v1 JAR + v2 APK Signature Scheme — verified locally: `Verified using v1 scheme: true`, `v2 scheme: true`), whereas `jarsigner` can only produce the v1 signature, which Android 11+ rejects on its own for a `targetSdk` 30+ app. Signing inside the build also means a bad password fails the BUILD rather than silently shipping an unsigned artifact.
+
+**Follow-up (first real run):** that `Verified using v1/v2 scheme` evidence is exactly what the CI check did NOT record, because it ran `apksigner verify --print-certs` without `--verbose`, which prints the signer certificates alone. The first signed run therefore logged a `V2 Signer:` certificate block and nothing about the scheme matrix — weaker evidence than this decision claims. The check now passes `--verbose`, pinned by `release_plumbing_shape.rs`, so every release records the schemes the Android version floor actually depends on.
 
 **Alternatives considered:** *hand-rolled `jarsigner` + `zipalign`* (rejected: v1-only, and re-implements what AGP already does correctly); *`apksigner sign` as a post-build CI step* (rejected: same result as AGP but keeps the signing identity outside the build graph, so `assembleRelease` alone would produce an unsigned APK a human could mistake for the shipped one).
 
@@ -136,6 +147,20 @@ Two consequences worth stating plainly, because both are user-visible and neithe
 
 - **An EMPTY `WERUST_VERSION` is the dev path, not a release.** The workflow sets `WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}`, so on the `workflow_dispatch` dry run the variable is present but empty. Presence is therefore tested after trimming to non-empty, and the dry run keeps falling through to `git describe` + the placeholder exactly as before. A dry run that failed because it is not a tag would be absurd.
 - **A hand-set `WERUST_VERSION` that is not a triple now fails a LOCAL build too** (`WERUST_VERSION=vendor-build ./gradlew :app:assembleDebug` used to produce the placeholder; it now fails with the same message). That is the rule doing its job rather than a side effect: the variable's meaning is "this is the released version", so an operator who sets it by hand is asking for exactly the artifact the guard protects. The dev path is *not setting it*, which is what a plain `./gradlew :app:assembleDebug` does.
+
+### 9. The key ALIAS is a repository VARIABLE, not a secret
+
+**Chosen:** `ANDROID_KEY_ALIAS` comes from `${{ vars.ANDROID_KEY_ALIAS || 'werust' }}` — an optional repository variable with a literal default — while the keystore and the two passwords stay secrets.
+
+**Why:** found the moment the secrets were first configured for real. GitHub redacts a secret's VALUE everywhere it appears in the logs of EVERY workflow in the repo, and this alias's value is the word `werust`. Holding it as a secret therefore masked that substring across the whole project's CI output: the signing check logged `crates/***-android`, `lib***_mobile.so`, `ANDROID_KEYSTORE_PATH: /home/runner/work/_temp/***-release.jks` and `OU=***`. That is a repo-wide, permanent readability cost paid to conceal something that is not concealed anyway — a key alias is printed in the signing certificate of every APK the key signs, including by the `apksigner verify --print-certs` output in the same public log. The secret was buying negative value.
+
+**Alternatives considered:** *inline the literal `werust` in the workflow* (rejected: it hardcodes a property of a keystore the workflow does not own, so a keystore regenerated with a different alias would need a code change rather than a config change — though the default below means this is the effective behaviour for anyone following the documented setup); *keep it a secret and accept the redaction* (rejected: the cost lands on every log in the repo, forever, and grows with any future secret whose value is a common word); *a variable with NO default* (rejected: it makes the happy path a four-item setup again, and a missing variable would hand AGP an empty alias).
+
+**The default is a real trade, not a convenience.** `|| 'werust'` means a repo whose keystore uses a different alias, and which forgets the variable, fails LOUDLY in the Gradle signing step (AGP cannot find the alias) rather than producing a wrong artifact. That is the acceptable direction of failure, and it is why the default is safe to have.
+
+**A general rule this instance illustrates:** put a value in `secrets` only if exposure HARMS. Identifiers, paths, aliases and flags belong in `vars`, precisely because the redaction is repo-wide and indiscriminate.
+
+**What it touches:** the `android-apk` leg's signing step and the human setup above. The Gradle side is UNCHANGED — it still reads `System.getenv("ANDROID_KEY_ALIAS")`, because the transport into the build is the environment either way. Pinned by `the_android_key_alias_is_a_variable_and_never_a_secret` in `release_plumbing_shape.rs`.
 
 ## What was verified locally
 

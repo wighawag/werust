@@ -261,7 +261,7 @@ mod smoke {
         }
         if !report.contains(&format!(
             "\"chainId\":\"{}\"",
-            werust_core::provider::STUB_CHAIN_ID
+            werust_core::provider::CHAIN_ID
         )) {
             failures.push(format!(
                 "an `eth_chainId` request must round-trip page -> native -> page, got {report}"

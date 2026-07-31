@@ -87,6 +87,32 @@ use serde_json::{json, Value};
 pub const DEFAULT_RPC_ENDPOINT: &str =
     "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161";
 
+/// The chain werust reads, as the `0x`-prefixed hexadecimal quantity EIP-695 /
+/// `eth_chainId` defines: `0x1`, Ethereum mainnet.
+///
+/// This is the ONE place werust states which chain it is on, and the value is
+/// CORRECT rather than provisional. Name resolution calls the MAINNET ENS
+/// registry deployment at its fixed address
+/// ([`ens::REGISTRY_ADDRESS`](crate::ens::REGISTRY_ADDRESS)), so werust is wired
+/// to mainnet by construction: an endpoint serving any other chain does not
+/// reconfigure the browser, it just makes every `.eth` lookup miss.
+///
+/// It is deliberately NOT derived from [`DEFAULT_RPC_ENDPOINT`] or the
+/// `WERUST_RPC_URL` lever, because those choose WHICH endpoint serves that chain
+/// (a transport choice), not WHICH chain werust is on — a URL carries no chain
+/// identity. Asking the endpoint itself (an `eth_chainId` round-trip at session
+/// construction) was considered and rejected here: it would make what the browser
+/// tells a page depend on network reachability, with no honest answer when the
+/// endpoint is unreachable.
+///
+/// The injected EIP-1193 provider reports this to pages
+/// ([`provider::CHAIN_ID`](crate::provider::CHAIN_ID) re-exports it, so there is
+/// one value and not two). When werust grows a real chain SELECTOR — which
+/// arrives with the deferred wallet model, since a keyless read-only provider has
+/// nothing to select — this constant becomes that selector's output and the
+/// provider follows with no second edit.
+pub const CHAIN_ID: &str = "0x1";
+
 /// The environment variable that overrides [`DEFAULT_RPC_ENDPOINT`] for a
 /// session: the opt-in lever for pointing ENS resolution at a private endpoint
 /// (e.g. a local node) without committing its URL. Fits the `WERUST_*` lever
@@ -594,6 +620,19 @@ mod tests {
     // core, so no test touches `std::env::set_var` (an unsafe setter in Rust
     // 2024 that would race under parallel `cargo test`).
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_chain_werust_reads_is_ethereum_mainnet() {
+        // A fact about the product, not a placeholder: ENS resolution calls the
+        // MAINNET registry deployment, so mainnet is what every configured
+        // endpoint is expected to serve. Changing this is changing chain.
+        assert_eq!(CHAIN_ID, "0x1");
+        assert_eq!(
+            crate::ens::REGISTRY_ADDRESS,
+            "0x00000000000C2E074eC69A0dFb2997BA6C7d2e1e",
+            "the mainnet ENS registry deployment is what pins werust to this chain"
+        );
+    }
 
     #[test]
     fn the_labelled_default_endpoint_is_1rpc() {

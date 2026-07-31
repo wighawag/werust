@@ -22,10 +22,28 @@
 //!   push the round-trip needs.
 //!
 //! **No key custody here.** This wires the provider SURFACE and message transport
-//! only; it answers exclusively benign, read-only methods (a chain-id / accounts
-//! stub) and holds NO private keys. The wallet-broker security model (own-process
-//! signing broker, the page never holds keys) is deferred to the exploration spec
+//! only; it answers exclusively benign, read-only methods (the chain id, and an
+//! empty authorised-account list) and holds NO private keys. The wallet-broker
+//! security model (own-process signing broker, the page never holds keys) is
+//! deferred to the exploration spec
 //! `rust-successor-native-renderer-architecture-benchmark`.
+//!
+//! **A read-only provider must be HONEST about it, not merely quiet.** werust has
+//! no wallet yet, so every request that would need one FAILS with a standard
+//! EIP-1193 error carrying a legible message, rather than resolving something
+//! empty that a dapp reads as success (see
+//! [`ProviderError::unauthorized`] and
+//! [`answer`](ProviderBridge::answer)). werust keeps injecting `window.ethereum`
+//! and makes every path honest — a provider that refuses honestly is strictly
+//! better for a dapp than no provider at all, and the injection is one of the two
+//! trust hooks a `Renderer` backend qualifies on
+//! ([`TrustHook::ProviderInjection`](renderer::TrustHook::ProviderInjection)). The
+//! alternative — stop occupying `window.ethereum` and announce over EIP-6963 only
+//! once a real signer exists — is DEFERRED, because it changes what that trust
+//! hook MEANS and so needs an ADR-0001 amendment, not a code change (tracked as
+//! `provider-eip6963-announcement-and-the-window-ethereum-namespace`; NO part of
+//! it is implemented here). Recorded in
+//! `docs/spikes/provider-refuses-honestly-instead-of-resolving-an-empty-account-list/README.md`.
 
 use renderer::{Renderer, ScriptMessage};
 use serde_json::{json, Value};
@@ -41,10 +59,15 @@ use serde_json::{json, Value};
 /// single channel name.
 pub const PROVIDER_BRIDGE: &str = "werustProvider";
 
-/// The EIP-1193 chain id the read-only stub reports, as the standard `0x`-prefixed
-/// quantity. `0x1` is Ethereum mainnet — a benign, keyless value that proves the
-/// full request -> native -> response round-trip.
-pub const STUB_CHAIN_ID: &str = "0x1";
+/// The chain id the injected provider reports to a page for `eth_chainId`, as the
+/// standard `0x`-prefixed quantity.
+///
+/// Re-exported from [`ethereum::CHAIN_ID`](crate::ethereum::CHAIN_ID) — the ONE
+/// place werust states which chain it is on — rather than restated here, so the
+/// page is told exactly the chain werust's own ENS/RPC backend reads and the two
+/// cannot drift apart. It is NOT a provisional stub value: see that constant's
+/// doc for why `0x1` is correct today and what would have to change it.
+pub use crate::ethereum::CHAIN_ID;
 
 /// A parsed page-side `request(...)` envelope: the correlation `id` plus the
 /// EIP-1193 `method` and its `params`.
@@ -76,6 +99,38 @@ pub struct ProviderError {
 }
 
 impl ProviderError {
+    /// The EIP-1193 `4100` "Unauthorized" refusal for a request that asks werust
+    /// to authorise an account (`eth_requestAccounts`) while it has no wallet.
+    ///
+    /// **Why this REJECTS instead of resolving `[]`.** A dapp writes
+    /// `const [account] = await ethereum.request({ method: 'eth_requestAccounts' })`.
+    /// Resolving an empty array sends it down its SUCCESS path with `account ===
+    /// undefined`, so it believes it is connected to nobody — worse than a clean
+    /// failure, because every dapp has an error path for "connect failed" and none
+    /// has one for "connected to nobody". Rejecting puts it on the path it already
+    /// handles.
+    ///
+    /// **Why `4100` and not `4001`.** `4100` is "the requested method and/or
+    /// account has not been authorized by the user", which is exactly true here,
+    /// and EIP-1193 recommends `4100` for an authorization failure. `4001` (User
+    /// Rejected Request) would give a SMOOTHER dapp UX, because many dapps
+    /// special-case it and silence it as a quiet "cancelled" — but the user
+    /// rejected nothing, and this project does not tell the page small lies. The
+    /// accepted cost: some dapps will surface a generic error banner rather than
+    /// cancelling quietly.
+    ///
+    /// The `message` is USER-VISIBLE (dapps commonly render `error.message`), so it
+    /// is a legible sentence rather than a code name.
+    #[must_use]
+    pub fn unauthorized() -> Self {
+        ProviderError {
+            code: 4100,
+            message: "werust does not have a wallet yet: it gives this page a read-only Ethereum \
+                      connection and holds no keys, so there is no account it can authorise."
+                .to_string(),
+        }
+    }
+
     /// The EIP-1193 `4200` "Unsupported Method" error for a method the read-only
     /// stub does not answer.
     #[must_use]
@@ -139,20 +194,29 @@ impl ProviderBridge {
     ///
     /// The stub answers only benign, keyless methods:
     ///
-    /// * `eth_chainId` -> [`STUB_CHAIN_ID`] (the configured chain id).
-    /// * `eth_accounts` / `eth_requestAccounts` -> `[]` (no accounts, because no
-    ///   keys are held here — the wallet-broker model is deferred).
+    /// * `eth_chainId` -> [`CHAIN_ID`], the chain werust's ENS/RPC backend reads.
+    /// * `eth_accounts` -> `[]`. A passive READ of the authorised accounts; there
+    ///   are none (no keys are held here), and an empty array is the conformant
+    ///   way to say so.
+    ///
+    /// `eth_requestAccounts` — the ASK — is refused with an EIP-1193
+    /// [`unauthorized`](ProviderError::unauthorized) (`4100`) error. It must never
+    /// resolve `[]`: that is not an outcome the method is specified to have, and it
+    /// silently walks a dapp down its success path with no account. The two methods
+    /// therefore DIFFER, deliberately.
     ///
     /// Any other method is refused with an EIP-1193
     /// [`unsupported`](ProviderError::unsupported) error. NOTHING here signs or
     /// touches a private key.
     pub fn answer(request: &ProviderRequest) -> Result<Value, ProviderError> {
         match request.method.as_str() {
-            "eth_chainId" => Ok(json!(STUB_CHAIN_ID)),
-            // No keys are held here, so there are no accounts to report. This is a
-            // read-only stub: it demonstrates the round-trip, it does not custody
-            // keys or grant access (the wallet-broker model is deferred).
-            "eth_accounts" | "eth_requestAccounts" => Ok(json!([])),
+            "eth_chainId" => Ok(json!(CHAIN_ID)),
+            // No keys are held here, so no account is authorised. `[]` is the
+            // conformant answer to the passive read, and it grants nothing.
+            "eth_accounts" => Ok(json!([])),
+            // The ASK cannot be granted, so it FAILS rather than resolving empty —
+            // see `ProviderError::unauthorized` for why 4100 and not 4001.
+            "eth_requestAccounts" => Err(ProviderError::unauthorized()),
             other => Err(ProviderError::unsupported(other)),
         }
     }
@@ -223,6 +287,22 @@ pub fn reject_script(id: u64, error: &ProviderError) -> String {
 ///   `emit`, over the standard events (`connect`, `disconnect`, `chainChanged`,
 ///   `accountsChanged`, `message`).
 /// * `isWerust: true` so a dapp can detect the injected provider.
+///
+/// **Nothing ever calls `emit` today, and that is deliberate.** EIP-1193 says a
+/// Provider MUST emit `connect` once it can service requests, but this shim is
+/// installed at DOCUMENT START, before any page script exists to have subscribed,
+/// so an emission at install would reach an empty listener map — ceremony with no
+/// observable effect. Emitting later would be guessing when listeners appeared,
+/// and the shim cannot state the `chainId` the event carries without first making
+/// a round-trip of its own. Nor is the event load-bearing for dapps: the mainstream
+/// libraries call `request(...)` immediately rather than waiting on `connect`, and
+/// werust answers from document start. The other three events describe changes
+/// (`chainChanged`, `accountsChanged`, `disconnect`) that a keyless read-only
+/// provider on a single fixed chain cannot have. So the surface stays present and
+/// conformant to subscribe to, and stays silent until there is something true to
+/// say — the first of those being a real wallet. Reasoning and the EIP-1193
+/// citation:
+/// `work/notes/findings/eip1193-connect-event-never-emitted-does-not-matter-yet-2026-07-31.md`.
 ///
 /// The shim holds no keys and makes no trust decisions; it is pure transport.
 #[must_use]
@@ -410,7 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn chain_id_stub_answers_without_keys() {
+    fn chain_id_answers_without_keys() {
         // Acceptance: a benign, read-only method demonstrates the round-trip end
         // to end without holding any private keys.
         let req = ProviderRequest {
@@ -419,21 +499,107 @@ mod tests {
             params: json!([]),
         };
         let result = ProviderBridge::answer(&req).expect("chain id is answered");
-        assert_eq!(result, json!(STUB_CHAIN_ID));
+        assert_eq!(result, json!(CHAIN_ID));
     }
 
     #[test]
-    fn accounts_stub_reports_no_keys() {
-        // No keys are held here, so eth_accounts is an empty list — the round-trip
-        // works, and it grants nothing.
-        for method in ["eth_accounts", "eth_requestAccounts"] {
-            let req = ProviderRequest {
-                id: 1,
-                method: method.into(),
-                params: json!([]),
-            };
-            assert_eq!(ProviderBridge::answer(&req).unwrap(), json!([]));
-        }
+    fn the_chain_the_page_is_told_is_the_chain_the_backend_reads() {
+        // One source, not two: the page is told exactly the chain werust's ENS/RPC
+        // backend reads. This guards against re-minting a second chain constant
+        // here, which could drift away from the backend's without anything failing.
+        assert_eq!(CHAIN_ID, crate::ethereum::CHAIN_ID);
+        let answered = ProviderBridge::answer(&ProviderRequest {
+            id: 1,
+            method: "eth_chainId".into(),
+            params: json!([]),
+        })
+        .expect("chain id is answered");
+        assert_eq!(answered, json!(crate::ethereum::CHAIN_ID));
+    }
+
+    #[test]
+    fn accounts_reports_no_authorised_accounts() {
+        // No keys are held here, so no account is authorised, and an empty array is
+        // the conformant way to SAY that — eth_accounts is a plain read, it does
+        // not ask for anything, so it answers and grants nothing.
+        let req = ProviderRequest {
+            id: 1,
+            method: "eth_accounts".into(),
+            params: json!([]),
+        };
+        assert_eq!(ProviderBridge::answer(&req).unwrap(), json!([]));
+    }
+
+    #[test]
+    fn request_accounts_is_refused_with_4100_rather_than_resolving_empty() {
+        // The defect this replaces: resolving `[]` sent every dapp down its SUCCESS
+        // path with `account === undefined`, so it believed it was connected to
+        // nobody. Asking for accounts must FAIL instead — 4100 Unauthorized, the
+        // code EIP-1193 recommends for an authorization failure.
+        let req = ProviderRequest {
+            id: 5,
+            method: "eth_requestAccounts".into(),
+            params: json!([]),
+        };
+        let err = ProviderBridge::answer(&req)
+            .expect_err("asking for accounts must reject, never resolve an empty list");
+        assert_eq!(err.code, 4100);
+        // The message is USER-VISIBLE (dapps render `error.message`): a legible
+        // sentence about the missing wallet, not a code name or a stack.
+        assert!(
+            err.message.contains("wallet"),
+            "the message must say werust has no wallet yet: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("read-only") && err.message.contains("no keys"),
+            "the message must explain the read-only, keyless provider: {}",
+            err.message
+        );
+        assert!(
+            !err.message.contains("4100") && !err.message.contains("EIP"),
+            "the message is for a human reading a dapp, not jargon: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn reading_accounts_and_asking_for_accounts_now_differ() {
+        // The two methods are no longer the same answer: the passive READ resolves
+        // an honest empty list, the REQUEST refuses. That difference is the whole
+        // point — a dapp that awaits `eth_requestAccounts` takes its error path.
+        let read = ProviderBridge::answer(&ProviderRequest {
+            id: 1,
+            method: "eth_accounts".into(),
+            params: json!([]),
+        });
+        let ask = ProviderBridge::answer(&ProviderRequest {
+            id: 2,
+            method: "eth_requestAccounts".into(),
+            params: json!([]),
+        });
+        assert_eq!(read, Ok(json!([])));
+        assert!(
+            ask.is_err(),
+            "eth_requestAccounts must not resolve: {ask:?}"
+        );
+        assert_ne!(read.is_ok(), ask.is_ok());
+    }
+
+    #[test]
+    fn handle_pushes_the_account_refusal_back_to_the_page() {
+        // End to end: the refusal reaches the page as an EIP-1193-shaped rejection
+        // of the correlated Promise, carrying the code AND the readable message.
+        let bridge = ProviderBridge::new();
+        let script = bridge
+            .handle(r#"{"id":6,"method":"eth_requestAccounts","params":[]}"#)
+            .expect("a refused request still settles the pending Promise");
+        assert!(
+            script.starts_with(&format!("window.{PROVIDER_BRIDGE}.__reject(6, ")),
+            "asking for accounts rejects the correlated Promise: {script}"
+        );
+        assert!(script.contains("4100"), "{script}");
+        assert!(script.contains("wallet"), "{script}");
     }
 
     #[test]
@@ -462,7 +628,7 @@ mod tests {
         // It calls the shim's private resolver with the correlation id + result.
         assert_eq!(
             script,
-            format!(r#"window.{PROVIDER_BRIDGE}.__resolve(9, "{STUB_CHAIN_ID}");"#)
+            format!(r#"window.{PROVIDER_BRIDGE}.__resolve(9, "{CHAIN_ID}");"#)
         );
     }
 

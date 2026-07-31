@@ -2,6 +2,8 @@
 
 Durable design record for task `eip1193-provider-injection-via-script-bridge` (spec `rust-successor-ship-webview-and-reach-t1-on-pure-rust-stack`, story 5; one of the two trust hooks that qualify a backend).
 
+> **Superseded in part (2026-07-31).** Two of the provider defaults recorded below have since changed: `eth_requestAccounts` now REJECTS with EIP-1193 `4100` instead of resolving `[]` (resolving empty walked dapps down their success path with no account), and `STUB_CHAIN_ID` is now `ethereum::CHAIN_ID`, re-exported as `provider::CHAIN_ID`. `eth_accounts -> []` and the `4200` refusal of everything else are unchanged. See `docs/spikes/provider-refuses-honestly-instead-of-resolving-an-empty-account-list/README.md`. The rest of this record still stands.
+
 ## What was built
 
 A native **EIP-1193 provider** is now injected into pages over the `Renderer` seam's script-message bridge, and a page-side `request({ method, params })` call round-trips across the bridge to a native handler and back — with NO keys involved.

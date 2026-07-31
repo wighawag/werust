@@ -370,7 +370,7 @@ mod tests {
         // the real `WebViewRenderer::install_provider` does, but drives it without
         // a GTK main loop or a display.
         use werust_core::provider::{
-            provider_shim, route_provider_message, ProviderBridge, PROVIDER_BRIDGE, STUB_CHAIN_ID,
+            provider_shim, route_provider_message, ProviderBridge, CHAIN_ID, PROVIDER_BRIDGE,
         };
 
         use std::sync::{Arc, Mutex};
@@ -421,7 +421,7 @@ mod tests {
         );
         assert_eq!(
             pushed[0],
-            format!(r#"window.{PROVIDER_BRIDGE}.__resolve(11, "{STUB_CHAIN_ID}");"#),
+            format!(r#"window.{PROVIDER_BRIDGE}.__resolve(11, "{CHAIN_ID}");"#),
             "the pending Promise for id 11 is resolved with the chain id"
         );
     }

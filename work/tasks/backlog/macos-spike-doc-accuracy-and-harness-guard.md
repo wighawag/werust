@@ -17,6 +17,8 @@ Three small, unrelated-to-each-other corrections found at Gate-2 of `macos-wkweb
 
 **3. Coverage locality.** README step 2 describes the five `webview-shared` tests as the lifecycle and off-thread-boundary tests, but `crates/webview-shared/src/lifecycle.rs` carries ZERO tests: the five are three `offthread` plus two `validate_url`. Either move the `LoadLifecycle` state-machine tests next to the code they cover, or correct the sentence. Prefer moving the tests if they exist elsewhere, since the point of the shared crate is that its guarantees travel with it.
 
+**4. The README's Gatekeeper instructions are wrong on a current macOS** (planted by the conductor at Gate-3 of `macos-release-packaging-leg`, 2026-07-31). `README.md`'s new "The macOS release artifact (`Werust.app`, UNSIGNED)" section leads with right-click then Open, which **macOS 15 (Sequoia) REMOVED** as a Gatekeeper bypass for unsigned apps; the path there is System Settings -> Privacy & Security -> Open Anyway. The second option given, `xattr -d com.apple.quarantine`, still works everywhere, so nobody is stranded, but the FIRST bullet is the one most people will try and it will not work on a current OS. Lead with what works today, keep the older path labelled as such, and do not promise a flow the platform withdrew. Same class as items 2 and 3: a doc claiming behaviour the system does not have.
+
 **Scope:** documentation accuracy and one shell guard. No behaviour change to the backend, the probe or the workflow's actual coverage beyond a possible path-filter addition.
 
 ## Acceptance criteria
@@ -25,6 +27,7 @@ Three small, unrelated-to-each-other corrections found at Gate-2 of `macos-wkweb
 - [ ] `typecheck-macos-from-linux.sh` refuses to `rm -rf` a `SCRATCH_DIR` outside a temp root, with a legible message; the safe default still works.
 - [ ] The README's statement about when the leg runs matches the workflow's actual triggers (adjust one or the other, and say which you chose).
 - [ ] The README's description of the `webview-shared` tests matches what that crate actually contains, or the tests move to match the description.
+- [ ] The README's macOS open-it instructions work on a current macOS (Sequoia removed the right-click -> Open bypass for unsigned apps); the still-valid `xattr` path is kept.
 - [ ] `cargo fmt --check && cargo clippy && cargo build && cargo test` green.
 
 ## Prompt

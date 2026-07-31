@@ -1172,14 +1172,30 @@ description = "WEB STORAGE as the web platform defines it: `window.localStorage`
 # opaque origin THROWS `SecurityError`, and the `null` is what ruled that out, so
 # `origin_map.rs` was correctly left alone.
 #
-# EVIDENCE CLASS PER CELL, stated rather than implied, because it differs:
-# * Android: MEASURED on-device, both before and after, by the instrumented probe
+# EVIDENCE CLASS PER CELL, stated rather than implied, because it is NOT equal.
+# The rule this row holds itself to (pinned on every push by
+# crates/werust-core/tests/web_storage_edge_wiring_shape.rs): every cell names
+# what backs it, and AN ENGINE DEFAULT IS NOT EVIDENCE on the origins werust
+# actually serves. That is not caution, it is measured: on a REGISTERED `ipfs://`
+# origin with `HasAuthorityComponent` + `TreatAsSecure` — a real, secure TUPLE
+# origin where `fetch` and `pushState` both work — Blink still rejects
+# `navigator.serviceWorker.register('/sw.js')` with `InvalidStateError`
+# (docs/spikes/windows-ipfs-origin-probe-on-ci/probe-report-2026-07-30.json,
+# WebView2 Runtime 150.0.4078.65; write-up in work/notes/observations/
+# service-worker-registration-differs-by-ipfs-serving-origin-2026-07-30.md).
+# Engine capabilities on CUSTOM-SCHEME origins are SCHEME-GATED, so "the engine
+# enables DOM storage by default and no edge disables it" says nothing about
+# `localStorage` on an `ipfs://` origin — which is precisely the origin three of
+# these five edges serve content on.
+#
+# EVIDENCE (android): MEASURED on-device, both before and after, by the
+#   instrumented probe
 #   crates/werust-android/app/src/androidTest/.../WebStorageTest.kt on an API 36
-#   emulator with System WebView 142 (`Medium_Phone_API_36.1`, 2026-07-31):
-#   `window.localStorage` went from `null` (round-trip `throw:TypeError`) to
-#   `[object Storage]` with a set/get round-trip that SURVIVES a reload of the
-#   same origin. Storage stays partitioned per CONTENT ADDRESS because
-#   `origin_map.rs` gives each CID its own subdomain
+#   emulator with System WebView 142.0.7444.174 (`Medium_Phone_API_36.1`,
+#   2026-07-31): `window.localStorage` went from `null` (round-trip
+#   `throw:TypeError`) to `[object Storage]` with a set/get round-trip that
+#   SURVIVES a reload of the same origin. Storage stays partitioned per CONTENT
+#   ADDRESS because `origin_map.rs` gives each CID its own subdomain
 #   (`https://<cid>.ipfs.werust.invalid`), so enabling it leaks nothing across
 #   sites. Measured scope, contradicting the folklore: this setting governs
 #   `localStorage` ONLY — `sessionStorage` was already a working `Storage` object
@@ -1188,21 +1204,41 @@ description = "WEB STORAGE as the web platform defines it: `window.localStorage`
 #   Guarded on every push by the source-shape test
 #   crates/werust-core/tests/web_storage_edge_wiring_shape.rs (there is NO CI
 #   emulator leg, so the on-device probe above is a hand-run measurement, not a
-#   gate).
-# * desktop (Linux/WebKitGTK): web storage is ON by default in WebKitGTK
-#   (`enable-html5-local-storage`) and this edge sets no storage setting at all.
-#   The evidence is the FIELD REPORT that motivated the task — the human ran
-#   `mandalas.eth`, which uses `localStorage`, and it worked on desktop while
-#   Android failed — not a probe that read the property back.
-# * macos / windows / ios: WKWebView (macOS and iOS) exposes no DOM-storage
-#   toggle at all and WebView2 inherits Chromium's browser defaults; none of the
-#   three edges touches a storage setting, so the capability is wired by the
-#   engine and nothing in werust disables it. The evidence there is the ENGINE
-#   DEFAULT plus the absence of any edge-side disabling — NOT a probe that read
-#   `window.localStorage` back the way the Android one does. Closing that gap is
-#   the proposed follow-on `matrix-web-platform-rows-are-measured-on-every-edge`,
-#   which would give this row (and its siblings below) the same evidence class on
-#   all five edges.
+#   gate). This is the ONE cell backed by a read-back of the property itself.
+# EVIDENCE (desktop): the FIELD REPORT that motivated the task, 2026-07-31 — the
+#   human ran `mandalas.eth`, a site that uses `localStorage`, on the GTK desktop
+#   and on Android: it WORKED on desktop and was `null` on Android. That is
+#   behaviour observed on the origin this edge really serves, which is why this
+#   cell is `implemented` while the three below are not; but it is a SITE-LEVEL
+#   observation, not a probe that read `window.localStorage` back, so it is the
+#   weaker of the two `implemented` cells and is named as such. (WebKitGTK also
+#   has web storage on by default — `enable-html5-local-storage` — and this edge
+#   sets no storage setting at all, but per the rule above that default is
+#   context, not evidence.) Upgrading this cell to a read-back is part of
+#   `matrix-web-platform-rows-are-measured-on-every-edge`.
+# EVIDENCE (macos): NONE. No probe on this edge has ever read
+#   `window.localStorage` back. WKWebView exposes no DOM-storage toggle and this
+#   edge touches no storage setting, but that is the ENGINE DEFAULT, which the
+#   scheme-gating measurement above disqualifies as evidence about an `ipfs://`
+#   origin. `stubbed` here means NOT ESTABLISHED, not "known broken": nothing
+#   suggests it fails, and nothing has shown that it works. Tracked by
+#   `matrix-web-platform-rows-are-measured-on-every-edge`, which prescribes the
+#   cheap route: `crates/macos-origin-probe` already runs on a real `macos-14`
+#   runner against a real `ipfs://` origin and already measures per-capability
+#   facts on it (`service_worker` is a field in its report), so a `local_storage`
+#   field answers this cell BY MEASUREMENT IN CI.
+# EVIDENCE (windows): NONE, for the same reason, on the engine that produced the
+#   scheme-gating measurement itself: WebView2 inherits Chromium's browser
+#   defaults and this edge disables nothing, but it is Blink on a registered
+#   `ipfs://` origin that refuses `serviceWorker.register`, so the default proves
+#   nothing here either. Same route: `crates/windows-origin-probe` already runs
+#   on `windows-latest` against that origin and already reports `service_worker`.
+# EVIDENCE (ios): NONE, and no probe leg exists on this edge at all. WKWebView on
+#   iOS is the same WebKit as macOS, so the macOS measurement will carry here by
+#   PORT EQUIVALENCE, exactly as ADR-0011 Amendment 3 argued for the `ipfs://`
+#   origin verdict (`WKURLSchemeHandler` is one WebKit class; what the runner
+#   measured is a property of the port, not of AppKit). Until that measurement
+#   exists there is nothing to carry, so this cell stays `stubbed` too.
 #
 # FURTHER WEB-PLATFORM ROWS ARE PROPOSED, NOT FILLED SPECULATIVELY. Adding
 # `web-storage` does not close the ceiling this incident exposed; it opens the
@@ -1214,12 +1250,13 @@ description = "WEB STORAGE as the web platform defines it: `window.localStorage`
 # `matrix-web-platform-row-cookies` (Android measured: first-party cookies work,
 # third-party cookies OFF, recorded as a deliberate privacy position), and
 # `matrix-web-platform-row-service-workers` (the macOS origin probe measured
-# `service_worker: reject:TypeError` on `ipfs://`, so this one may well be a real
+# `service_worker: reject:TypeError` on `ipfs://` and the Windows probe measured
+# `reject:InvalidStateError` on a registered one, so this is a real
 # cross-platform gap rather than a formality).
 desktop = { state = "implemented" }
-macos = { state = "implemented" }
-windows = { state = "implemented" }
-ios = { state = "implemented" }
+macos = { state = "stubbed", task = "matrix-web-platform-rows-are-measured-on-every-edge" }
+windows = { state = "stubbed", task = "matrix-web-platform-rows-are-measured-on-every-edge" }
+ios = { state = "stubbed", task = "matrix-web-platform-rows-are-measured-on-every-edge" }
 android = { state = "implemented" }
 
 [[capability]]

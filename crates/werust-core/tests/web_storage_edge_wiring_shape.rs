@@ -39,7 +39,10 @@
 //! 4. The parity matrix carries the `web-storage` row — its FIRST web-platform
 //!    row — with an explicit cell for all five platforms and the ceiling this
 //!    incident exposed stated in its description
-//!    (`the_matrix_carries_the_first_web_platform_row_with_an_explicit_cell_everywhere`).
+//!    (`the_matrix_carries_the_first_web_platform_row_with_an_explicit_cell_everywhere`),
+//!    and EVERY cell names the evidence that backs it, so no cell can claim
+//!    `implemented` off an engine default nobody measured
+//!    (`every_cell_in_the_web_storage_row_names_the_evidence_that_backs_it`).
 //! 5. The on-device instrumented probe exists and asserts the round-trip, and it
 //!    is honestly marked as NOT running in CI
 //!    (`the_on_device_probe_asserts_the_round_trip_and_says_it_does_not_run_in_ci`).
@@ -70,6 +73,20 @@ fn on_device_probe() -> String {
     source("crates/werust-android/app/src/androidTest/java/com/github/wighawag/werust/WebStorageTest.kt")
 }
 
+/// The `web-storage` row of the parity matrix, bounded at the next capability
+/// header so a LATER row's cells can never satisfy an assertion about this one.
+fn web_storage_row() -> String {
+    let matrix = source("docs/platform-capability-matrix.toml");
+    let row_start = matrix
+        .find("name = \"web-storage\"")
+        .expect("the matrix must carry the `web-storage` capability row");
+    let row = &matrix[row_start..];
+    match row.find("\n[[capability]]") {
+        Some(end) => row[..end].to_string(),
+        None => row.to_string(),
+    }
+}
+
 fn websettings_audit() -> String {
     source(
         "docs/spikes/android-enable-dom-storage-and-guard-web-platform-parity/WEBSETTINGS-AUDIT.md",
@@ -79,6 +96,9 @@ fn websettings_audit() -> String {
 /// The `WebSettings` defaults the task audited and deliberately left ALONE: they
 /// are user-visible UX judgements for a human, not conformance bugs. The audit
 /// note must name each one; the edge must set none of them.
+/// The parity matrix's five platform columns, in the matrix's own order.
+const PLATFORMS: [&str; 5] = ["desktop", "macos", "windows", "ios", "android"];
+
 const AUDITED_BUT_UNCHANGED: [&str; 7] = [
     "builtInZoomControls",
     "displayZoomControls",
@@ -196,18 +216,8 @@ fn the_matrix_carries_the_first_web_platform_row_with_an_explicit_cell_everywher
     // edges?" was unasked — which is why the guard that exists to stop a
     // capability shipping on one platform could not fire on this bug. The row
     // must say that, and give an explicit cell for all five platforms.
-    let matrix = source("docs/platform-capability-matrix.toml");
-    let row_start = matrix
-        .find("name = \"web-storage\"")
-        .expect("the matrix must carry the `web-storage` capability row");
-    let row = &matrix[row_start..];
-    // Bound the row at the next capability header if there is one, so the cell
-    // assertions cannot pass on a LATER row's cells.
-    let row = match row.find("\n[[capability]]") {
-        Some(end) => &row[..end],
-        None => row,
-    };
-    for platform in ["desktop", "macos", "windows", "ios", "android"] {
+    let row = web_storage_row();
+    for platform in PLATFORMS {
         assert!(
             row.contains(&format!("{platform} = {{ state = ")),
             "the web-storage row must give an explicit cell for `{platform}`: {row:?}"
@@ -221,6 +231,42 @@ fn the_matrix_carries_the_first_web_platform_row_with_an_explicit_cell_everywher
     // The general validity of every cell (and that a `stubbed` cell names a task
     // that really exists) is the sibling `platform_capability_parity.rs` guard's
     // job; this test only pins that the row is there and complete.
+}
+
+#[test]
+fn every_cell_in_the_web_storage_row_names_the_evidence_that_backs_it() {
+    // Criterion 4, the half this task was REQUEUED for. The row first landed
+    // `implemented` on all five platforms off ONE measurement (Android, on an
+    // emulator); the other four rested on "the engine enables DOM storage by
+    // default and no edge disables it". That inference is specifically unsafe
+    // here, and this repo has MEASURED why: on a registered, secure `ipfs://`
+    // tuple origin where `fetch` and `pushState` both work, Blink still rejects
+    // `navigator.serviceWorker.register` with `InvalidStateError`
+    // (docs/spikes/windows-ipfs-origin-probe-on-ci/probe-report-2026-07-30.json).
+    // Engine capabilities on CUSTOM-SCHEME origins are scheme-gated, so an
+    // engine default is not evidence about the origins werust actually serves.
+    //
+    // The durable rule, pinned here rather than left to review: EVERY cell of
+    // this row names the evidence class that backs it, in the row's own prose,
+    // keyed by platform. A future edge that flips a cell to `implemented` has to
+    // write down WHAT measured it, in the same change, or this reds.
+    let row = web_storage_row();
+    for platform in PLATFORMS {
+        assert!(
+            row.contains(&format!("EVIDENCE ({platform}):")),
+            "the web-storage row must state, as `EVIDENCE ({platform}):`, what backs that \
+             cell — a measurement, a field report, or the absence of one (a cell resting on \
+             an engine default nobody probed is the over-claim this row exists to stop): \
+             {row:?}"
+        );
+    }
+    assert!(
+        row.contains("android = { state = \"implemented\" }"),
+        "the android cell must stay `implemented`: it is the one cell backed by an \
+         on-device measurement (crates/werust-android/app/src/androidTest/.../\
+         WebStorageTest.kt on an API 36 emulator), and it is the fix this task landed: \
+         {row:?}"
+    );
 }
 
 #[test]

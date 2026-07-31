@@ -15,7 +15,7 @@
 ## Wiring
 
 - `crates/werust-android/app/src/main/java/com/github/wighawag/werust/BrowserActivity.kt` — `settings.domStorageEnabled = true` in the `WebView` configuration block, beside `javaScriptEnabled`, carrying the WHY its neighbours carry: the default is built for an app EMBEDDING a view rather than for a browser, and enabling it is safe here because `origin_map.rs` gives each CID its own subdomain, so storage stays partitioned per CONTENT ADDRESS exactly as it is on the four platforms with real `ipfs://<cid>` origins.
-- `crates/werust-core/tests/web_storage_edge_wiring_shape.rs` — the guard that **runs on every push**. It parses the Kotlin edge and pins that DOM storage is still enabled (so a refactor of that settings block cannot silently return `localStorage` to `null`), that the origin map still puts each CID in its own HOST LABEL (the safety premise, asserted rather than trusted), that the matrix row exists and is complete, and that every audited setting is listed in the audit note and set by nobody.
+- `crates/werust-core/tests/web_storage_edge_wiring_shape.rs` — the guard that **runs on every push**. It parses the Kotlin edge and pins that DOM storage is still enabled (so a refactor of that settings block cannot silently return `localStorage` to `null`), that the origin map still puts each CID in its own HOST LABEL (the safety premise, asserted rather than trusted), that the matrix row exists and is complete, that **every cell of the row names the evidence backing it** (`EVIDENCE (<platform>):`, so a cell cannot be flipped to `implemented` without writing down what measured it) with `android` pinned `implemented`, and that every audited setting is listed in the audit note and set by nobody.
 - `crates/werust-android/app/src/androidTest/java/com/github/wighawag/werust/WebStorageTest.kt` — the on-device probe that **does not run in CI**. It measures `localStorage`, `sessionStorage`, IndexedDB and cookies against the real System WebView with the setting off and on.
 - `docs/platform-capability-matrix.toml` — the `web-storage` row.
 
@@ -37,15 +37,17 @@ The captured evidence is logged under the `WebStorageProbe` logcat tag and quote
 
 ## Decisions
 
-### 1. The `web-storage` row is `implemented` on the four edges nobody probed, with the evidence class stated per cell
+### 1. Only the two MEASURED edges claim `implemented`; the three that rest on an engine default are `stubbed` (REVERSED after review, 2026-07-31)
 
-**Chosen:** all five cells are `implemented`, and the row's prose says exactly what backs each one: Android measured on-device, desktop backed by the field report that started this, and macOS/Windows/iOS backed by the engine default plus the absence of any edge-side disabling.
+**Chosen:** `android` = `implemented` (measured on-device), `desktop` = `implemented` (the field report, named as the weaker evidence), and `macos` / `windows` / `ios` = `stubbed` against `matrix-web-platform-rows-are-measured-on-every-edge`. Every cell carries an `EVIDENCE (<platform>):` line in the row saying what backs it, and the shape guard reds if one is missing.
 
-**Why:** the matrix's three states are `implemented` / `stubbed` (a known gap, task-linked) / `n-a` (with a reason). Web storage on those edges is not a GAP — WKWebView exposes no DOM-storage toggle at all and WebView2 inherits Chromium's browser defaults, no edge disables anything, and desktop was observed working in the field. Marking them `stubbed` would assert a defect that does not exist and would demand a task to "implement" something already working. What is missing is EVIDENCE, not capability, and the matrix has no state for that — so the honest move is the state that is true plus prose that does not overclaim, which is the standard the `macos`/`windows` columns already set elsewhere ("the evidence is compilation + the shape guard, not a driven SPA navigation").
+**This reverses what this task first landed.** The first version marked all five `implemented`, arguing that WKWebView exposes no DOM-storage toggle, WebView2 inherits Chromium's browser defaults, no edge disables anything, and therefore what was missing was EVIDENCE rather than capability. Review blocked it, and it was right to: **this repo has already MEASURED that engine defaults do not carry to the origins werust serves.** On a REGISTERED `ipfs://` origin with `HasAuthorityComponent` + `TreatAsSecure` — a real, secure tuple origin where `fetch` and `pushState` both work — Blink still rejects `navigator.serviceWorker.register('/sw.js')` with `InvalidStateError` (`docs/spikes/windows-ipfs-origin-probe-on-ci/probe-report-2026-07-30.json`, WebView2 150.0.4078.65; `work/notes/observations/service-worker-registration-differs-by-ipfs-serving-origin-2026-07-30.md`). Engine capabilities on CUSTOM-SCHEME origins are SCHEME-GATED, and `ipfs://` is exactly the origin those three edges serve. So "the engine enables it and nobody disabled it" is not an argument about `localStorage` on an `ipfs://` origin at all. A machine-readable `implemented` on three unmeasured edges would have defused the one row added to stop this class of over-claim — and ADR-0005 records the same over-claim being corrected once already (the guard's original seed listed `implemented`-everywhere where the code said otherwise).
 
-**Alternatives considered:** (a) `stubbed` on the three unmeasured edges — rejected, it would claim a bug that is not there and pollute the one signal `stubbed` carries; (b) add a fourth cell state such as `unmeasured` — rejected as out of scope and a change to ADR-0005's vocabulary that a storage fix has no business making unilaterally, though it is a reasonable thing for a human to consider if this recurs.
+**Why `desktop` stays `implemented` while those three do not** (the line has to be drawn somewhere, so it is drawn on the record rather than on a hunch): desktop has an OBSERVATION on the origin it really serves — the human ran `mandalas.eth`, a site that uses `localStorage`, and it worked there while it was `null` on Android. That is behaviour, not an inference from a default. It is still weaker than Android's read-back (a site working is not the property being read), and the cell says so, names it the weaker of the two, and points at the follow-on that would upgrade it. Stubbing desktop too was the alternative and is defensible; it was rejected because it would discard the one piece of real-world evidence this task actually has and would make `stubbed` mean "nobody wrote a probe", which is broader than the signal it should carry.
 
-**What it touches:** the parity guard's meaning of `implemented`, and the follow-on task `matrix-web-platform-rows-are-measured-on-every-edge`, which exists precisely to make the evidence equal.
+**Alternatives considered:** (a) all five `implemented` — what was blocked, above; (b) a fourth cell state such as `unmeasured` — rejected as a unilateral change to ADR-0005's vocabulary that a storage fix has no business making, and it would need the guard, the ADR and every reader updated (a reasonable thing for a human to consider if this recurs); (c) stub desktop as well — defensible, rejected for the reason above.
+
+**What it touches:** the parity guard's meaning of `stubbed` (see Decision 6), the follow-on task `matrix-web-platform-rows-are-measured-on-every-edge` (now the linked task for three cells, so it must resolve — it does, in `work/tasks/backlog/`), and any future edge that wants to flip a cell: the shape guard now demands an `EVIDENCE (<platform>):` line in the same change.
 
 ### 2. Further web-platform rows are AUTHORED as staged tasks, not filled in speculatively
 
@@ -76,6 +78,22 @@ The captured evidence is logged under the `WebStorageProbe` logcat tag and quote
 ### 5. Coherence: "web-platform row" is a new KIND of row, not a new concept beside `capability`
 
 The matrix's vocabulary is unchanged: `web-storage` is a `[[capability]]` with the same three cell states, validated by the same guard, with no new field or status. What is new is the KIND of thing a row can describe — a capability of the WEB PLATFORM rather than a werust feature — and that distinction is stated inside the row's own description, where a reader meets it, rather than minted as a separate mechanism. Nothing in `CONTEXT.md`'s glossary is re-meaned.
+
+### 6. Coherence: `stubbed` here means NOT ESTABLISHED, which stretches ADR-0005's "known gap" reading
+
+**Chosen:** the three unmeasured cells use `stubbed` + a task, the state ADR-0005 defines for "a known gap ... the matrix face of a no-op'd seam method".
+
+**Why this is recorded rather than assumed:** on `macos` / `windows` / `ios` there is no no-op'd seam and no known defect — nothing suggests web storage fails there; nothing has shown it works. That is a THIRD thing, and the matrix's vocabulary has two: a claim, or a tracked gap. Given only those, a tracked gap is the honest one, because it is the state that cannot mislead a release reader and it forces a linked task that resolves it. Each cell's prose says explicitly that `stubbed` means NOT ESTABLISHED rather than "known broken", so the stretch is visible where it is read, not buried here.
+
+**What it touches:** ADR-0005's vocabulary as READ (not as written — no file of it changed), and anyone scanning the matrix for real gaps, who will now find three cells that may turn out to be fine. If this recurs across several rows, minting a real `unmeasured` state (with the guard and the ADR updated together) is the clean fix; one row does not justify it.
+
+### 7. A per-cell `EVIDENCE (<platform>):` line is now a CHECKED convention of this row
+
+**Chosen:** the row's comment block gives one `EVIDENCE (<platform>):` paragraph per platform, and `web_storage_edge_wiring_shape.rs` reds if any of the five is missing.
+
+**Why:** the failure this task was requeued for was not a wrong cell, it was a cell whose backing was never written down, so nobody could see it was an inference. A marker makes "what backs this?" answerable by looking, and the guard makes flipping a cell without answering it impossible. The convention is scoped to the `web-storage` row and its test; it invents no matrix FIELD (a comment, not schema), so ADR-0005's format and the parity guard are untouched.
+
+**What it touches:** `matrix-web-platform-rows-are-measured-on-every-edge` and the three sibling row tasks, which now inherit the marker as the worked example — and any change that flips a `web-storage` cell, which must update the matching evidence line in the same commit. Whether the other 24 rows should adopt it is a human's call and is deliberately not done here.
 
 ## What this fix does NOT do
 

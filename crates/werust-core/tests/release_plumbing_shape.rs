@@ -46,6 +46,12 @@
 //!    honest name `app-debug-unsigned.apk`. The signing key material is supplied
 //!    ONLY through the environment, so the Gradle `signingConfigs.release` block
 //!    is inert for local dev builds (task `android-apk-signing`).
+//! 9. The macOS DESKTOP leg (task `macos-release-packaging-leg`,
+//!    `docs/adr/0011` macOS split sub-task 4) builds BOTH darwin slices,
+//!    `lipo`s them into ONE universal binary, bundles a minimal-`Info.plist`
+//!    `Werust.app` and attaches it, as a SIBLING job on the same `macos-14`
+//!    runner the iOS leg uses: decoupled from every other leg, deliberately
+//!    UNSIGNED, with `CFBundleVersion` read from the ONE Rust version source.
 //!
 //! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
 //! never runs Gradle, never reads a secret's value, and performs no I/O beyond
@@ -65,10 +71,17 @@ fn repo_root() -> PathBuf {
         .expect("resolve workspace root from crates/werust-core")
 }
 
+/// A repo-relative text file, read whole. Used where the contract lives in a
+/// file no pure-Rust parser can model (a shell script, a Kotlin DSL, the
+/// README): asserting on its TEXT is enough for the shape that matters.
+fn read_repo_file(rel: &str) -> String {
+    let path = repo_root().join(rel);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
 fn load_yaml(rel: &str) -> Value {
     let path = repo_root().join(rel);
-    let text =
-        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let text = read_repo_file(rel);
     serde_yaml::from_str(&text).unwrap_or_else(|e| panic!("parse {} as YAML: {e}", path.display()))
 }
 
@@ -487,13 +500,16 @@ fn every_rust_compiling_leg_injects_the_tag_version_into_the_build() {
     // `werust 0.0.0`. Each leg that compiles Rust must therefore export
     // `WERUST_VERSION` derived from the tag ref name.
     //
-    // All three legs qualify: the desktop leg `cargo build`s the binary, and both
-    // mobile legs cross-compile the shared core into their artifact.
+    // All four legs qualify: the desktop-Linux leg `cargo build`s the binary,
+    // both mobile legs cross-compile the shared core into their artifact, and the
+    // macOS desktop leg compiles it into both slices of the universal binary
+    // `Werust.app` carries (where the SAME resolved string is ALSO stamped into
+    // `CFBundleVersion`; see `macos_bundle_version_comes_from_the_one_rust_version_source`).
     //
     // Asserted on the job's `env:` MAPPING (not a substring sweep) so the
     // variable really is exported to every step of the leg, which is what makes
     // the cargo invocation — wherever it lives, GoReleaser's or Gradle's — see it.
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app"] {
+    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
         let j = job(leg);
         let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
             panic!(
@@ -553,7 +569,7 @@ fn every_rust_compiling_leg_passes_the_rpc_endpoint_secret_through() {
     // passes identically on either path. What it pins: the injection
     // EXPRESSION references the secret, and no leg hardcodes a literal
     // endpoint URL (a private RPC URL must never be committed).
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app"] {
+    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
         let j = job(leg);
         let env = j.get("env").and_then(Value::as_mapping).unwrap_or_else(|| {
             panic!(
@@ -620,7 +636,7 @@ fn dry_run_snapshots_and_uploads_artifacts_without_publishing() {
     );
 
     // Every leg uploads workflow artifacts on the dry-run.
-    for leg in ["goreleaser", "android-apk", "ios-simulator-app"] {
+    for leg in ["goreleaser", "android-apk", "ios-simulator-app", MACOS_LEG] {
         let j = job(leg);
         assert!(
             contains_substr(&j, "actions/upload-artifact"),
@@ -628,8 +644,9 @@ fn dry_run_snapshots_and_uploads_artifacts_without_publishing() {
         );
     }
 
-    // The mobile legs attach to the Release with `gh release upload` on a tag.
-    for leg in ["android-apk", "ios-simulator-app"] {
+    // Every non-GoReleaser leg attaches its artifact to the Release with
+    // `gh release upload` on a tag (GoReleaser publishes its own).
+    for leg in ["android-apk", "ios-simulator-app", MACOS_LEG] {
         let j = job(leg);
         assert!(
             contains_substr(&j, "gh release upload"),
@@ -937,5 +954,309 @@ fn the_keystore_handling_steps_touch_no_network() {
                 );
             }
         }
+    }
+}
+
+// --- Criterion 9: the macOS desktop packaging leg (task `macos-release-packaging-leg`) ---
+//
+// The FOURTH release leg (`docs/adr/0011-webview2-for-windows.md`'s macOS split,
+// sub-task 4): the AppKit shell `macos-appkit-window-and-chrome` shipped is a
+// binary nothing ever handed to a person. This leg builds it for BOTH darwin
+// architectures, `lipo`s the two slices into ONE universal binary, wraps it in a
+// minimal-`Info.plist` `Werust.app` and attaches the zip to the tagged Release
+// beside the desktop Linux binary, the Android APK and the iOS Simulator `.app`.
+//
+// It is a SIBLING of `ios-simulator-app`, not an extension of it: both run on the
+// same `macos-14` runner, but an iOS failure must never withhold the desktop
+// artifact (and vice versa), the same decoupling rule the mobile legs already
+// carry. Everything else is modelled on the mobile legs: `needs: verify`, an
+// idempotent `gh release create` before the upload, and a dry-run that uploads a
+// workflow artifact instead of publishing.
+//
+// Pinned HERE, in the pure-Rust gate, exactly like the rest of this file: the
+// assertions parse the workflow YAML and read the two packaging scripts as text,
+// so they need no macOS, no Xcode and no network.
+// Decisions: docs/spikes/macos-release-packaging-leg/README.md.
+
+/// The macOS desktop leg's job key in `release.yml`.
+const MACOS_LEG: &str = "macos-desktop-app";
+
+/// The script that builds both slices, `lipo`s them and assembles `Werust.app`.
+/// It lives in the CRATE (like `crates/werust-ios/build-and-run.sh`) because it
+/// is the product's packaging step, runnable by a human on a Mac, not a CI-only
+/// snippet.
+const MACOS_BUNDLE_SCRIPT: &str = "crates/werust-macos/bundle-app.sh";
+
+/// The BUILD-leg acceptance check the job runs on the assembled bundle: the
+/// macOS twin of `check-apk-abis.sh` / `check-app-bundle.sh`, and the place
+/// criterion 2's "both architectures verified with `lipo -info`" actually
+/// EXECUTES (it cannot run in this Linux gate).
+const MACOS_BUNDLE_CHECK: &str =
+    "docs/spikes/macos-release-packaging-leg/check-macos-app-bundle.sh";
+
+/// How a packaging SCRIPT reads werust's ONE version: the `werust-core` example
+/// that prints `werust_core::version()`, the accessor `build.rs` resolves from
+/// the release tag. Re-deriving the version in shell would mint the second
+/// source `version()`'s own docs forbid.
+const VERSION_EXAMPLE: &str = "--example print_version";
+
+/// The macOS bundle's user-facing name. One `.app`, one name, everywhere.
+const MACOS_APP_BUNDLE: &str = "Werust.app";
+
+/// A shell script's CODE, with whole-line `#` comments (and the shebang)
+/// dropped.
+///
+/// The absence assertions below ("no second version source", "no signing tool")
+/// have to distinguish RUNNING a command from EXPLAINING why the script does
+/// not: the packaging script's header names `git describe` and `codesign`
+/// precisely to record that it deliberately does neither, and that prose must
+/// not read as a violation. Whole-line comments are the only comment form this
+/// strips, which is all these scripts use for prose.
+fn shell_code_of(script: &str) -> String {
+    script
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn macos_desktop_leg_is_a_decoupled_sibling_on_the_shared_macos_runner() {
+    // Criterion 4: the existing `macos-14` runner shape (the one the iOS leg
+    // already uses, so no new runner class), and decoupled in BOTH directions.
+    let j = job(MACOS_LEG);
+    assert_eq!(
+        j.get("runs-on").and_then(Value::as_str),
+        Some("macos-14"),
+        "the macOS desktop leg MUST run on the existing `macos-14` runner shape (Xcode/`lipo`/\
+         the darwin SDKs are macOS-only)"
+    );
+    let needs = strings_of(
+        j.get("needs")
+            .unwrap_or_else(|| panic!("the `{MACOS_LEG}` job must declare `needs:`")),
+    );
+    assert!(
+        needs.iter().any(|n| n == "verify"),
+        "the `{MACOS_LEG}` leg must `needs: verify` (gated on a green tree, like every leg); got {needs:?}"
+    );
+    for sibling in ["goreleaser", "ios-simulator-app", "android-apk"] {
+        assert!(
+            !needs.iter().any(|n| n == sibling),
+            "the `{MACOS_LEG}` leg must NOT `needs: {sibling}`: it is a SIBLING leg, so no other \
+             platform's failure may withhold the macOS artifact; got {needs:?}"
+        );
+    }
+    // Being decoupled means the Release may not exist yet on a tag, so this leg
+    // guarantees its EXISTENCE the same idempotent way the mobile legs do.
+    assert!(
+        contains_substr(&j, "gh release create"),
+        "the `{MACOS_LEG}` leg must idempotently `gh release create` on a tag (a Release-EXISTENCE \
+         guarantee, since it waits on no other leg)"
+    );
+}
+
+#[test]
+fn macos_desktop_leg_builds_both_slices_and_lipos_them_into_one_universal_binary() {
+    // Criteria 1 + 2: both darwin targets, ONE universal binary, and the
+    // universality actually VERIFIED on the runner rather than assumed.
+    let j = job(MACOS_LEG);
+    assert!(
+        contains_substr(&j, MACOS_BUNDLE_SCRIPT),
+        "the `{MACOS_LEG}` leg must build + bundle via `{MACOS_BUNDLE_SCRIPT}` (the same \
+         script a human can run on a Mac), not an inline CI-only snippet"
+    );
+    assert!(
+        contains_substr(&j, MACOS_BUNDLE_CHECK),
+        "the `{MACOS_LEG}` leg must RUN the BUILD-leg check `{MACOS_BUNDLE_CHECK}` on the \
+         assembled bundle (the macOS twin of check-apk-abis.sh / check-app-bundle.sh)"
+    );
+
+    let script = read_repo_file(MACOS_BUNDLE_SCRIPT);
+    for triple in ["x86_64-apple-darwin", "aarch64-apple-darwin"] {
+        assert!(
+            script.contains(triple),
+            "{MACOS_BUNDLE_SCRIPT} must build the `{triple}` slice"
+        );
+    }
+    assert!(
+        script.contains("lipo -create"),
+        "{MACOS_BUNDLE_SCRIPT} must `lipo -create` the two slices into ONE universal binary"
+    );
+
+    let check = read_repo_file(MACOS_BUNDLE_CHECK);
+    for arch in ["x86_64", "arm64"] {
+        assert!(
+            check.contains(arch),
+            "{MACOS_BUNDLE_CHECK} must assert the `{arch}` slice is present (criterion 2: BOTH \
+             architectures verified with `lipo`)"
+        );
+    }
+    assert!(
+        check.contains("lipo"),
+        "{MACOS_BUNDLE_CHECK} must read the architectures with `lipo` (the tool that can see them)"
+    );
+}
+
+#[test]
+fn macos_desktop_leg_bundles_a_minimal_info_plist_and_attaches_the_zip() {
+    // Criterion 1: a real `.app` bundle, with the minimal key set the task names,
+    // zipped and attached beside the existing artifacts.
+    let script = read_repo_file(MACOS_BUNDLE_SCRIPT);
+    assert!(
+        script.contains(MACOS_APP_BUNDLE),
+        "{MACOS_BUNDLE_SCRIPT} must assemble `{MACOS_APP_BUNDLE}`"
+    );
+    assert!(
+        script.contains("Contents/MacOS"),
+        "{MACOS_BUNDLE_SCRIPT} must put the binary at the bundle's `Contents/MacOS/` location \
+         (a `.app` is a LAYOUT, not a renamed directory)"
+    );
+    for key in [
+        "CFBundleName",
+        "CFBundleIdentifier",
+        "CFBundleVersion",
+        "CFBundlePackageType",
+        // Not in the task's list but load-bearing: without it the bundle names no
+        // binary to launch, so the `.app` opens nothing at all.
+        "CFBundleExecutable",
+    ] {
+        assert!(
+            script.contains(key),
+            "{MACOS_BUNDLE_SCRIPT}'s Info.plist must declare `{key}`"
+        );
+    }
+    assert!(
+        script.contains("<string>APPL</string>"),
+        "{MACOS_BUNDLE_SCRIPT}'s Info.plist must set CFBundlePackageType to `APPL`"
+    );
+
+    // The artifact reaches BOTH destinations: attached on a tag, uploaded on the
+    // dry-run (the shared assertions live in
+    // `dry_run_snapshots_and_uploads_artifacts_without_publishing`; here we pin
+    // that it is the ZIPPED bundle that travels, not the bundle DIRECTORY, which
+    // no release asset can be).
+    let j = job(MACOS_LEG);
+    let zip_steps = steps_mentioning(&j, ".zip");
+    assert!(
+        !zip_steps.is_empty(),
+        "the `{MACOS_LEG}` leg must attach/upload a ZIP of the `.app` (a bundle directory is not \
+         a release asset)"
+    );
+}
+
+#[test]
+fn macos_bundle_version_comes_from_the_one_rust_version_source() {
+    // Criterion 3, and the reason the Android sibling task
+    // `android-apk-version-from-the-release-tag` exists: a packaging step that
+    // re-derives the version in shell IS a second source, and it drifts from the
+    // version the shipped binary reports the moment either side changes. So
+    // `CFBundleVersion` is READ OUT of the compiled core (the `print_version`
+    // example prints `werust_core::version()`, which `build.rs` resolved from
+    // `WERUST_VERSION` / `git describe`) instead of re-computed.
+    let script = shell_code_of(&read_repo_file(MACOS_BUNDLE_SCRIPT));
+    assert!(
+        script.contains(VERSION_EXAMPLE),
+        "{MACOS_BUNDLE_SCRIPT} must read the version from the ONE source by running the \
+         `werust-core` `{VERSION_EXAMPLE}` example"
+    );
+    for second_source in ["git describe", "CARGO_PKG_VERSION", "github.ref_name"] {
+        assert!(
+            !script.contains(second_source),
+            "{MACOS_BUNDLE_SCRIPT} must NOT re-derive the version from `{second_source}`: that is \
+             the SECOND version source `werust_core::version()`'s docs forbid"
+        );
+    }
+
+    let example = read_repo_file("crates/werust-core/examples/print_version.rs");
+    assert!(
+        example.contains("werust_core::version()"),
+        "the `print_version` example must print `werust_core::version()` itself (it exists ONLY to \
+         make that accessor readable by a packaging script)"
+    );
+
+    // The leg must not smuggle a version in either: its only version input is the
+    // job-level `WERUST_VERSION` the shared loop above already pins.
+    let j = job(MACOS_LEG);
+    assert!(
+        !contains_substr(&j, "git describe"),
+        "the `{MACOS_LEG}` leg must not re-derive a version in the workflow (it inherits \
+         WERUST_VERSION and the bundling script reads the resolved value back out)"
+    );
+}
+
+#[test]
+fn macos_desktop_leg_is_deliberately_unsigned() {
+    // Criterion 6 / the task's "unsigned, deliberately": no signing and no
+    // notarization anywhere in this leg (both need an Apple Developer account and
+    // are a separate follow-on, the macOS analogue of `android-apk-signing`).
+    // Pinned as an ABSENCE so a later "just add codesign here" edit has to come
+    // with the secrets-presence-flag pattern the Android leg established, rather
+    // than half a signing path.
+    let j = job(MACOS_LEG);
+    let script = shell_code_of(&read_repo_file(MACOS_BUNDLE_SCRIPT));
+    for tool in ["codesign", "notarytool", "altool", "stapler"] {
+        assert!(
+            !contains_substr(&j, tool),
+            "the `{MACOS_LEG}` leg must contain NO `{tool}` step (unsigned by design; signing + \
+             notarization are a follow-on that must copy the Android secrets-presence-flag pattern)"
+        );
+        assert!(
+            !script.contains(tool),
+            "{MACOS_BUNDLE_SCRIPT} must contain no `{tool}` step (unsigned by design)"
+        );
+    }
+    // Honest naming, the Android precedent (`app-debug-unsigned.apk`): the
+    // attached asset must SAY it is unsigned, so nothing on the Release page
+    // claims a signature it does not carry.
+    assert!(
+        contains_substr(&j, "unsigned"),
+        "the `{MACOS_LEG}` leg's artifact must be NAMED unsigned (the Android honest-naming \
+         precedent), so the Release page never implies a signature it does not carry"
+    );
+}
+
+#[test]
+fn readme_states_the_macos_artifact_is_unsigned_and_how_to_open_it() {
+    // Criterion 6: an unsigned `.app` does NOT open by double-click on a machine
+    // that has never seen it, so shipping one without saying how to open it ships
+    // a broken download. The README is where a person looks before downloading.
+    let readme = read_repo_file("README.md");
+    assert!(
+        readme.contains(MACOS_APP_BUNDLE),
+        "the README must name the macOS release artifact (`{MACOS_APP_BUNDLE}`)"
+    );
+    assert!(
+        readme.contains("unsigned"),
+        "the README must state plainly that the macOS artifact is UNSIGNED"
+    );
+    assert!(
+        readme.contains("xattr -d com.apple.quarantine"),
+        "the README must give the quarantine-clearing command (how to actually OPEN an unsigned \
+         `.app`)"
+    );
+    assert!(
+        readme.contains("android-apk-signing"),
+        "the README must NAME the signing follow-on by pointing at the precedent it will copy \
+         (the landed `android-apk-signing` leg)"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_macos_packaging_scripts_are_executable() {
+    // The workflow invokes both by PATH (`crates/werust-macos/bundle-app.sh`),
+    // exactly as the mobile legs invoke theirs, so a lost executable bit is a red
+    // release leg, caught here instead of on a tag.
+    use std::os::unix::fs::PermissionsExt;
+    for script in [MACOS_BUNDLE_SCRIPT, MACOS_BUNDLE_CHECK] {
+        let path = repo_root().join(script);
+        let mode = std::fs::metadata(&path)
+            .unwrap_or_else(|e| panic!("stat {}: {e}", path.display()))
+            .permissions()
+            .mode();
+        assert!(
+            mode & 0o111 != 0,
+            "{script} must be executable (the release workflow runs it by path)"
+        );
     }
 }

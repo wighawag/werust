@@ -21,7 +21,18 @@ Standard cargo workflow: `cargo build`, `cargo test` (the `verify` gate addition
 
 ### The macOS shell (`werust-macos`)
 
-On a Mac, `cargo run -p werust-macos [url]` opens the AppKit window over the `WKWebView` backend: the same URL bar, nav controls, trust indicator, error surface, in-URL-bar load progress, ⋮ menu and Console/Network debug view the GTK shell has, painted from the SAME `werust-core` derivation. It is a DEVELOPER build — unsigned, unnotarized and unbundled (packaging is its own task), and it is a separate binary because `werust` itself is bound to GTK/WebKitGTK. What CI proves about it, what still awaits a human on a Mac, and the manual verification steps are in [`docs/spikes/macos-appkit-window-and-chrome/README.md`](docs/spikes/macos-appkit-window-and-chrome/README.md).
+On a Mac, `cargo run -p werust-macos [url]` opens the AppKit window over the `WKWebView` backend: the same URL bar, nav controls, trust indicator, error surface, in-URL-bar load progress, ⋮ menu and Console/Network debug view the GTK shell has, painted from the SAME `werust-core` derivation. It is a separate binary because `werust` itself is bound to GTK/WebKitGTK. What CI proves about it, what still awaits a human on a Mac, and the manual verification steps are in [`docs/spikes/macos-appkit-window-and-chrome/README.md`](docs/spikes/macos-appkit-window-and-chrome/README.md). To package that shell as an app bundle (locally, exactly as the release does), run `crates/werust-macos/bundle-app.sh`.
+
+### The macOS release artifact (`Werust.app`, UNSIGNED)
+
+Every tagged release attaches `Werust-macos-universal-unsigned.app.zip`: a `Werust.app` bundle around one UNIVERSAL binary, `lipo`'d from the `x86_64-apple-darwin` and `aarch64-apple-darwin` builds, so a single download runs natively on both Intel and Apple Silicon. Its `CFBundleVersion` is the same version string the ⋮ menu inside it reports.
+
+It is **unsigned and unnotarized** (no Apple Developer account is involved), so Gatekeeper refuses a plain double-click the first time. Open it either way:
+
+- right-click (or Control-click) `Werust.app`, choose **Open**, then **Open** again in the dialog; or
+- clear the quarantine flag first: `xattr -d com.apple.quarantine /path/to/Werust.app`.
+
+Signing and notarization are a deliberate FOLLOW-ON, the macOS analogue of the landed `android-apk-signing` leg, and when it comes it should copy that leg's pattern: gate on a secrets-presence flag, no-op gracefully without it, name the artifacts honestly. Until then this build is for developers and early testers, not for general distribution. Decisions and what still awaits a human on a Mac: [`docs/spikes/macos-release-packaging-leg/README.md`](docs/spikes/macos-release-packaging-leg/README.md).
 
 ### Private Ethereum RPC endpoint (`WERUST_RPC_URL`)
 

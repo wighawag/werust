@@ -21,6 +21,11 @@ crates/werust-ios/build/
 crates/werust-ios/App/**/xcuserdata/
 crates/werust-ios/App/**/*.xcworkspace/xcuserdata/
 
+# macOS app bundle (crates/werust-macos) packaging output: `bundle-app.sh`
+# assembles Werust.app and its zip here, on CI and on a developer's Mac alike.
+# Build output, never committed.
+crates/werust-macos/build/
+
 # Signing key material. The Android release keystore lives OUTSIDE the repo and
 # reaches CI only as the base64 `ANDROID_KEYSTORE_B64` secret
 # (docs/spikes/android-apk-signing/README.md); this is the safety net for a

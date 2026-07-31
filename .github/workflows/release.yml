@@ -19,13 +19,24 @@ name: release
 #                            Release, so all artifacts are validated end-to-end
 #                            without cutting a release.
 #
-# Three build jobs mirror wezig's shape, all gated ONLY by `verify` (the
-# pure-Rust gate) so a tag can never ship a red tree, and so the mobile legs are
-# DECOUPLED from the desktop leg (a desktop build failure cannot block the APK /
-# `.app`):
+# Four build jobs mirror wezig's shape, all gated ONLY by `verify` (the
+# pure-Rust gate) so a tag can never ship a red tree, and so every platform leg
+# is DECOUPLED from the others (one platform's build failure cannot withhold
+# another platform's artifact):
 #   verify -> goreleaser (Linux desktop, native x86_64)
 #   verify -> android-apk (Linux, SDK+NDK)
 #   verify -> ios-simulator-app (macos-14)
+#   verify -> macos-desktop-app (macos-14, universal unsigned `Werust.app`)
+#
+# THE macOS DESKTOP ARTIFACT IS UNSIGNED, DELIBERATELY. `macos-desktop-app`
+# attaches a universal (`x86_64` + `arm64`) `Werust.app` with NO code signature
+# and NO notarization: both need an Apple Developer account and are a separate
+# follow-on, the macOS analogue of the Android release-signing path above. When
+# that follow-on comes it must copy the Android pattern (a secrets-PRESENCE env
+# flag, a graceful no-op without it, honest artifact naming) rather than invent a
+# second one. The zip is named `-unsigned` for that reason, and the README says
+# how to open it. Decisions:
+# docs/spikes/macos-release-packaging-leg/README.md.
 #
 # THE RELEASED VERSION REACHES THE COMPILED CODE. Every leg that compiles Rust
 # exports `WERUST_VERSION` from the tag ref name; `crates/werust-core/build.rs`
@@ -424,3 +435,97 @@ jobs:
         with:
           name: werust-ios-simulator-app
           path: crates/werust-ios/build/WerustShell-Simulator.app.zip
+
+  # The macOS DESKTOP leg (task `macos-release-packaging-leg`,
+  # `docs/adr/0011-webview2-for-windows.md`'s macOS split, sub-task 4): build the
+  # AppKit shell for BOTH darwin architectures, `lipo` the slices into ONE
+  # universal binary, bundle it as `Werust.app` and attach the zip to the Release
+  # (tag) or upload it as a workflow artifact (dry-run).
+  #
+  # A SIBLING of `ios-simulator-app`, not an extension of it: they share the
+  # `macos-14` runner shape (Xcode, `lipo` and the darwin SDKs are macOS-only) but
+  # nothing else, so an iOS failure can never withhold the desktop `.app` and vice
+  # versa. Like every other leg it is DECOUPLED (`needs: verify` only), so on a
+  # tag the Release may not exist yet when it runs, and the attach step
+  # idempotently `gh release create`s it first (a Release-EXISTENCE guarantee, not
+  # a dependency on another leg).
+  #
+  # UNSIGNED: see the header. Nothing here runs `codesign` or `notarytool`.
+  macos-desktop-app:
+    needs: verify
+    runs-on: macos-14
+    env:
+      # The released version, compiled INTO both slices of the universal binary.
+      # And because `bundle-app.sh` READS it back out of the compiled core
+      # (`werust-core`'s `print_version` example), it is also the SAME string
+      # that lands in the bundle's `CFBundleVersion`. So the Finder, the ⋮ menu and the other
+      # platforms cannot disagree about the version. Same tag-or-empty rule as
+      # every other leg.
+      WERUST_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      # Optional private RPC endpoint (same secret pass-through as the desktop
+      # Linux leg; empty -> public default).
+      WERUST_RPC_URL: ${{ secrets.WERUST_RPC_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Tags + history, so `build.rs`'s `git describe` fallback resolves a real
+          # version on the dry-run path (where WERUST_VERSION is empty), which is
+          # also the version stamped into `CFBundleVersion` there.
+          fetch-depth: 0
+
+      - name: Record what this run built on
+        run: |
+          sw_vers
+          xcodebuild -version || true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-macos-desktop-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-macos-desktop-cargo-
+
+      # The SAME script a human runs on a Mac (the `crates/werust-ios/build-and-run.sh`
+      # precedent): it adds both darwin targets, builds both release slices,
+      # `lipo`s them and writes the minimal `Info.plist`.
+      - name: Build both slices, lipo them, bundle Werust.app
+        run: crates/werust-macos/bundle-app.sh
+
+      - name: "BUILD-leg check: the .app is a real UNIVERSAL bundle at the released version"
+        # Where criteria 2 + 3 actually EXECUTE: `lipo` proves both
+        # architectures are in the one binary, and `CFBundleVersion` is compared
+        # against the version the compiled Rust core reports (so a second version
+        # source cannot creep in unnoticed). Deliberately NOT in the pure-Rust
+        # verify gate, which has no `lipo` and no darwin SDK.
+        run: docs/spikes/macos-release-packaging-leg/check-macos-app-bundle.sh crates/werust-macos/build/Werust.app
+
+      - name: Zip the .app
+        # `-y` keeps symlinks as symlinks, the same reason the iOS leg passes it.
+        # The name says UNSIGNED: the Android leg's honest-naming precedent, so
+        # nothing on the Release page implies a signature the artifact lacks.
+        run: |
+          cd crates/werust-macos/build
+          zip -r -y Werust-macos-universal-unsigned.app.zip Werust.app
+
+      # TAG PATH: attach the zipped `.app` to the Release, idempotently ensuring
+      # the Release exists first (`|| true` swallows the "already exists" error
+      # when another leg got there first).
+      - name: Attach the macOS .app zip to the Release (tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release upload "${GITHUB_REF_NAME}" crates/werust-macos/build/Werust-macos-universal-unsigned.app.zip --clobber
+
+      # DRY-RUN PATH: upload the zipped `.app` as a workflow artifact, publish
+      # nothing.
+      - name: Upload the macOS .app zip (dry-run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: werust-macos-desktop-app
+          path: crates/werust-macos/build/Werust-macos-universal-unsigned.app.zip

@@ -19,7 +19,13 @@ That is exactly the blind spot that let this task's own item 0 (the `desktop-pai
 
 **4. Docs still send readers to a file that no longer exists.** `windows-win32-window-and-chrome` deleted `crates/werust-macos/src/paint.rs` when it extracted `crates/desktop-paint`, and several committed docs still name that path: `.github/workflows/macos-renderer.yml` (header comment), `docs/spikes/macos-appkit-window-and-chrome/README.md` (three places), and the harness's own comment in `typecheck-macos-from-linux.sh`. One of those is in a file the parent task edited, which is the tell that a targeted fix missed a sweep. Repoint them all at `crates/desktop-paint`. This is the same defect class the parent task exists to fix — a doc that describes a tree that is gone — so it belongs here rather than being left for the next macOS agent to trip over.
 
-**Scope:** one test restructure, one process-id suffix, one doc-comment addition, one path sweep, and the prose correction that follows. No change to the harness's behaviour, no change to what the leg builds.
+**5. NARROW the macOS leg's `pull_request` filter to match the Windows one** (added by the conductor 2026-07-31, RATIFIED by the human in the same drive; it belongs here because item 4 already has you editing `.github/workflows/macos-renderer.yml`). The leg currently triggers on PRs touching `crates/werust-core/**`, so most core work in this repo spends `macos-14` minutes and can be gated by a red cross-platform leg. That cost was flagged by the human and the answer is: narrow it, the way `windows-renderer.yml` already is.
+
+Concretely: drop `crates/werust-core/**` from the `pull_request` filter and KEEP it on the `push` filter, so a core change that breaks macOS is still caught minutes after it merges, on a leg that gates nothing, plus `workflow_dispatch` for the deliberate case. Keep on the PR trigger only what is genuinely macOS-shaped: `crates/macos-renderer/**`, `crates/werust-macos/**`, `crates/macos-origin-probe/**`, `crates/webview-shared/**`, `crates/desktop-paint/**` (kept for the reason already recorded in the Windows leg: it is the one carrier both native desktop windows paint from), the spike docs paths, and the workflow itself. State the trade-off in the workflow header the way the Windows leg states its own, and PIN the choice with a test so the next widening is a deliberate edit rather than an accretion — this filter has now drifted wider twice in three tasks, which is precisely why the Windows sibling pins an exact set (`crates/werust-core/tests/windows_renderer_leg_shape.rs`, `PULL_REQUEST_FILTER`). Follow that shape; do not invent a second one.
+
+This also settles the guard-comment overclaim in item 4's neighbourhood: once the macOS pin is exact, `macos_backend_shape.rs`'s comment about widening requiring a test edit becomes TRUE rather than aspirational.
+
+**Scope:** one test restructure, one process-id suffix, one doc-comment addition, one path sweep, one PR-filter narrowing with its pin, and the prose corrections that follow. No change to the harness's behaviour, no change to what either leg BUILDS.
 
 ## Acceptance criteria
 
@@ -29,6 +35,7 @@ That is exactly the blind spot that let this task's own item 0 (the `desktop-pai
 - [ ] The test's module doc says why it writes into the real `$HOME` and that cleanup is unconditional.
 - [ ] No committed doc, comment or script names `crates/werust-macos/src/paint.rs`; every reference points at `crates/desktop-paint`.
 - [ ] The claim about the harness being verified matches what is actually enforced.
+- [ ] `macos-renderer.yml`'s `pull_request` filter no longer carries `crates/werust-core/**` (it stays on `push`), carries only genuinely macOS-shaped paths plus `desktop-paint`, states its trade-off in the header, and is pinned as an EXACT set in the `windows_renderer_leg_shape.rs` style so a later widening must edit a test.
 - [ ] `cargo fmt --check && cargo clippy && cargo build && cargo test` green.
 
 ## Prompt

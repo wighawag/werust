@@ -62,3 +62,33 @@ Additionally extend the instrumented `androidTest` in the `SpaClientNavOriginTes
 ## Prompt
 
 > Goal: on Android `window.localStorage` is `null` (found on `mandalas.eth`; desktop is fine). Cause: `BrowserActivity.kt` never sets `settings.domStorageEnabled` and Android's default is `false`, so the WebView returns `null` instead of a `Storage` object — non-conformant, and the `null` is what proves it is NOT the opaque-origin problem (that throws `SecurityError`), so do not touch `origin_map.rs`. (1) Set `domStorageEnabled = true` with a comment saying why the WebView default is wrong for a BROWSER and why it is safe here (each CID gets its own subdomain in `origin_map.rs`, so storage is partitioned per content address like the real `ipfs://<cid>` origins elsewhere). (2) MEASURE `localStorage`, `sessionStorage` and `indexedDB` on a device/emulator and record what you find — IndexedDB may need more than this switch, and a dapp fix that leaves it broken is half a fix; check cookie/third-party-cookie behaviour too and record it as a deliberate privacy position if it stays off. (3) AUDIT the other `WebSettings` browser-wrong defaults (pinch-zoom via `builtInZoomControls`, `useWideViewPort`/`loadWithOverviewMode`, media gesture, text scaling) and write the list down WITHOUT changing any of them — they are UX decisions for a human. (4) Add the matrix's FIRST web-platform row, `web-storage`, with an honest explicit cell for all five platforms; the guard missed this bug because all 24 existing rows are werust features and none asks whether the web platform behaves the same everywhere — say that in the row's description, and propose further rows (IndexedDB, cookies, service workers) as follow-on tasks rather than filling them speculatively. (5) Guard it where it runs: a source-shape test on the Ubuntu gate pinning that Android enables DOM storage (there is no CI emulator leg), plus an instrumented `androidTest` round-trip in the `SpaClientNavOriginTest.kt` style, saying plainly that half does not run in CI.
+
+## Requeue 2026-07-31
+
+CONDUCTOR HANDOFF (2026-07-31, drive-tasks). Gate 2 blocked this CORRECTLY on ONE point, and I verified its factual claim against the repo before writing this. Almost all of your work stands — the on-device measurement in particular is exactly what was asked for and is the best part of the diff. Do NOT redo it.
+
+WHAT STANDS (do not touch): the `domStorageEnabled` fix and its comment; `WebStorageTest.kt` and `MEASUREMENTS.md` (a real emulator run on API 36 / WebView 142.0.7444.174 — that is measurement, not argument); `WEBSETTINGS-AUDIT.md` and its change-nothing discipline; `web_storage_edge_wiring_shape.rs`; and the four authored follow-on tasks.
+
+THE ONE BLOCKING PROBLEM. Your `web-storage` row marks ALL FIVE platforms `implemented`:
+
+    desktop = { state = "implemented" }
+    macos   = { state = "implemented" }
+    windows = { state = "implemented" }
+    ios     = { state = "implemented" }
+    android = { state = "implemented" }
+
+You measured exactly ONE of them (android, on an emulator). The other four rest on "the engine enables DOM storage by default and no edge disables it". **That inference is specifically unsafe on this project, and this repo has already MEASURED why.** From `work/notes/observations/service-worker-registration-differs-by-ipfs-serving-origin-2026-07-30.md`, confirmed by `docs/spikes/windows-ipfs-origin-probe-on-ci/probe-report-2026-07-30.json` on WebView2 150.0.4078.65:
+
+> on a REGISTERED `ipfs://` origin with `HasAuthorityComponent` + `TreatAsSecure` — a real, secure tuple origin where `fetch` and `pushState` both work — `navigator.serviceWorker.register('/sw.js')` still rejects with `InvalidStateError`. So the refusal is about the SCHEME, not about the origin being opaque or insecure.
+
+Engine capabilities on custom-scheme origins are SCHEME-GATED. "No toggle disables it" therefore does not establish that `localStorage` works on an `ipfs://` origin in WKWebView or WebView2 — which is precisely the origin those three platforms serve. And the irony is the point: a machine-readable `implemented` on three unmeasured edges defuses the one row that was added to stop this exact class of over-claim. ADR-0005 records the same over-claim being corrected once already.
+
+WHAT TO DO — narrow, and mostly bookkeeping:
+
+1. **`android` stays `implemented`.** It is measured, and the measurement is committed.
+2. **`macos`, `windows` and `ios` become `stubbed`**, pointing at your already-authored `matrix-web-platform-rows-are-measured-on-every-edge` (it resolves, so the guard stays green). Each cell's prose should say WHY it is not `implemented`: not "we think it is broken", but "the engine default is not evidence on a custom-scheme origin, and this project has measured one capability that is scheme-gated on exactly these origins".
+3. **`desktop`:** decide honestly and say which you did. The human's field report is that `mandalas.eth` WORKS on the GTK desktop while being null on Android, which is real evidence for a site that uses `localStorage`; if you treat that as sufficient, cite it in the cell. If you would rather have a measurement, stub it against the same slug. Either is defensible; an unstated assumption is not.
+
+4. **STRENGTHEN THE FOLLOW-ON with the mechanism that already exists, because this is cheaper than it looks.** `matrix-web-platform-rows-are-measured-on-every-edge` currently implies hand-verification. It does not need it: `crates/macos-origin-probe` and `crates/windows-origin-probe` ALREADY run on real `macos-14` and `windows-latest` runners, already load a real `ipfs://` origin, and already measure per-capability facts on it — `service_worker` is literally a field in both probe reports. Adding a `local_storage` field (and later `indexed_db`, `cookies`) to those probes would answer macOS and Windows BY MEASUREMENT IN CI, with no hardware and no human, and the WebKit result carries to iOS by port equivalence exactly as ADR-0011 Amendment 3 argued for the origin verdict. Write that into the follow-on task as the prescribed approach, and note that the probes assert against a recorded `expected.json`, so a future regression would go red naming the field.
+
+Nothing else changes. Re-run the gate and re-surface.

@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>werust provider mimic — inspector</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    font: 14px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: #0d0d0d; color: #e0e0e0; margin: 0; padding: 20px;
+    max-width: 900px;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; }
+  h2 { font-size: 14px; margin: 24px 0 8px; color: #8ab; border-bottom: 1px solid #333; padding-bottom: 4px; }
+  .subtitle { color: #888; font-size: 12px; margin: 0 0 16px; }
+  button {
+    background: #1a1a2e; color: #e0e0e0; border: 1px solid #444; padding: 6px 12px;
+    cursor: pointer; font: inherit; border-radius: 4px; margin: 2px;
+  }
+  button:hover { background: #2a2a4e; }
+  button.call { background: #1e3a1e; border-color: #3a5a3a; }
+  button.call:hover { background: #2e5a2e; }
+  button.danger { background: #3a1e1e; border-color: #5a3a3a; }
+  button.danger:hover { background: #5a2e2e; }
+  pre {
+    background: #111; border: 1px solid #333; padding: 10px; overflow-x: auto;
+    border-radius: 4px; font-size: 12px; white-space: pre-wrap; word-break: break-all;
+  }
+  .log-entry { margin: 2px 0; padding: 4px 8px; border-radius: 3px; font-size: 12px; }
+  .log-ok { background: #0a2a0a; color: #6f6; }
+  .log-err { background: #2a0a0a; color: #f66; }
+  .log-info { background: #0a0a2a; color: #88f; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type=text] {
+    background: #111; color: #e0e0e0; border: 1px solid #444; padding: 4px 8px;
+    font: inherit; border-radius: 4px; flex: 1; min-width: 200px;
+  }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; }
+  .badge-werust { background: #1a3a5a; color: #6af; }
+  .badge-missing { background: #3a1a1a; color: #f88; }
+  .badge-present { background: #1a3a1a; color: #6f6; }
+</style>
+</head>
+<body>
+
+<h1>werust provider mimic — inspector</h1>
+<p class="subtitle">
+  Load this page in werust (to see its real provider) or in a normal browser
+  with the userscript active (to see the mimic). Below is exactly what a dapp
+  sees on <code>window.ethereum</code>.
+</p>
+
+<h2>Provider detection</h2>
+<pre id="detection">checking…</pre>
+
+<h2>Call a method</h2>
+<div class="row">
+  <button class="call" data-method="eth_chainId">eth_chainId</button>
+  <button class="call" data-method="eth_accounts">eth_accounts</button>
+  <button class="danger" data-method="eth_requestAccounts">eth_requestAccounts</button>
+  <button class="call" data-method="eth_blockNumber">eth_blockNumber</button>
+  <button class="call" data-method="personal_sign">personal_sign</button>
+</div>
+<div class="row" style="margin-top:8px">
+  <input type="text" id="customMethod" placeholder="custom method name, e.g. eth_getBalance">
+  <button class="call" id="callCustom">call</button>
+</div>
+
+<h2>EIP-6963 enumeration</h2>
+<p class="subtitle">Dispatch <code>eip6963:requestProvider</code> and see who announces (werust: nobody).</p>
+<button id="test6963">enumerate EIP-6963 providers</button>
+<pre id="eip6963result">not run</pre>
+
+<h2>Event log</h2>
+<div id="log"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  var logEl = document.getElementById("log");
+  function log(type, msg) {
+    var div = document.createElement("div");
+    div.className = "log-entry log-" + type;
+    div.textContent = new Date().toISOString().slice(11, 23) + " " + msg;
+    logEl.appendChild(div);
+    console.log("[mimic-inspector]", type, msg);
+  }
+
+  // ── Detection ────────────────────────────────────────────────────────────
+  var detEl = document.getElementById("detection");
+  var eth = window.ethereum;
+  var lines = [];
+
+  if (!eth) {
+    lines.push("❌ window.ethereum is undefined — no provider injected.");
+    lines.push("   (In werust this should not happen; check the userscript if testing in a browser.)");
+  } else {
+    lines.push("✅ window.ethereum is present");
+    lines.push("   typeof: " + typeof eth);
+    lines.push("   isWerust: " + (eth.isWerust === true ? "true" : (eth.isWerust === undefined ? "undefined (NOT werust)" : String(eth.isWerust))));
+    lines.push("");
+
+    // Wallet-identification flags mandalas checks
+    var flags = ["isMetaMask", "isExodus", "isOpera", "isGameStop", "isCoinbaseWallet", "isTrust", "isBraveWallet", "isRabby", "isApexWallet", "isBinanceWallet"];
+    lines.push("Wallet-identification flags (mandalas checks these):");
+    flags.forEach(function (f) {
+      var val = eth[f];
+      if (val === undefined) {
+        lines.push("   " + f + ": undefined  ← absent");
+      } else {
+        lines.push("   " + f + ": " + JSON.stringify(val));
+      }
+    });
+    lines.push("");
+
+    // Standard EIP-1193 surface
+    lines.push("EIP-1193 surface:");
+    ["request", "on", "removeListener", "emit"].forEach(function (m) {
+      lines.push("   " + m + ": " + (typeof eth[m] === "function" ? "function ✓" : typeof eth[m] + " ✗"));
+    });
+    lines.push("");
+
+    // Extra properties
+    var known = new Set(["isWerust", "request", "on", "removeListener", "emit"].concat(flags));
+    var extras = Object.keys(eth).filter(function (k) { return !known.has(k); });
+    if (extras.length > 0) {
+      lines.push("Extra properties:");
+      extras.forEach(function (k) { lines.push("   " + k + ": " + JSON.stringify(eth[k])); });
+    }
+  }
+
+  detEl.textContent = lines.join("\n");
+
+  // ── Method calls ────────────────────────────────────────────────────────
+  async function callMethod(method) {
+    log("info", "→ request({ method: \"" + method + "\" })");
+    try {
+      var result = await window.ethereum.request({ method: method });
+      log("ok", "← result: " + JSON.stringify(result));
+    } catch (e) {
+      log("err", "← error: code=" + e.code + " message=\"" + e.message + "\"");
+    }
+  }
+
+  document.querySelectorAll("button[data-method]").forEach(function (btn) {
+    btn.addEventListener("click", function () { callMethod(btn.dataset.method); });
+  });
+
+  document.getElementById("callCustom").addEventListener("click", function () {
+    var m = document.getElementById("customMethod").value.trim();
+    if (m) callMethod(m);
+  });
+
+  // ── EIP-6963 ──────────────────────────────────────────────────────────────
+  document.getElementById("test6963").addEventListener("click", function () {
+    var el = document.getElementById("eip6963result");
+    var announcements = [];
+
+    function handler(ev) {
+      var info = ev.detail && ev.detail.info;
+      var provider = ev.detail && ev.detail.provider;
+      announcements.push({
+        uuid: info && info.uuid,
+        name: info && info.name,
+        rdns: info && info.rdns,
+        icon: info && info.icon ? "(present)" : "(absent)",
+      });
+    }
+
+    window.addEventListener("eip6963:announceProvider", handler);
+    window.dispatchEvent(new Event("eip6963:requestProvider"));
+
+    setTimeout(function () {
+      window.removeEventListener("eip6963:announceProvider", handler);
+      if (announcements.length === 0) {
+        el.textContent = "No EIP-6963 providers announced (100ms timeout).\n" +
+          "This is what werust does — it does NOT implement EIP-6963.\n" +
+          "A dapp must fall back to window.ethereum.";
+      } else {
+        el.textContent = "Announced providers:\n" +
+          JSON.stringify(announcements, null, 2);
+      }
+      log("info", "EIP-6963 enumeration: " + announcements.length + " provider(s)");
+    }, 200);
+  });
+
+  // ── Event listeners ──────────────────────────────────────────────────────
+  if (window.ethereum) {
+    ["connect", "disconnect", "chainChanged", "accountsChanged", "message"].forEach(function (ev) {
+      window.ethereum.on(ev, function (payload) {
+        log("info", "-event: " + ev + " " + JSON.stringify(payload));
+      });
+    });
+  }
+})();
+</script>
+</body>
+</html>

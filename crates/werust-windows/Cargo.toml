@@ -55,6 +55,10 @@ windows = { version = "0.62", features = [
     # The title bar is drawn by the system: `DWMWA_USE_IMMERSIVE_DARK_MODE` is
     # how it follows the same OS setting.
     "Win32_Graphics_Dwm",
+    # `AttachConsole`: a GUI-subsystem binary has no console, so a run started
+    # FROM a terminal borrows that terminal's (`src/startup.rs`). werust never
+    # allocates one.
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     # The common controls: the progress bar, the tab control, the list views and
     # the tooltip that carries the trust EXPLANATION.

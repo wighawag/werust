@@ -55,6 +55,21 @@
 //! `docs/spikes/windows-win32-window-and-chrome/README.md`, including the manual
 //! verification steps for everything a CI runner cannot judge.
 //!
+//! # The binary is a GUI app
+//!
+//! `src/main.rs` links with `#![cfg_attr(windows, windows_subsystem =
+//! "windows")]`: a browser must not drag a console window onto the desktop
+//! beside itself, which is what the first run on real hardware found it doing.
+//! The `cfg` gate is what keeps everything above true -- the crate still compiles
+//! on every host, so its host-independent half stays inside the Ubuntu gate.
+//!
+//! The cost is that there is no console to print to, and this shell has an honest
+//! startup failure to report (a machine with no WebView2 Runtime is TOLD so). So
+//! [`startup`] gives that failure a surface on both launch paths -- the launching
+//! terminal's console when there is one, a message box when there is not -- and
+//! `main.rs` picks one per launch. Why, and what was rejected:
+//! `docs/spikes/windows-gui-subsystem-no-console-window/DECISIONS.md`.
+//!
 //! # The product decisions it FOLLOWS (never re-decides)
 //!
 //! * `docs/adr/0009` -- FOLLOW the OS colour scheme, never force dark. The ENGINE
@@ -97,6 +112,10 @@ pub mod profile;
 pub mod chrome;
 #[cfg(windows)]
 pub mod debugview;
+// Where werust's own words go now that the binary is a GUI app with no console
+// of its own (task `windows-gui-subsystem-no-console-window`).
+#[cfg(windows)]
+pub mod startup;
 #[cfg(windows)]
 pub mod win32;
 #[cfg(windows)]

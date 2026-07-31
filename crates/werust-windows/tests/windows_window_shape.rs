@@ -40,6 +40,16 @@
 //!    (`the_ci_leg_builds_tests_and_runs_the_window`,
 //!    `the_verification_honesty_is_recorded`).
 //! 7. The gate stays green (this file is a plain `cargo test`).
+//!
+//! AMENDMENT (task `windows-gui-subsystem-no-console-window`, 2026-07-31): the
+//! first run on REAL hardware found the binary linking as a CONSOLE-subsystem
+//! app, so Windows opened a console window beside the browser
+//! (`work/notes/findings/windows-shell-first-run-on-real-hardware-2026-07-31.md`).
+//! That is a property of the BINARY, not of any code path a runner can execute
+//! -- the Windows leg would report it green forever -- so it is pinned HERE, by
+//! reading `main.rs`, together with the surfaces that keep a startup FAILURE
+//! legible once there is no console to print to
+//! (`the_binary_links_as_a_gui_app_and_a_startup_failure_stays_legible`).
 
 use std::path::{Path, PathBuf};
 
@@ -58,7 +68,7 @@ fn exists(relative: &str) -> bool {
     repo_root().join(relative).exists()
 }
 
-/// The whole Win32 half, as one text: the three modules the Ubuntu gate cannot
+/// The whole Win32 half, as one text: the modules the Ubuntu gate cannot
 /// compile. Asserting over the set (rather than over one file) means a rule that
 /// leaks into a neighbouring module is still caught.
 fn win32_half() -> String {
@@ -67,6 +77,7 @@ fn win32_half() -> String {
         "crates/werust-windows/src/chrome.rs",
         "crates/werust-windows/src/debugview.rs",
         "crates/werust-windows/src/win32.rs",
+        "crates/werust-windows/src/startup.rs",
     ]
     .iter()
     .map(|path| source(path))
@@ -604,6 +615,62 @@ fn the_ci_leg_builds_tests_and_runs_the_window() {
             "the smoke must stay offline"
         );
     }
+}
+
+#[test]
+fn the_binary_links_as_a_gui_app_and_a_startup_failure_stays_legible() {
+    // The amendment above: `werust-windows.exe` must not bring a console window
+    // with it. The attribute is the ONLY thing that decides that, and it is
+    // invisible to every runtime test, so it is pinned by reading the source.
+    let main = source("crates/werust-windows/src/main.rs");
+    assert!(
+        main.contains("#![cfg_attr(windows, windows_subsystem = \"windows\")]"),
+        "the binary must link as a GUI app, or Windows allocates a console beside the window"
+    );
+    // `cfg`-gated, and the non-Windows arm that keeps this crate in the Ubuntu
+    // gate is untouched: it still COMPILES everywhere and still refuses LOUDLY.
+    assert!(
+        !main.contains("#![windows_subsystem"),
+        "the attribute must be cfg-gated, so nothing about the non-Windows build changes"
+    );
+    assert!(
+        main.contains("#[cfg(not(windows))]") && main.contains("only runs on Windows"),
+        "the non-Windows refusal arm must keep working"
+    );
+
+    // The other half of the change, and the risky one: under the windows
+    // subsystem there is no console, so a deleted message is a window that never
+    // appears with NO explanation -- and this shell has a pre-specified honest
+    // failure to report (no WebView2 Runtime). Both surfaces must be present.
+    assert!(
+        main.contains("eprintln!(\"werust: {e}\")"),
+        "the failure text must not be deleted: a terminal launch still prints it"
+    );
+    assert!(
+        main.contains("startup::attach_parent_console()")
+            && main.contains("startup::report_startup_failure("),
+        "a startup failure must reach the user on whichever surface launched werust"
+    );
+    let startup = source("crates/werust-windows/src/startup.rs");
+    assert!(
+        startup.contains("AttachConsole(ATTACH_PARENT_PROCESS)"),
+        "a terminal-launched run must borrow the terminal's console rather than spawn one"
+    );
+    assert!(
+        startup.contains("MessageBoxW("),
+        "a double-clicked run has no console, so its failure must take a message box"
+    );
+    // No console is ever CREATED: `AllocConsole` would re-open the very window
+    // this task closed.
+    let win32 = code_only(&win32_half());
+    assert!(
+        !win32.contains("AllocConsole"),
+        "werust must never allocate a console of its own"
+    );
+    assert!(
+        exists("docs/spikes/windows-gui-subsystem-no-console-window/DECISIONS.md"),
+        "how a startup failure is surfaced is a recorded decision, not a silent one"
+    );
 }
 
 #[test]

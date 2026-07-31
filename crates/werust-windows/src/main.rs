@@ -1,3 +1,16 @@
+// werust is a BROWSER, so on Windows it links as a GUI application: without this
+// the binary is a CONSOLE-subsystem app and Windows opens a console window
+// beside the browser window, which is what the first run on real hardware found
+// (`work/notes/findings/windows-shell-first-run-on-real-hardware-2026-07-31.md`,
+// task `windows-gui-subsystem-no-console-window`).
+//
+// `cfg`-gated because this binary deliberately still COMPILES on every host --
+// that is what keeps its host-independent half inside the Ubuntu `verify` gate,
+// and the `#[cfg(not(windows))]` arm below is what it does there. The attribute
+// changes the LINK only, so no test can observe it; it is pinned instead by
+// `tests/windows_window_shape.rs`.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 //! The `werust-windows` entry point: open the Win32 window on a URL.
 //!
 //! See `lib.rs` for what this shell is and what it deliberately leaves to the
@@ -21,14 +34,33 @@ fn main() -> ExitCode {
 
 #[cfg(windows)]
 fn run(url: &str) -> ExitCode {
-    println!(
-        "werust {} — a Rust web browser (Windows WebView2 backend)",
-        werust_core::version()
-    );
+    // A GUI-subsystem binary gets no console, so werust borrows the console of
+    // the terminal that launched it, and borrows nothing when it was
+    // double-clicked, which is the whole point. Printing before this call, or
+    // printing at all when it returned false, PANICS: there is no handle to
+    // write to. See `werust_windows::startup`.
+    let console = werust_windows::startup::attach_parent_console();
+    if console {
+        // Kept for the terminal launch, where a version line is what the person
+        // typing asked for; a double-clicked browser has nobody to print it to.
+        // The same string is on the ⋮ menu and behind `werust version`.
+        println!(
+            "werust {} — a Rust web browser (Windows WebView2 backend)",
+            werust_core::version()
+        );
+    }
     match werust_windows::window::run(url) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("werust: {e}");
+            // The one legible report, on the surface this launch can see. A
+            // startup failure is PRE-SPECIFIED product behaviour here (a machine
+            // with no WebView2 Runtime is told so, with the download link), so it
+            // must never be swallowed just because there is no console.
+            if console {
+                eprintln!("werust: {e}");
+            } else {
+                werust_windows::startup::report_startup_failure(&e.to_string());
+            }
             ExitCode::FAILURE
         }
     }

@@ -3,7 +3,7 @@
 # box and without a CI round trip.
 #
 # The Ubuntu `verify` gate never compiles `crates/windows-renderer/src/backend.rs`
-# nor `crates/werust-windows/src/{window,chrome,debugview,win32}.rs` (they are
+# nor `crates/werust-windows/src/{window,chrome,debugview,win32,startup}.rs` (they are
 # `#[cfg(windows)]`), so a typo there would otherwise only surface on the
 # `windows-renderer` CI leg, minutes later. `cargo-xwin` downloads the MSVC CRT +
 # Windows SDK headers/import-libs and drives `clang-cl`/`lld-link`, which is

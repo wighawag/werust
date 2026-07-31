@@ -46,7 +46,7 @@ The CSS-class NAMES come from the core's exported sets; the palette that gives e
 5. **The ⋮ menu is the core's `BrowserMenu`**, version line disabled, Debug entry activatable, in order.
 6. **The debug rows are the core's row derivation**, including the per-request trust column, and the incremental refresh survives ring-buffer eviction AT the cap.
 7. **The durable profile rule is right**: `%LOCALAPPDATA%\werust\WebView2`, never `%TEMP%`, and an unreadable variable declines rather than inventing a path.
-8. **The Win32 source has the shape it must have** — `crates/werust-windows/tests/windows_window_shape.rs` parses the four files the gate cannot compile: every surface present, no chrome rule called from Win32-land, no class name or label restated, no second palette, no second OS-colour-scheme reader, the new-window rule left to the engine (ADR-0010), the page geometry depending on the banner and never on progress, the durable profile really passed, and the CI leg really building/testing/running this crate.
+8. **The Win32 source has the shape it must have** — `crates/werust-windows/tests/windows_window_shape.rs` parses the files the gate cannot compile (four here; `src/startup.rs` joined them with [`windows-gui-subsystem-no-console-window`](../windows-gui-subsystem-no-console-window/README.md)): every surface present, no chrome rule called from Win32-land, no class name or label restated, no second palette, no second OS-colour-scheme reader, the new-window rule left to the engine (ADR-0010), the page geometry depending on the banner and never on progress, the durable profile really passed, and the CI leg really building/testing/running this crate.
 
 ## What the LOCAL type-check proves (and what it does not)
 

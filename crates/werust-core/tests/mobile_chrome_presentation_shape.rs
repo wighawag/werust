@@ -33,9 +33,14 @@
 //!   (`both_mobile_bindings_decode_every_derived_field`,
 //!   `both_mobile_painters_paint_from_the_derived_fields`).
 //! - The trust EXPLANATION exists on BOTH mobile platforms, surfaced in a
-//!   platform-appropriate way (an accessibility description + a tap affordance,
-//!   never a hover tooltip)
+//!   platform-appropriate way (the platform's SECONDARY accessibility slot + a
+//!   tap affordance, never a hover tooltip)
 //!   (`both_mobile_edges_surface_the_trust_explanation`).
+//! - The badge's accessibility LABEL stays the badge's own short STATE name, so
+//!   a screen reader announces WHICH posture this is first and always, and the
+//!   ~240-character explanation follows it instead of replacing it (task
+//!   `mobile-trust-badge-accessibility-announces-the-state-not-only-the-essay`)
+//!   (`both_mobile_edges_announce_the_trust_state_before_its_explanation`).
 //! - One encoder, in the core: neither mobile crate carries a chrome-JSON twin
 //!   (`the_chrome_json_is_encoded_once_in_the_core_not_per_mobile_crate`).
 
@@ -118,6 +123,21 @@ const DERIVED_FIELDS: &[&str] = &[
     "trustPinActionLabel",
     "trustPinDetail",
 ];
+
+/// Whether `code` contains `target = value` as a STATEMENT of its own — a whole
+/// line, once [`scan`] has stripped the comments.
+///
+/// A plain `contains` cannot express this wiring, because `chrome.trustIndicator`
+/// is a PREFIX of `chrome.trustIndicatorDetail`: a substring assertion that the
+/// badge's accessibility label is the STATE would pass on an edge that assigned
+/// the ESSAY, which is exactly the regression
+/// `both_mobile_edges_announce_the_trust_state_before_its_explanation` exists to
+/// catch. Both edges write these assignments one per line, so line equality is
+/// the whole check.
+fn assigns(code: &str, target: &str, value: &str) -> bool {
+    let statement = format!("{target} = {value}");
+    code.lines().any(|line| line.trim() == statement)
+}
 
 /// The source with COMMENTS removed and every STRING LITERAL collected.
 ///
@@ -396,13 +416,16 @@ fn both_mobile_edges_surface_the_trust_explanation() {
     // The gap this task closed: `trust_indicator_detail`, the sentence saying
     // what a posture MEANS, existed only on desktop, where it is the badge's
     // hover tooltip. Mobile has no hover, so each edge must surface it in a
-    // platform-appropriate way: an ACCESSIBILITY description (the screen reader
-    // reads the meaning, not the glyph) AND an explicit TAP affordance.
+    // platform-appropriate way: the platform's SECONDARY accessibility slot (the
+    // screen reader reads the meaning after the state, see
+    // `both_mobile_edges_announce_the_trust_state_before_its_explanation`) AND an
+    // explicit TAP affordance.
     let (kotlin, _) = scan(&source(KOTLIN_PAINTER));
     assert!(
-        kotlin.contains("trust.contentDescription = chrome.trustIndicatorDetail"),
-        "the Android trust badge must carry the core's explanation as its accessibility \
-         description"
+        assigns(&kotlin, "trustDetailText", "chrome.trustIndicatorDetail")
+            && assigns(&kotlin, "info.stateDescription", "trustDetailText"),
+        "the Android trust badge must carry the core's explanation in its accessibility STATE \
+         description, taken from the carrier"
     );
     assert!(
         kotlin.contains("setOnClickListener { showTrustExplanation() }"),
@@ -415,8 +438,12 @@ fn both_mobile_edges_surface_the_trust_explanation() {
 
     let (swift, _) = scan(&source(SWIFT_PAINTER));
     assert!(
-        swift.contains("trustLabel.accessibilityLabel = chrome.trustIndicatorDetail"),
-        "the iOS trust badge must carry the core's explanation as its accessibility label"
+        assigns(
+            &swift,
+            "trustLabel.accessibilityValue",
+            "chrome.trustIndicatorDetail"
+        ),
+        "the iOS trust badge must carry the core's explanation as its accessibility VALUE"
     );
     assert!(
         swift.contains(
@@ -427,6 +454,82 @@ fn both_mobile_edges_surface_the_trust_explanation() {
     assert!(
         swift.contains("UIAlertController("),
         "the iOS tap must actually show the explanation"
+    );
+}
+
+#[test]
+fn both_mobile_edges_announce_the_trust_state_before_its_explanation() {
+    // The regression this task fixed (task
+    // `mobile-trust-badge-accessibility-announces-the-state-not-only-the-essay`):
+    // the explanation reached mobile by REPLACING the badge's accessibility text,
+    // so a screen-reader user heard a ~240-character sentence on every focus and
+    // never heard WHICH state the badge was in — the one fact a sighted user gets
+    // instantly, dropped for the users who most depend on it.
+    //
+    // The platform-idiomatic split, pinned here: the LABEL is the badge's own
+    // short state name (announced FIRST and always), and the explanation goes in
+    // the platform's SECONDARY slot — `stateDescription` on Android,
+    // `accessibilityValue` on iOS — where it FOLLOWS the state instead of
+    // replacing it. Both strings stay the core's (`trust_indicator`,
+    // `trust_indicator_detail`) off the same one carrier.
+    let (kotlin, _) = scan(&source(KOTLIN_PAINTER));
+    assert!(
+        assigns(&kotlin, "trust.contentDescription", "chrome.trustIndicator"),
+        "the Android badge's accessibility label must be the core's STATE name, so TalkBack \
+         announces which posture this is before explaining it"
+    );
+    assert!(
+        assigns(
+            &kotlin,
+            "contentDescription",
+            "initialChrome.trustIndicator"
+        ),
+        "the badge's FIRST paint must announce the state too, not only later refreshes"
+    );
+    assert!(
+        !assigns(
+            &kotlin,
+            "trust.contentDescription",
+            "chrome.trustIndicatorDetail"
+        ) && !assigns(
+            &kotlin,
+            "contentDescription",
+            "initialChrome.trustIndicatorDetail"
+        ),
+        "the explanation must not REPLACE the Android badge's accessibility label; it belongs \
+         in the secondary slot"
+    );
+
+    let (swift, _) = scan(&source(SWIFT_PAINTER));
+    assert!(
+        assigns(
+            &swift,
+            "trustLabel.accessibilityLabel",
+            "chrome.trustIndicator"
+        ),
+        "the iOS badge's accessibility label must be the core's STATE name, so VoiceOver \
+         announces which posture this is before explaining it"
+    );
+    assert!(
+        assigns(
+            &swift,
+            "trustLabel.accessibilityLabel",
+            "initialChrome.trustIndicator"
+        ),
+        "the badge's FIRST paint must announce the state too, not only later refreshes"
+    );
+    assert!(
+        !assigns(
+            &swift,
+            "trustLabel.accessibilityLabel",
+            "chrome.trustIndicatorDetail"
+        ) && !assigns(
+            &swift,
+            "trustLabel.accessibilityLabel",
+            "initialChrome.trustIndicatorDetail"
+        ),
+        "the explanation must not REPLACE the iOS badge's accessibility label; it belongs in \
+         `accessibilityValue`"
     );
 }
 
@@ -536,6 +639,39 @@ fn the_chrome_json_is_encoded_once_in_the_core_not_per_mobile_crate() {
             "{twin} is a second copy of the chrome wire form; the core owns it now"
         );
     }
+}
+
+#[test]
+fn the_assignment_check_is_not_satisfied_by_a_longer_field_name() {
+    // The guard ON the guard, part two: `chrome.trustIndicator` is a PREFIX of
+    // `chrome.trustIndicatorDetail`, so a substring check would call the essay a
+    // state name and green-light the very regression
+    // `both_mobile_edges_announce_the_trust_state_before_its_explanation` pins.
+    let code = "        trustLabel.accessibilityLabel = chrome.trustIndicatorDetail\n";
+    assert!(
+        assigns(
+            code,
+            "trustLabel.accessibilityLabel",
+            "chrome.trustIndicatorDetail"
+        ),
+        "an indented whole-line assignment is matched"
+    );
+    assert!(
+        !assigns(
+            code,
+            "trustLabel.accessibilityLabel",
+            "chrome.trustIndicator"
+        ),
+        "assigning the DETAIL must not read as assigning the state name"
+    );
+    assert!(
+        !assigns(
+            "        trustLabel.accessibilityValue = chrome.trustIndicatorDetail\n",
+            "trustLabel.accessibilityLabel",
+            "chrome.trustIndicatorDetail"
+        ),
+        "a different SLOT is a different assignment"
+    );
 }
 
 #[test]

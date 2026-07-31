@@ -307,14 +307,18 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         trustLabel.textAlignment = .right
         trustLabel.setContentHuggingPriority(.required, for: .horizontal)
         trustLabel.translatesAutoresizingMaskIntoConstraints = false
-        // The trust EXPLANATION on a platform with no hover: the badge carries the
-        // core's `trust_indicator_detail` as its accessibility label (VoiceOver
-        // reads what the posture MEANS, not just its glyph) and a TAP shows the
-        // same sentence in an alert. Both are set in `refreshChrome()` from the
-        // same one derivation; the tap affordance is wired once here.
+        // The trust EXPLANATION on a platform with no hover: the badge's
+        // accessibility LABEL is its own short STATE name (VoiceOver announces
+        // WHICH posture this is first and always), and the core's
+        // `trust_indicator_detail` follows it in the SECONDARY slot,
+        // `accessibilityValue`, which VoiceOver reads straight after the label. A
+        // TAP shows the same sentence in an alert. Both are set in
+        // `refreshChrome()` from the same one derivation; the tap affordance is
+        // wired once here.
         trustLabel.isUserInteractionEnabled = true
         trustLabel.isAccessibilityElement = true
-        trustLabel.accessibilityLabel = initialChrome.trustIndicatorDetail
+        trustLabel.accessibilityLabel = initialChrome.trustIndicator
+        trustLabel.accessibilityValue = initialChrome.trustIndicatorDetail
         trustLabel.addGestureRecognizer(
             UITapGestureRecognizer(target: self, action: #selector(showTrustExplanation)))
 
@@ -436,13 +440,17 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         reloadButton.isEnabled = !chrome.loading
         statusLabel.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
-        // matching desktop; the seam-default no-op is gone. Its EXPLANATION (the
-        // core's `trust_indicator_detail`, which used to reach desktop only) rides
-        // along as the badge's accessibility label, and the tap affordance wired in
-        // `layoutChrome()` shows the same sentence: the platform-appropriate
-        // stand-in for desktop's hover tooltip.
+        // matching desktop; the seam-default no-op is gone. The badge's
+        // accessibility LABEL is the badge's own STATE name, so VoiceOver announces
+        // which posture this is FIRST and always; its EXPLANATION (the core's
+        // `trust_indicator_detail`, which used to reach desktop only) follows in
+        // the secondary slot (`accessibilityValue`) and in the tap alert wired in
+        // `layoutChrome()`: the platform-appropriate stand-in for desktop's hover
+        // tooltip. Both strings are the core's, off this ONE snapshot — the edge
+        // neither re-derives nor re-words either.
         trustLabel.text = chrome.trustIndicator
-        trustLabel.accessibilityLabel = chrome.trustIndicatorDetail
+        trustLabel.accessibilityLabel = chrome.trustIndicator
+        trustLabel.accessibilityValue = chrome.trustIndicatorDetail
         // The trust surface's TRUST-ON-FIRST-USE section, cached off this ONE
         // painted snapshot so the tap handler needs no second chrome read (which
         // would cross the C-ABI into the session again and could disagree with the
@@ -543,15 +551,16 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// exactly what desktop shows, and a future rewording lands on both at once.
     ///
     /// TWO affordances, both from the same one field: this TAP (an explicit user
-    /// gesture, no hover needed) and the badge's accessibility label set in
-    /// ``refreshChrome()`` (VoiceOver reads the meaning, not the glyph).
+    /// gesture, no hover needed) and the badge's accessibility VALUE set in
+    /// ``refreshChrome()`` (VoiceOver reads the meaning after the state, never
+    /// instead of it).
     ///
     /// It reads the PAINTED badge rather than calling the core again: a chrome read
     /// crosses the C-ABI into the session, and the label + its accessibility text
     /// were both set by the last ``refreshChrome()`` from ONE chrome snapshot, so
     /// they cannot disagree with each other.
     @objc private func showTrustExplanation() {
-        guard let detail = trustLabel.accessibilityLabel, !detail.isEmpty else { return }
+        guard let detail = trustLabel.accessibilityValue, !detail.isEmpty else { return }
         // The TRUST-ON-FIRST-USE section of the same surface (task
         // `ipns-tofu-pin-and-warn-on-change`): what this MUTABLE name resolves to
         // now, what the user blessed for it, and (when there is something new to

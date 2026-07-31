@@ -6,6 +6,7 @@ import android.content.pm.ApplicationInfo
 import android.content.res.ColorStateList
 import android.graphics.Bitmap
 import android.graphics.Paint
+import android.os.Build
 import android.os.Bundle
 import android.os.Message
 import android.util.TypedValue
@@ -13,6 +14,7 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.view.accessibility.AccessibilityNodeInfo
 import android.view.inputmethod.EditorInfo
 import android.webkit.ConsoleMessage
 import android.webkit.JavascriptInterface
@@ -220,6 +222,22 @@ class BrowserActivity : ComponentActivity() {
     private var trustPinActionOffered: Boolean = false
     private var trustPinActionLabelText: String = ""
 
+    /**
+     * The trust EXPLANATION (the core's `trust_indicator_detail`), cached from the
+     * last [refreshChrome] for the two places that surface it: the badge's
+     * accessibility STATE description and the [showTrustExplanation] dialog.
+     *
+     * It is a FIELD rather than a widget property because the badge's own
+     * accessibility text is no longer free to hold it: the `contentDescription` is
+     * the badge's short STATE name, so a screen reader announces WHICH posture
+     * this is first and always (task
+     * `mobile-trust-badge-accessibility-announces-the-state-not-only-the-essay`),
+     * and Android's secondary slot (`AccessibilityNodeInfo.setStateDescription`)
+     * is write-only from a node the framework hands us. Like the TOFU strings
+     * above, it is the core's derivation held only between a paint and a tap.
+     */
+    private var trustDetailText: String = ""
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -357,16 +375,40 @@ class BrowserActivity : ComponentActivity() {
         trust = TextView(this).apply {
             text = initialChrome.trustIndicator
             gravity = Gravity.END
-            // The trust EXPLANATION on a platform with no hover: the badge carries
-            // the core's `trust_indicator_detail` as its accessibility description
-            // (TalkBack reads what the posture MEANS, not just its glyph) and a TAP
-            // shows the same sentence in a dialog. Both are set in [refreshChrome]
-            // from the same one derivation; the tap affordance is wired once here.
-            contentDescription = initialChrome.trustIndicatorDetail
+            // The badge's accessibility LABEL is the badge's own text: the short
+            // STATE name, so TalkBack announces WHICH posture this is first and
+            // always — the one fact a sighted user reads instantly.
+            contentDescription = initialChrome.trustIndicator
+            // The trust EXPLANATION on a platform with no hover: the core's
+            // `trust_indicator_detail` rides in the SECONDARY accessibility slot
+            // (`stateDescription`, below), so it FOLLOWS the state rather than
+            // replacing it, and a TAP shows the same sentence in a dialog. Both
+            // are refreshed in [refreshChrome] from the same one derivation; the
+            // tap affordance is wired once here.
             isClickable = true
             isFocusable = true
             setOnClickListener { showTrustExplanation() }
+            // Android's secondary announcement slot, read by TalkBack AFTER the
+            // content description. It arrived in API 30, and this app's floor is
+            // API 21, so on older devices the badge announces its STATE only and
+            // the explanation stays one tap away (the dialog above) — the same
+            // deal desktop gives a mouse user, whose explanation is a HOVER away.
+            // Never the other way round: dropping the state was the regression
+            // (task
+            // `mobile-trust-badge-accessibility-announces-the-state-not-only-the-essay`).
+            accessibilityDelegate = object : View.AccessibilityDelegate() {
+                override fun onInitializeAccessibilityNodeInfo(
+                    host: View,
+                    info: AccessibilityNodeInfo
+                ) {
+                    super.onInitializeAccessibilityNodeInfo(host, info)
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        info.stateDescription = trustDetailText
+                    }
+                }
+            }
         }
+        trustDetailText = initialChrome.trustIndicatorDetail
         status = TextView(this).apply {
             text = initialChrome.statusLine
             gravity = Gravity.START
@@ -571,21 +613,22 @@ class BrowserActivity : ComponentActivity() {
      * exactly what desktop shows, and a future rewording lands on both at once.
      *
      * TWO affordances, both from the same one field: this TAP (an explicit user
-     * gesture, no hover needed) and the badge's accessibility description set in
-     * [refreshChrome] (TalkBack reads the meaning, not the glyph). The framework
-     * `AlertDialog` keeps the edge framework-only (the single androidx dependency
-     * stays the back-dispatcher one), and the dismiss button is the PLATFORM's
-     * localized OK rather than a string minted here.
+     * gesture, no hover needed) and the badge's accessibility STATE description
+     * set in [refreshChrome] (TalkBack reads the meaning after the state, never
+     * instead of it). The framework `AlertDialog` keeps the edge framework-only
+     * (the single androidx dependency stays the back-dispatcher one), and the
+     * dismiss button is the PLATFORM's localized OK rather than a string minted
+     * here.
      *
-     * It reads the PAINTED badge rather than calling the core again: a chrome read
-     * takes the native session lock, which on the UI thread can wait behind an
-     * in-flight `ipfs://` retrieval (the ANR guard,
+     * It reads the LAST PAINTED snapshot rather than calling the core again: a
+     * chrome read takes the native session lock, which on the UI thread can wait
+     * behind an in-flight `ipfs://` retrieval (the ANR guard,
      * `work/notes/observations/mobile-chrome-reads-still-take-the-session-lock-2026-07-29.md`).
-     * The badge and its description were both set by the last [refreshChrome] from
-     * ONE chrome snapshot, so they cannot disagree with each other.
+     * The badge and [trustDetailText] were both set by the last [refreshChrome]
+     * from ONE chrome snapshot, so they cannot disagree with each other.
      */
     private fun showTrustExplanation() {
-        val detail = trust.contentDescription?.toString().orEmpty()
+        val detail = trustDetailText
         if (detail.isEmpty()) return
         // The TRUST-ON-FIRST-USE section of the same surface (task
         // `ipns-tofu-pin-and-warn-on-change`): what this MUTABLE name resolves to
@@ -652,13 +695,17 @@ class BrowserActivity : ComponentActivity() {
         reloadButton.isEnabled = !chrome.loading
         status.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
-        // matching desktop; the seam-default no-op is gone. Its EXPLANATION (the
-        // core's `trust_indicator_detail`, which used to reach desktop only) rides
-        // along as the badge's accessibility description, and the tap affordance
-        // wired in `onCreate` shows the same sentence: the platform-appropriate
-        // stand-in for desktop's hover tooltip.
+        // matching desktop; the seam-default no-op is gone. The badge's
+        // accessibility LABEL is the badge's own STATE name, so TalkBack announces
+        // which posture this is FIRST and always; its EXPLANATION (the core's
+        // `trust_indicator_detail`, which used to reach desktop only) follows in
+        // the secondary slot (`stateDescription`, wired in `onCreate`) and in the
+        // tap dialog: the platform-appropriate stand-in for desktop's hover
+        // tooltip. Both strings are the core's, off this ONE snapshot — the edge
+        // neither re-derives nor re-words either.
         trust.text = chrome.trustIndicator
-        trust.contentDescription = chrome.trustIndicatorDetail
+        trust.contentDescription = chrome.trustIndicator
+        trustDetailText = chrome.trustIndicatorDetail
         // The trust surface's TRUST-ON-FIRST-USE section, cached off this ONE
         // painted snapshot so the tap handler never takes the native session lock
         // on the UI thread (the ANR guard). Every string is the core's derivation:

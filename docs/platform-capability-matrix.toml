@@ -369,16 +369,24 @@ description = "EXPLAIN what the current trust posture MEANS, not just which badg
 #   as its tooltip).
 # * ios/android: a hover tooltip is not available and would not be discoverable if
 #   it were, so each edge surfaces the SAME sentence TWICE over, from the
-#   `trustIndicatorDetail` field the chrome JSON now carries: as the badge's
-#   accessibility description (Android `contentDescription`, iOS
-#   `accessibilityLabel`; a screen-reader user previously heard a glyph and three
-#   words) and behind a TAP on the badge, which shows it in the platform's standard
-#   alert titled with the badge (BrowserActivity.kt `showTrustExplanation`,
-#   WKWebViewShellController.swift `showTrustExplanation`).
+#   `trustIndicatorDetail` field the chrome JSON now carries: in the platform's
+#   SECONDARY accessibility slot (Android `stateDescription`, iOS
+#   `accessibilityValue`) and behind a TAP on the badge, which shows it in the
+#   platform's standard alert titled with the badge (BrowserActivity.kt
+#   `showTrustExplanation`, WKWebViewShellController.swift
+#   `showTrustExplanation`). The badge's accessibility LABEL stays the badge's own
+#   short state name, so a screen reader announces WHICH posture this is first and
+#   always and the explanation FOLLOWS it: putting the ~240-character sentence in
+#   the label instead dropped the state for exactly the users who most depend on
+#   it (task
+#   `mobile-trust-badge-accessibility-announces-the-state-not-only-the-essay`,
+#   work/notes/observations/mobile-trust-badge-accessibility-slot-decisions-2026-07-31.md,
+#   which also records why Android 10 and older get the state plus the tap only:
+#   `stateDescription` arrived in API 30 and this app's floor is 21).
 # HONEST LIMIT: the two mobile surfaces are wired in Kotlin/Swift, which this
 # repo's pure-Rust gate never compiles. What the gate DOES enforce is that the
 # sentence reaches both edges from the one derivation and that both really wire it
-# to an accessibility description and a tap
+# to the secondary accessibility slot (never over the state label) and a tap
 # (crates/werust-core/tests/mobile_chrome_presentation_shape.rs); that a real
 # device shows the alert is checked by the mobile CI legs building/launching the
 # edges, not by an on-device assertion.

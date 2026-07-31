@@ -9,12 +9,20 @@
 //! asked for a NUMBER rather than an assurance ("the honest expectation is 'no
 //! measurable change'. Say so with a number").
 //!
-//! WHAT IT COMPARES: the BASELINE below is the pre-change encoder (the facts
-//! only, exactly the eleven fields the two `ffi_json` twins used to emit), frozen
-//! here as a measurement fixture, against today's [`werust_core::chrome_json`].
-//! Both are timed over the same chrome states, plus a decode of each document
-//! (the edge's half of a refresh), so the comparison covers the whole
-//! encode + parse round trip a refresh really pays.
+//! WHAT IT COMPARES: the BASELINE below is the FACTS-ONLY document (exactly the
+//! eleven fields the two `ffi_json` twins used to emit), encoded with the SAME
+//! `serde_json` encoder today's [`werust_core::chrome_json`] uses and frozen here
+//! as a measurement fixture. Both are timed over the same chrome states, plus a
+//! decode of each document (the edge's half of a refresh), so the comparison
+//! covers the whole encode + parse round trip a refresh really pays.
+//!
+//! So the delta isolates ONE variable, the ten EXTRA FIELDS. It is deliberately
+//! NOT this commit's literal before/after: the deleted twins hand-rolled their
+//! JSON with `format!` plus their own escaping, so a true before/after would fold
+//! the ENCODER SWAP into the same number and measure two changes at once. Read
+//! the columns as "facts only" vs "facts + derivation", never as "before" vs
+//! "after"; the conclusion rests on the absolute magnitude (microseconds, on an
+//! event-driven cadence) rather than on which half of the delta is which.
 //!
 //! WHAT IT DOES NOT MEASURE, stated so the number is not over-read: the JNI /
 //! C-ABI string hop itself, and the platform parsers on the other side
@@ -38,12 +46,15 @@ use std::time::{Duration, Instant};
 use renderer::{LoadState, TrustPosture};
 use werust_core::{chrome_json, ChromeState, LoadStep};
 
-/// The PRE-CHANGE chrome document: the eleven `ChromeState` FACTS and nothing
-/// else, as the two `ffi_json` twins emitted them before this task.
+/// The FACTS-ONLY chrome document: the eleven `ChromeState` facts and nothing
+/// else — the field SET the two `ffi_json` twins emitted before this task, but
+/// encoded here with the same `serde_json` the shipping encoder uses rather than
+/// with their hand-rolled `format!`, so the comparison varies the FIELDS and not
+/// the encoder (see the module docs).
 ///
 /// Frozen here as the measurement BASELINE only. It is not used by anything that
-/// ships, and it must not grow: its whole purpose is to be what the wire looked
-/// like on 2026-07-31, before the derived strings joined it.
+/// ships, and it must not grow: its whole purpose is to be the field set the wire
+/// carried on 2026-07-31, before the derived strings joined it.
 fn baseline_facts_only_json(state: &ChromeState) -> String {
     serde_json::json!({
         "url": state.url_text,
@@ -152,7 +163,7 @@ fn time_per_call(iterations: u32, mut f: impl FnMut() -> usize) -> Duration {
 fn main() {
     const ITERATIONS: u32 = 100_000;
 
-    println!("werust chrome-refresh cost: facts-only (pre-change) vs facts + derivation");
+    println!("werust chrome-refresh cost: facts only (same encoder) vs facts + derivation");
     println!("{ITERATIONS} iterations per measurement, per-call averages\n");
 
     let mut baseline_bytes = 0usize;
@@ -160,24 +171,24 @@ fn main() {
     let states = representative_states();
 
     println!(
-        "{:<28} {:>9} {:>9} {:>11} {:>11}",
-        "chrome state", "was (B)", "now (B)", "encode was", "encode now"
+        "{:<28} {:>12} {:>12} {:>13} {:>13}",
+        "chrome state", "facts (B)", "+derived (B)", "encode facts", "encode both"
     );
     for (name, state) in &states {
-        let was = baseline_facts_only_json(state);
-        let now = chrome_json(state);
-        baseline_bytes += was.len();
-        carrier_bytes += now.len();
+        let facts_only = baseline_facts_only_json(state);
+        let with_derivation = chrome_json(state);
+        baseline_bytes += facts_only.len();
+        carrier_bytes += with_derivation.len();
 
-        let encode_was = time_per_call(ITERATIONS, || baseline_facts_only_json(state).len());
-        let encode_now = time_per_call(ITERATIONS, || chrome_json(state).len());
+        let encode_facts_only = time_per_call(ITERATIONS, || baseline_facts_only_json(state).len());
+        let encode_with_derivation = time_per_call(ITERATIONS, || chrome_json(state).len());
         println!(
-            "{:<28} {:>9} {:>9} {:>11?} {:>11?}",
+            "{:<28} {:>12} {:>12} {:>13?} {:>13?}",
             name,
-            was.len(),
-            now.len(),
-            encode_was,
-            encode_now
+            facts_only.len(),
+            with_derivation.len(),
+            encode_facts_only,
+            encode_with_derivation
         );
     }
 
@@ -188,16 +199,16 @@ fn main() {
         .iter()
         .max_by_key(|(_, state)| chrome_json(state).len())
         .expect("there is at least one state");
-    let was = baseline_facts_only_json(worst);
-    let now = chrome_json(worst);
-    let parse_was = time_per_call(ITERATIONS, || {
-        serde_json::from_str::<serde_json::Value>(&was)
+    let facts_only = baseline_facts_only_json(worst);
+    let with_derivation = chrome_json(worst);
+    let parse_facts_only = time_per_call(ITERATIONS, || {
+        serde_json::from_str::<serde_json::Value>(&facts_only)
             .expect("valid JSON")
             .as_object()
             .map_or(0, serde_json::Map::len)
     });
-    let parse_now = time_per_call(ITERATIONS, || {
-        serde_json::from_str::<serde_json::Value>(&now)
+    let parse_with_derivation = time_per_call(ITERATIONS, || {
+        serde_json::from_str::<serde_json::Value>(&with_derivation)
             .expect("valid JSON")
             .as_object()
             .map_or(0, serde_json::Map::len)
@@ -208,7 +219,9 @@ fn main() {
         states.len(),
         (carrier_bytes as f64 / baseline_bytes as f64 - 1.0) * 100.0
     );
-    println!("worst-case decode (largest document): {parse_was:?} -> {parse_now:?}");
+    println!(
+        "worst-case decode (largest document): {parse_facts_only:?} -> {parse_with_derivation:?}"
+    );
     println!(
         "\nA chrome refresh is ONE encode + ONE decode. The mobile refresh cadence is \
          event-driven\n(after each core action / page-lifecycle signal), not a timer or a \

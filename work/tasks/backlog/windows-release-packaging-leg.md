@@ -30,6 +30,11 @@ Pin the workflow shape with a test in the existing `crates/werust-core/tests/rel
 
 ADR sizing: 2 to 4 person-days.
 
+> FORWARD-POINTER (planted by the conductor at Gate-3 of `windows-backend-error-mapping-and-leg-header-accuracy`, 2026-07-31). **You will be FORCED to edit `crates/werust-core/tests/windows_renderer_leg_shape.rs`, by design.** That task converted the leg's `pull_request` guard from a must-have/must-not-have pair into an EXACT-set pin (`PULL_REQUEST_FILTER`), so any new PR-filter path this leg needs reds the Ubuntu gate until you update the constant in the same change. That is intended (a widening must be a decision, not an accretion), not a bug to route around; do not loosen the pin to make your change easier. While you are in those exact files, carry these two three-line prose corrections that Gate-2 raised and that are not worth a task of their own:
+>
+> - `crates/windows-renderer/src/pure.rs`'s rustdoc, the new `DECISIONS.md` item 1, and the pure test's assertion message all say the environment-creation error LEADS with the platform detail. It TRAILS it, after a colon. Either reword all three to "carries"/"keeps", or reorder the message to put the `HRESULT` first, and make the three agree. This is the same doc-overclaims-the-tool class that task existed to close, so leaving it would be a small joke at the repo's expense.
+> - Two guard comments overclaim what they enforce: `macos_backend_shape.rs` says pinning `desktop-paint` means "the next widening of either filter is an edit to a test rather than an accretion", but that test only asserts `contains(...)` plus a two-entry deny list, so a NEW macOS PR-filter path still lands silently; and `windows-renderer.yml`'s header says the list and the header "neither can move without the other going red", yet no test holds the header PROSE. Soften both comments to claim only what is really pinned, or make the macOS pin exact like the Windows one. Do not let a comment promise a guard that does not exist.
+
 ## Acceptance criteria
 
 - [ ] A tagged release attaches a Windows desktop artifact (a zip containing `werust-windows.exe`) alongside the existing artifacts.

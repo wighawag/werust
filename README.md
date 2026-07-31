@@ -7,13 +7,14 @@ A from-scratch, general-purpose web browser in **Rust** for a "post-trusted-serv
 `werust` with no argument (or `werust <url>`) opens the browser window, as always. A few verb-first subcommands run HEADLESSLY instead — no GTK window, no display needed — so a resolution can be scripted or debugged over ssh:
 
 ```
-werust resolve <ens-name>   # print the contenthash reference the name points at (ipfs://<cid> or ipns://<name>)
-werust resolve --json <n>   # the same facts as one JSON object: {"name":…,"kind":…,"reference":…}
+werust resolve <ens-name>   # print the ipfs://<cid> the browser would load for the name
+werust resolve --json <n>   # the same facts as one JSON object:
+                            #   {"name":…,"kind":…,"reference":…,"cid":…,"mutable":…,"pointer":…}
 werust version              # print the version banner (also --version, -V)
 werust --help               # the usage message (also -h)
 ```
 
-`resolve` prints the reference on stdout and exits 0; a resolution failure prints the reason on stderr and exits 1. It performs the ENS read only: a mutable `ipns-ns` name is reported as the `ipns://<name>` pointer it is, NOT followed to its current CID (`docs/spikes/headless-cli-mode/DECISIONS.md`). Any other first argument is still treated as a URL to open in the GUI, so nothing that launched the browser before does anything different now.
+`resolve` prints the reference on stdout and exits 0; a resolution failure prints the reason on stderr and exits 1. It performs the FULL resolution the browser performs, through the same core path: a name whose ENS contenthash is a MUTABLE `ipns-ns` pointer is followed through its CLIENT-VERIFIED IPNS record to the CID it points at right now, so what `resolve` prints is what the GUI would load. Following is not flattening — the mutable name is still a mutable name (`docs/adr/0006`): the human form notes it on stderr (stdout stays the bare `ipfs://<cid>` a script can pin) and `--json` carries both the followed `pointer` and the resolved `cid` (`docs/spikes/cli-resolve-follows-mutable-names-to-the-cid/DECISIONS.md`). Any other first argument is still treated as a URL to open in the GUI, so nothing that launched the browser before does anything different now.
 
 ## Development
 

@@ -107,6 +107,42 @@ impl ProtoCode {
         }
     }
 
+    /// The multicodec / ENSIP-7 WIRE name of the protocol (`ipfs-ns`, `ipns-ns`,
+    /// `swarm-ns`, …): the ONE spelling werust reports a contenthash protocol
+    /// under on a machine-readable surface.
+    ///
+    /// Distinct from [`display_name`](ProtoCode::display_name), which is the
+    /// PROSE name a refusal sentence reads ("points to Swarm, not supported").
+    /// This is the identifier a script pins: the headless `werust resolve
+    /// --json` object's `kind` field is exactly this string, so the CLI, a later
+    /// `fetch` verb and any other surface cannot fork a second spelling of the
+    /// same protocol (task `cli-resolve-follows-mutable-names-to-the-cid`;
+    /// mirrors [`crate::debug::trust_posture_wire_name`] and
+    /// [`LoadStep::wire_name`](crate::LoadStep::wire_name), the repo's existing
+    /// wire-vocabulary helpers).
+    ///
+    /// The names are the authoritative multicodec table's, the same table
+    /// [`from_code`](ProtoCode::from_code) reads the values from, so nothing is
+    /// minted here. An [`Unknown`](ProtoCode::Unknown) protoCode has no name in
+    /// that table, so it reports the sentinel `unknown`; its RAW hex value stays
+    /// available through [`DecodedContenthash::reason`], which is what a refusal
+    /// prints.
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            ProtoCode::Ipfs => "ipfs-ns",
+            ProtoCode::Swarm => "swarm-ns",
+            ProtoCode::Ipns => "ipns-ns",
+            ProtoCode::ZeroNet => "zeronet",
+            ProtoCode::DnsLink => "dnslink",
+            ProtoCode::Onion => "onion",
+            ProtoCode::Onion3 => "onion3",
+            ProtoCode::Skynet => "skynet-ns",
+            ProtoCode::Arweave => "arweave-ns",
+            ProtoCode::Unknown { .. } => "unknown",
+        }
+    }
+
     /// The human-readable protocol name used in a "points to <protocol>" refusal.
     #[must_use]
     fn display_name(self) -> &'static str {
@@ -543,6 +579,33 @@ mod tests {
         assert!(
             matches!(err, ContenthashError::InvalidIpnsName(_)),
             "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn every_protocol_reports_its_ensip7_multicodec_wire_name() {
+        // Acceptance (task `cli-resolve-follows-mutable-names-to-the-cid`): the
+        // protocol VOCABULARY a machine-readable surface prints (the headless
+        // `resolve --json` object's `kind`) comes from THIS helper, in the
+        // multicodec / ENSIP-7 spelling the decoder already dispatches on — so no
+        // surface mints its own `"ipfs"`/`"ipns"` variant.
+        assert_eq!(ProtoCode::Ipfs.wire_name(), "ipfs-ns");
+        assert_eq!(ProtoCode::Ipns.wire_name(), "ipns-ns");
+        assert_eq!(ProtoCode::Swarm.wire_name(), "swarm-ns");
+        assert_eq!(ProtoCode::Arweave.wire_name(), "arweave-ns");
+        assert_eq!(ProtoCode::Skynet.wire_name(), "skynet-ns");
+        assert_eq!(ProtoCode::ZeroNet.wire_name(), "zeronet");
+        assert_eq!(ProtoCode::DnsLink.wire_name(), "dnslink");
+        assert_eq!(ProtoCode::Onion.wire_name(), "onion");
+        assert_eq!(ProtoCode::Onion3.wire_name(), "onion3");
+        // An unnamed protoCode has no multicodec name to spell; the raw hex stays
+        // in the refusal `reason()`, which is the surface that reports it.
+        assert_eq!(ProtoCode::Unknown { code: 0x99 }.wire_name(), "unknown");
+        assert!(
+            DecodedContenthash::Unsupported(ProtoCode::Unknown { code: 0x99 })
+                .reason()
+                .expect("an unsupported protocol has a refusal")
+                .contains("0x99")
         );
     }
 

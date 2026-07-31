@@ -8,6 +8,8 @@ These are the judgement calls this task bakes in, recorded so the named follow-o
 
 ## Decision 1: `resolve` reports a MUTABLE `ipns-ns` contenthash as `ipns://<name>` and does NOT follow it
 
+> **SUPERSEDED (2026-07-31, task `cli-resolve-follows-mutable-names-to-the-cid`).** The human ratified the opposite at the Gate-2 review of this task (`work/notes/observations/gate3-headless-cli-mode-2026-07-30.md`): the CLI and the GUI must not disagree about what a name resolves to, so `resolve` now performs the FULL resolution and FOLLOWS an `ipns-ns` pointer through its client-verified record to the `ipfs://<cid>` — with no flag and no second verb. The mutability is kept (a stderr note, and `mutable` + `pointer` in `--json`), and the alternative rejected below ((a), "follow the record") is what shipped, via a lifted core function both surfaces call rather than a fetch stack pulled into the binary. See [`../cli-resolve-follows-mutable-names-to-the-cid/DECISIONS.md`](../cli-resolve-follows-mutable-names-to-the-cid/DECISIONS.md). The reasoning below is kept as the record of why it was scoped out first.
+
 `werust resolve ronan.eth` prints `ipns://k51qzi5uqu5dlu1ien9spji7pu49mfw97mn0qv4azugqcvenj0dvzq9bgwp1zc`, not the CID that name currently points at. The immutable case prints its `ipfs://<cid>` unchanged.
 
 - **What it touches.** The out-of-scope `fetch` subcommand (it is the verb that would want the followed CID), and any script reading `resolve`'s stdout.

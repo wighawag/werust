@@ -26,11 +26,8 @@ use std::collections::HashMap;
 
 use renderer::{LoadEvent, LoadState, Renderer, RendererError, TrustPosture};
 
-use fetcher::{HttpFetcher, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT};
-
-use crate::contenthash::DecodedContenthash;
 use crate::ethereum::{EthereumProvider, RpcProvider};
-use crate::ipns::{GatewayIpnsRecordSource, IpnsRecordSource};
+use crate::ipns::IpnsRecordSource;
 
 pub mod contenthash;
 pub mod debug;
@@ -39,6 +36,7 @@ pub mod ethereum;
 pub mod ipfs;
 pub mod ipns;
 pub mod menu;
+pub mod name_resolution;
 pub mod provider;
 pub mod redirects;
 pub mod retrieval;
@@ -1357,25 +1355,13 @@ impl BrowserShell {
     /// subsystem to chase.
     #[must_use]
     pub fn with_provider(renderer: Box<dyn Renderer>, provider: Box<dyn EthereumProvider>) -> Self {
-        // The default IPNS record source: a trustless-gateway fetch over the bound
-        // HTTP `Fetcher`, pointed at the user's chosen retrieval backend (the SAME
-        // `active_gateway_endpoint` the content path uses, so the IPNS record and
-        // the content it points at come from one chosen gateway — no second
-        // config). Verification of the fetched record happens client-side in
-        // `ipns::resolve_ipns_name`, so this untrusted source cannot misdirect a
-        // name.
-        //
-        // The record fetch is a SMALL single signed-record GET, a distinct step
-        // from the (larger, slower) content fetch it precedes, so it uses the
-        // SPLIT-OUT `DEFAULT_IPNS_RECORD_TIMEOUT` (shorter than the content
-        // path's `DEFAULT_GLOBAL_TIMEOUT`) with the SAME tight connect bound: a
-        // cold-but-progressing record lookup is not killed, a dead gateway still
-        // fails fast, and the record step does not eat the content step's budget
-        // (`fetch-timeout-raise-and-split-for-ipns-and-content`).
-        let ipns_source = Box::new(GatewayIpnsRecordSource::with_gateway(
-            HttpFetcher::with_timeouts(DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT),
-            &crate::retrieval::active_gateway_endpoint(),
-        ));
+        // The default IPNS record source (`ipns::default_record_source`): a
+        // trustless-gateway fetch over the bound HTTP `Fetcher`, pointed at the
+        // user's chosen retrieval backend, with the record step's own split-out
+        // timeouts. Built by the CORE helper, not here, so the headless
+        // `werust resolve` — which resolves the same names with no shell —
+        // cannot end up pointed at a different gateway or budget.
+        let ipns_source = Box::new(crate::ipns::default_record_source());
         Self::with_provider_and_ipns_source(renderer, provider, ipns_source)
     }
 
@@ -1612,27 +1598,30 @@ impl BrowserShell {
     /// Resolve a bare `.eth` `name` through the ENS front door and load the
     /// content it points to.
     ///
-    /// This is the tracer-bullet path: it resolves `name` via the ENS core
-    /// ([`ens::resolve`](crate::ens::resolve): namehash -> registry -> resolver ->
-    /// contenthash -> ENSIP-7 decode) over the shell's
-    /// [`EthereumProvider`](crate::ethereum::EthereumProvider), then dispatches by
-    /// the DECODED contenthash's OWN type:
+    /// This is the tracer-bullet path. The name-to-CID step itself is NOT written
+    /// here: it is [`crate::name_resolution::resolve_name_with_progress`], the ONE
+    /// callable resolution path (namehash -> registry -> resolver -> ENSIP-7
+    /// decode over the shell's
+    /// [`EthereumProvider`](crate::ethereum::EthereumProvider), and, for a MUTABLE
+    /// `ipns-ns` contenthash, the client-VERIFIED IPNS record fetched over the
+    /// shell's untrusted [`IpnsRecordSource`](crate::ipns::IpnsRecordSource)).
+    /// The headless `werust resolve` calls the SAME function, so the CLI and the
+    /// GUI cannot disagree about what a name resolves to, and a record that fails
+    /// verification fails identically in both (task
+    /// `cli-resolve-follows-mutable-names-to-the-cid`). What stays HERE is the
+    /// shell's own half: the load-step pin, feeding the resolved CID into the
+    /// verified `ipfs://` path, and the TRUST flagging:
     ///
-    /// * an `ipfs-ns` name feeds its `ipfs://<cid>` into the EXISTING verified
-    ///   `ipfs://` render path (the seam's scheme handler hash-verifies the
-    ///   bytes), and the load is flagged ENS-originated
+    /// * an IMMUTABLE (`ipfs-ns`) name's load is flagged ENS-originated
     ///   ([`Renderer::mark_ens_origin`]) so the resulting posture is
     ///   "content-verified, name via trusted RPC" rather than plain
     ///   `ContentVerified`;
-    /// * an `ipns-ns` name is first RESOLVED to its current CID via a
-    ///   client-VERIFIED IPNS record ([`crate::ipns::resolve_ipns_name`] over the
-    ///   shell's untrusted [`IpnsRecordSource`](crate::ipns::IpnsRecordSource)),
-    ///   then that CID feeds the SAME verified `ipfs://` path. It is flagged BOTH
-    ///   ENS-originated AND mutable-named, so the loudest applicable posture wins
+    /// * a MUTABLE (followed `ipns-ns`) name's load is flagged BOTH ENS-originated
+    ///   AND mutable-named, so the loudest applicable posture wins
     ///   (`NameViaTrustedRpc` via ENS today; `MutableName` once Phase 2 clears the
     ///   RPC warning) — NEVER immutable `ContentVerified`;
-    /// * every OTHER type (swarm/arweave/unknown) is the decoder's graceful,
-    ///   protocol-named failure — NEVER defaulted to `ipfs://`.
+    /// * an unsupported contenthash (swarm/arweave/unknown) never reaches a load
+    ///   at all: it is the decoder's graceful, protocol-named failure.
     ///
     /// The `path` (from [`eth_name_and_path_from_entry`], with its leading `/`, or
     /// `""` for a bare name) is threaded into the resolved load: the backend loads
@@ -1654,63 +1643,40 @@ impl BrowserShell {
         // The ENS front door proceeds, so any prior invalid-entry state is cleared
         // (a valid route never leaves the badge showing).
         self.chrome.invalid_entry = None;
-        // Step 1 of the pipeline: resolving the name (namehash -> registry ->
-        // resolver -> contenthash). Pin the step so a resolution FAILURE surfaces
-        // "resolving name" as the stage it failed at, and so a caller inspecting
-        // mid-resolution sees genuine progress.
-        self.resolving_step = Some(LoadStep::ResolvingName);
-        match crate::ens::resolve(self.provider.as_ref(), name) {
-            Ok(DecodedContenthash::Ipfs { uri, .. }) => {
-                // The immutable `ipfs-ns` case: load the resolved CID + the typed
-                // sub-path directly. It is ENS-originated (trusted RPC) but NOT
-                // mutable-flagged, so the posture is `NameViaTrustedRpc`.
-                self.load_resolved_content(name, path, &uri, false);
-                Ok(())
-            }
-            Ok(DecodedContenthash::Ipns { name: ipns_name }) => {
-                // The MUTABLE `ipns-ns` case: RESOLVE the IPNS name to its current
-                // CID via a client-VERIFIED record (fetched from the untrusted
-                // record source, its signature + name-binding + validity checked
-                // client-side against the key) BEFORE loading anything. A bad
-                // record / bad target fails closed with its distinct reason —
-                // nothing unverified is rendered.
-                // Step 2 (IPNS names only): fetch + client-verify the signed
-                // record before any content. Pin the step so a record
-                // fetch/verify failure surfaces "fetching record".
-                self.resolving_step = Some(LoadStep::FetchingRecord);
-                match crate::ipns::resolve_ipns_name(self.ipns_source.as_ref(), &ipns_name) {
-                    Ok(resolved) => {
-                        // The name is MUTABLE, so flag the load mutable-named too:
-                        // its honest posture is at most `MutableName`, NEVER
-                        // immutable `ContentVerified`. Via ENS the LOUDER
-                        // `NameViaTrustedRpc` still wins today (the two-axis display
-                        // rule); it falls back to `MutableName` once Phase 2 clears
-                        // the RPC warning — no rule change here.
-                        self.load_resolved_content(name, path, &resolved.uri, true);
-                    }
-                    // A record/target failure is fail-closed with its distinct,
-                    // legible reason — the load renders nothing.
-                    Err(e) => self.fail_ens_load(name, path, &e.to_string()),
-                }
-                Ok(())
-            }
-            // A well-formed but unsupported contenthash (swarm/arweave/unknown) is
-            // the decoder's named refusal. `resolve` already maps it to
-            // `Err(UnsupportedContenthash)`, so it does not surface here as an
-            // `Ok`; but should the contract ever change, dispatch is by the
-            // DECODED type's OWN kind — only `ipfs-ns`/`ipns-ns` are loadable, so an
-            // `Unsupported` is fail-closed with its named reason, NEVER mis-
-            // dispatched to `ipfs://`.
-            Ok(other @ DecodedContenthash::Unsupported(_)) => {
-                let reason = other
-                    .reason()
-                    .unwrap_or_else(|| "unsupported contenthash protocol".to_string());
-                self.fail_ens_load(name, path, &reason);
+        // Resolve the name to the content it points at, through the ONE shared
+        // resolution path. The pipeline STEP it reaches is reported back through
+        // the progress callback (`ResolvingName`, then `FetchingRecord` for a
+        // mutable name) and pinned here, so a FAILURE still surfaces the stage it
+        // failed at. The callback writes to a local cell rather than to `self`
+        // because the resolution borrows the shell's provider + record source; the
+        // pin is applied the moment it returns, which is the same state the old
+        // inline match left behind at this point (resolution is synchronous, so
+        // no caller can observe the shell in between).
+        let reached_step = std::cell::Cell::new(None);
+        let resolved = crate::name_resolution::resolve_name_with_progress(
+            self.provider.as_ref(),
+            self.ipns_source.as_ref(),
+            name,
+            &mut |step| reached_step.set(Some(step)),
+        );
+        self.resolving_step = reached_step.get();
+        match resolved {
+            Ok(resolved) => {
+                // Feed the resolved CID + the typed sub-path into the verified
+                // `ipfs://` path. A MUTABLE name (a followed `ipns-ns` pointer)
+                // ALSO flags the load mutable-named: its honest posture is at most
+                // `MutableName`, NEVER immutable `ContentVerified`. Via ENS the
+                // LOUDER `NameViaTrustedRpc` still wins today (the two-axis display
+                // rule); it falls back to `MutableName` once Phase 2 clears the RPC
+                // warning — no rule change here.
+                let mutable = resolved.is_mutable();
+                self.load_resolved_content(name, path, resolved.uri(), mutable);
                 Ok(())
             }
             // Any typed resolution failure (unnormalizable name, no resolver, no/
-            // malformed/unsupported contenthash, an RPC/seam error) is fail-closed
-            // with its distinct, legible reason — nothing unverified is rendered.
+            // malformed/unsupported contenthash, an RPC/seam error, or a record
+            // that did not fetch/decode/VERIFY) is fail-closed with its distinct,
+            // legible reason — nothing unverified is rendered.
             Err(e) => {
                 self.fail_ens_load(name, path, &e.to_string());
                 Ok(())

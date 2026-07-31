@@ -49,7 +49,7 @@
 //! signed libp2p-key record). This module resolves libp2p-key IPNS names only;
 //! DNSLink is the deferred follow-on the task names.
 
-use fetcher::{Cid, Fetcher};
+use fetcher::{Cid, Fetcher, HttpFetcher, DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT};
 use libp2p_identity::PeerId;
 use quick_protobuf::{BytesReader, MessageWrite, Writer};
 use rust_ipns::Record;
@@ -235,6 +235,36 @@ impl<F: Fetcher> GatewayIpnsRecordSource<F> {
             gateway: gateway.trim_end_matches('/').to_string(),
         }
     }
+}
+
+/// The DEFAULT [`IpnsRecordSource`] werust resolves mutable names through: a
+/// trustless-gateway fetch over the bound HTTP [`Fetcher`](fetcher::Fetcher),
+/// pointed at the user's chosen retrieval backend.
+///
+/// ONE construction site for both surfaces that resolve a name — the
+/// [`BrowserShell`](crate::BrowserShell) front door and the headless
+/// `werust resolve` — so the gateway ENDPOINT (the SAME
+/// [`active_gateway_endpoint`](crate::retrieval::active_gateway_endpoint) the
+/// content path uses, so the record and the content it points at come from one
+/// chosen gateway) and the TIMEOUTS cannot diverge between them.
+///
+/// The record fetch is a SMALL single signed-record GET, a distinct step from
+/// the (larger, slower) content fetch it precedes, so it uses the SPLIT-OUT
+/// [`DEFAULT_IPNS_RECORD_TIMEOUT`] (shorter than the content path's global
+/// timeout) with the SAME tight connect bound: a cold-but-progressing record
+/// lookup is not killed, a dead gateway still fails fast, and the record step
+/// does not eat the content step's budget (task
+/// `fetch-timeout-raise-and-split-for-ipns-and-content`).
+///
+/// The source is UNTRUSTED by construction: [`resolve_ipns_name`] verifies the
+/// record client-side against the key, so a hostile or buggy gateway cannot
+/// misdirect a name.
+#[must_use]
+pub fn default_record_source() -> GatewayIpnsRecordSource<HttpFetcher> {
+    GatewayIpnsRecordSource::with_gateway(
+        HttpFetcher::with_timeouts(DEFAULT_CONNECT_TIMEOUT, DEFAULT_IPNS_RECORD_TIMEOUT),
+        &crate::retrieval::active_gateway_endpoint(),
+    )
 }
 
 impl<F: Fetcher> IpnsRecordSource for GatewayIpnsRecordSource<F> {

@@ -2,6 +2,8 @@
 
 Task: `headless-cli-mode`. Judgement calls: [`DECISIONS.md`](DECISIONS.md).
 
+> **The `resolve` OUTPUT below is superseded** (2026-07-31, task `cli-resolve-follows-mutable-names-to-the-cid`): `resolve` now completes the resolution, so `ronan.eth` prints the `ipfs://<cid>` its client-verified IPNS record points at (with the mutability on stderr and in `--json`) instead of the `ipns://` pointer, and `--json`'s `kind` is now the ENSIP-7 `ipfs-ns`/`ipns-ns` spelling. The dispatch map itself still holds. Current transcript: [`../cli-resolve-follows-mutable-names-to-the-cid/README.md`](../cli-resolve-follows-mutable-names-to-the-cid/README.md).
+
 ## What landed
 
 One verb-first dispatch at the top of `crates/werust/src/main.rs`, before any GTK setup:
@@ -15,7 +17,7 @@ std::env::args().skip(1) -> parse_args -> Command
                                           `- Gui     -> banner + Application::builder() … (unchanged)
 ```
 
-`run_resolve` builds a `werust_core::ethereum::RpcProvider::new()` — the SAME endpoint source the GUI shell uses (`WERUST_RPC_URL` when set and non-empty, else the compiled default) — and calls `werust_core::ens::resolve(&provider, name)`. It touches NO GTK: no `Application`, no window, not even `gtk::init`, so it runs over ssh and in CI with no display. No new dependencies: the JSON form is `format!` + a local `json_escape`.
+`run_resolve` builds a `werust_core::ethereum::RpcProvider::new()` — the SAME endpoint source the GUI shell uses (`WERUST_RPC_URL` when set and non-empty, else the compiled default) — and resolves the name through the core (`werust_core::ens::resolve` when this landed; since `cli-resolve-follows-mutable-names-to-the-cid` it is `werust_core::name_resolution::resolve_name`, the same path the GUI front door walks). It touches NO GTK: no `Application`, no window, not even `gtk::init`, so it runs over ssh and in CI with no display. No new dependencies: the JSON form is `format!` + a local `json_escape`.
 
 ## Manual verification (2026-07-30, `werust 0.2.9-8-g828d0b5`, Debian desktop, `DISPLAY` unused)
 

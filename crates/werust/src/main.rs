@@ -44,7 +44,7 @@ use gtk4::{
 
 use webkit6::prelude::WebViewExt;
 use webview_renderer::WebViewRenderer;
-use werust_core::contenthash::DecodedContenthash;
+use werust_core::name_resolution::ResolvedName;
 // The debug view's ROW rules are the shared core's, not this edge's: they moved
 // there with their tests when the macOS debug view needed the same derivation
 // (task `macos-appkit-window-and-chrome`).
@@ -53,7 +53,6 @@ use werust_core::debug::{
     network_status_text, network_trust_css_class, network_trust_label, tail_plan, ConsoleEntry,
     DebugCapture, NetworkEntry, TailPlan,
 };
-use werust_core::ens;
 use werust_core::ethereum::RpcProvider;
 use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::{
@@ -550,7 +549,8 @@ enum Command {
         url: String,
     },
     /// `werust resolve <name> [--json]`: resolve an ENS name headlessly and print
-    /// the contenthash reference it points at.
+    /// the `ipfs://<cid>` it loads — FOLLOWING a mutable `ipns-ns` pointer through
+    /// its client-verified record, exactly as the GUI does.
     Resolve {
         /// The ENS name to resolve, exactly as typed (the ENS core normalizes it,
         /// and refuses an unnormalizable name fail-closed).
@@ -583,10 +583,16 @@ fn usage() -> String {
          Usage:\n\
          \x20 werust                      open the browser GUI on {DEFAULT_URL}\n\
          \x20 werust <url>                open the browser GUI on <url>\n\
-         \x20 werust resolve <ens-name>   resolve an ENS name to its contenthash reference\n\
+         \x20 werust resolve <ens-name>   resolve an ENS name to the ipfs://<cid> it loads\n\
          \x20 werust resolve --json <n>   the same, as one JSON object\n\
          \x20 werust version              print the version banner (also --version, -V)\n\
          \x20 werust --help               print this message (also -h)\n\
+         \n\
+         `resolve` performs the FULL resolution the browser performs: a name whose\n\
+         ENS contenthash is a MUTABLE ipns-ns pointer is followed through its\n\
+         client-verified IPNS record to the CID it points at right now. stdout is\n\
+         always the bare ipfs://<cid>; the mutable step is noted on stderr, and\n\
+         --json carries both the followed pointer and the CID.\n\
          \n\
          The ENS read goes through the RPC endpoint WERUST_RPC_URL names, else the\n\
          compiled-in default (the same endpoint the GUI uses).",
@@ -640,48 +646,77 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Command {
     }
 }
 
-/// Format the OUTPUT of a headless `resolve` for a decoded contenthash: the
-/// reference line (or its one-object JSON form), or the protocol-named REFUSAL
-/// for a contenthash werust cannot express as a reference.
+/// What a successful headless `resolve` writes: the stdout `line` (the RESULT),
+/// plus the optional stderr `note` that keeps the answer honest.
 ///
-/// The success form is a single BARE reference line so `$(werust resolve …)` is
-/// directly usable in a script, and the `--json` form carries the same facts as
-/// one flat object (`name`, `kind`, `reference`) hand-rolled with `format!` — no
-/// serde in the binary (task `headless-cli-mode`).
+/// Two streams because they serve two readers. stdout stays a single bare
+/// machine-usable value (`$(werust resolve …)` is directly usable in a script,
+/// the property `headless-cli-mode` established), so the mutable-name warning
+/// cannot be appended to it; stderr is the HUMAN channel this binary already uses
+/// for its reasons, so the warning goes there and nothing is hidden.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolveOutput {
+    /// The stdout line: the `ipfs://<cid>` reference, or the one-object JSON form.
+    line: String,
+    /// The stderr note, for a MUTABLE name in the human (non-`--json`) form.
+    note: Option<String>,
+}
+
+/// Format the OUTPUT of a headless `resolve` for a resolved name: the
+/// `ipfs://<cid>` line (or its one-object JSON form), plus the mutable-name note
+/// when the CID came from a followed `ipns-ns` pointer.
 ///
-/// The two loadable contenthash kinds are reported DISTINCTLY, never flattened
-/// into one "ipfs" answer: an `ipfs-ns` name yields its immutable `ipfs://<cid>`,
-/// and a MUTABLE `ipns-ns` name yields the `ipns://<name>` pointer it really is
-/// (`docs/adr/0006`/`0007`: the mutable name is its own honest posture). This
-/// subcommand does NOT follow that pointer to its current CID — that is the IPNS
-/// record fetch + verify step, which is content retrieval (the out-of-scope
-/// `fetch` subcommand), not the ENS read this verb performs. A later `--follow`
-/// (or `fetch`) can add it without changing what `resolve` means.
+/// `resolve` performs the FULL resolution the browser performs — a name whose
+/// contenthash is a MUTABLE `ipns-ns` pointer is followed through its
+/// client-verified record to the CID it points at right now (task
+/// `cli-resolve-follows-mutable-names-to-the-cid`) — so the printed reference is
+/// the one werust itself can open, not the `ipns://` pointer its own URL bar
+/// cannot (`docs/adr/0007` decision 4).
 ///
-/// [`Err`] is the fail-closed arm: a well-formed contenthash for an unsupported
-/// protocol is the DECODER's own named reason, printed to stderr with exit 1 —
-/// never printed as if it were a loadable reference. (`ens::resolve` already maps
-/// that case to `Err(UnsupportedContenthash)`, so it does not normally arrive
-/// here; dispatching on the decoded kind's OWN shape means a contract change
-/// cannot turn it into fake output.)
-fn resolve_output(name: &str, decoded: &DecodedContenthash, json: bool) -> Result<String, String> {
-    let (kind, reference) = match decoded {
-        DecodedContenthash::Ipfs { uri, .. } => ("ipfs", uri.clone()),
-        DecodedContenthash::Ipns { name } => ("ipns", format!("ipns://{name}")),
-        other => {
-            return Err(other
-                .reason()
-                .unwrap_or_else(|| "unsupported contenthash protocol".to_string()));
-        }
-    };
+/// But following is NOT flattening (`docs/adr/0006`): a mutable name's CID is
+/// "what it points at right now", so the mutable fact rides along with it — a
+/// stderr NOTE in the human form, and BOTH facts (`mutable`, the followed
+/// `pointer`, AND the resolved `cid`) in the `--json` object, so a script that
+/// pins the CID can see it came from a mutable name. The `--json` form gets no
+/// note: it already carries the fact in the object, and a script's stderr should
+/// stay quiet on success.
+///
+/// The `kind` value is the CORE's protocol vocabulary
+/// ([`ProtoCode::wire_name`](werust_core::contenthash::ProtoCode::wire_name):
+/// the ENSIP-7 `ipfs-ns` / `ipns-ns` spelling the decoder dispatches on), never a
+/// spelling minted in this binary, so a later `fetch` verb cannot fork a second
+/// one. The object itself is hand-rolled with `format!` — no serde in the binary
+/// (task `headless-cli-mode`).
+fn resolve_output(name: &str, resolved: &ResolvedName, json: bool) -> ResolveOutput {
     if json {
-        Ok(format!(
-            "{{\"name\":\"{}\",\"kind\":\"{kind}\",\"reference\":\"{}\"}}",
-            json_escape(name),
-            json_escape(&reference)
-        ))
-    } else {
-        Ok(reference)
+        // A stable shape: the same keys for both kinds, with `pointer` null when
+        // there was no mutable pointer to follow, so a consumer reads one form.
+        let pointer = match resolved.mutable_pointer() {
+            Some(pointer) => format!("\"{}\"", json_escape(pointer)),
+            None => "null".to_string(),
+        };
+        return ResolveOutput {
+            line: format!(
+                "{{\"name\":\"{name}\",\"kind\":\"{kind}\",\"reference\":\"{reference}\",\
+                 \"cid\":\"{cid}\",\"mutable\":{mutable},\"pointer\":{pointer}}}",
+                name = json_escape(name),
+                kind = resolved.proto_code().wire_name(),
+                reference = json_escape(resolved.uri()),
+                cid = json_escape(resolved.cid()),
+                mutable = resolved.is_mutable(),
+            ),
+            note: None,
+        };
+    }
+    ResolveOutput {
+        line: resolved.uri().to_string(),
+        note: resolved.mutable_pointer().map(|pointer| {
+            format!(
+                "werust: {name} is a MUTABLE name ({pointer}): this is the CID its \
+                 client-verified IPNS record points at right now, and its controller \
+                 can repoint it."
+            )
+        }),
     }
 }
 
@@ -707,32 +742,41 @@ fn json_escape(text: &str) -> String {
     out
 }
 
-/// Run the headless `resolve` subcommand: resolve `name` through the ENS core and
-/// print [`resolve_output`], with a Unix exit status.
+/// Run the headless `resolve` subcommand: resolve `name` through the core's ONE
+/// name-resolution path and print [`resolve_output`], with a Unix exit status.
+///
+/// The resolution is [`werust_core::name_resolution::resolve_name`] — the SAME
+/// function [`BrowserShell`]'s ENS front door calls, so the CLI prints exactly
+/// what the GUI would load for that name, including following a MUTABLE
+/// `ipns-ns` contenthash through its client-VERIFIED IPNS record. There is no
+/// second implementation to drift: a record that fails verification fails this
+/// command the same way it fails the browser's load.
 ///
 /// NO GTK is touched on this path — no [`Application`], no window, not even
 /// `gtk::init` — so it runs over ssh, in CI and in any environment with no
-/// display. The provider is [`RpcProvider::new`], the SAME endpoint source the GUI
-/// shell builds (the `WERUST_RPC_URL` env lever, else the compiled default), so a
-/// CLI resolution and the browser's own address-bar resolution can never disagree
-/// about which chain they read.
+/// display. The provider is [`RpcProvider::new`] and the record source is
+/// [`werust_core::ipns::default_record_source`], the SAME endpoint sources the
+/// GUI shell builds (the `WERUST_RPC_URL` env lever and the user's chosen
+/// retrieval backend), so a CLI resolution and the browser's own address-bar
+/// resolution can never disagree about which chain or which gateway they read.
 ///
 /// A failure prints the core's OWN typed reason to stderr (`werust: {e}`, the
 /// formatting the GUI surfaces too) and exits 1, so a script can branch on the
 /// status instead of parsing stdout.
 fn run_resolve(name: &str, json: bool) -> glib::ExitCode {
     let provider = RpcProvider::new();
-    match ens::resolve(&provider, name) {
-        Ok(decoded) => match resolve_output(name, &decoded, json) {
-            Ok(line) => {
-                println!("{line}");
-                glib::ExitCode::SUCCESS
+    let ipns_source = werust_core::ipns::default_record_source();
+    match werust_core::name_resolution::resolve_name(&provider, &ipns_source, name) {
+        Ok(resolved) => {
+            let output = resolve_output(name, &resolved, json);
+            // The mutable-name note goes FIRST and to stderr, so stdout stays the
+            // bare result a script consumes.
+            if let Some(note) = output.note {
+                eprintln!("{note}");
             }
-            Err(reason) => {
-                eprintln!("werust: {reason}");
-                glib::ExitCode::FAILURE
-            }
-        },
+            println!("{}", output.line);
+            glib::ExitCode::SUCCESS
+        }
         Err(e) => {
             eprintln!("werust: {e}");
             glib::ExitCode::FAILURE
@@ -1291,14 +1335,14 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 mod tests {
     use super::{
         app_id, banner, parse_args, resolve_output, should_open_web_inspector, usage, Command,
-        APP_CSS, DEFAULT_URL,
+        ResolveOutput, ResolvedName, APP_CSS, DEFAULT_URL,
     };
     use gtk4::prelude::*;
     use gtk4::{gdk, gio, Label};
     use renderer::TrustPosture;
     use std::cell::RefCell;
     use std::rc::Rc;
-    use werust_core::contenthash::{DecodedContenthash, ProtoCode};
+    use werust_core::contenthash::ProtoCode;
     use werust_core::debug::{ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry};
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
     use werust_core::CssClassFamily;
@@ -1790,67 +1834,94 @@ mod tests {
     }
 
     #[test]
-    fn resolve_prints_the_decoded_reference_and_fails_closed_on_an_unsupported_one() {
-        // Acceptance (task `headless-cli-mode`): `werust resolve <name>` prints the
-        // resolved contenthash REFERENCE on stdout (one bare line, so
+    fn resolve_prints_the_ipfs_reference_for_an_immutable_name() {
+        // Acceptance (task `headless-cli-mode`, kept): `werust resolve <name>`
+        // prints the resolved reference on stdout as ONE bare line (so
         // `$(werust resolve …)` is directly usable), and `--json` prints the same
         // facts as one machine-readable object. Pure, so the formatting is pinned
         // without a network or a display.
-        let ipfs = DecodedContenthash::Ipfs {
+        //
+        // The `kind` is the CORE's ENSIP-7 vocabulary (`ProtoCode::wire_name`),
+        // never a spelling minted in this binary (task
+        // `cli-resolve-follows-mutable-names-to-the-cid`).
+        let immutable = ResolvedName::Immutable {
             uri: "ipfs://bafkreiabc".into(),
             cid: "bafkreiabc".into(),
         };
         assert_eq!(
-            resolve_output("example.eth", &ipfs, false),
-            Ok("ipfs://bafkreiabc".to_string())
+            resolve_output("example.eth", &immutable, false),
+            ResolveOutput {
+                line: "ipfs://bafkreiabc".to_string(),
+                note: None,
+            },
+            "an immutable name prints its CID with nothing to warn about"
         );
         assert_eq!(
-            resolve_output("example.eth", &ipfs, true),
-            Ok(
-                "{\"name\":\"example.eth\",\"kind\":\"ipfs\",\"reference\":\"ipfs://bafkreiabc\"}"
-                    .to_string()
-            )
+            resolve_output("example.eth", &immutable, true),
+            ResolveOutput {
+                line: "{\"name\":\"example.eth\",\"kind\":\"ipfs-ns\",\
+                       \"reference\":\"ipfs://bafkreiabc\",\"cid\":\"bafkreiabc\",\
+                       \"mutable\":false,\"pointer\":null}"
+                    .to_string(),
+                note: None,
+            }
         );
+        assert_eq!(
+            ProtoCode::Ipfs.wire_name(),
+            "ipfs-ns",
+            "the printed kind IS the core's vocabulary, not a literal here"
+        );
+    }
 
-        // A MUTABLE `ipns-ns` contenthash is reported as the `ipns://<name>`
-        // pointer it is — honestly distinct from an immutable `ipfs://` reference,
-        // and NOT followed (following a record is the fetch path, not this ENS
-        // read; see the module docs).
-        let ipns = DecodedContenthash::Ipns {
-            name: "k51qzifixture".into(),
+    #[test]
+    fn resolve_follows_a_mutable_name_to_the_cid_and_keeps_saying_it_is_mutable() {
+        // Acceptance (task `cli-resolve-follows-mutable-names-to-the-cid`): a name
+        // whose ENS contenthash is a MUTABLE `ipns-ns` pointer resolves through to
+        // the `ipfs://<cid>` the GUI would actually load — the CLI no longer prints
+        // the `ipns://` pointer werust's own URL bar cannot open. But the mutable
+        // fact is NOT lost (`docs/adr/0006`): the human form says so on stderr, and
+        // `--json` carries BOTH the followed pointer and the resolved CID, so a
+        // script that pins the CID can see where it came from.
+        let mutable = ResolvedName::Mutable {
+            pointer: "ipns://k51qzifixture".into(),
+            uri: "ipfs://bafkreicurrent".into(),
+            cid: "bafkreicurrent".into(),
         };
+
+        let human = resolve_output("ronan.eth", &mutable, false);
         assert_eq!(
-            resolve_output("ronan.eth", &ipns, false),
-            Ok("ipns://k51qzifixture".to_string())
+            human.line, "ipfs://bafkreicurrent",
+            "stdout is the loadable CID, one bare line"
         );
-        assert_eq!(
-            resolve_output("ronan.eth", &ipns, true),
-            Ok(
-                "{\"name\":\"ronan.eth\",\"kind\":\"ipns\",\"reference\":\"ipns://k51qzifixture\"}"
-                    .to_string()
-            )
+        let note = human.note.expect("a mutable name carries a note");
+        assert!(
+            note.contains("MUTABLE") && note.contains("ipns://k51qzifixture"),
+            "the note names the mutability AND the followed pointer: {note}"
         );
 
-        // Fail-closed: a well-formed contenthash for a protocol werust does not
-        // support is the decoder's OWN protocol-named refusal on stderr (exit 1),
-        // never printed as if it were a loadable reference.
-        let unsupported = DecodedContenthash::Unsupported(ProtoCode::Swarm);
-        let reason = resolve_output("example.eth", &unsupported, false)
-            .expect_err("an unsupported contenthash must be a refusal, not output");
-        assert!(
-            reason.contains("Swarm"),
-            "the refusal names the protocol: {reason}"
+        assert_eq!(
+            resolve_output("ronan.eth", &mutable, true),
+            ResolveOutput {
+                line: "{\"name\":\"ronan.eth\",\"kind\":\"ipns-ns\",\
+                       \"reference\":\"ipfs://bafkreicurrent\",\"cid\":\"bafkreicurrent\",\
+                       \"mutable\":true,\"pointer\":\"ipns://k51qzifixture\"}"
+                    .to_string(),
+                // `--json` already carries the fact in the object, so a scripted
+                // success stays quiet on stderr.
+                note: None,
+            }
+        );
+        assert_eq!(
+            ProtoCode::Ipns.wire_name(),
+            "ipns-ns",
+            "the mutable kind is the core's ENSIP-7 spelling too"
         );
 
         // The JSON is escaped, so a name carrying a quote/backslash cannot break
         // the object it is embedded in (hand-rolled output, no serde).
-        assert_eq!(
-            resolve_output("a\"b\\c", &ipns, true),
-            Ok(
-                "{\"name\":\"a\\\"b\\\\c\",\"kind\":\"ipns\",\"reference\":\"ipns://k51qzifixture\"}"
-                    .to_string()
-            )
-        );
+        assert!(resolve_output("a\"b\\c", &mutable, true)
+            .line
+            .starts_with("{\"name\":\"a\\\"b\\\\c\","));
     }
 
     #[test]

@@ -527,7 +527,7 @@ impl BrowserShell {
 pub mod provider {
     use renderer::ScriptMessage;
     pub const PROVIDER_BRIDGE: &str = "werustProvider";
-    pub const STUB_CHAIN_ID: &str = "0x1";
+    pub const CHAIN_ID: &str = "0x1";
     pub struct ProviderBridge;
     impl ProviderBridge {
         pub fn new() -> Self {

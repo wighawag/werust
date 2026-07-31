@@ -54,13 +54,13 @@ So the flag flip alone would have left the lint half of the gate advisory: stric
 
 ## What the flipped gate covers, and what it cannot
 
-The Ubuntu gate compiles all 18 workspace members, so `--all-targets` lints every lib, bin, integration test, `#[cfg(test)]` module and example that compiles on Linux:
+The Ubuntu gate compiles all 17 workspace members, so `--all-targets` lints every lib, bin, integration test, `#[cfg(test)]` module and example that compiles on Linux:
 
 - **Fully covered** (whole crate, tests included): `werust`, `werust-core`, `renderer`, `fetcher`, `script-engine`, `webview-renderer`, `webview-shared`, `desktop-paint`, `native-renderer`.
 - **Fully covered too, despite being "mobile"**: `werust-android-core` and `werust-ios-core` are plain Rust on Linux; only android's `jni_exports` module (`crates/werust-android/rust/src/lib.rs` ~947-1449) is `#[cfg(target_os = "android")]`. Their Kotlin and Swift edges are of course not Rust and are outside clippy entirely.
 - **Host-independent half only**: `macos-renderer`, `werust-macos`, `macos-origin-probe`, `windows-renderer`, `werust-windows`, `windows-origin-probe`. The gate lints their pure decision rules (`pure.rs`, `facts.rs`, `cli.rs`, `profile.rs`, `page.rs`), their unit tests and their source-shape guards, which is genuinely most of what those crates are ASSERTED on. It does not, and cannot, lint the platform half:
 
-  | Unlinted on Ubuntu | Lines |
+  | Not linted by the Ubuntu gate | Lines |
   | --- | --- |
   | `crates/windows-renderer/src/backend.rs` | 1565 |
   | `crates/werust-macos/src/window.rs` | 1304 |
@@ -73,12 +73,42 @@ The Ubuntu gate compiles all 18 workspace members, so `--all-targets` lints ever
   | `crates/werust-windows/src/win32.rs` | 207 |
   | plus each `main.rs`'s platform arm and `werust-android`'s `jni_exports` | ~550 |
 
-  Roughly 7.5k lines of platform Rust, still unlinted after this change.
+  Roughly 7.5k lines of platform Rust, which no GATE lints after this change. They are not unlinted, though: the two cross-target harnesses below already run clippy over most of them from Linux, just by hand and at a lower bar.
 
-- **Examples.** There are eight and no benches. `werust-core/examples/{print_version,chrome_json_cost}.rs`, `native-renderer/examples/render_subset.rs` and `webview-renderer/examples/navigate_and_show.rs` are linted in full. The four load-bearing CI smokes (`macos-renderer/examples/trust_hooks_smoke.rs`, `werust-macos/examples/window_smoke.rs`, `windows-renderer/examples/trust_hooks_smoke.rs`, `werust-windows/examples/window_smoke.rs`) are `#[cfg]`-gated to their platform, so `--all-targets` on Linux lints only their `#[cfg(not(...))]` stub `main`. Their real bodies are in the unlinted set above.
+- **Examples.** There are eight and no benches. `werust-core/examples/{print_version,chrome_json_cost}.rs`, `native-renderer/examples/render_subset.rs` and `webview-renderer/examples/navigate_and_show.rs` are linted in full. The four load-bearing CI smokes (`macos-renderer/examples/trust_hooks_smoke.rs`, `werust-macos/examples/window_smoke.rs`, `windows-renderer/examples/trust_hooks_smoke.rs`, `werust-windows/examples/window_smoke.rs`) are `#[cfg]`-gated to their platform, so `--all-targets` on Linux lints only their `#[cfg(not(...))]` stub `main`. Their real bodies are in the platform set above.
 
 Read `--all-targets` as "every TARGET on this host", never as "every crate".
 
-## The follow-on this deliberately does not do
+## What the two cross-target harnesses lint (and at what bar)
 
-`.github/workflows/macos-renderer.yml` and `.github/workflows/windows-renderer.yml` already build, test and RUN those crates on native runners, but neither runs clippy at all. Adding the same `cargo clippy --all-targets -- -D warnings` (scoped with `-p`) to those two legs is the cheap way to cover the ~7.5k lines above, and it needs no cross-target trick: the platform half already compiles there. Out of scope here because it lands lint debt discovery on legs this task cannot see the output of, and because clearing whatever it finds is its own inventory. Captured in `work/notes/observations/platform-ci-legs-never-run-clippy-2026-07-31.md`.
+The task asked whether the cross-target type-check harnesses can cheaply lint the platform halves from Linux. They already DO, which is why the table above says no GATE lints those lines rather than that they are unlinted:
+
+| Harness | Invocation | Bar |
+| --- | --- | --- |
+| `docs/spikes/windows-webview2-renderer-backend/typecheck-windows-from-linux.sh` | `cargo xwin clippy -p windows-renderer -p werust-windows --target x86_64-pc-windows-msvc --tests --examples` | `--tests --examples`, no `-D warnings` |
+| `docs/spikes/macos-wkwebview-renderer-backend/typecheck-macos-from-linux.sh` | scratch-workspace `cargo clippy --target aarch64-apple-darwin --all-targets` (the ENGINE, against stand-in `werust-core`/`fetcher`) | `--all-targets`, no `-D warnings` |
+| (same script) | `cargo clippy -p werust-macos --target aarch64-apple-darwin --lib --examples` | bin arm and unit tests excluded on purpose, no `-D warnings` |
+| (same script) | `cargo clippy -p macos-origin-probe --target aarch64-apple-darwin --all-targets` (in the repo) | `--all-targets`, no `-D warnings` |
+
+Three differences from the gate matter, and all three are why this is coverage rather than a guarantee. They are DEVELOPER TOOLS a human runs by hand, so nothing fails when nobody runs them. None passes `-D warnings`, so clippy prints and exits 0, which is the same toothlessness this task just removed from `verify`. And they are narrower than `--all-targets`: the Windows one is `--tests --examples`, `werust-macos` is `--lib --examples` only (its unit tests assert against the REAL core, which the stand-in cannot judge), and neither `windows-origin-probe`'s `#[cfg(windows)]` half nor `werust-android`'s `jni_exports` is in any harness at all.
+
+## The follow-ons this deliberately does not do
+
+Two levers, in rising cost. Both are captured in `work/notes/observations/platform-ci-legs-never-run-clippy-2026-07-31.md`; whether either becomes a task is the human's call.
+
+### 1. Raise the two harnesses to the gate's bar (`--all-targets -- -D warnings`)
+
+This is the cheaper one, and it is the one the task named: one flag per invocation in two committed shell scripts, no new infrastructure, and it holds the platform halves to the standard the rest of the tree now is. MEASURED on 2026-07-31 (cargo 1.91.1 / clippy 0.1.91, Linux) by running each leg at the raised bar WITHOUT editing the scripts:
+
+| Leg, at `--all-targets -- -D warnings` | Result |
+| --- | --- |
+| `typecheck-windows-from-linux.sh --all-targets -- -D warnings` (`windows-renderer` + `werust-windows`) | exit **0**, clean |
+| the macOS engine, in the harness's scratch workspace | exit **0**, clean |
+| `-p macos-origin-probe --target aarch64-apple-darwin` | exit **0**, clean |
+| `-p werust-macos` | **not measurable**: that leg no longer compiles at all, because the harness's stand-in core has drifted behind the real one (`work/notes/observations/macos-typecheck-harness-standin-core-drifted-2026-07-31.md`) |
+
+So for three of the four legs the cost is zero lint debt: the flags can be raised today and stay green. The fourth needs the stand-in repaired first, which is that note's business and not a lint question. Not done here because this task's scope was the Ubuntu gate, and because raising a harness whose fourth leg is red would land a knowingly-red developer tool, which is the same ordering mistake the task's do-both-halves-in-one-change rule exists to avoid.
+
+### 2. Add clippy to the two platform CI legs
+
+`.github/workflows/macos-renderer.yml` and `.github/workflows/windows-renderer.yml` already build, test and RUN those crates on native runners, but neither runs clippy at all. Adding the same `cargo clippy --all-targets -- -D warnings` (scoped with `-p`) to those two legs is what turns the harness coverage above into a GATE, and it needs no cross-target trick and no stand-in core: the platform half already compiles there, so it is also the only lever that reaches `windows-origin-probe`'s Win32 half and the four smokes' real bodies. Out of scope here because it lands lint-debt discovery on legs this task cannot see the output of, and because clearing whatever it finds is its own inventory.

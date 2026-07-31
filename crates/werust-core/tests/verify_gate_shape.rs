@@ -24,6 +24,10 @@
 //! Ubuntu gate cannot compile the `#[cfg(target_os = "macos")]` /
 //! `#[cfg(windows)]` halves of the platform crates, so `--all-targets` lints
 //! their host-independent halves and their platform halves stay unlinted there.
+//! (Those halves ARE linted from Linux by the two cross-target harnesses,
+//! `docs/spikes/{windows-webview2-renderer-backend/typecheck-windows-from-linux,
+//! macos-wkwebview-renderer-backend/typecheck-macos-from-linux}.sh`, but by hand
+//! and at a lower bar than this gate: no `-D warnings`.)
 //! The honest inventory is in
 //! `docs/spikes/verify-lints-test-targets-and-clears-the-existing-debt/README.md`.
 

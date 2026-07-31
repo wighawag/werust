@@ -1,0 +1,5 @@
+# The macOS cross-target typecheck harness is red: its stand-in core drifted behind the real one
+
+2026-07-31, noticed while re-checking harness coverage for `verify-lints-test-targets-and-clears-the-existing-debt` (out of that task's scope, not fixed).
+
+`docs/spikes/macos-wkwebview-renderer-backend/typecheck-macos-from-linux.sh` fails on its second leg (`-p werust-macos --lib --examples`) before clippy can say anything: `crates/desktop-paint` is symlinked in as REAL source but compiled against the script's stand-in `fake-core`, and that stand-in lacks `trust_pin_action_label`, `trust_pin_action_visible` and `trust_pin_detail`, which `desktop-paint` has imported since `ipns-tofu-pin-and-warn-on-change` (`e772025`). So `error[E0432]: unresolved imports`, and the AppKit window half has not actually been type-checked from Linux since that task landed. The first leg (the engine) and the third (`macos-origin-probe`) still pass. Fix is three stub `fn`s in the harness's `fake-core`, but the recurring shape is that the stand-in has no guard forcing it to keep up with the real core.

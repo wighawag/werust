@@ -12,7 +12,29 @@
 //! the ordinary Ubuntu gate rather than trusting to review.
 //!
 //! It is cheap: the guard refuses BEFORE any `rustup`/`cargo` work, so the
-//! refusal path costs one `bash` process and touches no network.
+//! refusal path costs one `bash` process and touches no network. The ALLOW path
+//! costs one more `bash` process, because `rustup` and `cargo` are STUBBED on
+//! `PATH` for it -- so both halves of the guard are EXECUTED on every ordinary
+//! gate run, and with the allow path goes the harness's whole prologue. That is
+//! deliberate (task `macos-harness-guard-teeth-and-paint-path-residue`, item 1):
+//! the allow assertion used to be reachable only on a host where NO location is
+//! outside a temp root, i.e. never on the gate, so the repaired harness body was
+//! never RUN by CI at all -- the only other test on it matches its source TEXT.
+//! The `desktop-paint` extraction broke this harness for exactly as long as
+//! nothing executed it.
+//!
+//! WHY THIS TEST WRITES INTO THE REAL `$HOME`. The refusal can only be provoked
+//! with a `SCRATCH_DIR` that is genuinely outside every temp root, and `$HOME` is
+//! the one such location a developer machine and a CI runner agree on (the repo's
+//! `target/` and the working directory are the fallbacks, and on the acceptance
+//! gate both sit UNDER a temp root). Writing there is safe and is not the
+//! shared-write violation it looks like: the victim is a hidden directory this
+//! test CREATES, named for this process (`…-probe-<pid>`, so two runs sharing a
+//! `HOME` -- two worktrees, a parallel gate -- cannot delete each other's), it
+//! holds one file this test wrote, nothing else in the repo reads or writes that
+//! name, and it is removed UNCONDITIONALLY (before the assertions, so a failing
+//! assertion still leaves the home directory clean). The harness itself never
+//! deletes it: refusing to is the entire point of the assertion.
 //!
 //! WHY THE VICTIM DIRECTORY IS CHOSEN AND NOT HARD-CODED. The first version of
 //! this test built its victim under `target/`, calling that "not a temp root".
@@ -88,6 +110,11 @@ fn is_under_a_temp_root(path: &Path) -> bool {
 /// for the odd host with no `HOME`. Each candidate is checked with the guard's
 /// rule rather than assumed, so this returns `None` rather than a wrong answer
 /// when a host has genuinely put everything under a temp root.
+///
+/// The name carries this PROCESS's id, exactly as the allow path's scratch and
+/// stub directories do: two gate runs sharing a `HOME` (two worktrees, or a
+/// parallel gate) would otherwise pick the same victim and delete each other's
+/// mid-assertion, which reads exactly like the guard breaking.
 #[cfg(unix)]
 fn a_probe_dir_outside_every_temp_root() -> Option<PathBuf> {
     let bases = [
@@ -95,10 +122,14 @@ fn a_probe_dir_outside_every_temp_root() -> Option<PathBuf> {
         Some(repo_root().join("target")),
         std::env::current_dir().ok(),
     ];
+    let name = format!(
+        ".werust-typecheck-harness-guard-probe-{}",
+        std::process::id()
+    );
     bases
         .into_iter()
         .flatten()
-        .map(|base| base.join(".werust-typecheck-harness-guard-probe"))
+        .map(|base| base.join(&name))
         .find(|candidate| !is_under_a_temp_root(candidate))
 }
 
@@ -110,11 +141,17 @@ fn the_harness_refuses_to_delete_a_scratch_dir_outside_a_temp_root() {
     // REFUSE, legibly, and leave every file where it found it.
     let Some(victim) = a_probe_dir_outside_every_temp_root() else {
         // No location on this host is outside a temp root -- `HOME`, the checkout
-        // and the working directory are all inside one -- so the refusal cannot
-        // be provoked here. Assert the CONVERSE instead of skipping: the guard
-        // still has to ALLOW the delete it exists to permit, and a guard whose
-        // teeth are quietly ignored is the footgun it was meant to close.
-        assert_the_harness_deletes_a_scratch_dir_under_a_temp_root();
+        // and the working directory are all inside one -- so there is no path to
+        // offer the harness that it is REQUIRED to refuse, and nothing here can
+        // be asserted without asserting something false. The guard's other half
+        // is unaffected: `the_harness_deletes_a_scratch_dir_under_a_temp_root`
+        // runs unconditionally, on this host as on any other, so the teeth are
+        // never wholly ignored (which is why this arm no longer stands in for it
+        // -- the two tests must not depend on each other's environment).
+        eprintln!(
+            "note: every candidate location on this host is under a temp root, so the harness's \
+             REFUSAL cannot be provoked here; the allow path is asserted by its own test"
+        );
         return;
     };
     std::fs::create_dir_all(&victim).unwrap_or_else(|e| panic!("create the probe dir: {e}"));
@@ -152,15 +189,28 @@ fn the_harness_refuses_to_delete_a_scratch_dir_outside_a_temp_root() {
     }
 }
 
-/// The other half of the guard's teeth, used where the refusal cannot be
-/// provoked: a `SCRATCH_DIR` that IS under a temp root must still be rebuilt from
-/// nothing, or the harness would refuse its own default and be simply broken.
+/// The other half of the guard's teeth, and the only thing in this repo that
+/// EXECUTES the harness: a `SCRATCH_DIR` that IS under a temp root must still be
+/// rebuilt from nothing, or the harness would refuse its own default and be
+/// simply broken.
+///
+/// UNCONDITIONAL on purpose. This assertion used to be reachable only from the
+/// refusal test's fallback arm -- i.e. only on a host where nothing is outside a
+/// temp root -- so on every ordinary host, the gate included, the harness's body
+/// was never run at all and `the_harnesss_default_scratch_dir_stays_under_a_temp_root`
+/// only string-matched its source. That is the blind spot the `desktop-paint`
+/// extraction slipped through.
 ///
 /// `rustup` and `cargo` are stubbed on `PATH` so this costs a shell run rather
 /// than a cross-target `cargo clippy` (and never reaches the network): the
-/// delete happens in the script's own prologue, long before any real work.
+/// delete happens in the script's own prologue, long before any real work. What
+/// the stub COSTS is stated where the claim is made
+/// (`docs/spikes/macos-wkwebview-renderer-backend/README.md`): the type-check
+/// itself is not re-run here, so this proves the harness ASSEMBLES, not that the
+/// macOS sources compile.
 #[cfg(unix)]
-fn assert_the_harness_deletes_a_scratch_dir_under_a_temp_root() {
+#[test]
+fn the_harness_deletes_a_scratch_dir_under_a_temp_root() {
     let unique = std::process::id();
     let stubs = std::env::temp_dir().join(format!("werust-harness-guard-stubs-{unique}"));
     std::fs::create_dir_all(&stubs).unwrap_or_else(|e| panic!("create the stub bin dir: {e}"));
@@ -189,6 +239,7 @@ fn assert_the_harness_deletes_a_scratch_dir_under_a_temp_root() {
         .expect("run the committed macOS type-check harness");
 
     let rebuilt = !doomed.exists();
+    let dangling = dangling_symlinks(&scratch);
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
     let status = output.status;
     std::fs::remove_dir_all(&scratch).ok();
@@ -206,6 +257,42 @@ fn assert_the_harness_deletes_a_scratch_dir_under_a_temp_root() {
         status.success(),
         "the harness must run through with `rustup`/`cargo` stubbed, got {status}:\n{stderr}"
     );
+    // The one failure the stubs would otherwise HIDE. The workspace is assembled
+    // by symlinking the REAL sources out of `crates/`, and `ln -s` is perfectly
+    // happy to point at a file that no longer exists -- so a crate that moves
+    // (the `desktop-paint` extraction did exactly this to `paint.rs`) leaves a
+    // dangling link that only reds at `cargo check` time, which the stub never
+    // reaches. Asserting the assembled tree resolves is what puts THAT breakage
+    // in front of the ordinary gate rather than the next macOS agent.
+    assert!(
+        dangling.is_empty(),
+        "the harness assembled its scratch workspace with symlinks that point at nothing -- a \
+         source it mirrors has MOVED or been deleted: {dangling:?}"
+    );
+}
+
+/// Every symlink under `dir` whose target does not exist, without following the
+/// links (so this walks the harness's OWN tree, not the repo it points into).
+#[cfg(unix)]
+fn dangling_symlinks(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_symlink() {
+            if !path.exists() {
+                out.push(path);
+            }
+        } else if kind.is_dir() {
+            out.extend(dangling_symlinks(&path));
+        }
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -221,9 +308,11 @@ fn write_stub(dir: &Path, name: &str, body: &str) {
 fn the_harnesss_default_scratch_dir_stays_under_a_temp_root() {
     // The guard is only tolerable because the DEFAULT is inside what it allows:
     // a harness that refused its own default would just be broken. Pinned on the
-    // source rather than by running it, because the accepting path is a full
-    // `cargo clippy` against `aarch64-apple-darwin` (minutes, and a toolchain
-    // target the gate need not have installed).
+    // SOURCE, because the two tests above run the harness with an explicit
+    // `SCRATCH_DIR` and so say nothing about the value it falls back to; running
+    // it with no `SCRATCH_DIR` at all is the only way to observe that default,
+    // and that is a full `cargo clippy` against `aarch64-apple-darwin` (minutes,
+    // and a toolchain target the gate need not have installed).
     let harness = source(HARNESS);
     assert!(
         harness.contains(r#"SCRATCH="${SCRATCH_DIR:-${TMPDIR:-/tmp}/werust-macos-typecheck}""#),

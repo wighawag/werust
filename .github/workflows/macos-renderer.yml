@@ -16,7 +16,8 @@ name: macos-renderer
 #      debug view, loaded off-screen with a pinned content-addressed fixture,
 #      asserting what the real WIDGETS hold. That is the only place the AppKit
 #      layer is executed at all; everything derivable about it is already
-#      unit-tested on the Ubuntu gate (`crates/werust-macos/src/paint.rs`).
+#      unit-tested on the Ubuntu gate (`crates/desktop-paint`, the shared painter
+#      half both native desktop windows consume).
 #   4. MEASURES the `WKURLSchemeHandler` origin behaviour
 #      (`crates/macos-origin-probe`), which is what turns this repo's recorded
 #      iOS MECHANISM ANALYSIS into a runtime fact: both WebKit ports share the
@@ -56,26 +57,35 @@ on:
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
       - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"
-  # NARROWER than the push filter above, deliberately. The SPIKE DOCS paths are
-  # the one addition (task `macos-spike-doc-accuracy-and-harness-guard`, item 2):
-  # the RECORDED VERDICT -- `expected.json` and the verbatim run it is stamped
-  # from -- lives in the spike directory, so re-recording it after a deliberate
-  # re-decision is exactly the pull request that most needs WebKit re-measured
-  # against it, which is what the header above PROMISES happens. That claim and
-  # this list are held together by
-  # `the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger`
-  # in `crates/macos-renderer/tests/macos_backend_shape.rs`.
+  # NARROWER than the push filter above, deliberately, and pinned EXACTLY by
+  # `the_pull_request_filter_is_the_pinned_exact_set_and_push_carries_the_rest`
+  # in `crates/macos-renderer/tests/macos_backend_shape.rs`: this list is the one
+  # the paragraphs below describe, and neither can move without the other going
+  # red. It carries what is genuinely macOS-shaped, plus the SHARED painter and
+  # the SPIKE DOCS paths (task `macos-spike-doc-accuracy-and-harness-guard`,
+  # item 2): the RECORDED VERDICT -- `expected.json` and the verbatim run it is
+  # stamped from -- lives in the spike directory, so re-recording it after a
+  # deliberate re-decision is exactly the pull request that most needs WebKit
+  # re-measured against it, which is what the header above PROMISES happens. That
+  # claim and this list are also held together by
+  # `the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger`.
   #
-  # What stays PUSH-ONLY, and why: `crates/renderer/**` and `crates/fetcher/**`
-  # are the wider DEPENDENCY surface. A change to them can break this leg, but
-  # gating every such pull request on `macos-14` minutes is the exact cost the
-  # sibling `windows-renderer.yml` header states and refuses (pinned by
-  # `crates/werust-core/tests/windows_renderer_leg_shape.rs`). Watching them on
-  # `push` to `main` finds the breakage minutes after it merges, on a leg that
-  # gates nothing, and `workflow_dispatch` covers the deliberate case.
-  # `crates/werust-core/**` remains here, as it has since this leg landed; whether
-  # it should is an open question the human has flagged about this leg, and
-  # answering it is a decision of its own, not a side effect of a docs fix.
+  # WHAT STAYS PUSH-ONLY, AND WHY (the deliberate trade-off). `crates/renderer/**`,
+  # `crates/fetcher/**` and `crates/werust-core/**` are the wider DEPENDENCY
+  # surface. A change to them can break this leg, but gating every such pull
+  # request on `macos-14` minutes is a cost with no matching benefit: the leg
+  # would gate most core work in this repo, and a red cross-platform leg would
+  # block a change that has nothing to do with macOS. Watching them on `push` to
+  # `main` finds the breakage minutes after it merges, on a leg that gates
+  # nothing, and `workflow_dispatch` covers the deliberate case. That is exactly
+  # the trade the sibling `windows-renderer.yml` header states, and this leg now
+  # gives the same answer to the same question.
+  #
+  # `crates/werust-core/**` was on this filter from the day the leg landed and was
+  # REMOVED by task `macos-harness-guard-teeth-and-paint-path-residue`, which
+  # answered the open question the previous task deliberately left standing: two
+  # desktop legs disagreeing about whether a core PR is macOS-shaped is a
+  # difference nobody could act on, and the cost was the one the human flagged.
   pull_request:
     paths:
       - "crates/macos-renderer/**"
@@ -91,7 +101,6 @@ on:
       - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"
-      - "crates/werust-core/**"
       - "docs/spikes/macos-wkwebview-renderer-backend/**"
       - "docs/spikes/macos-appkit-window-and-chrome/**"
       - ".github/workflows/macos-renderer.yml"

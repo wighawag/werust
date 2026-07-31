@@ -130,8 +130,10 @@ const PULL_REQUEST_FILTER: &[&str] = &[
 
 /// The wider DEPENDENCY surface: built by the leg, deliberately NOT on the
 /// `pull_request` filter, and therefore watched on `push` to `main` instead.
-/// This is the trade-off the workflow header states and refuses to copy from
-/// `macos-renderer.yml`.
+/// This is the trade-off the workflow header states; `macos-renderer.yml` made
+/// the same choice later (task
+/// `macos-harness-guard-teeth-and-paint-path-residue`), so both desktop legs now
+/// pin the same shape.
 const PUSH_ONLY_DEPENDENCY_SURFACE: &[&str] = &[
     "crates/werust-core/**",
     "crates/fetcher/**",
@@ -386,13 +388,15 @@ fn the_registry_read_exists_in_exactly_one_place() {
 #[test]
 fn the_pull_request_filter_stays_narrow_and_push_carries_the_rest() {
     // The DELIBERATE trade-off (stated in the workflow header, recorded in
-    // docs/spikes/windows-renderer-ci-leg/README.md): the sibling
-    // `macos-renderer.yml` triggers on PRs touching `crates/werust-core/**`, so
-    // most core work now spends `macos-14` minutes and can be gated by a red
-    // cross-platform leg — a cost the human has flagged. This leg does NOT copy
-    // that. Its PR filter carries only what is genuinely Windows-shaped; the
-    // wider dependency surface is caught on `push` to `main` (early detection,
-    // no PR gating) and on demand via `workflow_dispatch`.
+    // docs/spikes/windows-renderer-ci-leg/README.md): this leg's PR filter
+    // carries only what is genuinely Windows-shaped; the wider dependency
+    // surface is caught on `push` to `main` (early detection, no PR gating) and
+    // on demand via `workflow_dispatch`. It landed as the counter-example to the
+    // sibling `macos-renderer.yml`, which triggered on PRs touching
+    // `crates/werust-core/**` — so most core work spent `macos-14` minutes and
+    // could be gated by a red cross-platform leg, a cost the human flagged. Task
+    // `macos-harness-guard-teeth-and-paint-path-residue` settled it this way on
+    // BOTH legs, so the two now agree rather than differing.
     //
     // This assertion is the guard against reflexive BROADENING: widening the PR
     // filter is a real decision, and it should have to change this test and the
@@ -413,9 +417,9 @@ fn the_pull_request_filter_stays_narrow_and_push_carries_the_rest() {
     for dependency_only in PUSH_ONLY_DEPENDENCY_SURFACE {
         assert!(
             !pr.iter().any(|p| p == dependency_only),
-            "the `pull_request` filter must NOT include `{dependency_only}`: that is the exact \
-             macOS-leg cost under review (every core PR spending Windows minutes and gateable by \
-             a red cross-platform leg). It is covered by the `push` filter and by \
+            "the `pull_request` filter must NOT include `{dependency_only}`: that is the cost \
+             both desktop legs refuse (every core PR spending cross-platform runner minutes and \
+             gateable by a red cross-platform leg). It is covered by the `push` filter and by \
              workflow_dispatch; got {pr:?}"
         );
     }

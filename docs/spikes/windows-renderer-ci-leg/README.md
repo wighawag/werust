@@ -110,6 +110,8 @@ Judgement calls made inside this task, recorded so a reviewer can ratify or reve
 
 **What it touches:** the macOS leg's own filter (this leg is now the counter-example in that review, not a second instance of the pattern), and every core PR's minute budget.
 
+**Settled 2026-07-31** by task `macos-harness-guard-teeth-and-paint-path-residue`: the review this choice fed ended the same way, and `macos-renderer.yml` dropped `crates/werust-core/**` from its `pull_request` filter (keeping it on `push`) and pinned its remaining set exactly, in this leg's shape. The two desktop legs no longer differ, so the paragraphs above describe how the answer was reached rather than a live divergence.
+
 **The cost, stated plainly:** a `werust-core`/`fetcher`/`renderer` change that breaks the Windows build is found minutes AFTER it merges, on a leg that gates nothing, rather than before. `windows_renderer_leg_shape.rs` asserts both halves — the narrow PR list and the wider push list — so broadening is a decision that has to change the test and the header comment together.
 
 ### D2 — the WebView2 registry read was EXTRACTED into a shared composite action, which edits a second workflow

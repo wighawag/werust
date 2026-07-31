@@ -84,17 +84,22 @@ name: windows-renderer
 #
 # WHAT STAYS OFF THE PR FILTER, AND WHY (the deliberate trade-off, unchanged
 # since this leg landed). The wider DEPENDENCY surface this leg builds
-# (`werust-core`, `fetcher`, `renderer`) is caught on `push` to `main` instead.
-# The sibling `macos-renderer.yml` triggers on PRs touching
-# `crates/werust-core/**`, so most core work spends `macos-14` minutes and can be
-# gated by a red cross-platform leg, a cost currently under review, and one this
-# leg does not copy: early detection WITHOUT gating every core PR on a
-# cross-platform runner, plus `workflow_dispatch` for the deliberate case (which
-# is this leg's whole purpose anyway). The cost of the trade is honest and
-# bounded: a core change that breaks the Windows build is found minutes after it
-# merges rather than before, on a leg that gates nothing. The same guard pins
-# this half too, so narrowing or broadening it stays a decision rather than a
-# reflex.
+# (`werust-core`, `fetcher`, `renderer`) is caught on `push` to `main` instead:
+# early detection WITHOUT gating every core PR on a cross-platform runner, plus
+# `workflow_dispatch` for the deliberate case (which is this leg's whole purpose
+# anyway). The cost of the trade is honest and bounded: a core change that breaks
+# the Windows build is found minutes after it merges rather than before, on a leg
+# that gates nothing. The same guard pins this half too, so narrowing or
+# broadening it stays a decision rather than a reflex.
+#
+# The sibling `macos-renderer.yml` USED to differ here -- it triggered on PRs
+# touching `crates/werust-core/**`, so most core work spent `macos-14` minutes and
+# could be gated by a red cross-platform leg, the cost this leg refused to copy.
+# Task `macos-harness-guard-teeth-and-paint-path-residue` settled that the other
+# way: the macOS leg now keeps `werust-core` on `push` only and pins its own PR
+# filter exactly (`crates/macos-renderer/tests/macos_backend_shape.rs`). Both
+# desktop legs now answer the same question the same way, which is what makes the
+# answer a rule rather than a preference.
 on:
   workflow_dispatch:
   push:

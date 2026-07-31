@@ -4,6 +4,8 @@ Task: `one-derivation-close-the-aggregate-and-tooltip-gaps`. Source spec: `work/
 
 Both choices below are shape choices on a surface every future painter binds to (the queued `windows-webview2-backend-and-window` and `mobile-chrome-presentation-from-one-derivation`), so they are recorded here to be ratified or reversed deliberately rather than discovered later.
 
+**Path note (2026-07-31, task `macos-harness-guard-teeth-and-paint-path-residue`).** The macOS painter half named below as `crates/werust-macos/src/paint.rs` no longer exists at that path: `windows-win32-window-and-chrome` EXTRACTED it verbatim, with its tests, to [`crates/desktop-paint`](../../../crates/desktop-paint) so both native desktop windows consume one carrier (`werust_macos::paint` re-exports it). `every_exported_class_has_a_colour` and the `CssClassFamily::ALL` iteration live there now, and there is one native-widget coverage gate rather than a per-edge one. The paths below are left as they were when the choices were made; only this note is new.
+
 ## D1 — the family aggregate is an ENUM (`CssClassFamily::ALL`), not a third `&[&[&str]]` const
 
 **Chosen:** `pub enum CssClassFamily { TrustIndicator, ErrorBanner, DebugConsole }` in `werust-core`, with `CssClassFamily::ALL` (the aggregate the coverage gates iterate) and a total `const fn classes()` that hands back the very family `const` the rules are exported beside. `CssClassFamily::ALL` is kept complete by `_CSS_CLASS_FAMILY_ALL_IS_EVERY_FAMILY_IN_SLOT_ORDER`, the same anonymous-`const` total-`match` construction `TrustPosture::ALL` and `LoadStep::ALL` already use.

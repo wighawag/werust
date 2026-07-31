@@ -408,8 +408,9 @@ pub mod debug {
     pub fn route_capture_message(_capture: &DebugCapture, _body: &str) {}
 }
 
-// --- The chrome DERIVATION + the shell (`werust-macos`'s `paint.rs` reads
-// these; the real ones are what the Ubuntu gate compiles it against). ---
+// --- The chrome DERIVATION + the shell (the shared painter `crates/desktop-paint`
+// reads these, and `werust_macos::paint` re-exports it; the real ones are what
+// the Ubuntu gate compiles it against). ---
 pub const TRUST_INDICATOR_CSS_CLASSES: &[&str] = &[];
 pub const ERROR_BANNER_CSS_CLASSES: &[&str] = &[];
 pub const CHROME_CSS_CLASS_SETS: &[&[&str]] = &[];

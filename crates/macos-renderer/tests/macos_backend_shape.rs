@@ -43,6 +43,53 @@
 
 use std::path::{Path, PathBuf};
 
+/// The macOS leg's `pull_request` filter, ENTRY FOR ENTRY: the list the
+/// workflow's header paragraph describes in prose.
+///
+/// Every entry is here because it is genuinely macOS-shaped (`macos-renderer`
+/// and `werust-macos` hold `cfg(target_os = "macos")` halves that compile
+/// nowhere else; `macos-origin-probe` is the WebKit origin measurement), because
+/// it is the toolkit-free half this backend reuses verbatim (`webview-shared`),
+/// because it is the SHARED painter both native desktop windows consume
+/// (`desktop-paint` -- not macOS-shaped, but a break in the one carrier both
+/// windows paint from is genuinely cross-platform and this leg's window smoke is
+/// what catches it), or because it holds the RECORDED VERDICT this leg re-measures
+/// WebKit against (the two spike directories).
+///
+/// Pinned as an EXACT set, in the shape of the sibling
+/// `crates/werust-core/tests/windows_renderer_leg_shape.rs`'s
+/// `PULL_REQUEST_FILTER` (task
+/// `macos-harness-guard-teeth-and-paint-path-residue`, item 5). This filter has
+/// drifted WIDER twice in three tasks with nothing going red, which is exactly
+/// the accretion an exact pin ends: adding or removing a path must now be an edit
+/// to this list, with the workflow's header paragraph updated in the same change.
+const PULL_REQUEST_FILTER: &[&str] = &[
+    "crates/macos-renderer/**",
+    "crates/werust-macos/**",
+    "crates/desktop-paint/**",
+    "crates/macos-origin-probe/**",
+    "crates/webview-shared/**",
+    "docs/spikes/macos-wkwebview-renderer-backend/**",
+    "docs/spikes/macos-appkit-window-and-chrome/**",
+    ".github/workflows/macos-renderer.yml",
+];
+
+/// The wider DEPENDENCY surface: built by the leg, deliberately NOT on the
+/// `pull_request` filter, and therefore watched on `push` to `main` instead.
+///
+/// `crates/werust-core/**` joined this list with task
+/// `macos-harness-guard-teeth-and-paint-path-residue`, which answered the open
+/// question the previous task left standing: it had been on the PR filter since
+/// this leg landed, so most core work in this repo spent `macos-14` minutes and
+/// could be gated by a red cross-platform leg. The Windows sibling had already
+/// refused that cost, and two legs answering the same question differently is a
+/// difference nobody can act on.
+const PUSH_ONLY_DEPENDENCY_SURFACE: &[&str] = &[
+    "crates/werust-core/**",
+    "crates/renderer/**",
+    "crates/fetcher/**",
+];
+
 /// Read a source file relative to the repo root. `CARGO_MANIFEST_DIR` is
 /// `crates/macos-renderer`, so the root is two levels up.
 fn source(relative: &str) -> String {
@@ -56,6 +103,21 @@ fn repo_root() -> PathBuf {
 
 fn exists(relative: &str) -> bool {
     repo_root().join(relative).exists()
+}
+
+/// The `paths:` entries of one `on:` trigger, read as whole list ITEMS.
+///
+/// Item-wise rather than by substring, because the filters in this workflow are
+/// surrounded by prose comments that NAME paths (including paths deliberately
+/// kept OFF the list they sit next to), and a substring search would happily read
+/// the explanation as the trigger.
+fn trigger_paths(workflow: &str, from: &str, to: &str) -> Vec<String> {
+    between(workflow, from, to)
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("- \""))
+        .filter_map(|entry| entry.strip_suffix('"'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn backend() -> String {
@@ -674,7 +736,7 @@ fn the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger() {
          this test and the workflow's path filter with it"
     );
     let workflow = source(".github/workflows/macos-renderer.yml");
-    let pull_request = between(&workflow, "  pull_request:", "\npermissions:");
+    let pull_request = trigger_paths(&workflow, "  pull_request:", "\npermissions:");
     for claimed in [
         // "the backend"
         "crates/macos-renderer/**",
@@ -696,35 +758,57 @@ fn the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger() {
         "crates/desktop-paint/**",
     ] {
         assert!(
-            pull_request.contains(claimed),
+            pull_request.iter().any(|p| p == claimed),
             "the `pull_request` path filter must cover `{claimed}`: the spike README \
              claims a PR touching it re-runs the leg"
         );
     }
-    // And no FURTHER than that. Making the claim true is not licence to widen the
-    // trigger: the wider DEPENDENCY surface stays on `push` to `main`, so a
-    // `renderer` or `fetcher` pull request is not gated on `macos-14` minutes.
-    // That is the trade-off the sibling `windows-renderer.yml` states in its
-    // header and pins in `crates/werust-core/tests/windows_renderer_leg_shape.rs`;
-    // this leg's version of the pin lives here, so broadening it has to change a
-    // test and a comment rather than slip in.
+    // And no FURTHER than that: making the claim true is not licence to widen the
+    // trigger. That half is `the_pull_request_filter_is_the_pinned_exact_set_and_push_carries_the_rest`
+    // below, which pins the whole list rather than a must-have/must-not-have pair.
+}
+
+#[test]
+fn the_pull_request_filter_is_the_pinned_exact_set_and_push_carries_the_rest() {
+    // The DELIBERATE trade-off, stated in the workflow's header: this leg's PR
+    // filter carries only what is genuinely macOS-shaped (plus the shared painter
+    // and the recorded verdict), and the wider DEPENDENCY surface it also BUILDS
+    // is watched on `push` to `main` instead -- early detection, on a leg that
+    // gates nothing, plus `workflow_dispatch` for the deliberate case. Gating
+    // every core pull request on `macos-14` minutes is the cost the sibling
+    // `windows-renderer.yml` refused from the day it landed; this leg now answers
+    // the same question the same way.
     //
-    // The `push` half is matched on whole list ENTRIES, because the comment above
-    // the filter names these two paths in prose and a substring search would
-    // happily read the explanation as the trigger.
-    let push = between(&workflow, "  push:", "  pull_request:");
-    for dependency_only in ["crates/renderer/**", "crates/fetcher/**"] {
+    // Pinned as an EXACT set, in the sibling's shape
+    // (`crates/werust-core/tests/windows_renderer_leg_shape.rs`), because a
+    // must-have/must-not-have pair let this filter drift wider twice in three
+    // tasks while the header went on describing the filter the file no longer had.
+    let workflow = source(".github/workflows/macos-renderer.yml");
+    let pull_request = trigger_paths(&workflow, "  pull_request:", "\npermissions:");
+    let mut expected: Vec<&str> = PULL_REQUEST_FILTER.to_vec();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = pull_request.iter().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "the `pull_request` filter must be EXACTLY the pinned set. Widening it gates more pull \
+         requests on a `macos-14` runner and narrowing it drops a macOS-shaped change from the \
+         only leg that compiles it. Either way it is a decision, so change this list AND the \
+         workflow's header paragraph, which describes it in prose"
+    );
+
+    let push = trigger_paths(&workflow, "  push:", "  pull_request:");
+    for dependency_only in PUSH_ONLY_DEPENDENCY_SURFACE {
         assert!(
-            !pull_request.contains(dependency_only),
+            !pull_request.iter().any(|p| p == dependency_only),
             "the `pull_request` filter must NOT carry `{dependency_only}`: it is the wider \
              dependency surface, watched on `push` to `main` instead. Adding it gates ordinary \
-             core work on a cross-platform runner -- the exact cost under review on this leg"
+             core work on a cross-platform runner"
         );
         // ...but what the PR filter gives up must still be caught post-merge, or
         // the narrowness is a hole rather than a trade.
         assert!(
-            push.lines()
-                .any(|line| line.trim() == format!("- \"{dependency_only}\"")),
+            push.iter().any(|p| p == dependency_only),
             "`{dependency_only}` must stay on the `push` filter: it is what the narrow \
              `pull_request` filter relies on to be caught minutes after a merge instead"
         );

@@ -3,6 +3,7 @@ title: "Make `verify`'s clippy lint TEST targets too, clearing the existing debt
 slug: verify-lints-test-targets-and-clears-the-existing-debt
 blockedBy: []
 covers: []
+needsAnswers: true
 ---
 
 ## What to build

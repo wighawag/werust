@@ -52,6 +52,11 @@
 //!    `Werust.app` and attaches it, as a SIBLING job on the same `macos-14`
 //!    runner the iOS leg uses: decoupled from every other leg, deliberately
 //!    UNSIGNED, with `CFBundleVersion` read from the ONE Rust version source.
+//! 10. The Android APK's `versionCode`/`versionName` are DERIVED from the release
+//!     tag through that same one version source (`WERUST_VERSION` / `git
+//!     describe`), folded into the monotonic integer Android sequences updates
+//!     on, with a placeholder that keeps an untagged local build working (task
+//!     `android-apk-version-from-the-release-tag`).
 //!
 //! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
 //! never runs Gradle, never reads a secret's value, and performs no I/O beyond
@@ -1284,4 +1289,245 @@ fn the_macos_packaging_scripts_are_executable() {
             "{script} must be executable (the release workflow runs it by path)"
         );
     }
+}
+
+// --- Criterion 10: the APK's versionCode/versionName come from the release tag ---
+//
+// Task `android-apk-version-from-the-release-tag`, the other half of what makes a
+// signed release UPDATABLE: Android sequences updates on a strictly increasing
+// INTEGER `versionCode`, so an APK that hardcodes `versionCode = 1` /
+// `versionName = "0.0.0"` looks like the same build forever no matter what tag
+// cut it — and its `versionName` disagrees with the version the ⋮ menu reports
+// from the Rust core, the two-version-sources drift this repo keeps removing.
+//
+// Pinned the same way the rest of this file pins the Gradle side: by reading the
+// app module's Kotlin DSL as TEXT inside the pure-Rust gate (there is no
+// Kotlin-DSL parser here, and no SDK, no NDK and no network either). What the
+// text has to show is exactly the contract: the version is READ from the one
+// existing source, folded into one monotonic integer, and degrades to a
+// placeholder instead of failing a local untagged build.
+//
+// Decisions (the fold, and the rejected CI-run-number alternative):
+// docs/spikes/android-apk-signing/README.md.
+
+/// The Android app module's Gradle script — the Android half of the release
+/// plumbing (signing config, and now the version mapping).
+const ANDROID_APP_GRADLE: &str = "crates/werust-android/app/build.gradle.kts";
+
+/// The Android module README, where the human-facing release notes live (how to
+/// build, and what installing the first signed release requires).
+const ANDROID_README: &str = "crates/werust-android/README.md";
+
+/// Where the Android release DECISIONS live: the signing ones landed there, and
+/// the version mapping is the other half of the same "an update can actually be
+/// offered" story, so it is recorded beside them rather than in a new file.
+const ANDROID_DECISIONS: &str = "docs/spikes/android-apk-signing/README.md";
+
+/// The right-hand side of the last `<name> =` assignment in the Gradle script,
+/// trimmed. Used to assert a `defaultConfig` field is bound to a RESOLVED value
+/// rather than to a committed literal.
+fn gradle_assignment(gradle: &str, name: &str) -> String {
+    let prefix = format!("{name} = ");
+    let mut found: Vec<&str> = gradle
+        .lines()
+        .map(str::trim)
+        .filter_map(|l| l.strip_prefix(&prefix))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "expected EXACTLY one `{name} = ` assignment in {ANDROID_APP_GRADLE}; found {found:?}"
+    );
+    found.pop().unwrap().trim().to_string()
+}
+
+#[test]
+fn android_apk_version_is_read_from_the_one_existing_version_source() {
+    // The version must arrive from the SAME source `crates/werust-core/build.rs`
+    // resolves — `WERUST_VERSION` (which the `android-apk` job already exports
+    // from the tag), else `git describe --tags --always`, else the workspace
+    // Cargo version — so the APK manifest and the ⋮ menu cannot disagree. A
+    // second source (a hand-bumped literal, a CI run number, a date) is exactly
+    // the drift this pins shut.
+    let gradle = read_repo_file(ANDROID_APP_GRADLE);
+
+    assert!(
+        gradle.contains("System.getenv(\"WERUST_VERSION\")"),
+        "{ANDROID_APP_GRADLE} must read the released version from the SAME `WERUST_VERSION` the \
+         `android-apk` job injects from the tag"
+    );
+    for arg in ["\"describe\"", "\"--tags\"", "\"--always\""] {
+        assert!(
+            gradle.contains(arg),
+            "{ANDROID_APP_GRADLE} must fall back to the SAME `git describe --tags --always` \
+             build.rs uses (missing {arg}), so an untagged dev build still reports the version \
+             the core reports"
+        );
+    }
+
+    // Bound to the resolved values, never to a committed literal: `versionCode =
+    // 1` / `versionName = "0.0.0"` is the bug.
+    let code = gradle_assignment(&gradle, "versionCode");
+    assert!(
+        code.parse::<i64>().is_err(),
+        "`versionCode` must be bound to the version resolved from the tag, not to the literal \
+         {code:?} (a literal can never increase, so no release can be offered as an update)"
+    );
+    let name = gradle_assignment(&gradle, "versionName");
+    assert!(
+        !name.starts_with('"'),
+        "`versionName` must be bound to the SAME resolved version string the Rust core reports, \
+         not to the literal {name:?}"
+    );
+}
+
+#[test]
+fn android_version_code_folds_the_semver_triple_into_one_monotonic_integer() {
+    // The chosen mapping: `major * 10000 + minor * 100 + patch` (v0.2.9 -> 209,
+    // v1.0.0 -> 10000). Monotonic across every release this project will
+    // plausibly cut, and readable back by eye — unlike a CI run number, which is
+    // monotonic too but destroys the correspondence between the APK's version and
+    // the release it came from.
+    let gradle = read_repo_file(ANDROID_APP_GRADLE);
+    let folded = gradle.replace(' ', "");
+    assert!(
+        folded.contains("*10000+") && folded.contains("*100+"),
+        "{ANDROID_APP_GRADLE} must fold the semver triple as `major * 10000 + minor * 100 + \
+         patch` (the recorded mapping)"
+    );
+    // Only a CLEAN triple folds; anything else (a `git describe` suffix, a
+    // pre-release tag) is not a released version.
+    assert!(
+        gradle.contains(r"^(\d+)\.(\d+)\.(\d+)$"),
+        "{ANDROID_APP_GRADLE} must fold only a CLEAN `major.minor.patch` triple (anchored), so a \
+         `git describe`-shaped dev version takes the placeholder path instead of folding into a \
+         meaningless code"
+    );
+}
+
+#[test]
+fn a_local_untagged_android_build_keeps_working_on_a_placeholder() {
+    // A local `./gradlew :app:assembleDebug` with no tag, no `WERUST_VERSION` and
+    // possibly no git must still BUILD and still INSTALL: a dev APK with a
+    // placeholder version is a far better outcome than a dev APK that will not
+    // build. So the mapping degrades to the previous hardcoded `versionCode = 1`
+    // rather than throwing, and every version lookup is failure-tolerant.
+    let gradle = read_repo_file(ANDROID_APP_GRADLE);
+    assert!(
+        gradle.contains("devPlaceholderVersionCode = 1"),
+        "{ANDROID_APP_GRADLE} must keep the `versionCode = 1` placeholder for an untagged local \
+         build (named, so the fallback is visible)"
+    );
+    assert!(
+        gradle.contains("?: devPlaceholderVersionCode"),
+        "the resolved versionCode must FALL BACK to the placeholder when the version is absent or \
+         is not a clean triple, never fail the build"
+    );
+    assert!(
+        gradle.contains("catch"),
+        "the `git describe` lookup must be failure-TOLERANT (no git, a source tarball, a git that \
+         errors) exactly as build.rs's is"
+    );
+}
+
+#[test]
+fn the_android_leg_mints_no_second_version_source_in_the_workflow() {
+    // The workflow's ONLY version input stays the job-level `WERUST_VERSION` the
+    // shared loop above already pins. A version computed in the JOB (a run
+    // number, a `git describe`, a hand-written versionCode passed as a Gradle
+    // property) would be the second source that makes the APK manifest and the ⋮
+    // menu disagree.
+    let j = job("android-apk");
+    for second_source in [
+        "git describe",
+        "github.run_number",
+        "versionCode",
+        "versionName",
+    ] {
+        assert!(
+            !contains_substr(&j, second_source),
+            "the `android-apk` leg must not derive a version from `{second_source}`: the version \
+             comes from `WERUST_VERSION`, resolved once, so the APK manifest and the ⋮ menu \
+             cannot disagree"
+        );
+    }
+}
+
+#[test]
+fn the_apk_version_mapping_decision_is_recorded_beside_the_signing_decisions() {
+    // Criterion 5 of the task: the mapping is a USER-VISIBLE, hard-to-reverse
+    // choice (a versionCode can never go DOWN for an installed app), so it is
+    // recorded — with the alternative it rejected — where the signing decisions
+    // already live, because the two together are what make a release updatable.
+    let decisions = read_repo_file(ANDROID_DECISIONS);
+    assert!(
+        decisions
+            .replace(' ', "")
+            .contains("major*10000+minor*100+patch"),
+        "{ANDROID_DECISIONS} must record the CHOSEN versionCode mapping (major * 10000 + minor * \
+         100 + patch)"
+    );
+    assert!(
+        decisions.contains("run number"),
+        "{ANDROID_DECISIONS} must record the REJECTED alternative (a CI run number / timestamp: \
+         monotonic, but it destroys the correspondence to the release it came from)"
+    );
+}
+
+#[test]
+fn the_android_readme_warns_that_the_first_signed_release_needs_an_uninstall() {
+    // The release APK keeps the DEBUG `applicationId` but is signed with a
+    // different key, so a device holding a previously installed debug APK must
+    // uninstall it before the signed one will install. A one-time transition, not
+    // a defect — but an undocumented one looks exactly like a broken download.
+    let readme = read_repo_file(ANDROID_README);
+    assert!(
+        readme.contains("uninstall"),
+        "{ANDROID_README} must say that installing the first RELEASE-signed APK over a previously \
+         installed debug APK requires an uninstall first (different signing key, same \
+         applicationId)"
+    );
+    // And the version story the same reader needs: what the APK's version now IS.
+    assert!(
+        readme.contains("versionCode"),
+        "{ANDROID_README} must explain where the APK's `versionCode`/`versionName` come from (the \
+         release tag, via the one version source)"
+    );
+}
+
+#[test]
+fn the_resolved_version_reaches_the_cross_compiled_core_too_not_just_the_manifest() {
+    // The manifest and the ⋮ menu must agree, and they are produced by two
+    // different steps of the SAME Gradle build: `defaultConfig` (evaluated every
+    // configuration) and the `cargoBuildRustCore` cross-compile (an UP-TO-DATE-
+    // checked task). Without the resolved version as a task INPUT, a local
+    // rebuild after the version changed re-stamps the manifest while reusing the
+    // previously compiled `libwerust_mobile.so` — observed on a real build: the
+    // APK read `versionCode=300 / versionName=0.3.0` while the packaged `.so`
+    // still carried `0.2.9-91-g…`, i.e. exactly the disagreement this task
+    // exists to make impossible.
+    //
+    // So the ONE resolved version is BOTH the manifest's and the cargo build's:
+    // declared as an input so a changed version re-runs the cross-compile, and
+    // exported into the cargo environment so `build.rs` resolves that same value
+    // instead of whatever the (possibly reused) Gradle daemon inherited.
+    let gradle = read_repo_file(ANDROID_APP_GRADLE);
+    assert!(
+        gradle.contains("environment(\"WERUST_VERSION\""),
+        "{ANDROID_APP_GRADLE} must export the RESOLVED version into the cargo cross-compile's \
+         environment, so the core the APK carries reports the same string the manifest declares"
+    );
+    let cargo_task = gradle
+        .split_once("abstract class CargoBuildRustCore")
+        .expect("the cross-compile task class")
+        .1;
+    let task_body = cargo_task
+        .split_once("@TaskAction")
+        .expect("the task's property block, before its action")
+        .0;
+    assert!(
+        task_body.contains("werustVersion"),
+        "the cross-compile task must take the resolved version as a declared @Input, or a \
+         version change leaves an UP-TO-DATE task shipping a stale core"
+    );
 }

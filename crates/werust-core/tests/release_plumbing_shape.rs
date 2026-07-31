@@ -1938,11 +1938,371 @@ fn the_windows_app_manifest_declares_visual_styles_and_per_monitor_v2() {
         "{WINDOWS_APP_MANIFEST} must ALSO carry the legacy `<dpiAware>true/pm</dpiAware>` \
          fallback, which is what a pre-1607 Windows 10 reads"
     );
-    // A manifest is XML that the LINKER parses: a malformed one fails the build
-    // on the runner, so keep the shape assertion honest about the envelope too.
+    // The side-by-side ENVELOPE, by its two identifying strings. This says
+    // nothing about well-formedness (two `contains` calls cannot): that is
+    // `the_windows_app_manifest_is_well_formed_xml` below, which exists because
+    // this assertion USED to claim it and a malformed manifest sailed past it
+    // into a red release job.
     assert!(
         manifest.contains("urn:schemas-microsoft-com:asm.v1") && manifest.contains("</assembly>"),
-        "{WINDOWS_APP_MANIFEST} must be a well-formed side-by-side assembly manifest"
+        "{WINDOWS_APP_MANIFEST} must be a side-by-side assembly manifest (the asm.v1 namespace, \
+         closed by `</assembly>`)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The manifest is XML, and NOTHING in this repo parsed it (task
+// `windows-app-manifest-is-malformed-xml-and-breaks-the-release-link`).
+//
+// `mt.exe` parses it on the Windows runner, at LINK time, and refuses a
+// malformed one: `general error c1010070` -> `LNK1327` -> the whole
+// `windows-desktop-app` release job, and its artifact, are lost (release run
+// 30624906073). The Ubuntu gate cannot link a Windows binary, so the ONLY way it
+// can hold that contract is to parse the file itself. The shape assertions above
+// pin identity STRINGS, which a malformed file satisfies just as happily.
+//
+// The trigger was this repo's own prose style: a `--` used as a dash inside an
+// XML comment, which XML forbids outright (XML 1.0 §2.5). The comments are
+// load-bearing and stay; only the punctuation was illegal.
+//
+// DECISION (dependency-free, hand-written scanner rather than an XML crate):
+// `docs/spikes/windows-app-manifest-is-malformed-xml-and-breaks-the-release-link/README.md`.
+// In short: one 60-line file, in ONE crate's dev-dependencies, would not justify
+// a new parsing lineage in a workspace whose deps are each argued for by name;
+// the scanner below covers exactly the vocabulary an application manifest uses
+// and REFUSES anything outside it (loudly) rather than passing it silently, and
+// `the_manifest_guard_has_teeth` proves it catches the regression that actually
+// shipped instead of trivially returning "fine".
+// ---------------------------------------------------------------------------
+
+/// Line and column (both 1-based) of a byte offset, so the guard's message reads
+/// like the parser's own ("line 17, column 52") and points at the character to
+/// fix rather than at the file.
+fn xml_line_and_column(src: &str, offset: usize) -> (usize, usize) {
+    let before = &src[..offset];
+    let line = before.bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    (line, column)
+}
+
+/// One reported problem, located.
+fn xml_problem(src: &str, offset: usize, problem: &str) -> Option<String> {
+    let (line, column) = xml_line_and_column(src, offset);
+    Some(format!("{problem} (line {line}, column {column})"))
+}
+
+/// The length in bytes of the XML Name at the start of `s` (0 if there is none).
+fn xml_name_len(s: &str) -> usize {
+    let mut len = 0;
+    for (idx, ch) in s.char_indices() {
+        let ok = if idx == 0 {
+            ch.is_ascii_alphabetic() || ch == '_' || ch == ':'
+        } else {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '-' | '.')
+        };
+        if !ok {
+            break;
+        }
+        len = idx + ch.len_utf8();
+    }
+    len
+}
+
+/// `true` if `s` STARTS with a syntactically valid entity or character
+/// reference (`&amp;`, `&#38;`, `&#x26;`). A bare `&` is not well-formed XML,
+/// and is the other punctuation trap waiting in a hand-edited manifest whose
+/// `<description>` is English prose.
+fn xml_reference_is_valid(s: &str) -> bool {
+    let Some(end) = s[1..].find(';') else {
+        return false;
+    };
+    let body = &s[1..1 + end];
+    match body.strip_prefix('#') {
+        Some(digits) => {
+            let digits = digits.strip_prefix('x').unwrap_or(digits);
+            !digits.is_empty() && digits.chars().all(|c| c.is_ascii_hexdigit())
+        }
+        None => !body.is_empty() && xml_name_len(body) == body.len(),
+    }
+}
+
+/// Scan `src` for the FIRST well-formedness violation, `None` if there is none.
+///
+/// Deliberately narrow: it understands the XML declaration, comments, CDATA,
+/// elements (nesting, matching end tags, quoted attribute values, self-closing
+/// tags), character data and references, which is the complete vocabulary of a
+/// Win32 application manifest. Anything else (a DOCTYPE, an internal subset) is
+/// REPORTED rather than skipped, so this can never silently bless a construct it
+/// does not actually check. It is not a validator: it says nothing about
+/// namespaces, schemas or whether `mt.exe` likes the CONTENT, only about the
+/// well-formedness `mt.exe` refused.
+fn xml_well_formedness_error(src: &str) -> Option<String> {
+    let bytes = src.as_bytes();
+    // Every open start tag, with the offset it was opened at.
+    let mut open: Vec<(&str, usize)> = Vec::new();
+    let mut roots = 0usize;
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            // Character data.
+            if bytes[i] == b'&' && !xml_reference_is_valid(&src[i..]) {
+                return xml_problem(
+                    src,
+                    i,
+                    "a bare `&` is not well-formed XML: write `&amp;` (or a character reference)",
+                );
+            }
+            if src[i..].starts_with("]]>") {
+                return xml_problem(
+                    src,
+                    i,
+                    "the sequence `]]>` may not appear in character data",
+                );
+            }
+            i += 1;
+            continue;
+        }
+
+        let rest = &src[i..];
+
+        if rest.starts_with("<!--") {
+            let content_at = i + 4;
+            let Some(rel) = src[content_at..].find("-->") else {
+                return xml_problem(src, i, "an XML comment is never closed (no `-->`)");
+            };
+            let content = &src[content_at..content_at + rel];
+            if let Some(dash) = content.find("--") {
+                return xml_problem(
+                    src,
+                    content_at + dash,
+                    "an XML comment may not contain `--` (XML 1.0 §2.5), so this repo's prose dash \
+                     is illegal HERE: rephrase with a comma, a colon, parentheses or two \
+                     sentences (NOT a spaced hyphen)",
+                );
+            }
+            if content.ends_with('-') {
+                return xml_problem(
+                    src,
+                    content_at + content.len(),
+                    "an XML comment may not end with `-` (it would close as `--->`)",
+                );
+            }
+            i = content_at + rel + 3;
+            continue;
+        }
+
+        if rest.starts_with("<?") {
+            let Some(rel) = src[i + 2..].find("?>") else {
+                return xml_problem(
+                    src,
+                    i,
+                    "an XML declaration / processing instruction is never closed (no `?>`)",
+                );
+            };
+            i += 2 + rel + 2;
+            continue;
+        }
+
+        if rest.starts_with("<![CDATA[") {
+            let Some(rel) = src[i + 9..].find("]]>") else {
+                return xml_problem(src, i, "a CDATA section is never closed (no `]]>`)");
+            };
+            i += 9 + rel + 3;
+            continue;
+        }
+
+        if rest.starts_with("<!") {
+            return xml_problem(
+                src,
+                i,
+                "this guard understands only the declaration, comments, CDATA and elements an \
+                 application manifest is made of; it refuses to bless a `<!…>` construct it does \
+                 not parse",
+            );
+        }
+
+        if rest.starts_with("</") {
+            let name_at = i + 2;
+            let name_len = xml_name_len(&src[name_at..]);
+            if name_len == 0 {
+                return xml_problem(src, name_at, "expected an element name after `</`");
+            }
+            let name = &src[name_at..name_at + name_len];
+            let mut j = name_at + name_len;
+            while bytes.get(j).is_some_and(u8::is_ascii_whitespace) {
+                j += 1;
+            }
+            if bytes.get(j) != Some(&b'>') {
+                return xml_problem(src, j.min(bytes.len()), "expected `>` to close the end tag");
+            }
+            match open.pop() {
+                None => {
+                    return xml_problem(
+                        src,
+                        i,
+                        &format!("end tag `</{name}>` has no matching start tag"),
+                    );
+                }
+                Some((expected, opened_at)) if expected != name => {
+                    let (line, _) = xml_line_and_column(src, opened_at);
+                    return xml_problem(
+                        src,
+                        i,
+                        &format!(
+                            "end tag `</{name}>` does not match the still-open `<{expected}>` from \
+                             line {line}"
+                        ),
+                    );
+                }
+                Some(_) => {}
+            }
+            i = j + 1;
+            continue;
+        }
+
+        // A start tag (possibly self-closing).
+        let name_at = i + 1;
+        let name_len = xml_name_len(&src[name_at..]);
+        if name_len == 0 {
+            return xml_problem(
+                src,
+                i,
+                "`<` must start a tag, a comment or a declaration here: escape a literal one as \
+                 `&lt;`",
+            );
+        }
+        let name = &src[name_at..name_at + name_len];
+        let mut j = name_at + name_len;
+        let mut quote: Option<u8> = None;
+        let self_closing;
+        loop {
+            let Some(&c) = bytes.get(j) else {
+                return xml_problem(src, i, &format!("the start tag `<{name}` is never closed"));
+            };
+            match quote {
+                Some(q) => {
+                    if c == q {
+                        quote = None;
+                    } else if c == b'&' && !xml_reference_is_valid(&src[j..]) {
+                        return xml_problem(
+                            src,
+                            j,
+                            "a bare `&` in an attribute value is not well-formed XML: write \
+                             `&amp;`",
+                        );
+                    }
+                }
+                None => {
+                    if c == b'"' || c == b'\'' {
+                        quote = Some(c);
+                    } else if c == b'<' {
+                        return xml_problem(src, j, "`<` may not appear inside a tag");
+                    } else if c == b'>' {
+                        self_closing = bytes[j - 1] == b'/';
+                        break;
+                    }
+                }
+            }
+            j += 1;
+        }
+        if open.is_empty() {
+            roots += 1;
+            if roots > 1 {
+                return xml_problem(
+                    src,
+                    i,
+                    &format!("`<{name}>` is a SECOND root element; XML allows exactly one"),
+                );
+            }
+        }
+        if !self_closing {
+            open.push((name, i));
+        }
+        i = j + 1;
+    }
+
+    if let Some((name, opened_at)) = open.last() {
+        return xml_problem(src, *opened_at, &format!("`<{name}>` is never closed"));
+    }
+    if roots == 0 {
+        return Some("the document has no root element".to_string());
+    }
+    None
+}
+
+#[test]
+fn the_windows_app_manifest_is_well_formed_xml() {
+    // THE GUARD. `mt.exe` parses this file at link time on the Windows runner,
+    // and the Ubuntu gate cannot link a Windows binary, so the gate parses it
+    // here instead: an edit to those (load-bearing, deliberately kept) comments
+    // can no longer red a release job that only runs on a tag.
+    let manifest = read_repo_file(WINDOWS_APP_MANIFEST);
+    if let Some(problem) = xml_well_formedness_error(&manifest) {
+        panic!(
+            "{WINDOWS_APP_MANIFEST} is not well-formed XML: {problem}.\n`mt.exe` refuses a \
+             malformed manifest (`general error c1010070`), `link.exe` then dies (`LNK1327`), and \
+             the `{WINDOWS_LEG}` release job ships NOTHING (release run 30624906073)."
+        );
+    }
+}
+
+#[test]
+fn the_manifest_guard_has_teeth() {
+    // A guard nobody can see fail is not a guard. Each sample below is a way
+    // this file has broken or could break; the FIRST is verbatim the shape that
+    // actually cost a release artifact (a `--` used as a prose dash inside a
+    // comment), and the last is the manifest as it stands, which must pass.
+    let broken = [
+        (
+            "the `--` prose dash that broke run 30624906073",
+            "<!--\n  the identity (name + version + publicKeyToken) -- a wrong token is silent.\n\
+             -->\n<assembly/>",
+        ),
+        (
+            "a comment ending in a hyphen",
+            "<!-- a trailing hyphen -\n--->\n<assembly/>",
+        ),
+        ("an unterminated comment", "<!-- forever\n<assembly/>"),
+        (
+            "a mismatched end tag",
+            "<assembly><dependency></assembly></dependency>",
+        ),
+        ("an unclosed element", "<assembly><dependency></assembly>"),
+        ("an unclosed start tag", "<assembly\n"),
+        (
+            "an unquoted-run-on attribute value",
+            "<assembly name=\"werust>\n",
+        ),
+        (
+            "a bare `&` in prose",
+            "<description>werust & friends</description>",
+        ),
+        ("two root elements", "<assembly/><assembly/>"),
+        ("no root element at all", "<!-- only a comment -->\n"),
+    ];
+    for (what, sample) in broken {
+        assert!(
+            xml_well_formedness_error(sample).is_some(),
+            "the manifest guard must REJECT {what}, or it cannot hold the contract it claims: \
+             {sample:?}"
+        );
+    }
+
+    // …and it must not cry wolf on the constructs the manifest legitimately uses.
+    let fine = concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n",
+        "<!-- a comment with a hyphenated-word, an <element> and a stray - dash -->\n",
+        "<assembly xmlns=\"urn:schemas-microsoft-com:asm.v1\" manifestVersion=\"1.0\">\n",
+        "  <assemblyIdentity type=\"win32\" name=\"a.b-c\" version=\"1.0.0.0\" />\n",
+        "  <description>prose with an &amp; and a &#x2014; reference</description>\n",
+        "  <windowsSettings><dpiAware>true/pm</dpiAware></windowsSettings>\n",
+        "</assembly>\n",
+    );
+    assert_eq!(
+        xml_well_formedness_error(fine),
+        None,
+        "the manifest guard must ACCEPT the ordinary manifest vocabulary"
     );
 }
 

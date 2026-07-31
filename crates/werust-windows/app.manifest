@@ -2,6 +2,13 @@
 <!--
   werust's Win32 application manifest (task `windows-release-packaging-leg`).
 
+  EDITING THESE COMMENTS: a double hyphen is ILLEGAL inside an XML comment (XML
+  1.0 §2.5), so this repo's ordinary prose dash cannot be used here. Rephrase
+  with a comma, a colon, parentheses or two sentences. `mt.exe` refuses a
+  malformed manifest at LINK time on the Windows runner, which no Ubuntu gate can
+  reach, so `crates/werust-core/tests/release_plumbing_shape.rs` parses this file
+  instead (task `windows-app-manifest-is-malformed-xml-and-breaks-the-release-link`).
+
   It is EMBEDDED into every binary this crate produces by `build.rs`, which hands
   it to the MSVC linker as `/MANIFEST:EMBED /MANIFESTINPUT:<this file>`. Decisions
   (including why that mechanism rather than a resource compiler):
@@ -14,9 +21,9 @@
   1. THE COMMON-CONTROLS v6 DEPENDENCY. Windows ships comctl32 5.82 AND 6; a
      process gets 6 only by asking for it here. Without it every control draws
      in the pre-Vista style. The identity below is Microsoft's documented one
-     (name + version + publicKeyToken + language) -- a wrong token silently
-     leaves the process on 5.82 rather than failing, which is why the shape test
-     pins all three.
+     (name + version + publicKeyToken + language). A wrong token silently leaves
+     the process on 5.82 rather than failing, which is why the shape test pins
+     all three.
 
      What it does NOT buy: dark mode. Standard Win32 controls do not follow the
      OS light/dark setting on the strength of this manifest; that needs the
@@ -35,7 +42,7 @@
 
      The consequence the by-hand check must judge: `crates/werust-windows/src/chrome.rs`
      lays its rectangles out in RAW pixels, so a DPI-aware process draws the
-     chrome at 100% metrics on a 200% display -- crisp, but small -- where an
+     chrome at 100% metrics on a 200% display (crisp, but small), where an
      unaware one drew it blurry at the right apparent size. The PAGE is the half
      that unambiguously improves. Recorded at
      work/notes/observations/windows-chrome-is-raw-pixels-under-per-monitor-v2-2026-07-31.md.
@@ -50,7 +57,7 @@
     four-part Win32 assembly version, NOT werust's version: werust's ONE version
     is `werust_core::version()`, resolved from the release tag by
     crates/werust-core/build.rs and compiled into the binary. Wiring this field
-    to it would mint the second version source this repo keeps removing -- and
+    to it would mint the second version source this repo keeps removing, and
     could not represent it anyway (`0.2.9-3-gabc1234` is not `n.n.n.n`).
   -->
   <assemblyIdentity

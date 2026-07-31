@@ -9,10 +9,17 @@
 # Windows SDK headers/import-libs and drives `clang-cl`/`lld-link`, which is
 # enough to COMPILE the crate for `x86_64-pc-windows-msvc` from here.
 #
-# It is a TYPE-CHECK, not a build and certainly not a test: nothing links a real
-# WebView2 loader, nothing runs, and no WebView2 Runtime is involved. Treat the
-# `windows-renderer` workflow as the actual verdict; this is the fast inner loop.
-# (The macOS sibling `typecheck-macos-from-linux.sh` exists for the same reason.)
+# It is a TYPE-CHECK (plus clippy's lints), not a build and certainly not a test:
+# nothing links a real WebView2 loader, nothing runs, and no WebView2 Runtime is
+# involved. Treat the `windows-renderer` workflow as the actual verdict; this is
+# the fast inner loop. (The macOS sibling `typecheck-macos-from-linux.sh` exists
+# for the same reason, and also runs clippy rather than a bare check.)
+#
+# It runs CLIPPY rather than `check` because that is the check the Windows spike
+# READMEs credit it with, and a harness that performs less than its doc claims is
+# the drift task `windows-backend-error-mapping-and-leg-header-accuracy` closed.
+# The Ubuntu `verify` gate lints these crates' host-independent halves already;
+# this is the only place the `cfg(windows)` halves are linted at all.
 #
 # Prerequisites (once):
 #   rustup target add x86_64-pc-windows-msvc
@@ -43,7 +50,7 @@ fi
 # the WINDOW (`werust-windows`, the Win32 chrome over it, task
 # `windows-win32-window-and-chrome`) -- including its `window_smoke` example,
 # which is the only place the Win32 layer is executed anywhere.
-exec cargo xwin check \
+exec cargo xwin clippy \
   -p windows-renderer \
   -p werust-windows \
   --target x86_64-pc-windows-msvc \

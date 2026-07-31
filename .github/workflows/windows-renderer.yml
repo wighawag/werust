@@ -59,37 +59,42 @@ name: windows-renderer
 # also distinct from `windows-origin-probe.yml`, which MEASURES WebView2 origin
 # behaviour against a recorded verdict; this leg compiles and tests Rust.
 #
-# WHY THE `pull_request` FILTER IS NARROW (the deliberate trade-off). The sibling
-# `macos-renderer.yml` triggers on PRs touching `crates/werust-core/**`, so most
-# core work now spends `macos-14` minutes and can be gated by a red cross-platform
-# leg — a cost currently under review. This leg does NOT copy that filter. Its PR
-# trigger carries only what is genuinely Windows-shaped: `webview-shared` (the
-# half the Windows backend reuses verbatim), `windows-origin-probe` (the only
-# Windows-specific code in the tree), the shared version action and this file.
-# The wider dependency surface it builds — `werust-core`, `fetcher`, `renderer` —
-# is caught on `push` to `main` instead: early detection WITHOUT gating every
-# core PR on a cross-platform runner, plus `workflow_dispatch` for the deliberate
-# case (which is this leg's whole purpose anyway). The cost of the trade is
-# honest and bounded: a core change that breaks the Windows build is found
-# minutes after it merges rather than before, on a leg that gates nothing.
-# `crates/werust-core/tests/windows_renderer_leg_shape.rs` pins this choice, so
-# broadening it has to be a decision rather than a reflex.
+# WHAT THE `pull_request` FILTER CARRIES. Everything that is genuinely
+# Windows-shaped, plus the one shared half whose breakage this leg is the place
+# to see: `crates/windows-renderer/**` (the WebView2 backend) and
+# `crates/werust-windows/**` (the Win32 window), whose `cfg(windows)` halves
+# compile NOWHERE else, so a PR touching either is exactly the case this leg
+# exists to gate; `crates/webview-shared/**`, the toolkit-free half the backend
+# reuses verbatim; `crates/windows-origin-probe/**`; `crates/desktop-paint/**`,
+# the SHARED painter both native desktop windows consume, so a change to it
+# changes what the window smoke below asserts; plus the shared version action and
+# this file.
 #
-# WHAT THE PR FILTER CARRIES TODAY, and why it grew. It is no longer only the
-# probe: `crates/windows-renderer/**` joined it with the backend task and
-# `crates/werust-windows/**` + `crates/desktop-paint/**` with the window task.
-# The first two are genuinely Windows-shaped — their `cfg(windows)` halves compile
-# NOWHERE else, so a PR touching them is exactly the case this leg exists to
-# gate. `desktop-paint` is not Windows-shaped, but it is the SHARED half both
-# native desktop windows paint from, so a change to it changes what the window
-# smoke asserts. The trade-off above is unchanged and still deliberate:
-# `werust-core`, `fetcher` and `renderer` stay OFF the PR filter (they are caught
-# on `push` and by `workflow_dispatch`), because gating every core PR on a
-# cross-platform runner is the cost under review. The header paragraph above
-# still describes the ORIGINAL narrow filter; rewriting it to describe the filter
-# as it now is belongs to task
-# `windows-backend-error-mapping-and-leg-header-accuracy`, which owns that
-# correction — this note exists so the widening is not silent in the meantime.
+# That is WIDER than the filter this leg landed with, which carried only
+# `webview-shared`, the probe, the action and this file. When it landed, the
+# probe really was the only Windows-specific code in the tree. The engine
+# arrived with `windows-webview2-renderer-backend`, the window and the shared
+# painter with `windows-win32-window-and-chrome`, and each was added on purpose:
+# gating a PR that touches Windows-only code on the only leg that compiles it is
+# the discrimination the original narrow choice was making, not a departure from
+# it. `crates/werust-core/tests/windows_renderer_leg_shape.rs` now pins the PR
+# filter EXACTLY (no entry may join or leave it without editing that test), so
+# the widening-by-accretion this comment used to trail behind cannot happen
+# silently again.
+#
+# WHAT STAYS OFF THE PR FILTER, AND WHY (the deliberate trade-off, unchanged
+# since this leg landed). The wider DEPENDENCY surface this leg builds
+# (`werust-core`, `fetcher`, `renderer`) is caught on `push` to `main` instead.
+# The sibling `macos-renderer.yml` triggers on PRs touching
+# `crates/werust-core/**`, so most core work spends `macos-14` minutes and can be
+# gated by a red cross-platform leg, a cost currently under review, and one this
+# leg does not copy: early detection WITHOUT gating every core PR on a
+# cross-platform runner, plus `workflow_dispatch` for the deliberate case (which
+# is this leg's whole purpose anyway). The cost of the trade is honest and
+# bounded: a core change that breaks the Windows build is found minutes after it
+# merges rather than before, on a leg that gates nothing. The same guard pins
+# this half too, so narrowing or broadening it stays a decision rather than a
+# reflex.
 on:
   workflow_dispatch:
   push:
@@ -103,13 +108,33 @@ on:
       - "crates/werust-core/**"
       - "crates/fetcher/**"
       - "crates/windows-origin-probe/**"
+      # The spike directory is KEPT here, deliberately (task
+      # `windows-backend-error-mapping-and-leg-header-accuracy`), and only here:
+      # it holds the RECORDED EVIDENCE: the verbatim `trust_hooks_smoke`
+      # transcript this leg's claims are stamped from, and the local
+      # cross-target type-check harness both Windows crates are iterated with.
+      # Re-recording evidence is precisely the change worth re-measuring, which
+      # is the same logic `macos-renderer.yml` applies to its spike paths. The
+      # price is that a README typo in that directory burns one `windows-latest`
+      # run on `main`, where this leg gates nothing. That is cheap enough that
+      # keeping the evidence honest wins. It is deliberately NOT on the `pull_request`
+      # filter below, so no docs edit is ever GATED on a Windows runner.
       - "docs/spikes/windows-webview2-renderer-backend/**"
       - ".github/actions/webview2-runtime-version/**"
       - ".github/workflows/windows-renderer.yml"
+  # Pinned EXACTLY by `crates/werust-core/tests/windows_renderer_leg_shape.rs`:
+  # this list is the one the header describes, and neither can move without the
+  # other going red.
   pull_request:
     paths:
       - "crates/windows-renderer/**"
       - "crates/werust-windows/**"
+      # The shared painter, KEPT here deliberately (task
+      # `windows-backend-error-mapping-and-leg-header-accuracy`): it is not
+      # Windows-shaped, but it is the one carrier both native desktop windows
+      # paint from, so a break in it is genuinely cross-platform and the window
+      # smoke below is what catches it. `macos-renderer.yml` carries it on its
+      # PR filter for the same reason.
       - "crates/desktop-paint/**"
       - "crates/webview-shared/**"
       - "crates/windows-origin-probe/**"

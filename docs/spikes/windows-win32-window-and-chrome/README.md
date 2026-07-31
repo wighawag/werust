@@ -52,6 +52,8 @@ The CSS-class NAMES come from the core's exported sets; the palette that gives e
 
 [`typecheck-windows-from-linux.sh`](../windows-webview2-renderer-backend/typecheck-windows-from-linux.sh) type-checks the engine, the window and both smokes against `x86_64-pc-windows-msvc` from Linux, via `cargo-xwin`. Run 2026-07-30 on this code: **clean — `cargo xwin clippy -p werust-windows -p windows-renderer --tests --examples` with no errors and no warnings.**
 
+**That clippy line was run BESIDE the harness, not BY it.** As committed by this task the harness ended in `cargo xwin check`, which is weaker than the command recorded above, so this paragraph credited the tool with a check it did not perform. Task `windows-backend-error-mapping-and-leg-header-accuracy` closed the gap in the tool rather than in the prose ([why](../windows-backend-error-mapping-and-leg-header-accuracy/DECISIONS.md)): the harness now runs exactly that `cargo xwin clippy … --tests --examples`, re-run clean (no errors, no warnings from either Windows crate) on 2026-07-31 against the tree that landed it.
+
 That means every `CreateWindowExW`, every `SendMessageW`, every struct layout and every seam signature in the Win32 half type-checks against the real Windows SDK bindings. It is **not a build and not a test**: nothing links the WebView2 loader, nothing runs, no window is created and no message loop turns. It proves the shape of the Win32 wiring, not that anything WORKS — that is what the CI leg below is for, and this is simply the fast inner loop that keeps CI from being the first place a typo is found.
 
 ## What CI proved

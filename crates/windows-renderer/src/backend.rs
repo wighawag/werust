@@ -92,7 +92,7 @@ use webview_shared::offthread::{complete_ipfs_request, RequestSink, RetrievalOut
 use webview_shared::{validate_url, LoadLifecycle, SharedLifecycle};
 
 use crate::pure::{
-    bridge_adapter_script, missing_runtime_error, navigation_failure,
+    bridge_adapter_script, environment_creation_error, missing_runtime_error, navigation_failure,
     os_color_scheme_from_apps_use_light_theme, parse_bridge_envelope, reason_phrase, scheme_filter,
     scheme_of, SCHEME_HAS_AUTHORITY_COMPONENT, SCHEME_TREAT_AS_SECURE,
 };
@@ -461,9 +461,11 @@ impl Webview2Renderer {
     ///
     /// Fails with an honest, NAMED [`RendererError::Backend`] when this machine
     /// has no WebView2 Runtime -- never a crash (`docs/adr/0011` finding 6; the
-    /// message itself is [`crate::pure::missing_runtime_error`]). The check is
-    /// made HERE as well as at environment creation, so a shell learns the truth
-    /// before it opens a window it cannot fill.
+    /// message itself is [`crate::pure::missing_runtime_error`]). The presence
+    /// check is made HERE, at construction, so a shell learns the truth before it
+    /// opens a window it cannot fill -- and because it has already run, a LATER
+    /// refusal is reported as itself rather than as a missing runtime
+    /// ([`crate::pure::environment_creation_error`]).
     pub fn new() -> Result<Self, RendererError> {
         Self::with_user_data_folder(default_user_data_folder())
     }
@@ -586,6 +588,12 @@ impl Webview2Renderer {
     /// Create the environment with EXACTLY the set of scheme names registered so
     /// far, each with the flags the origin probe MEASURED as giving a real
     /// `ipfs://<cid>` tuple origin (ADR-0011 Amendment 2).
+    ///
+    /// Every failure here is POST-presence-check -- construction already proved
+    /// the runtime installed via `runtime_version()?` -- so it travels as
+    /// [`crate::pure::environment_creation_error`], which keeps the `HRESULT`
+    /// that can actually diagnose a corrupt profile folder, a policy block or a
+    /// version refusal, instead of advising an install that cannot help.
     fn create_environment(&self) -> Result<ICoreWebView2Environment, RendererError> {
         let options = CoreWebView2EnvironmentOptions::default();
         // Sorted so the registration set is DETERMINISTIC. WebView2 requires every
@@ -628,15 +636,17 @@ impl Webview2Renderer {
                     },
                 )),
             )
-            .map_err(|e| missing_runtime_error(&e.to_string()))?;
+            .map_err(|e| environment_creation_error(&e.to_string()))?;
         }
         webview2_com::wait_with_pump(receiver)
             .map_err(|e| {
                 RendererError::Backend(format!("waiting for the WebView2 environment failed: {e}"))
             })?
-            // A refusal HERE is still most often "no runtime", so it is reported
-            // with the same honest, named message rather than as a raw HRESULT.
-            .map_err(|e| missing_runtime_error(&e.to_string()))
+            // The runtime is PROVEN present by now, so a refusal here is a
+            // corrupt or non-writable user-data folder, a policy block or a
+            // version refusal -- reported as itself, with the platform's own
+            // detail leading.
+            .map_err(|e| environment_creation_error(&e.to_string()))
     }
 
     /// The engine settings this backend depends on.

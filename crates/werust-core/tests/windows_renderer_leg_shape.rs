@@ -41,6 +41,14 @@
 //! 4. The `pull_request` filter is the NARROW one, and the coverage it gives up
 //!    is really picked up by the `push` filter
 //!    (`the_pull_request_filter_stays_narrow_and_push_carries_the_rest`).
+//!
+//! Criterion 4 was TIGHTENED by task
+//! `windows-backend-error-mapping-and-leg-header-accuracy`: the filter is now
+//! pinned ENTRY BY ENTRY rather than by a must-have/must-not-have pair. The
+//! original pair let the filter grow silently (the backend task added the engine,
+//! the window task added the window and the shared painter, and the workflow's
+//! own header went on describing the narrow filter it no longer had), which is
+//! exactly the accretion this guard exists to make deliberate.
 
 use std::path::{Path, PathBuf};
 
@@ -93,6 +101,42 @@ const GREEN_ON_WINDOWS: &[&str] = &[
 /// pkg-config, which a `windows-latest` runner has nothing to satisfy. Measured,
 /// not assumed (the spike README records the failure).
 const RED_ON_WINDOWS: &[&str] = &["werust", "webview-renderer"];
+
+/// The `pull_request` filter, ENTRY FOR ENTRY: the list the workflow's header
+/// paragraph describes in prose.
+///
+/// Every entry is here because it is Windows-shaped (`windows-renderer` and
+/// `werust-windows` hold `cfg(windows)` halves that compile nowhere else;
+/// `windows-origin-probe` is the WebView2 origin measurement), because it is the
+/// shared half the Windows backend reuses verbatim (`webview-shared`), or
+/// because it is the SHARED painter both native desktop windows consume
+/// (`desktop-paint`, which is not Windows-shaped, but a break in it is genuinely
+/// cross-platform and this leg's window smoke is what catches it).
+///
+/// Pinned as an EXACT set, not a subset: the previous must-have/must-not-have
+/// pair let two later tasks widen the trigger without anything going red, which
+/// left the workflow's own header describing a filter the file no longer had.
+/// Adding or removing a path must now be an edit to this list, with the header
+/// paragraph updated in the same change.
+const PULL_REQUEST_FILTER: &[&str] = &[
+    "crates/windows-renderer/**",
+    "crates/werust-windows/**",
+    "crates/desktop-paint/**",
+    "crates/webview-shared/**",
+    "crates/windows-origin-probe/**",
+    ".github/actions/webview2-runtime-version/**",
+    ".github/workflows/windows-renderer.yml",
+];
+
+/// The wider DEPENDENCY surface: built by the leg, deliberately NOT on the
+/// `pull_request` filter, and therefore watched on `push` to `main` instead.
+/// This is the trade-off the workflow header states and refuses to copy from
+/// `macos-renderer.yml`.
+const PUSH_ONLY_DEPENDENCY_SURFACE: &[&str] = &[
+    "crates/werust-core/**",
+    "crates/fetcher/**",
+    "crates/renderer/**",
+];
 
 /// Read a repo file. `CARGO_MANIFEST_DIR` is `crates/werust-core`, so the root
 /// is two levels up.
@@ -355,32 +399,38 @@ fn the_pull_request_filter_stays_narrow_and_push_carries_the_rest() {
     // header comment together.
     let wf = load_yaml(LEG);
     let pr = trigger_paths(&wf, "pull_request");
-    for narrow in [
-        "crates/webview-shared/**",
-        "crates/windows-origin-probe/**",
-        // The Windows SHELL is as Windows-shaped as its engine: a PR that
-        // touches it should be gated on the leg that is the only place its Win32
-        // half compiles at all.
-        "crates/werust-windows/**",
-        ".github/workflows/windows-renderer.yml",
-    ] {
+    let mut expected: Vec<&str> = PULL_REQUEST_FILTER.to_vec();
+    expected.sort_unstable();
+    let mut got: Vec<&str> = pr.iter().map(String::as_str).collect();
+    got.sort_unstable();
+    assert_eq!(
+        got, expected,
+        "the `pull_request` filter must be EXACTLY the pinned set. Widening it gates more pull \
+         requests on a `windows-latest` runner and narrowing it drops a Windows-shaped change \
+         from the only leg that compiles it. Either way it is a decision, so change this list \
+         AND the workflow's header paragraph, which describes it in prose"
+    );
+    for dependency_only in PUSH_ONLY_DEPENDENCY_SURFACE {
         assert!(
-            pr.iter().any(|p| p == narrow),
-            "the `pull_request` filter must still catch a Windows-shaped change: missing \
-             {narrow:?}; got {pr:?}"
+            !pr.iter().any(|p| p == dependency_only),
+            "the `pull_request` filter must NOT include `{dependency_only}`: that is the exact \
+             macOS-leg cost under review (every core PR spending Windows minutes and gateable by \
+             a red cross-platform leg). It is covered by the `push` filter and by \
+             workflow_dispatch; got {pr:?}"
         );
     }
-    assert!(
-        !pr.iter().any(|p| p == "crates/werust-core/**"),
-        "the `pull_request` filter must NOT include `crates/werust-core/**`: that is the exact \
-         macOS-leg cost under review (every core PR spending Windows minutes and gateable by a \
-         red cross-platform leg). It is covered by the `push` filter and by workflow_dispatch; \
-         got {pr:?}"
-    );
 
     // What the PR filter gives up must really be picked up post-merge, or the
     // narrowness is a hole rather than a trade.
     let push = trigger_paths(&wf, "push");
+    for dependency_only in PUSH_ONLY_DEPENDENCY_SURFACE {
+        assert!(
+            push.iter().any(|p| p == dependency_only),
+            "the `push` filter must carry `{dependency_only}`: it is what the deliberately narrow \
+             `pull_request` filter relies on to be caught minutes after a merge instead; got \
+             {push:?}"
+        );
+    }
     for pkg in GREEN_ON_WINDOWS {
         // Every crate in the set is a `crates/<package-name>` directory.
         let dir = format!("crates/{pkg}/**");

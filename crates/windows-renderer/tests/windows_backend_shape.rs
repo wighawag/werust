@@ -555,7 +555,11 @@ fn a_machine_without_the_webview2_runtime_fails_honestly() {
         backend.contains("GetAvailableCoreWebView2BrowserVersionString"),
         "the runtime presence check must be Microsoft's own API"
     );
-    let check = between(&backend, "fn runtime_version() -> Result<String", "\n}\n");
+    // Anchored on the FREE function (column 0), not on the `Webview2Renderer`
+    // method of the same name that merely delegates to it: `between` takes the
+    // FIRST match, and the method's slice would otherwise run to the end of the
+    // whole `impl` block and assert about code that is not the check.
+    let check = between(&backend, "\nfn runtime_version() -> Result<String", "\n}\n");
     assert!(
         check.contains("missing_runtime_error"),
         "a missing runtime must produce the honest, NAMED error"
@@ -568,16 +572,29 @@ fn a_machine_without_the_webview2_runtime_fails_honestly() {
         );
     }
     // Construction checks it, so a shell learns the truth before it opens a
-    // window it cannot fill; environment creation maps its refusal through the
-    // same message, so a runtime that disappears in between is still honest.
+    // window it cannot fill.
     assert!(
         between(&backend, "pub fn with_user_data_folder(", "\n    }\n")
             .contains("runtime_version()?"),
         "construction must check for the runtime"
     );
+    // ...and BECAUSE it did, everything after it is talking to a runtime that is
+    // PROVEN present. A corrupt profile folder, a policy block or a version
+    // refusal must therefore be reported as itself, not as advice to install a
+    // runtime the machine already has (task
+    // `windows-backend-error-mapping-and-leg-header-accuracy`). Both messages are
+    // unit-tested in `pure.rs`; what is asserted here is which one the wiring
+    // reaches for, since the Ubuntu gate cannot compile this file.
+    let create_environment = between(&backend, "fn create_environment(", "\n    }\n");
     assert!(
-        between(&backend, "fn create_environment(", "\n    }\n").contains("missing_runtime_error"),
-        "an environment refusal must be reported with the same honest, named message"
+        !create_environment.contains("missing_runtime_error"),
+        "environment creation runs AFTER `runtime_version()?` proved the runtime present, so it \
+         must not report its refusals as a missing runtime"
+    );
+    assert!(
+        create_environment.contains("environment_creation_error"),
+        "an environment refusal must arrive as a plain backend error carrying the platform's own \
+         detail"
     );
     // And the whole engine half must be free of panicking unwraps: this is the
     // ONE platform whose runtime can genuinely be absent.

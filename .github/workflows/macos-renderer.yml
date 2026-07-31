@@ -80,6 +80,14 @@ on:
     paths:
       - "crates/macos-renderer/**"
       - "crates/werust-macos/**"
+      # KEPT here deliberately (task
+      # `windows-backend-error-mapping-and-leg-header-accuracy`), not inherited:
+      # it arrived on BOTH desktop legs' PR filters with
+      # `windows-win32-window-and-chrome` with nothing pinning it. A break in the
+      # ONE carrier both native windows paint from really is cross-platform, and
+      # each leg's window smoke is what catches it, so both keep it, and both
+      # now pin it (`macos_backend_shape.rs` here,
+      # `crates/werust-core/tests/windows_renderer_leg_shape.rs` there).
       - "crates/desktop-paint/**"
       - "crates/macos-origin-probe/**"
       - "crates/webview-shared/**"

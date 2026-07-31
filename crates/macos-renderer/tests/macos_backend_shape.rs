@@ -684,6 +684,16 @@ fn the_readme_claim_about_when_the_leg_runs_matches_the_pull_request_trigger() {
         // "the recorded verdict" -- `expected.json` and the run it was stamped
         // from, which live beside this README.
         "docs/spikes/macos-wkwebview-renderer-backend/**",
+        // Not claimed by that README sentence, and pinned here deliberately by
+        // task `windows-backend-error-mapping-and-leg-header-accuracy`: the
+        // SHARED painter both native desktop windows consume arrived on BOTH
+        // legs' PR filters with `windows-win32-window-and-chrome`, with nothing
+        // holding it. It is KEPT (a break in the one carrier both windows paint
+        // from is genuinely cross-platform, and each leg's window smoke is what
+        // catches it) and pinned, so the next widening of either filter is an
+        // edit to a test rather than an accretion. The Windows half of the pin
+        // is `crates/werust-core/tests/windows_renderer_leg_shape.rs`.
+        "crates/desktop-paint/**",
     ] {
         assert!(
             pull_request.contains(claimed),

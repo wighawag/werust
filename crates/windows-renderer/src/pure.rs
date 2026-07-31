@@ -57,10 +57,15 @@ pub const BRIDGE_ENVELOPE_BODY: &str = "body";
 /// It arrives through the seam's ordinary [`RendererError::Backend`], so a shell
 /// shows it the same way it shows any other backend failure and NOTHING panics.
 ///
-/// `detail` is whatever the platform said (the `HRESULT` text from
-/// `GetAvailableCoreWebView2BrowserVersionString`, or the environment-creation
-/// failure). It is appended rather than swallowed, because a runtime that is
-/// present-but-broken must not be reported as absent.
+/// `detail` is whatever the platform said: the `HRESULT` text from
+/// `GetAvailableCoreWebView2BrowserVersionString`, the ONE call that can tell
+/// "no runtime" apart from "the runtime refused". It is appended rather than
+/// swallowed, because a runtime that is present-but-broken must not be reported
+/// as absent.
+///
+/// Use this ONLY where the runtime really may be absent, at the presence check.
+/// Everything downstream of it has already PROVEN the runtime present and
+/// belongs in [`environment_creation_error`].
 #[must_use]
 pub fn missing_runtime_error(detail: &str) -> RendererError {
     let detail = detail.trim();
@@ -71,6 +76,38 @@ pub fn missing_runtime_error(detail: &str) -> RendererError {
     );
     if !detail.is_empty() {
         message.push_str(&format!(" (the system reported: {detail})"));
+    }
+    RendererError::Backend(message)
+}
+
+/// The honest failure for a machine that HAS the runtime but was refused an
+/// environment: say what refused, and carry the platform's own detail.
+///
+/// `Webview2Renderer::with_user_data_folder` calls `runtime_version()?` before
+/// anything else, and that call succeeds only when
+/// `GetAvailableCoreWebView2BrowserVersionString` named an installed runtime. So
+/// by the time `CreateCoreWebView2EnvironmentWithOptions` runs, the runtime is
+/// PROVEN present and every refusal from here on is something else: a
+/// non-writable or corrupt user-data folder, a group-policy block, a runtime
+/// too old for a requested option. [`missing_runtime_error`] would answer all
+/// three with "install the Evergreen Runtime", which cannot help, and would bury
+/// the `HRESULT` (the only thing that can) in a trailing parenthetical.
+///
+/// So this is a plain [`RendererError::Backend`] that names the operation and
+/// LEADS with `detail`. Honest failure is the product value here (`docs/adr/0005`
+/// on silent no-ops, the fail-closed load path): an error that confidently
+/// misdiagnoses itself is worse than a generic one.
+#[must_use]
+pub fn environment_creation_error(detail: &str) -> RendererError {
+    let detail = detail.trim();
+    let mut message = format!(
+        "the {WEBVIEW2_RUNTIME_NAME} is installed on this machine, but it refused to create the \
+         browser environment werust renders in"
+    );
+    if detail.is_empty() {
+        message.push('.');
+    } else {
+        message.push_str(&format!(": {detail}"));
     }
     RendererError::Backend(message)
 }
@@ -306,6 +343,47 @@ mod tests {
         let message = missing_runtime_error("   ").to_string();
         assert!(message.contains(WEBVIEW2_RUNTIME_NAME));
         assert!(!message.contains("()"), "got: {message}");
+    }
+
+    #[test]
+    fn a_refusal_after_the_runtime_is_proven_present_is_not_reported_as_a_missing_runtime() {
+        // The distinction this pair of functions EXISTS to make.
+        // `with_user_data_folder` calls `runtime_version()?` before anything
+        // else, and that call succeeds only when
+        // `GetAvailableCoreWebView2BrowserVersionString` named a runtime. So
+        // every refusal after it -- a non-writable or corrupt user-data folder,
+        // a group-policy block, a version refusal -- comes from a runtime that
+        // is PROVEN present, and telling that user to install one is advice that
+        // cannot help while burying the `HRESULT` that could.
+        let error = environment_creation_error("0x8007000D the data is invalid");
+        let RendererError::Backend(message) = &error else {
+            panic!("an environment refusal must be a backend error, got {error:?}");
+        };
+        assert!(
+            message.contains("0x8007000D the data is invalid"),
+            "the platform's own detail is the ONLY thing that can diagnose this, so it must lead \
+             rather than trail, got: {message}"
+        );
+        assert!(
+            !message.contains(WEBVIEW2_RUNTIME_DOWNLOAD),
+            "a runtime that is already installed must not be advertised for download, got: \
+             {message}"
+        );
+        for misdiagnosis in ["is not available", "Install"] {
+            assert!(
+                !message.contains(misdiagnosis),
+                "a failure AFTER the presence check must not claim the runtime is missing \
+                 ({misdiagnosis:?}), got: {message}"
+            );
+        }
+        // The other half of the distinction: the presence check's message is
+        // unchanged and still the one that names the download.
+        let absent = missing_runtime_error("0x80070002").to_string();
+        assert!(absent.contains(WEBVIEW2_RUNTIME_DOWNLOAD) && absent.contains("Install"));
+        // And a detail-less refusal still reads as a sentence, like its sibling.
+        let bare = environment_creation_error("  ").to_string();
+        assert!(bare.contains(WEBVIEW2_RUNTIME_NAME), "got: {bare}");
+        assert!(!bare.ends_with(':'), "got: {bare}");
     }
 
     #[test]

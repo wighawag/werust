@@ -564,64 +564,74 @@ mod tests {
         // So for a spread of chrome states, each painted field must EQUAL the
         // core function that decides it — asserted against the real `werust-core`
         // on the Ubuntu gate, with no Mac and no Windows box in sight.
-        let mut states = vec![ChromeState::default()];
-        // Loading, mid-pipeline.
-        let mut loading = ChromeState::default();
-        loading.url_text = "ipfs://bafy/index.html".into();
-        loading.load_state = LoadState::Started;
-        loading.load_step = LoadStep::FetchingContent;
-        states.push(loading);
-        // A settled, content-verified page.
-        let mut verified = ChromeState::default();
-        verified.load_state = LoadState::Finished;
-        verified.trust_posture = TrustPosture::ContentVerified;
-        states.push(verified);
-        // A mutable name (never labelled "verified": ADR-0006/0007).
-        let mut mutable = ChromeState::default();
-        mutable.load_state = LoadState::Finished;
-        mutable.trust_posture = TrustPosture::MutableName;
-        states.push(mutable);
-        // A hard failure, and a transient one.
-        let mut failed = ChromeState::default();
-        failed.load_state = LoadState::Failed;
-        failed.last_error = Some("points to Swarm, not supported".into());
-        states.push(failed);
-        let mut timed_out = ChromeState::default();
-        timed_out.load_state = LoadState::Failed;
-        timed_out.last_error = Some("timed out fetching the IPNS record".into());
-        states.push(timed_out);
-        // An invalid URL-bar entry (the orthogonal axis).
-        let mut invalid = ChromeState::default();
-        invalid.url_text = "not a url".into();
-        invalid.invalid_entry = Some("not a url".into());
-        states.push(invalid);
-        // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`):
-        // a blessable-but-unblessed name, and a blessed name that has CHANGED (the
-        // loudest settled state there is).
         let pin = TrustedNamePin {
             name: "ronan.eth".into(),
             cid: "bafyblessed".into(),
             blessed_at: 1_800_000_000,
             posture: TrustPosture::NameViaTrustedRpc,
         };
-        let mut blessable = ChromeState::default();
-        blessable.load_state = LoadState::Finished;
-        blessable.trust_posture = TrustPosture::NameViaTrustedRpc;
-        blessable.mutable_name = Some(MutableNameTrust {
-            name: "ronan.eth".into(),
-            cid: "bafyblessed".into(),
-            blessed: None,
-        });
-        states.push(blessable);
-        let mut changed = ChromeState::default();
-        changed.load_state = LoadState::Finished;
-        changed.trust_posture = TrustPosture::NameViaTrustedRpc;
-        changed.mutable_name = Some(MutableNameTrust {
-            name: "ronan.eth".into(),
-            cid: "bafychanged".into(),
-            blessed: Some(pin),
-        });
-        states.push(changed);
+        let states = vec![
+            ChromeState::default(),
+            // Loading, mid-pipeline.
+            ChromeState {
+                url_text: "ipfs://bafy/index.html".into(),
+                load_state: LoadState::Started,
+                load_step: LoadStep::FetchingContent,
+                ..Default::default()
+            },
+            // A settled, content-verified page.
+            ChromeState {
+                load_state: LoadState::Finished,
+                trust_posture: TrustPosture::ContentVerified,
+                ..Default::default()
+            },
+            // A mutable name (never labelled "verified": ADR-0006/0007).
+            ChromeState {
+                load_state: LoadState::Finished,
+                trust_posture: TrustPosture::MutableName,
+                ..Default::default()
+            },
+            // A hard failure, and a transient one.
+            ChromeState {
+                load_state: LoadState::Failed,
+                last_error: Some("points to Swarm, not supported".into()),
+                ..Default::default()
+            },
+            ChromeState {
+                load_state: LoadState::Failed,
+                last_error: Some("timed out fetching the IPNS record".into()),
+                ..Default::default()
+            },
+            // An invalid URL-bar entry (the orthogonal axis).
+            ChromeState {
+                url_text: "not a url".into(),
+                invalid_entry: Some("not a url".into()),
+                ..Default::default()
+            },
+            // The TOFU mutable-name axis (task `ipns-tofu-pin-and-warn-on-change`):
+            // a blessable-but-unblessed name, and a blessed name that has CHANGED
+            // (the loudest settled state there is).
+            ChromeState {
+                load_state: LoadState::Finished,
+                trust_posture: TrustPosture::NameViaTrustedRpc,
+                mutable_name: Some(MutableNameTrust {
+                    name: "ronan.eth".into(),
+                    cid: "bafyblessed".into(),
+                    blessed: None,
+                }),
+                ..Default::default()
+            },
+            ChromeState {
+                load_state: LoadState::Finished,
+                trust_posture: TrustPosture::NameViaTrustedRpc,
+                mutable_name: Some(MutableNameTrust {
+                    name: "ronan.eth".into(),
+                    cid: "bafychanged".into(),
+                    blessed: Some(pin),
+                }),
+                ..Default::default()
+            },
+        ];
 
         for state in &states {
             let paint = ChromePaint::of(state);
@@ -670,10 +680,12 @@ mod tests {
         // 2. In-flight progress is visible but the ERROR BANNER — the only
         //    surface allowed to displace the page — stays hidden. Progress lives
         //    in the URL bar (task `loading-progress-in-the-url-bar-not-a-banner`).
-        let mut loading = ChromeState::default();
-        loading.load_state = LoadState::Started;
-        loading.load_step = LoadStep::ResolvingName;
-        loading.trust_posture = TrustPosture::ContentVerified;
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::ResolvingName,
+            trust_posture: TrustPosture::ContentVerified,
+            ..Default::default()
+        };
         let paint = ChromePaint::of(&loading);
         assert_eq!(paint.trust_class, "trust-loading");
         assert_eq!(paint.trust_text, trust_indicator(&loading));
@@ -689,17 +701,21 @@ mod tests {
         );
 
         // Settled: no progress, and no tooltip left to linger on hover.
-        let mut settled = ChromeState::default();
-        settled.load_state = LoadState::Finished;
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            ..Default::default()
+        };
         let paint = ChromePaint::of(&settled);
         assert!(!paint.progress_visible);
         assert_eq!(paint.progress_fraction, 0.0);
         assert_eq!(paint.progress_tooltip, None);
 
         // A FAILURE is the one state that may take the banner.
-        let mut failed = ChromeState::default();
-        failed.load_state = LoadState::Failed;
-        failed.last_error = Some("boom".into());
+        let failed = ChromeState {
+            load_state: LoadState::Failed,
+            last_error: Some("boom".into()),
+            ..Default::default()
+        };
         assert!(ChromePaint::of(&failed).error_visible);
     }
 
@@ -717,14 +733,16 @@ mod tests {
             blessed_at: 1_800_000_000,
             posture: TrustPosture::NameViaTrustedRpc,
         };
-        let mut changed = ChromeState::default();
-        changed.load_state = LoadState::Finished;
-        changed.trust_posture = TrustPosture::NameViaTrustedRpc;
-        changed.mutable_name = Some(MutableNameTrust {
-            name: "ronan.eth".into(),
-            cid: "bafychanged".into(),
-            blessed: Some(pin),
-        });
+        let changed = ChromeState {
+            load_state: LoadState::Finished,
+            trust_posture: TrustPosture::NameViaTrustedRpc,
+            mutable_name: Some(MutableNameTrust {
+                name: "ronan.eth".into(),
+                cid: "bafychanged".into(),
+                blessed: Some(pin),
+            }),
+            ..Default::default()
+        };
         let paint = ChromePaint::of(&changed);
         assert_eq!(paint.trust_class, "trust-name-changed");
         assert_ne!(paint.trust_class, "trust-mutable-name");

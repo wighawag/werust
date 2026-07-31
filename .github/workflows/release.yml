@@ -115,11 +115,13 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # The verify gate — identical to dorfl.json's `verify`.
+      # The verify gate, identical to dorfl.json's `verify`, step for step
+      # (`crates/werust-core/tests/verify_gate_shape.rs` reds if the two drift).
+      # Clippy lints ALL targets and denies warnings; see verify.yml's note.
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo clippy
-        run: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
       - name: cargo build
         run: cargo build
       - name: cargo test

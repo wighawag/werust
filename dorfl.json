@@ -1,6 +1,6 @@
 {
 	"dorflCmd": "npx dorfl@0.11.1",
-	"verify": "cargo fmt --check && cargo clippy && cargo build && cargo test",
+	"verify": "cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test",
 	"harness": "pi",
 	"autoBuild": false,
 	"autoTask": false,

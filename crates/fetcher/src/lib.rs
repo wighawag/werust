@@ -493,7 +493,10 @@ fn verify_bytes_against_cid(cid: &Cid, bytes: &[u8]) -> Result<(), VerifyError> 
     match mh.code() {
         MULTIHASH_SHA2_256 => {
             let computed = Sha256::digest(bytes);
-            if computed.as_slice() == mh.digest() {
+            // Slice via `Deref`, not `GenericArray::as_slice`: the latter is
+            // deprecated pending generic-array 1.x, and the gate denies warnings.
+            // Same bytes either way; this comparison is the verify itself.
+            if &computed[..] == mh.digest() {
                 Ok(())
             } else {
                 Err(VerifyError::HashMismatch {
@@ -527,7 +530,9 @@ pub fn cid_v1_raw_sha256(bytes: &[u8]) -> Result<String, VerifyError> {
     /// The `raw` IPLD multicodec code (block bytes ARE the content).
     const RAW_CODEC: u64 = 0x55;
     let digest = Sha256::digest(bytes);
-    let mh = Multihash::<64>::wrap(MULTIHASH_SHA2_256, digest.as_slice())
+    // `&digest[..]` rather than the deprecated `GenericArray::as_slice` (see
+    // `verify_bytes_against_cid`).
+    let mh = Multihash::<64>::wrap(MULTIHASH_SHA2_256, &digest[..])
         .map_err(|e| VerifyError::InvalidCid(e.to_string()))?;
     Ok(Cid::new_v1(RAW_CODEC, mh).to_string())
 }

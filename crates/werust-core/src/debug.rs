@@ -1992,9 +1992,9 @@ mod tests {
                 "`{class}` is returned for a real console level but is not in the exported set"
             );
         }
-        for exported in DEBUG_CONSOLE_CSS_CLASSES.iter().copied() {
+        for exported in DEBUG_CONSOLE_CSS_CLASSES {
             assert!(
-                produced.contains(&exported),
+                produced.contains(exported),
                 "`{exported}` is exported but no console level produces it (a dead name)"
             );
         }

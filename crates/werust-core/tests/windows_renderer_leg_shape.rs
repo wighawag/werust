@@ -439,7 +439,7 @@ fn the_pull_request_filter_stays_narrow_and_push_carries_the_rest() {
         // Every crate in the set is a `crates/<package-name>` directory.
         let dir = format!("crates/{pkg}/**");
         assert!(
-            push.iter().any(|p| *p == dir),
+            push.contains(&dir),
             "the `push` filter must cover every crate the leg builds, since the PR filter \
              deliberately does not: missing {dir:?}; got {push:?}"
         );

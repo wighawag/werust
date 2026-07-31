@@ -38,12 +38,19 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
-      # The verify gate — identical to dorfl.json's `verify`.
+      # The verify gate, identical to dorfl.json's `verify`, step for step
+      # (`crates/werust-core/tests/verify_gate_shape.rs` reds if the two drift).
       - name: cargo fmt --check
         run: cargo fmt --check
 
+      # `--all-targets` so `#[cfg(test)]` modules, integration tests and the
+      # load-bearing `examples/` are linted, not just lib/bin targets; `-D
+      # warnings` because `cargo clippy` EXITS 0 on warnings, so without it the
+      # lint half of the gate only prints. See
+      # `docs/spikes/verify-lints-test-targets-and-clears-the-existing-debt/`
+      # for what this covers and what it (still) cannot.
       - name: cargo clippy
-        run: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: cargo build
         run: cargo build

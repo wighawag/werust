@@ -37,9 +37,10 @@
 //!    (`the_origin_probe_and_its_negative_control_exist`).
 //! 6. A CI job on the existing `macos-14` runner builds and exercises it
 //!    (`a_macos_14_ci_job_builds_and_exercises_the_backend`).
-//! 7/8. What CI proved vs what awaits a Mac is written down, and the Ubuntu gate
-//!    stays green (`the_verification_honesty_is_recorded`, plus this file being a
-//!    plain `cargo test`).
+//! 7. What CI proved vs what awaits a Mac is written down
+//!    (`the_verification_honesty_is_recorded`).
+//! 8. The Ubuntu gate stays green: this file is a plain `cargo test` that needs
+//!    no Xcode and no SDK.
 
 use std::path::{Path, PathBuf};
 

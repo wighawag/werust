@@ -3,17 +3,20 @@ title: "Sign and notarize the macOS `.app` so a downloaded release opens without
 slug: macos-app-signing-and-notarization
 blockedBy: [macos-release-packaging-leg]
 covers: []
-needsAnswers: true
+reason: "Cannot be built: there is no paid Apple Developer Program membership (2026-08-01), which Developer ID signing and notarization both require unconditionally. Independently, there is no Mac, so even a fully notarized `.app` could not be validated by anyone on this project. Revisit ONLY if the membership is bought, and then AFTER iOS device delivery, which is the purchase that would actually buy testability. Ground truth + the three consequences: work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md"
 ---
 
-<!-- open-questions -->
+## Why this is cancelled (2026-08-01)
 
-## Open questions
+The two open questions this task carried were answered by the human, and both answers are terminal for it:
 
-1. **Is there an Apple Developer account?** Developer ID signing and notarization both require a paid Apple Developer Program membership ($99/yr) and a Developer ID Application certificate. Without one this task cannot be built at all, and the honest alternative is to keep shipping unsigned and improve the open-it instructions instead. Does the account exist, or is it wanted?
-2. **Where do the secrets live, and who puts them there?** The Android precedent needs a keystore, its password and an alias in repository secrets, provided by the human. This needs the exported Developer ID certificate (`.p12`) plus its password, and an App Store Connect API key (issuer id, key id, `.p8`) for `notarytool`. Same question as `android-apk-signing`: the human provides them, but confirm which storage (repository secrets vs an environment) and who rotates them.
+1. **Is there an Apple Developer account?** No, and one is not wanted for now. Developer ID signing and notarization each require a paid membership; there is no free or CI-side substitute (a GitHub macOS runner cannot stand in: free "Personal Team" provisioning is Xcode-interactive, needs an attached device, and mints credentials no CI job can authenticate with). So this task is unbuildable as written, not merely unscheduled.
+2. **Where do the secrets live?** Void. There is no `.p12` certificate and no App Store Connect API key to store, so the question has no subject.
 
-<!-- /open-questions -->
+**The honest alternative this task names for itself ("keep shipping unsigned and improve the open-it instructions instead") was considered and deliberately NOT spun out as a successor task.** With no Mac, nobody here can see the Gatekeeper dialog, follow the click-path, or confirm the instructions are correct, so it would be writing confident documentation about an unobservable flow. Writing unverifiable prose is worse than leaving the current README text alone.
+
+**What remains true and is recorded elsewhere:** the release still attaches a deliberately UNSIGNED `Werust-macos-universal-unsigned.app.zip`, named for what it is, and `release.yml`'s header still documents the gap. The broader consequence (macOS and iOS have no human in the loop at all, so CI is their only evidence and their smokes deserve to be stronger than platforms that get field-tested) is captured as a finding rather than lost in this cancelled task.
+
 
 ## What to build
 

@@ -23,7 +23,7 @@ The chrome adopts the conventions a user already knows.
 - **Loading**: a spinner joins the existing URL-bar progress bar, both driven by the same `is_loading` truth, with reload and stop collapsing into the single button browsers use.
 - **History buttons**: kept on desktop, removed from both mobile edges, where the platform's own gesture is the affordance.
 
-The trust indicator's visual language is deliberately NOT part of this spec; it turned out to be a trust-model decision rather than a chrome-polish one and now lives in `work/specs/proposed/trust-and-privacy-indicators.md` and `docs/adr/0012`.
+The trust indicator's visual language is deliberately NOT part of this spec; it turned out to be a trust-model decision rather than a chrome-polish one and now lives in `work/specs/proposed/trust-indicator-and-details-panel.md` and `docs/adr/0012`.
 
 ## User Stories
 
@@ -70,7 +70,7 @@ The shortcut table is a pure function, so the whole set is a table test with no 
 
 - **Find-in-page and bookmarks**, and therefore Ctrl+F and Ctrl+D. Binding a shortcut to a feature that does not exist is worse than leaving the key free.
 - **Tabs**, and any shortcut that implies them (Ctrl+T, Ctrl+W, Ctrl+Tab). `docs/adr/0010` records that `_blank` and `window.open` navigate in place until tabs exist.
-- **The trust indicator's icon and the privacy indicator.** Moved to `trust-and-privacy-indicators` + `docs/adr/0012`.
+- **The trust indicator's icon and its details panel.** Moved to `trust-indicator-and-details-panel` + `docs/adr/0012`. (A separate PRIVACY indicator was analysed and deferred there; do not add one here.)
 - **Removing the desktop back/forward buttons.** Explicitly rejected by the human: desktop keeps them, matching every desktop browser.
 
 ## Further Notes

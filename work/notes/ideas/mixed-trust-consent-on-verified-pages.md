@@ -27,8 +27,8 @@ Three things constrain the design, and all three are moving:
 ## Shape, if it is built
 
 - The permission is per (page origin -> target origin), remembered, and revocable.
-- The prompt states the consequence in the vocabulary the indicators already use: granting it DEGRADES this page's privacy level, and (pre-Helios) means part of what the page shows was not verified.
-- The natural home for both the prompt's detail and the revocation is the trust/privacy details panel (`trust-and-privacy-indicators`), which is already positioned to be the single trust/privacy/permissions surface. Do not mint a second permissions UI.
+- The prompt states the consequence in the vocabulary the chrome already uses: (pre-Helios) part of what the page shows was not verified, and the request is observable. Note it cannot lean on a privacy INDICATOR to carry that, since the indicator is deferred (`docs/adr/0012` status note), so the prompt must say it in words.
+- The natural home for both the prompt's detail and the revocation is the trust details panel (`trust-indicator-and-details-panel`), which is already positioned to be the single trust/permissions surface. Do not mint a second permissions UI.
 - Case 1 (plaintext http anywhere) needs no consent: block, and say so.
 
 ## Not decided

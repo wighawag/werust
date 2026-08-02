@@ -1,19 +1,9 @@
 ---
 title: "Give the trust indicator a real icon and a details panel: colour-coded posture in the toolbar, protocol identity and certificate detail behind a click"
 slug: trust-indicator-and-details-panel
-needsAnswers: true
 ---
 
 > Launch snapshot — records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks.
-
-<!-- open-questions -->
-
-## Open questions
-
-1. **Which colour does each of the six trust states get?** The family is fixed (`TRUST_INDICATOR_CSS_CLASSES`: loading, verified, name-via-trusted-rpc, mutable-name, name-changed, unverified) and `docs/adr/0006` fixes their loudness precedence, but the mapping to green/orange/red is a product decision. The proposal to confirm or correct: **green** = content-verified (a direct `ipfs://<cid>`: hash-verified, immutable, nothing can lie about it); **orange** = mutable-name AND name-via-trusted-rpc (a third party could misdirect the name, though the bytes verified); **red** = unverified-origin (the ordinary server web) AND name-changed (a name you personally blessed now points elsewhere, which ADR-0006 makes the loudest state there is); **neutral** = loading. Note this puts the entire ordinary https web at red, which is honest under werust's thesis but is a deliberate stance worth confirming rather than assuming.
-2. **How much certificate detail, and what does an edge that cannot produce it show?** WebKitGTK, WKWebView (`serverTrust`), Android (`SslCertificate`) and WebView2 expose different amounts. Minimum useful set (issuer, subject, validity dates, fingerprint), or more? And a missing capability must degrade honestly: does that edge hide the section, or say it cannot read it?
-
-<!-- /open-questions -->
 
 ## Problem Statement
 
@@ -52,7 +42,7 @@ The privacy indicator that this spec originally also covered is DEFERRED (`docs/
 ### Autonomy notes
 
 - **`humanOnly`**: not set. The trust model itself is already decided and recorded (`docs/adr/0006`, `docs/adr/0012`); what remains is presentation.
-- **`needsAnswers`**: set, on two questions. The colour mapping is a stance about the ordinary web, and the certificate-detail scope depends on a per-edge capability survey; both would otherwise be guessed at tasking time.
+- **`needsAnswers`**: not set. Both launch questions were answered by the human on 2026-08-01 and are recorded under Implementation Decisions (the colour mapping including its ordinary-web consequence, and the certificate-detail floor plus its honest-degradation rule).
 
 ## Implementation Decisions
 
@@ -66,7 +56,22 @@ The privacy indicator that this spec originally also covered is DEFERRED (`docs/
 
 **Certificate detail is a per-edge capability, not a uniform feature**, so it needs a capability-matrix row (`docs/adr/0005`) and must degrade honestly on an edge that cannot produce it.
 
-**Colour is not the only channel** (story 5): the posture must remain distinguishable by icon shape and by the words already derived, so hue is reinforcement rather than the sole carrier.
+**The colour mapping is fixed** (human, 2026-08-01), over the whole `TRUST_INDICATOR_CSS_CLASSES` family so it is total by construction:
+
+| state | colour | why |
+| --- | --- | --- |
+| content-verified | **green** | a direct `ipfs://<cid>`: hash-verified and immutable, so nothing can lie about it |
+| mutable-name | **orange** | the bytes verified, but the controller can repoint the name |
+| name-via-trusted-rpc | **orange** | the bytes verified, but a trusted RPC could misdirect the name |
+| unverified-origin | **red** | the ordinary server web: nothing was verified |
+| name-changed | **red** | a name the user personally blessed now points elsewhere, the loudest state `docs/adr/0006` defines |
+| loading | **neutral** | no posture is being asserted yet |
+
+**The consequence is deliberate and was accepted explicitly: the ENTIRE ordinary https web shows red.** This is a stance, not an oversight. werust's thesis is that the origin is not trusted by default (`docs/adr/0001`), so a page whose bytes nothing verified is exactly what red means, however common that is. Do not soften it to "neutral because it is normal": that would restate the thesis as its opposite. The two red states are still distinguishable by icon and words, since name-changed is a personal-trust violation while unverified-origin is merely the status quo.
+
+**Colour is not the only channel** (story 5): the posture must remain distinguishable by icon shape and by the words already derived, so hue is reinforcement rather than the sole carrier. This matters more than usual here, because two states share red and two share orange, so hue alone cannot separate the pairs even for a user who sees it perfectly.
+
+**Certificate detail has a fixed FLOOR and an honest ceiling** (human, 2026-08-01): the minimum useful set is issuer, subject, validity dates and fingerprint. An edge may show more if it can, but an edge that cannot produce the set **says so** rather than hiding the section: a silently absent panel section looks like a bug and reads like a claim about the certificate. Which edges can produce what is the capability-matrix row's job to record.
 
 ## Testing Decisions
 

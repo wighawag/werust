@@ -3,7 +3,7 @@ title: "The chrome should behave like a browser: conventional keyboard shortcuts
 slug: chrome-conventional-controls
 ---
 
-> Launch snapshot — records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks.
+> Launch snapshot — records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/` items. TASKED 2026-08-01 into nine tasks; the Implementation and Testing detail moved into those tasks, which own what to build.
 
 ## Problem Statement
 
@@ -43,38 +43,18 @@ The trust indicator's visual language is deliberately NOT part of this spec; it 
 14. As a desktop user, I want the back and forward buttons kept, so that the chrome still matches desktop browser convention.
 15. As a user who has learned werust's F12 web inspector, I want it to keep working exactly as it does, so that a new shortcut layer does not break the one binding that already exists.
 
-### Autonomy notes
-
-- **`humanOnly`**: not set. Nothing here touches secrets, release plumbing or security material; it is chrome behaviour.
-- **`needsAnswers`**: not set. The three questions this spec launched with were answered by the human on 2026-08-01: Escape is focus-dependent (stories 5 and 6), reload and stop collapse into one control (story 10), and the trust-icon question moved out to its own spec. Ctrl+F and Ctrl+D remain deliberately unbound (see Out of Scope).
-
-## Implementation Decisions
-
-**The shortcut mapping is a core derivation, not five key handlers.** The precedent already exists and is good: `should_open_web_inspector(keyval, modifiers)` is a pure, display-free, test-pinned function in the desktop binary. Generalise that shape into the toolkit-free core as a resolution from an abstract (key, modifiers) pair to a chrome ACTION, with each edge translating its native key event into the abstract form. This is what makes the Cmd-versus-Ctrl split a single branch instead of a per-edge reimplementation, and it makes the whole shortcut table testable without a display. The existing F12 behaviour folds into the same table rather than sitting beside it.
-
-**Escape is focus-dependent, which means the resolution takes focus as an input.** Stop-the-load when the page has focus; revert-and-restore when the URL bar does. Note this is the one shortcut whose action is not a pure function of (key, modifiers) alone, so the derivation's signature must accommodate it rather than special-casing Escape in each edge.
-
-**Reload and stop become one control.** Reload while idle, stop while loading, driven by the same `ChromeState::is_loading` the progress bar reads. This removes the separate Stop button that is currently the documented cancel affordance, so the cancel path must be verified to survive the merge, including its keyboard route (story 5).
-
-**The spinner reads `is_loading`; it does not mint a second loading truth.** `load_progress_visible` / `_fraction` / `_hint` already derive from `ChromeState`; spinner visibility is another derived value from the same state, not a widget an edge toggles on its own. Two presentations, one fact.
-
-**History buttons become a per-painter affordance decision, and core does not change.** `ChromeState::can_go_back` / `can_go_forward`, the `Renderer` seam's `go_back` / `go_forward`, and the `desktop-paint` snapshot all STAY exactly as they are: Android's hardware Back rides on them today and the new Alt+Left will ride on them tomorrow. Only the two mobile painters stop rendering buttons for them.
-
-**Precondition before removing the iOS buttons:** confirm `allowsBackForwardNavigationGestures` is actually enabled on the WKWebView. This must be asserted in code/CI rather than field-tested, because nobody on this project has a Mac (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`). Removing a button in favour of a gesture that turns out to be disabled would strand iOS history navigation with no way to notice.
-
-## Testing Decisions
-
-The shortcut table is a pure function, so the whole set is a table test with no display, exactly as `should_open_web_inspector` is pinned today, including its negative cases (which stopped Ctrl+Shift+I from colliding with the GTK debugger). Escape needs both focus states covered, since that is the case a per-edge implementation would get wrong. Spinner visibility and the reload/stop control's mode are derived-value tests on `ChromeState`. The mobile button removal is a source-shape assertion per edge, plus, for iOS, an assertion that the swipe gesture is enabled.
-
 ## Out of Scope
 
 - **Find-in-page and bookmarks**, and therefore Ctrl+F and Ctrl+D. Binding a shortcut to a feature that does not exist is worse than leaving the key free.
 - **Tabs**, and any shortcut that implies them (Ctrl+T, Ctrl+W, Ctrl+Tab). `docs/adr/0010` records that `_blank` and `window.open` navigate in place until tabs exist.
 - **The trust indicator's icon and its details panel.** Moved to `trust-indicator-and-details-panel` + `docs/adr/0012`. (A separate PRIVACY indicator was analysed and deferred there; do not add one here.)
 - **Removing the desktop back/forward buttons.** Explicitly rejected by the human: desktop keeps them, matching every desktop browser.
+- **Hardware-keyboard shortcuts on the mobile edges.** Confirmed at tasking: no story asks for them, and the shortcut tasks cover the three desktop edges only.
 
 ## Further Notes
 
-Sequencing matters here, and one order is wrong: the shortcuts must land BEFORE any history button is removed anywhere. Today Alt+Left does not exist, so a mobile edge that drops its buttons before the shortcut layer exists is relying entirely on the platform gesture, with no fallback if that gesture turns out to be disabled (the iOS risk above). Shortcuts first is also the order that lets each later change be judged on its own.
+**Two things were MEASURED at tasking time and changed the work; both are now carried by the tasks.**
 
-The original request that produced this spec also asked whether the desktop back/forward buttons could go; the answer was no, and it is recorded in Out of Scope so it is not re-proposed.
+`allowsBackForwardNavigationGestures` is set nowhere in the repo, and `WKWebView` defaults it to false, so iOS has no edge-swipe back today. Story 13 was therefore a gap to FIX, not a precondition to verify, and it became its own task that the iOS button-removal task is blocked on. Removing those buttons first would have left iOS with no history navigation at all, which nobody here could have discovered by using it (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`).
+
+This spec originally required the shortcut layer to land before ANY history button was removed. At tasking the human relaxed that for the MOBILE edges deliberately: that ordering exists to guarantee a keyboard fallback, and mobile has no keyboard. Android's system Back is already wired to history, and iOS's affordance is the swipe, so the mobile removals are blocked on their own real prerequisites instead. The desktop buttons are not being removed at all, so the original constraint has no remaining subject.

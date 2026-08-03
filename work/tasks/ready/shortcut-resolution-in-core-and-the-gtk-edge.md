@@ -66,3 +66,7 @@ dorfl claim shortcut-resolution-in-core-and-the-gtk-edge --arbiter origin
 git fetch origin && git switch -c work/shortcut-resolution-in-core-and-the-gtk-edge origin/main
 git mv work/tasks/ready/shortcut-resolution-in-core-and-the-gtk-edge.md work/tasks/done/shortcut-resolution-in-core-and-the-gtk-edge.md
 ```
+
+## Requeue 2026-08-03
+
+Previous run CRASHED for an ENVIRONMENTAL reason only: the acceptance gate ran in /tmp (a 16G tmpfs already 100% full from unrelated projects) and rustc died with 'No space left on device' while linking. This was NOT a code defect and NOT a gate finding. Your committed work on this branch is intact and is being CONTINUED. Do not restart or rewrite the implementation; re-verify it compiles and passes the gate, and only fix genuine defects the gate now reports.

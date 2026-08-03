@@ -229,12 +229,15 @@ fn the_view_is_read_only_and_the_f12_inspector_is_untouched() {
         );
     }
 
-    // The F12 native WebKit inspector coexists untouched: the shortcut predicate
-    // and `show` are still wired (its own unit test pins the F12 /
-    // not-Ctrl+Shift+I decision), and the debug view is a SEPARATE window, not a
-    // replacement.
+    // The F12 native WebKit inspector coexists untouched: the shell still
+    // performs the web-inspector action and calls `show` on the live view, and
+    // the debug view is a SEPARATE window, not a replacement. (The F12 DECISION
+    // itself moved into the shared `werust_core::shortcuts` table by task
+    // `shortcut-resolution-in-core-and-the-gtk-edge`, where its
+    // F12 / not-Ctrl+Shift+I assertions now live; this edge translates and
+    // performs. The check is the same strength: the wiring must still be here.)
     assert!(
-        desktop.contains("should_open_web_inspector") && desktop.contains("inspector.show()"),
+        desktop.contains("ChromeAction::OpenWebInspector") && desktop.contains("inspector.show()"),
         "the F12 WebKit inspector wiring must be untouched"
     );
     assert!(

@@ -10,7 +10,9 @@ Note (correcting an earlier belief): the `shift+F12` that was reachable before t
 2. Press **F12** in the werust window. The WebKitGTK Web Inspector opens over the page: a real console with a JS REPL you can type into and evaluate, a Network tab, and DOM/Sources.
 3. F12 is deliberately NOT the GTK interactive debugger. That separate GTK widget/CSS surface stays on its own keys (Ctrl+Shift+I / Ctrl+Shift+D) and is untouched.
 
-Wiring: `crates/webview-renderer/src/backend.rs` (`WebViewRenderer::new` sets `WebKitSettings.enable-developer-extras`; `WebViewRenderer::show_inspector` calls `WebInspector::show`) and `crates/werust/src/main.rs` (the F12 key controller via `should_open_web_inspector`).
+Wiring: `crates/webview-renderer/src/backend.rs` (`WebViewRenderer::new` sets `WebKitSettings.enable-developer-extras`; `WebViewRenderer::show_inspector` calls `WebInspector::show`) and `crates/werust/src/main.rs` (the key controller, which performs whatever the shared resolution returns).
+
+Update (task `shortcut-resolution-in-core-and-the-gtk-edge`): the F12 DECISION is no longer a predicate in the desktop binary. `should_open_web_inspector` is gone and F12 is one row of the shared, toolkit-free shortcut table in `werust_core::shortcuts` (`resolve_chord` -> `ChromeAction::OpenWebInspector`), which the GTK edge translates its `gdk` key events into. The behaviour above is unchanged, including that Ctrl+Shift+I / Ctrl+Shift+D stay GTK's interactive debugger; the assertions that pin it moved with it.
 
 ## iOS (WKWebView) — Safari Web Inspector over USB
 

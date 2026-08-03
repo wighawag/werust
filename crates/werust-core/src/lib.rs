@@ -41,6 +41,7 @@ pub mod pins;
 pub mod provider;
 pub mod redirects;
 pub mod retrieval;
+pub mod shortcuts;
 
 /// The version-RESOLUTION rules the build script runs, compiled in under test so
 /// the pure-Rust `verify` gate covers them.

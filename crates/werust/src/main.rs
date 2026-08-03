@@ -24,6 +24,16 @@
 //! properties, so a second desktop window (Win32, AppKit) reuses the rules
 //! instead of minting a fourth copy of them.
 //!
+//! Neither is the meaning of a KEY CHORD or a mouse side button: what Ctrl+L,
+//! F5, Alt+Left, Escape (by focus) or the mouse's Back button MEANS is
+//! [`werust_core::shortcuts`]'s single, display-free resolution, and this file
+//! only TRANSLATES `gdk` keyvals/modifier flags into that vocabulary and
+//! PERFORMS the [`ChromeAction`] it hands back through the same
+//! [`BrowserShell`] the toolbar buttons drive (task
+//! `shortcut-resolution-in-core-and-the-gtk-edge`, spec
+//! `chrome-conventional-controls`). The F12 web-inspector predicate that used to
+//! decide a chord's meaning HERE is gone: it is one row of that table now.
+//!
 //! The same is now true of the DEBUG VIEW's rows: `console_row_text`, the level
 //! and trust CSS classes, the network columns and the incremental-refresh
 //! `tail_plan` were private to this file until the macOS debug view needed the
@@ -55,6 +65,10 @@ use werust_core::debug::{
 };
 use werust_core::ethereum::RpcProvider;
 use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
+// The MEANING of every key chord and mouse side button is the shared core's ONE
+// resolution; this edge translates its native events into that vocabulary and
+// performs what comes back (never decides what a chord means).
+use werust_core::shortcuts::{self, Chord, ChromeAction, Focus, Modifiers, PointerButton};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
     invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip, status_line,
@@ -119,32 +133,187 @@ fn app_id(version: &str) -> String {
     format!("{APP_ID_STEM}.{element}")
 }
 
-/// Whether a key press should open the WebKit Web Inspector (the in-window
-/// devtools: a console REPL + network + DOM for the page), given the pressed
-/// key and the active modifiers.
+/// GDK's button number for the mouse's rear side button (the one a user calls
+/// "button 4" and a mouse engraves "Back").
 ///
-/// The chosen shortcut is F12 with NO modifiers (task
-/// `enable-web-inspector-devtools-all-platforms`,
-/// `work/notes/observations/web-inspector-devtools-gating-decisions-2026-07-23.md`):
-/// F12 is the desktop-browser-idiomatic devtools key and, crucially, does NOT
-/// collide with the GTK INTERACTIVE debugger (widget tree / CSS), which GTK4
-/// binds to Ctrl+Shift+I and Ctrl+Shift+D. So opening the WEB inspector on F12
-/// leaves the GTK debugger's own keys untouched, satisfying the
-/// "does not conflict with the GTK interactive debugger" acceptance criterion.
+/// X11 and Wayland/libinput both deliver the two extra side buttons as GDK
+/// buttons 8 (`BTN_SIDE`) and 9 (`BTN_EXTRA`); 4 and 5 are the legacy X11 scroll
+/// buttons, which GDK4 delivers as scroll events instead, so binding THOSE would
+/// make the wheel navigate history. GDK exposes named constants only for the
+/// primary/middle/secondary buttons, hence these two.
+const GDK_BUTTON_BACK: u32 = 8;
+
+/// GDK's button number for the forward side button ("button 5").
+const GDK_BUTTON_FORWARD: u32 = 9;
+
+/// Translate a GDK keyval into the toolkit-free [`shortcuts::Key`] vocabulary,
+/// or [`None`] for a key that vocabulary has no name for.
 ///
-/// Pure (a function of the keyval + modifiers) so the shortcut decision — in
-/// particular that it is F12 and NOT Ctrl+Shift+I — is pinned display-free; the
-/// GTK key controller that calls it, and the `show_inspector` it triggers, need a
-/// display and are covered by the ignored end-to-end tests.
-fn should_open_web_inspector(keyval: gdk::Key, modifiers: gdk::ModifierType) -> bool {
-    // F12 alone, ignoring lock modifiers (Caps/Num Lock) but rejecting any
-    // Ctrl/Shift/Alt combination, so this never fires on the GTK debugger's
-    // Ctrl+Shift+I / Ctrl+Shift+D.
-    let chord = modifiers
-        & (gdk::ModifierType::CONTROL_MASK
-            | gdk::ModifierType::SHIFT_MASK
-            | gdk::ModifierType::ALT_MASK);
-    keyval == gdk::Key::F12 && chord.is_empty()
+/// TRANSLATION ONLY: it says WHICH key was pressed, never what it means. The
+/// named keys are the ones werust's shortcut table uses; everything else falls
+/// through to the character the keyval produces (so a letter chord like Ctrl+L
+/// arrives as `Character('l')`), and a keyval with no character at all (a bare
+/// modifier, a dead key) is simply not expressible and resolves to nothing.
+fn shortcut_key(keyval: gdk::Key) -> Option<shortcuts::Key> {
+    if keyval == gdk::Key::Escape {
+        Some(shortcuts::Key::Escape)
+    } else if keyval == gdk::Key::F5 {
+        Some(shortcuts::Key::F5)
+    } else if keyval == gdk::Key::F12 {
+        Some(shortcuts::Key::F12)
+    } else if keyval == gdk::Key::Left || keyval == gdk::Key::KP_Left {
+        Some(shortcuts::Key::ArrowLeft)
+    } else if keyval == gdk::Key::Right || keyval == gdk::Key::KP_Right {
+        Some(shortcuts::Key::ArrowRight)
+    } else {
+        keyval.to_unicode().map(shortcuts::Key::Character)
+    }
+}
+
+/// Translate GDK's modifier flags into the toolkit-free [`Modifiers`].
+///
+/// Only the four modifiers a shortcut can use are carried across. Everything
+/// else GDK reports (Caps/Num Lock, the button masks) is dropped here, which is
+/// what keeps a chord firing while a lock key happens to be on. It is the
+/// the F12 binding has had since it landed, now expressed as "the core never
+/// hears about lock modifiers" instead of a mask in a predicate.
+///
+/// GDK's Super (the Windows/Command key position) and Meta both map to the UI
+/// Events `meta` the core speaks, so a Super chord is REPORTED rather than
+/// silently read as unmodified.
+fn shortcut_modifiers(state: gdk::ModifierType) -> Modifiers {
+    Modifiers {
+        control: state.contains(gdk::ModifierType::CONTROL_MASK),
+        alt: state.contains(gdk::ModifierType::ALT_MASK),
+        shift: state.contains(gdk::ModifierType::SHIFT_MASK),
+        meta: state.contains(gdk::ModifierType::SUPER_MASK)
+            || state.contains(gdk::ModifierType::META_MASK),
+    }
+}
+
+/// What a GTK key press MEANS: this edge's native event, translated and handed
+/// to the shared resolution.
+///
+/// The whole of this edge's key handling, and deliberately a pure function of
+/// (keyval, modifiers, focus) so the translation is pinned display-free, exactly
+/// as the F12 predicate it replaces was. The decision itself is
+/// [`shortcuts::resolve_chord`]'s; the platform's accelerator convention is the
+/// core's call too ([`shortcuts::PrimaryModifier::for_target`], Ctrl on this
+/// Linux edge), so the Cmd-versus-Ctrl split is not restated here.
+fn shortcut_action(
+    keyval: gdk::Key,
+    modifiers: gdk::ModifierType,
+    focus: Focus,
+) -> Option<ChromeAction> {
+    let key = shortcut_key(keyval)?;
+    shortcuts::resolve_chord(
+        Chord::new(key, shortcut_modifiers(modifiers)),
+        focus,
+        shortcuts::PrimaryModifier::for_target(),
+    )
+}
+
+/// Translate a GDK button number into the toolkit-free [`PointerButton`], or
+/// [`None`] for the ordinary buttons the page keeps.
+fn shortcut_pointer_button(button: u32) -> Option<PointerButton> {
+    match button {
+        GDK_BUTTON_BACK => Some(PointerButton::Back),
+        GDK_BUTTON_FORWARD => Some(PointerButton::Forward),
+        _ => None,
+    }
+}
+
+/// Report which of the two focus contexts the shared resolution distinguishes is
+/// live, so Escape can mean "stop the load" in the page and "revert my edit" in
+/// the URL bar without this edge deciding either.
+///
+/// The URL bar is a `GtkEntry`, which delegates the keyboard to an internal
+/// `GtkText`, so "is the entry focused?" is asked of the window's focus widget
+/// (the entry itself OR anything inside it) rather than of the entry's own
+/// `has_focus`, which is false while the user is typing in it.
+fn shortcut_focus(url_entry: &Entry) -> Focus {
+    let Some(root) = url_entry.root() else {
+        return Focus::Page;
+    };
+    // `RootExt::focus`, the widget the toplevel currently routes the keyboard to.
+    match gtk4::prelude::RootExt::focus(&root) {
+        Some(focused)
+            if &focused == url_entry.upcast_ref::<Widget>() || focused.is_ancestor(url_entry) =>
+        {
+            Focus::UrlBar
+        }
+        _ => Focus::Page,
+    }
+}
+
+/// PERFORM a resolved [`ChromeAction`]: this edge's half of the shortcut layer,
+/// shared by the key controller and the mouse side buttons.
+///
+/// Every action is performed the SAME way the equivalent toolbar control
+/// performs it: through the [`BrowserShell`] (and therefore the `Renderer`
+/// seam), gated on the SAME [`ChromeState`] capability flags the buttons take
+/// their sensitivity from, then a chrome repaint. Nothing here re-decides what
+/// the action was for; the `match` is exhaustive over
+/// [`ChromeAction`](werust_core::shortcuts::ChromeAction), so an action added to
+/// the shared vocabulary stops this edge compiling until it is handled or
+/// explicitly declined.
+fn perform_chrome_action(
+    action: ChromeAction,
+    shell: &Rc<RefCell<BrowserShell>>,
+    url_entry: &Entry,
+    inspector_view: &webkit6::WebView,
+    refresh: &Rc<dyn Fn()>,
+) {
+    match action {
+        ChromeAction::FocusUrlBar => {
+            // Focus AND select, so the next keystroke replaces the address
+            // (story 1); no shell call, so no repaint is owed.
+            url_entry.grab_focus();
+            url_entry.select_region(0, -1);
+        }
+        ChromeAction::Reload => {
+            let _ = shell.borrow_mut().reload();
+            refresh();
+        }
+        ChromeAction::GoBack => {
+            // The SAME capability flag the Back button's sensitivity reads: a
+            // shortcut must not be able to drive a history move the on-screen
+            // control refuses.
+            let can_go_back = shell.borrow().chrome().can_go_back;
+            if can_go_back {
+                shell.borrow_mut().go_back();
+                refresh();
+            }
+        }
+        ChromeAction::GoForward => {
+            let can_go_forward = shell.borrow().chrome().can_go_forward;
+            if can_go_forward {
+                shell.borrow_mut().go_forward();
+                refresh();
+            }
+        }
+        ChromeAction::Stop => {
+            shell.borrow_mut().stop();
+            refresh();
+        }
+        ChromeAction::RevertUrlBar => {
+            // Revert the edit and restore the CURRENT page's URL (story 6): the
+            // bar goes back to the shell's `url_text`, the same one fact
+            // `Chrome::refresh` paints it from, so Escape can never leave the bar
+            // showing something the chrome does not believe.
+            let url = shell.borrow().chrome().url_text.clone();
+            url_entry.set_text(&url);
+            url_entry.set_position(-1);
+        }
+        ChromeAction::OpenWebInspector => {
+            // This edge HAS the capability, so it has a handler; an edge that
+            // does not (macOS) simply has none, and the shared resolution stays
+            // capability-agnostic.
+            if let Some(inspector) = inspector_view.inspector() {
+                inspector.show();
+            }
+        }
+    }
 }
 
 /// Builds the startup banner shown when the browser launches.
@@ -1360,27 +1529,71 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     shell.borrow_mut().focus_page(true);
     refresh();
 
-    // Wire the WEB inspector shortcut: F12 opens the WebKitGTK Web Inspector
-    // (a real console REPL + network + DOM) over the current page IN-WINDOW
-    // (task `enable-web-inspector-devtools-all-platforms`). F12 is chosen to NOT
-    // collide with the GTK interactive debugger (Ctrl+Shift+I / Ctrl+Shift+D),
-    // which is a separate GTK-level widget/CSS surface, not web content. The key
-    // controller is added to the WINDOW so the shortcut works wherever focus is,
-    // and `show_inspector` is a safe no-op in a release build (developer-extras is
-    // off there — the inspector is gated on a debug build), so this shortcut
-    // cannot open devtools on a shipped build.
+    // Wire the CONVENTIONAL BROWSER SHORTCUTS: Ctrl+L, Ctrl+R / F5, Alt+Left /
+    // Alt+Right, Escape (by focus) and F12, plus the mouse's back/forward side
+    // buttons (task `shortcut-resolution-in-core-and-the-gtk-edge`, spec
+    // `chrome-conventional-controls`). What each input MEANS is decided ONCE, in
+    // `werust_core::shortcuts`; this edge translates the `gdk` event into that
+    // vocabulary, reports which of the two focus contexts is live, and performs
+    // the returned action through the shell. The F12 row is the web inspector
+    // that used to be this file's own predicate: `show` is a safe no-op in a
+    // release build (developer-extras is off there), so it still cannot open
+    // devtools on a shipped build.
+    //
+    // Both controllers are added to the WINDOW, in the CAPTURE phase: a browser's
+    // own chords have to beat both the focused page (a page may bind Escape, and
+    // WebKitGTK would otherwise swallow it) and the URL bar's own text-editing
+    // keys, which is how every browser behaves. Anything the resolution does NOT
+    // claim is propagated untouched, so ordinary typing, page keys and GTK4's
+    // interactive-debugger chords (Ctrl+Shift+I / Ctrl+Shift+D) still reach their
+    // usual handler.
     let key_controller = gtk4::EventControllerKey::new();
-    key_controller.connect_key_pressed(move |_controller, keyval, _keycode, modifiers| {
-        if should_open_web_inspector(keyval, modifiers) {
-            if let Some(inspector) = inspector_view.inspector() {
-                inspector.show();
+    key_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    key_controller.connect_key_pressed({
+        let shell = shell.clone();
+        let refresh = refresh.clone();
+        let url_entry = url_entry.clone();
+        let inspector_view = inspector_view.clone();
+        move |_controller, keyval, _keycode, modifiers| {
+            let focus = shortcut_focus(&url_entry);
+            match shortcut_action(keyval, modifiers, focus) {
+                Some(action) => {
+                    perform_chrome_action(action, &shell, &url_entry, &inspector_view, &refresh);
+                    glib::Propagation::Stop
+                }
+                None => glib::Propagation::Proceed,
             }
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
         }
     });
     window.add_controller(key_controller);
+
+    // The mouse's extra side buttons ("4 and 5", GDK 8 and 9) navigate history,
+    // through the SAME resolution and the SAME performer the keyboard uses (the
+    // same input-to-action plumbing), so nothing here decides what a button
+    // means either. Button 0 listens to every button; anything that is not a side
+    // button is left unclaimed for the page.
+    let mouse_controller = gtk4::GestureClick::new();
+    mouse_controller.set_button(0);
+    mouse_controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
+    mouse_controller.connect_pressed({
+        let shell = shell.clone();
+        let refresh = refresh.clone();
+        let url_entry = url_entry.clone();
+        let inspector_view = inspector_view.clone();
+        move |gesture, _n_press, _x, _y| {
+            let Some(button) = shortcut_pointer_button(gesture.current_button()) else {
+                return;
+            };
+            let Some(action) = shortcuts::resolve_pointer_button(button) else {
+                return;
+            };
+            perform_chrome_action(action, &shell, &url_entry, &inspector_view, &refresh);
+            // Claimed, so the page does not ALSO act on a button the chrome just
+            // consumed.
+            gesture.set_state(gtk4::EventSequenceState::Claimed);
+        }
+    });
+    window.add_controller(mouse_controller);
 
     // Pump the seam's load-lifecycle events on the GTK loop and keep the chrome in
     // step; this is what turns WebKitGTK's async load into a live, reflected UI.
@@ -1414,8 +1627,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        app_id, banner, parse_args, resolve_output, should_open_web_inspector, usage, Command,
-        ResolveOutput, ResolvedName, APP_CSS, DEFAULT_URL,
+        app_id, banner, parse_args, resolve_output, shortcut_action, shortcut_pointer_button,
+        usage, Command, ResolveOutput, ResolvedName, APP_CSS, DEFAULT_URL,
     };
     use gtk4::prelude::*;
     use gtk4::{gdk, gio, Label};
@@ -1425,46 +1638,140 @@ mod tests {
     use werust_core::contenthash::ProtoCode;
     use werust_core::debug::{ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry};
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
+    use werust_core::shortcuts::{ChromeAction, Focus, PointerButton};
     use werust_core::CssClassFamily;
 
     #[test]
     fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
-        // Acceptance: the desktop web-inspector shortcut is F12 (a real console
-        // REPL + network in-window), and it does NOT conflict with the GTK
-        // interactive debugger, which GTK4 binds to Ctrl+Shift+I / Ctrl+Shift+D.
-        // So F12 (no modifiers) opens the WEB inspector, while the GTK debugger's
-        // own chords must NOT trigger it — the two surfaces stay distinct.
-        assert!(
-            should_open_web_inspector(gdk::Key::F12, gdk::ModifierType::empty()),
+        // Acceptance (story 15, the assertions the web-inspector task landed,
+        // MOVED onto the shared resolution rather than weakened): the desktop
+        // web-inspector shortcut is F12 (a real console REPL + network
+        // in-window), and it does NOT conflict with the GTK interactive
+        // debugger, which GTK4 binds to Ctrl+Shift+I / Ctrl+Shift+D. So F12 (no
+        // modifiers) opens the WEB inspector, while the GTK debugger's own chords
+        // must NOT trigger it: the two surfaces stay distinct. What changed is
+        // WHERE the decision lives (`werust_core::shortcuts`); this edge only
+        // translates the `gdk` event into it.
+        assert_eq!(
+            shortcut_action(gdk::Key::F12, gdk::ModifierType::empty(), Focus::Page),
+            Some(ChromeAction::OpenWebInspector),
             "F12 opens the web inspector"
         );
         // Caps/Num Lock (non-chord modifiers) must not stop F12 firing.
-        assert!(should_open_web_inspector(
-            gdk::Key::F12,
-            gdk::ModifierType::LOCK_MASK
-        ));
+        assert_eq!(
+            shortcut_action(gdk::Key::F12, gdk::ModifierType::LOCK_MASK, Focus::Page),
+            Some(ChromeAction::OpenWebInspector)
+        );
 
         // The GTK interactive debugger's chords must NOT open the web inspector.
         let gtk_debugger_chord = gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK;
-        assert!(
-            !should_open_web_inspector(gdk::Key::i, gtk_debugger_chord),
+        assert_eq!(
+            shortcut_action(gdk::Key::i, gtk_debugger_chord, Focus::Page),
+            None,
             "Ctrl+Shift+I is the GTK debugger, not the web inspector"
         );
-        assert!(
-            !should_open_web_inspector(gdk::Key::d, gtk_debugger_chord),
+        assert_eq!(
+            shortcut_action(gdk::Key::d, gtk_debugger_chord, Focus::Page),
+            None,
             "Ctrl+Shift+D is the GTK debugger, not the web inspector"
         );
         // A modified F12 (any Ctrl/Shift/Alt) is not the plain-F12 shortcut either,
         // so the web-inspector key is unambiguous and cannot be a debugger chord.
-        assert!(!should_open_web_inspector(
-            gdk::Key::F12,
-            gdk::ModifierType::CONTROL_MASK
-        ));
-        // An unrelated key never opens it.
-        assert!(!should_open_web_inspector(
-            gdk::Key::a,
-            gdk::ModifierType::empty()
-        ));
+        assert_eq!(
+            shortcut_action(gdk::Key::F12, gdk::ModifierType::CONTROL_MASK, Focus::Page),
+            None
+        );
+        // An unrelated key never opens it, and is not claimed at all.
+        assert_eq!(
+            shortcut_action(gdk::Key::a, gdk::ModifierType::empty(), Focus::Page),
+            None
+        );
+    }
+
+    #[test]
+    fn the_gtk_edge_translates_its_native_key_events_into_the_shared_resolution() {
+        // Acceptance: the GTK edge TRANSLATES `gdk` keyvals + `gdk` modifier
+        // flags into the toolkit-free vocabulary and performs what the SHARED
+        // resolution returns; the MEANING of each chord is the core's
+        // (`werust_core::shortcuts`), which is what this asserts end to end from
+        // the native event. Display-free, like the F12 predicate it replaces.
+        let ctrl = gdk::ModifierType::CONTROL_MASK;
+        let alt = gdk::ModifierType::ALT_MASK;
+        let none = gdk::ModifierType::empty();
+
+        // Story 1: Ctrl+L reaches the URL bar (whatever case the keyval carries).
+        assert_eq!(
+            shortcut_action(gdk::Key::l, ctrl, Focus::Page),
+            Some(ChromeAction::FocusUrlBar)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::L, ctrl, Focus::Page),
+            Some(ChromeAction::FocusUrlBar)
+        );
+        // Story 2: Ctrl+R and F5 reload.
+        assert_eq!(
+            shortcut_action(gdk::Key::r, ctrl, Focus::Page),
+            Some(ChromeAction::Reload)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::F5, none, Focus::Page),
+            Some(ChromeAction::Reload)
+        );
+        // Story 3: Alt+Left / Alt+Right navigate history, from the arrow keys and
+        // from the keypad arrows the same physical mapping produces.
+        assert_eq!(
+            shortcut_action(gdk::Key::Left, alt, Focus::Page),
+            Some(ChromeAction::GoBack)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::Right, alt, Focus::Page),
+            Some(ChromeAction::GoForward)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::KP_Left, alt, Focus::Page),
+            Some(ChromeAction::GoBack)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::KP_Right, alt, Focus::Page),
+            Some(ChromeAction::GoForward)
+        );
+
+        // Stories 5 and 6: Escape is FOCUS-dependent, and this edge reports
+        // focus rather than branching on it.
+        assert_eq!(
+            shortcut_action(gdk::Key::Escape, none, Focus::Page),
+            Some(ChromeAction::Stop)
+        );
+        assert_eq!(
+            shortcut_action(gdk::Key::Escape, none, Focus::UrlBar),
+            Some(ChromeAction::RevertUrlBar)
+        );
+
+        // Ordinary typing is never claimed: an unmodified letter, and a letter
+        // typed IN the URL bar, must reach the widget under the user's hands.
+        assert_eq!(shortcut_action(gdk::Key::l, none, Focus::UrlBar), None);
+        assert_eq!(shortcut_action(gdk::Key::r, none, Focus::Page), None);
+        // …and so does a key GDK reports with no unicode meaning at all.
+        assert_eq!(shortcut_action(gdk::Key::Shift_L, none, Focus::Page), None);
+    }
+
+    #[test]
+    fn the_gtk_edge_maps_the_mouse_side_buttons_onto_the_shared_resolution() {
+        // Story 7: the mouse's back/forward side buttons ("buttons 4 and 5")
+        // navigate history. X11/Wayland deliver them to GDK as buttons 8 and 9;
+        // that NUMBER is the only thing this edge knows, and what they DO is the
+        // core's call.
+        assert_eq!(shortcut_pointer_button(8), Some(PointerButton::Back));
+        assert_eq!(shortcut_pointer_button(9), Some(PointerButton::Forward));
+        // The ordinary buttons stay the page's: primary, middle and secondary
+        // must never be claimed by the chrome.
+        for button in [1, 2, 3] {
+            assert_eq!(
+                shortcut_pointer_button(button),
+                None,
+                "button {button} belongs to the page"
+            );
+        }
     }
 
     #[test]

@@ -1260,6 +1260,48 @@ ios = { state = "stubbed", task = "matrix-web-platform-rows-are-measured-on-ever
 android = { state = "implemented" }
 
 [[capability]]
+name = "conventional-shortcuts"
+description = "The keyboard shortcuts every browser has, plus the mouse's back/forward side buttons: focus-and-select the URL bar, reload, history back/forward, stop, and the web inspector, with Escape FOCUS-dependent (stop the load with the page focused, revert the edit and restore the current URL with the URL bar focused) and the platform's own accelerator (Ctrl on Linux/Windows, Cmd on macOS)."
+# The MEANING of every chord and side button is ONE toolkit-free resolution in
+# `werust_core::shortcuts` (`resolve_chord` / `resolve_pointer_button`), pinned by
+# a display-free table test that drives BOTH accelerator conventions, so each edge
+# only TRANSLATES its native event into that vocabulary and PERFORMS the returned
+# `ChromeAction` through the existing `BrowserShell` / `Renderer` seam and the
+# existing `ChromeState::can_go_back` / `can_go_forward` flags. The resolution is
+# deliberately CAPABILITY-AGNOSTIC: it resolves a chord to an action whether or
+# not the asking edge can perform it, and an edge without the capability simply
+# has no handler (macOS + the `web-inspector` row above is the live case). Task
+# `shortcut-resolution-in-core-and-the-gtk-edge`, spec
+# `chrome-conventional-controls`; decisions at
+# docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/DECISIONS.md.
+# Desktop (Linux/GTK) is the edge that proves it end to end: a window-level
+# `EventControllerKey` and a `GestureClick`, both in the CAPTURE phase (a
+# browser's own chords beat the focused page and the URL bar's text editing,
+# and everything unclaimed propagates untouched), translating `gdk` keyvals +
+# modifier flags and GDK buttons 8/9 into the shared vocabulary
+# (`shortcut_key` / `shortcut_modifiers` / `shortcut_pointer_button` in
+# crates/werust/src/main.rs) and performing the result in one
+# `perform_chrome_action`. Guarded source-shape-wise by
+# crates/werust-core/tests/shortcut_edge_wiring_shape.rs; the chord table and the
+# `gdk` translation are unit-tested display-free, while "the key really reaches
+# the window" is a claim no runner in this repo pressed (manual steps at
+# docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/README.md).
+# macOS and Windows are the two sibling edge tasks: the resolution (including the
+# Cmd branch) is already shared, so each is a translation of NSEvent / Win32 key
+# input, not a new decision.
+# The MOBILE cells are `n-a` rather than stubbed: the spec
+# `chrome-conventional-controls` puts hardware-keyboard shortcuts on the mobile
+# edges explicitly OUT OF SCOPE ("Confirmed at tasking: no story asks for them,
+# and the shortcut tasks cover the three desktop edges only"), and neither phone
+# edge has a mouse with side buttons. Android's system Back is a different
+# affordance and has its own row (`system-back-navigates-history`).
+desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "shortcuts-and-mouse-history-buttons-on-the-macos-edge" }
+windows = { state = "stubbed", task = "shortcuts-and-mouse-history-buttons-on-the-windows-edge" }
+ios = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The iOS history affordance is the WebKit edge-swipe (enable-the-ios-back-forward-swipe-gesture)." }
+android = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The Android history affordance is the system Back button (row system-back-navigates-history)." }
+
+[[capability]]
 name = "debug-view-console-network"
 description = "The in-app tabbed DEBUG VIEW opened from the browser menu's Debug entry: a Console tab (level-distinguished rows: level + message + source:line) and a Network tab (method / url / status / mime / size rows, each carrying werust's HONEST per-request trust posture in the trust indicator's SAME vocabulary, ADR-0006), a Clear action driving the shared store's `clear()`, live updates on the existing refresh cadence (no busy loop), READ-ONLY (a typeable REPL stays the native inspector's job). Renders the ONE shared capture store (`debug-capture-console-and-network`); the native F12/remote inspector (`web-inspector`) coexists as the deep devtools."
 # Desktop fills the open-debug-view HOOK the menu task left (`open_debug_view`

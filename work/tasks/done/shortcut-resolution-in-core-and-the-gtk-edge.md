@@ -70,3 +70,9 @@ git mv work/tasks/ready/shortcut-resolution-in-core-and-the-gtk-edge.md work/tas
 ## Requeue 2026-08-03
 
 Previous run CRASHED for an ENVIRONMENTAL reason only: the acceptance gate ran in /tmp (a 16G tmpfs already 100% full from unrelated projects) and rustc died with 'No space left on device' while linking. This was NOT a code defect and NOT a gate finding. Your committed work on this branch is intact and is being CONTINUED. Do not restart or rewrite the implementation; re-verify it compiles and passes the gate, and only fix genuine defects the gate now reports.
+
+## Decisions
+
+The non-obvious, in-scope judgement calls this task baked in are recorded, one entry each (what was chosen, why, the alternatives, and which sibling task inherits it), in **`docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/DECISIONS.md`**: the abstract key/modifier vocabulary (spelled after W3C UI Events, so no toolkit enum crosses into the core), the CAPABILITY-AGNOSTIC rule the three sibling edge tasks depend on, the `PrimaryModifier` parameter carrying the Cmd-versus-Ctrl split on both the accelerator and the history axis, focus as a two-valued input, the mouse side buttons riding the same vocabulary, the GTK controllers sitting on the window in the CAPTURE phase, what Escape restores in the URL bar, and why the parity matrix's mobile cells are `n-a`.
+
+The same file's siblings carry the rest: `docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/README.md` (where things live, the shortcut set, and the manual display-needing check), the `shortcut resolution (chord -> chrome action)` glossary entry in `CONTEXT.md`, the `conventional-shortcuts` row in `docs/platform-capability-matrix.toml`, and the module docs on `crates/werust-core/src/shortcuts.rs`.

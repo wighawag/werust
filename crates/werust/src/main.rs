@@ -174,9 +174,9 @@ fn shortcut_key(keyval: gdk::Key) -> Option<shortcuts::Key> {
 ///
 /// Only the four modifiers a shortcut can use are carried across. Everything
 /// else GDK reports (Caps/Num Lock, the button masks) is dropped here, which is
-/// what keeps a chord firing while a lock key happens to be on. It is the
-/// the F12 binding has had since it landed, now expressed as "the core never
-/// hears about lock modifiers" instead of a mask in a predicate.
+/// what keeps a chord firing while a lock key happens to be on. That is the
+/// behaviour the F12 binding has had since it landed, now expressed as "the
+/// core never hears about lock modifiers" instead of a mask in a predicate.
 ///
 /// GDK's Super (the Windows/Command key position) and Meta both map to the UI
 /// Events `meta` the core speaks, so a Super chord is REPORTED rather than

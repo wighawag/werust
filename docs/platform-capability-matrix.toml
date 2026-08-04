@@ -1286,9 +1286,28 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # `gdk` translation are unit-tested display-free, while "the key really reaches
 # the window" is a claim no runner in this repo pressed (manual steps at
 # docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/README.md).
-# macOS and Windows are the two sibling edge tasks: the resolution (including the
-# Cmd branch) is already shared, so each is a translation of NSEvent / Win32 key
-# input, not a new decision.
+# macOS is the remaining sibling edge task: the resolution (including the Cmd
+# branch) is already shared, so it is a translation of NSEvent input, not a new
+# decision.
+# WINDOWS (task `shortcuts-and-mouse-history-buttons-on-the-windows-edge`)
+# translates the SAME vocabulary from Win32: virtual-key codes + `GetKeyState`
+# bits + `XBUTTON1`/`XBUTTON2` in `crates/werust-windows/src/shortcuts.rs`, a PURE
+# module the Ubuntu gate unit-tests (the codes are cross-checked against the SDK's
+# own `VK_*` at compile time on Windows), performed by ONE
+# `perform_chrome_action` in crates/werust-windows/src/window.rs. It has TWO
+# delivery paths because WebView2 hosts the page in another process: a
+# message-loop pre-filter for everything the CHROME has the focus for (this
+# edge's equivalent of the GTK capture phase -- Win32 delivers a key to the
+# FOCUSED control, so an `EDIT` would otherwise eat Escape), and the engine's
+# `add_AcceleratorKeyPressed` hook for keys pressed over the PAGE, which never
+# reach this thread's message loop at all. Mouse side buttons arrive as
+# `WM_XBUTTONDOWN` over the chrome and as `WM_APPCOMMAND` from a child window.
+# Guarded source-shape-wise by crates/werust-windows/tests/windows_window_shape.rs
+# and exercised on the `windows-latest` leg by `examples/window_smoke.rs` (a
+# posted F5, a page-focused F5 through the accelerator hook, and a posted
+# XBUTTON1 that really navigates history); what a runner cannot press is recorded
+# at
+# docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/README.md.
 # The MOBILE cells are `n-a` rather than stubbed: the spec
 # `chrome-conventional-controls` puts hardware-keyboard shortcuts on the mobile
 # edges explicitly OUT OF SCOPE ("Confirmed at tasking: no story asks for them,
@@ -1297,7 +1316,7 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # affordance and has its own row (`system-back-navigates-history`).
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "shortcuts-and-mouse-history-buttons-on-the-macos-edge" }
-windows = { state = "stubbed", task = "shortcuts-and-mouse-history-buttons-on-the-windows-edge" }
+windows = { state = "implemented" }
 ios = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The iOS history affordance is the WebKit edge-swipe (enable-the-ios-back-forward-swipe-gesture)." }
 android = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The Android history affordance is the system Back button (row system-back-navigates-history)." }
 

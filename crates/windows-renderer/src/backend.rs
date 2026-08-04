@@ -64,11 +64,12 @@ use std::sync::{Arc, Mutex};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
-    take_pwstr, ContentLoadingEventHandler, CoreWebView2CustomSchemeRegistration,
-    CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, NavigationCompletedEventHandler,
-    NavigationStartingEventHandler, NewWindowRequestedEventHandler, SourceChangedEventHandler,
-    WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
+    take_pwstr, AcceleratorKeyPressedEventHandler, ContentLoadingEventHandler,
+    CoreWebView2CustomSchemeRegistration, CoreWebView2EnvironmentOptions,
+    CreateCoreWebView2ControllerCompletedHandler, CreateCoreWebView2EnvironmentCompletedHandler,
+    NavigationCompletedEventHandler, NavigationStartingEventHandler,
+    NewWindowRequestedEventHandler, SourceChangedEventHandler, WebMessageReceivedEventHandler,
+    WebResourceRequestedEventHandler,
 };
 use windows::core::{w, Interface, BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{E_POINTER, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -429,6 +430,9 @@ pub struct Webview2Renderer {
     /// The live engine, shared with whatever [`DevTools`] handles the shell took
     /// before boxing this backend behind the seam.
     dev_tools: Rc<RefCell<Option<ICoreWebView2>>>,
+    /// The shell's hook onto the keys the PAGE has focus for, shared with
+    /// whatever [`AcceleratorKeys`] handles it took before boxing.
+    accelerators: AcceleratorKeys,
     life: SharedLifecycle,
 }
 
@@ -453,6 +457,56 @@ impl DevTools {
             return false;
         };
         unsafe { engine.OpenDevToolsWindow() }.is_ok()
+    }
+}
+
+/// The shell's handle onto the ACCELERATOR KEYS pressed while the PAGE has the
+/// focus (task `shortcuts-and-mouse-history-buttons-on-the-windows-edge`).
+///
+/// It exists because of one platform fact: WebView2 hosts the page in its OWN
+/// process, so a key pressed over the page is delivered to a window this process
+/// does not own and NEVER reaches the shell's message loop.
+/// `ICoreWebView2Controller::add_AcceleratorKeyPressed` is the documented way an
+/// app sees those keys, and this is the thinnest possible pipe from it to the
+/// shell: the handler is given the Win32 VIRTUAL-KEY CODE and answers whether
+/// werust CLAIMED it. What a key MEANS is decided in `werust_core::shortcuts` and
+/// translated by the WINDOW, exactly as for a key the chrome had the focus for;
+/// this crate learns nothing about chords.
+///
+/// A handle rather than a method for the same reason [`DevTools`] is one: the
+/// shell installs its handler only once the window exists, by which time this
+/// backend is boxed behind the `Renderer` seam and unreachable.
+///
+/// # A claimed key must be performed LATER, not here
+///
+/// Microsoft documents the windowed-mode handler as running SYNCHRONOUSLY with
+/// the browser process BLOCKED, so a COM call back into WebView2 from inside it
+/// fails with `RPC_E_CANTCALLOUT_ININPUTSYNCCALL`. Every werust chrome action
+/// ends in such a call (reload, stop, history), so the shell's handler must post
+/// the action to its own message loop and return promptly -- which is what the
+/// window does.
+#[derive(Clone, Default)]
+pub struct AcceleratorKeys {
+    /// `Rc<dyn Fn>` rather than `Box`, so the handler is CLONED out of the slot
+    /// before it is called and a re-entrant install cannot panic on the borrow.
+    #[allow(clippy::type_complexity)]
+    handler: Rc<RefCell<Option<Rc<dyn Fn(u16) -> bool>>>>,
+}
+
+impl AcceleratorKeys {
+    /// Install the shell's handler: it is given the virtual-key code of a key
+    /// pressed while the page had the focus, and answers `true` when werust
+    /// claimed it (so WebView2's OWN accelerator for that key does not ALSO
+    /// act).
+    pub fn on_key(&self, handler: impl Fn(u16) -> bool + 'static) {
+        *self.handler.borrow_mut() = Some(Rc::new(handler));
+    }
+
+    /// Whether the shell claims `virtual_key`. `false` when no handler is
+    /// installed, which leaves WebView2 behaving exactly as it did before.
+    fn claims(&self, virtual_key: u16) -> bool {
+        let handler = self.handler.borrow().clone();
+        handler.is_some_and(|handler| handler(virtual_key))
     }
 }
 
@@ -501,6 +555,7 @@ impl Webview2Renderer {
             pending_scripts: Vec::new(),
             pending_eval: Vec::new(),
             dev_tools: Rc::new(RefCell::new(None)),
+            accelerators: AcceleratorKeys::default(),
             life,
         })
     }
@@ -532,6 +587,17 @@ impl Webview2Renderer {
         }
     }
 
+    /// A handle onto the keys the PAGE swallows, for the SHELL's shortcut layer.
+    ///
+    /// Taken BEFORE boxing, exactly like [`dev_tools`](Self::dev_tools), and for
+    /// the same reason: the window that answers these keys does not exist yet.
+    /// See [`AcceleratorKeys`] for why the pipe carries a virtual-key code and
+    /// nothing else.
+    #[must_use]
+    pub fn accelerator_keys(&self) -> AcceleratorKeys {
+        self.accelerators.clone()
+    }
+
     /// Realise the environment, the controller and the engine now, if they do not
     /// exist yet.
     ///
@@ -555,6 +621,7 @@ impl Webview2Renderer {
 
         self.configure(&webview)?;
         self.wire_events(&webview)?;
+        self.wire_accelerator_keys(&controller)?;
         self.apply_document_start_scripts(&webview);
 
         unsafe {
@@ -906,6 +973,65 @@ impl Webview2Renderer {
                 .map_err(|e| wiring("add_WebMessageReceived", e))?;
         }
 
+        Ok(())
+    }
+
+    /// Forward the keys pressed while the PAGE has the focus to whatever handler
+    /// the shell installed on its [`AcceleratorKeys`] handle.
+    ///
+    /// This is on the CONTROLLER, not the engine: it is a WINDOWING concern (who
+    /// sees a keystroke), which is also why it is the one event wired outside
+    /// [`wire_events`](Self::wire_events). It carries no meaning -- a virtual-key
+    /// code goes out, a yes/no comes back -- so the shortcut vocabulary stays in
+    /// `werust_core::shortcuts` and its Win32 translation stays in the window
+    /// crate.
+    fn wire_accelerator_keys(
+        &self,
+        controller: &ICoreWebView2Controller,
+    ) -> Result<(), RendererError> {
+        let accelerators = self.accelerators.clone();
+        let mut token = 0i64;
+        unsafe {
+            controller
+                .add_AcceleratorKeyPressed(
+                    &AcceleratorKeyPressedEventHandler::create(Box::new(
+                        move |_controller, args| {
+                            let Some(args) = args else { return Ok(()) };
+                            let mut kind = COREWEBVIEW2_KEY_EVENT_KIND::default();
+                            args.KeyEventKind(&mut kind)?;
+                            // Key DOWN only (a system key down is the same press with
+                            // Alt held, which is how the history chords arrive); the
+                            // matching key-up must not perform the action twice.
+                            if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                                && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                            {
+                                return Ok(());
+                            }
+                            let mut virtual_key = 0u32;
+                            args.VirtualKey(&mut virtual_key)?;
+                            let Ok(virtual_key) = u16::try_from(virtual_key) else {
+                                return Ok(());
+                            };
+                            if !accelerators.claims(virtual_key) {
+                                // Unclaimed: the page keeps every key werust says
+                                // nothing about, and WebView2 keeps its own
+                                // accelerators.
+                                return Ok(());
+                            }
+                            // Claimed, so WebView2's OWN handling of the same key
+                            // (its built-in Ctrl+R, F12, Alt+Arrow…) must not also
+                            // act: werust's chrome is the one that reloads, and it
+                            // does it through the shell.
+                            args.SetHandled(true)?;
+                            Ok(())
+                        },
+                    )),
+                    &mut token,
+                )
+                .map_err(|e| {
+                    RendererError::Backend(format!("add_AcceleratorKeyPressed failed: {e}"))
+                })?;
+        }
         Ok(())
     }
 

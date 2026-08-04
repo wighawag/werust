@@ -25,10 +25,18 @@ name: windows-renderer
 # off-screen (toolbar, trust indicator and its EXPLANATION, error banner, ⋮ menu,
 # tabbed debug view), loads a pinned hash-verified `ipfs://` fixture through the
 # production verifying route and asserts what the real WIDGETS hold, then fails a
-# tampered CID and asserts the banner takes the page. That is the ONLY place the
+# tampered CID and asserts the banner takes the page. Since task
+# `shortcuts-and-mouse-history-buttons-on-the-windows-edge` that same smoke also
+# drives the CONVENTIONAL SHORTCUTS as real messages: a posted `WM_KEYDOWN` (F5)
+# through the message-loop filter, a page-focused key through the engine's
+# `AcceleratorKeyPressed` hook, and a posted `WM_XBUTTONDOWN` (`XBUTTON1`) that
+# really navigates history. That is the ONLY place the
 # Win32 layer is executed at all; everything derivable about it is unit-tested on
 # the Ubuntu gate (`crates/desktop-paint`, the shared painter half both native
-# desktop windows consume).
+# desktop windows consume, and `crates/werust-windows/src/shortcuts.rs`, the pure
+# Win32-to-`werust_core::shortcuts` translation). What a runner still cannot
+# press is recorded at
+# docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/README.md.
 #
 # The `trust_hooks_smoke` step is the one that
 # matters for the ENGINE, because a backend qualifies for werust on the TRUST

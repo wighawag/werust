@@ -41,6 +41,24 @@
 //!    `the_verification_honesty_is_recorded`).
 //! 7. The gate stays green (this file is a plain `cargo test`).
 //!
+//! AMENDMENT (task `shortcuts-and-mouse-history-buttons-on-the-windows-edge`):
+//! the conventional browser shortcuts reached this edge. What each chord and
+//! side button MEANS was decided once, for every edge, in
+//! `werust_core::shortcuts`; this edge contributes TRANSLATION (virtual-key codes
+//! and `GetKeyState` bits into that vocabulary, in the pure
+//! `crates/werust-windows/src/shortcuts.rs` the Ubuntu gate unit-tests) and
+//! EXECUTION. The property neither unit test can prove -- that the EDGE decides
+//! nothing, and that the delivery paths really go through the shared resolution
+//! -- is guarded here, exactly as the sibling
+//! `crates/werust-core/tests/shortcut_edge_wiring_shape.rs` guards the GTK edge
+//! (`the_win32_edge_translates_into_the_shared_resolution_and_decides_nothing`,
+//! `the_edge_names_no_key_meaning_outside_its_translation`,
+//! `the_edge_handles_every_action_the_shared_vocabulary_defines`,
+//! `history_rides_the_existing_seam_and_its_capability_flags`,
+//! `the_side_buttons_ride_the_same_resolution_and_the_same_performer`,
+//! `the_page_focused_keys_arrive_through_the_engines_accelerator_hook`,
+//! `the_shortcut_paths_are_exercised_on_the_windows_leg`).
+//!
 //! AMENDMENT (task `windows-gui-subsystem-no-console-window`, 2026-07-31): the
 //! first run on REAL hardware found the binary linking as a CONSOLE-subsystem
 //! app, so Windows opened a console window beside the browser
@@ -97,6 +115,11 @@ fn chrome() -> String {
 /// turns them into pixels for the display the window is on.
 fn dpi_seam() -> String {
     source("crates/werust-windows/src/dpi.rs")
+}
+
+/// The SHORTCUT seam: the pure Win32-to-`werust_core::shortcuts` translation.
+fn shortcut_translation() -> String {
+    source("crates/werust-windows/src/shortcuts.rs")
 }
 
 /// Every integer literal in `body` that does NOT go through the DPI seam.
@@ -982,5 +1005,344 @@ fn the_verification_honesty_is_recorded() {
     assert!(
         harness.contains("werust-windows"),
         "the local Windows type-check harness must cover the window crate too"
+    );
+}
+
+#[test]
+fn the_win32_edge_translates_into_the_shared_resolution_and_decides_nothing() {
+    // The heart of the shortcut half: this edge's whole key path is translate ->
+    // ask the core -> perform. The TRANSLATION is a pure module (so the Ubuntu
+    // gate tests it), it calls the SHARED resolution, and it takes the
+    // accelerator convention from the core rather than restating "Windows is a
+    // Ctrl platform".
+    let translation = shortcut_translation();
+    assert!(
+        translation.contains("shortcuts::resolve_chord(")
+            && translation.contains("shortcuts::PrimaryModifier::for_target()"),
+        "the edge must ask the SHARED resolution what a chord means, on the core's own convention"
+    );
+    // Pure by construction: the module may not reach for the `windows` crate at
+    // all, which is what keeps it inside the Ubuntu gate.
+    assert!(
+        !code_only(&translation).contains("windows::"),
+        "the translation must stay host-independent: it is the half the Ubuntu gate tests"
+    );
+    let lib = source("crates/werust-windows/src/lib.rs");
+    assert!(
+        lib.contains("pub mod shortcuts;") && !lib.contains("#[cfg(windows)]\npub mod shortcuts;"),
+        "the shortcut translation must NOT be cfg-gated, like the DPI and profile seams"
+    );
+    assert!(
+        translation.contains("#[cfg(test)]"),
+        "the translation must carry its own unit tests on the Ubuntu gate"
+    );
+    // The virtual-key codes are spelled here as plain `u16` (the price of being
+    // pure), so the Win32 half must pin them against the SDK's own `VK_*`.
+    let window = window();
+    let pinned = between(
+        &window,
+        "const _VIRTUAL_KEY_CODES_MATCH_THE_SDK: () = {",
+        "\n};",
+    );
+    for code in [
+        "VK_SHIFT",
+        "VK_CONTROL",
+        "VK_MENU",
+        "VK_ESCAPE",
+        "VK_LEFT",
+        "VK_RIGHT",
+        "VK_LWIN",
+        "VK_RWIN",
+        "VK_F5",
+        "VK_F12",
+    ] {
+        assert!(
+            pinned.contains(&format!("crate::shortcuts::{code} == {code}.0")),
+            "`{code}` must be checked against the SDK's own value at compile time: {pinned:?}"
+        );
+    }
+}
+
+#[test]
+fn the_edge_names_no_key_meaning_outside_its_translation() {
+    // The teeth: the ONLY place this edge may name a specific KEY is its
+    // translation function. A `Key::Escape` in the window would be this edge
+    // deciding what Escape means, which is precisely the per-edge drift the
+    // shared resolution exists to prevent.
+    let translation = shortcut_translation();
+    // The PRODUCTION half only, and cut BEFORE `code_only`: that helper drops
+    // `#`-led lines (it is applied to manifests too), which would eat the
+    // `#[cfg(test)]` marker itself.
+    let production = code_only(
+        translation
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the translation must have a production half"),
+    );
+    let translated = between(
+        &translation,
+        "pub fn shortcut_key(",
+        "/// Translate the keyboard",
+    );
+    for key in [
+        "shortcuts::Key::Escape",
+        "shortcuts::Key::F5",
+        "shortcuts::Key::F12",
+        "shortcuts::Key::ArrowLeft",
+        "shortcuts::Key::ArrowRight",
+        "shortcuts::Key::Character",
+    ] {
+        assert_eq!(
+            production.matches(key).count(),
+            translated.matches(key).count(),
+            "`{key}` may only be named while TRANSLATING, never where the edge acts on it"
+        );
+    }
+    // And the Win32 half names no key at all: it hands the virtual-key code
+    // straight to the translation.
+    let win32 = code_only(&win32_half());
+    assert!(
+        !win32.contains("shortcuts::Key::"),
+        "the Win32 half must not name a key: it only carries the code it was given"
+    );
+    // …outside the compile-time cross-check, which is the ONE place the SDK's
+    // own `VK_*` may be named (it compares them with the pure module's, it does
+    // not act on a key).
+    let acting = win32.replace(
+        between(
+            &win32,
+            "const _VIRTUAL_KEY_CODES_MATCH_THE_SDK: () = {",
+            "\n};",
+        ),
+        "",
+    );
+    for claimed in ["VK_ESCAPE.0", "VK_F5.0", "VK_LEFT.0", "VK_RIGHT.0"] {
+        assert!(
+            !acting.contains(&format!("== {claimed}")),
+            "`{claimed}` must not be branched on in the Win32 half: that is a second shortcut table"
+        );
+    }
+    // The old edge-local F12 branch is GONE, folded into the shared table, and
+    // the inspector is now opened by the RESOLVED action.
+    assert!(
+        !win32.contains("ID_DEV_TOOLS"),
+        "the URL bar's own F12 command must be gone: F12 is a row in the shared table now"
+    );
+}
+
+#[test]
+fn the_edge_handles_every_action_the_shared_vocabulary_defines() {
+    // One performer, with an arm for every action the core can resolve. Driven
+    // off `ChromeAction::ALL` rather than a hand-copied list, so an action added
+    // to the shared vocabulary reds here until this edge handles it.
+    let window = window();
+    let performer = between(
+        &window,
+        "fn perform_chrome_action(",
+        "/// Post a resolved action",
+    );
+    for action in werust_core::shortcuts::ChromeAction::ALL {
+        assert!(
+            performer.contains(&format!("ChromeAction::{action:?}")),
+            "the Win32 edge must handle {action:?}: {performer:?}"
+        );
+    }
+    // Focus is REPORTED, as an input to the resolution, and answered with ONE
+    // question rather than by classifying the widget tree.
+    let focus = between(&window, "fn focus_context(&self) -> Focus {", "\n    }\n");
+    assert!(
+        focus.contains("GetFocus()")
+            && focus.contains("Focus::UrlBar")
+            && focus.contains("Focus::Page"),
+        "the edge must REPORT which of the two focus contexts is live: {focus:?}"
+    );
+    assert!(
+        window.contains("controller.focus_context()"),
+        "the reported focus must be handed to the resolution, not branched on at the edge"
+    );
+    // The web inspector is still the PLATFORM's own devtools, reached only when
+    // the core resolves that action.
+    assert!(
+        performer.contains("dev_tools.open()"),
+        "the inspector action must open Edge's own DevTools: {performer:?}"
+    );
+}
+
+#[test]
+fn history_rides_the_existing_seam_and_its_capability_flags() {
+    // A shortcut performs history EXACTLY as the toolbar button does: through
+    // `BrowserShell::go_back` / `go_forward` (the existing `Renderer` seam
+    // methods) gated on the existing `ChromeState` flags, so a chord or a side
+    // button can never drive a move the on-screen control refuses.
+    let window = window();
+    let performer = between(
+        &window,
+        "fn perform_chrome_action(",
+        "/// Post a resolved action",
+    );
+    for expected in [
+        "chrome().can_go_back",
+        "go_back()",
+        "chrome().can_go_forward",
+        "go_forward()",
+    ] {
+        assert!(
+            performer.contains(expected),
+            "the history actions must go through `{expected}`: {performer:?}"
+        );
+    }
+    // The seam itself is UNCHANGED by this edge: no shortcut vocabulary leaked
+    // into it.
+    let seam = source("crates/renderer/src/lib.rs");
+    assert!(
+        seam.contains("fn go_back(&mut self)") && seam.contains("fn go_forward(&mut self)"),
+        "the Renderer seam's history methods must be unchanged"
+    );
+    assert!(
+        !seam.contains("shortcut") && !seam.contains("Chord"),
+        "the shortcut layer must not have leaked into the Renderer seam"
+    );
+}
+
+#[test]
+fn the_side_buttons_ride_the_same_resolution_and_the_same_performer() {
+    // Mouse buttons 4 and 5 navigate history, through the SAME resolution and the
+    // SAME performer the keyboard uses. The edge knows only which BUTTON the
+    // message named -- and it has two messages to read it from, because a click
+    // over the page lands on a window this process does not own.
+    let window = window();
+    assert!(
+        window.contains("WM_XBUTTONDOWN") && window.contains("shortcut_pointer_button(wparam.0)"),
+        "a side-button click over the chrome must be translated, not interpreted"
+    );
+    assert!(
+        window.contains("WM_APPCOMMAND") && window.contains("app_command_pointer_button(lparam.0)"),
+        "a side-button click over a CHILD window arrives as an app command and must be honoured"
+    );
+    assert!(
+        window.contains("WM_XBUTTONUP => LRESULT(1)"),
+        "the release must be swallowed, or DefWindowProc turns one click into a second navigation"
+    );
+    let pointer = between(&window, "fn perform_pointer_button(", "\n}\n");
+    assert!(
+        pointer.contains("shortcuts::resolve_pointer_button")
+            && pointer.contains("perform_chrome_action(controller, action)"),
+        "the mouse path must ask the core, then perform: {pointer:?}"
+    );
+    assert!(
+        !pointer.contains("go_back()") && !pointer.contains("go_forward()"),
+        "the mouse path must not decide that a button means history: {pointer:?}"
+    );
+}
+
+#[test]
+fn the_page_focused_keys_arrive_through_the_engines_accelerator_hook() {
+    // The platform fact this edge is shaped by: WebView2 hosts the page in ANOTHER
+    // PROCESS, so a key pressed over the page never reaches this thread's message
+    // loop and `add_AcceleratorKeyPressed` is the documented way to see it. The
+    // hook carries a virtual-key code and a yes/no -- no chord vocabulary crosses
+    // into the engine.
+    let engine = source("crates/windows-renderer/src/backend.rs");
+    assert!(
+        engine.contains("add_AcceleratorKeyPressed("),
+        "the engine must forward the keys the page swallows"
+    );
+    let hook = between(
+        &engine,
+        "fn wire_accelerator_keys(",
+        "/// Install the document-start scripts",
+    );
+    assert!(
+        hook.contains("COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN")
+            && hook.contains("COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN"),
+        "an Alt chord arrives as a SYSTEM key down, so both kinds must be forwarded: {hook:?}"
+    );
+    assert!(
+        hook.contains("args.SetHandled(true)"),
+        "a claimed key must be marked handled, or WebView2's own accelerator acts too: {hook:?}"
+    );
+    assert!(
+        !code_only(&engine).contains("shortcuts::") && !code_only(&engine).contains("ChromeAction"),
+        "the engine must learn nothing about chords: it carries a virtual-key code"
+    );
+
+    // And the WINDOW answers it with the same translation, reporting the page as
+    // the focus (which is what the event means) and POSTING the action rather
+    // than performing it inside a callback that blocks the browser process.
+    let window = window();
+    let claim = between(&window, "fn claim_accelerator_key(", "\n}\n");
+    assert!(
+        claim.contains("shortcut_action(") && claim.contains("Focus::Page"),
+        "the page-focused path must use the same translation: {claim:?}"
+    );
+    assert!(
+        claim.contains("post_chrome_action("),
+        "a claimed key must be POSTED: the callback runs with the browser process blocked: {claim:?}"
+    );
+    assert!(
+        window.contains("WM_WERUST_CHROME_ACTION"),
+        "the posted action needs a message of its own"
+    );
+    assert!(
+        window.contains("ChromeAction::ALL"),
+        "the posted action must be carried as its slot in the CORE's action list"
+    );
+
+    // The chrome-focused half: a message-loop pre-filter, this edge's equivalent
+    // of the GTK shell's capture phase. Anything unclaimed is dispatched
+    // untouched.
+    let filter = between(&window, "fn filter_shortcut(", "\n}\n");
+    assert!(
+        filter.contains("WM_KEYDOWN") && filter.contains("WM_SYSKEYDOWN"),
+        "an Alt chord arrives as WM_SYSKEYDOWN and must be filtered too: {filter:?}"
+    );
+    assert!(
+        filter.contains("GetKeyState") && filter.contains("controller.focus_context()"),
+        "the filter must translate the modifier state and report focus: {filter:?}"
+    );
+    assert!(
+        window.contains("if self.filter_shortcut(&message) {")
+            && window.contains("if window.filter_shortcut(&message) {"),
+        "both message loops (the smoke's pump and the product's) must give the layer first look"
+    );
+}
+
+#[test]
+fn the_shortcut_paths_are_exercised_on_the_windows_leg() {
+    // The interactive half belongs on the `windows-latest` leg, because it is the
+    // only place a real window pumps real messages. The smoke posts the messages
+    // Windows itself posts and reads the result off the shell and the widgets.
+    let smoke = source("crates/werust-windows/examples/window_smoke.rs");
+    for driven in [
+        "post_key(&window, werust_windows::shortcuts::VK_F5)",
+        "window.claim_accelerator_key(werust_windows::shortcuts::VK_F5)",
+        "post_x_button(&window, werust_windows::shortcuts::XBUTTON1)",
+    ] {
+        assert!(
+            smoke.contains(driven),
+            "the smoke must drive `{driven}` against the real window"
+        );
+    }
+    assert!(
+        smoke.contains("!window.claim_accelerator_key(0x09)"),
+        "the smoke must also check that an UNCLAIMED key is left to the page"
+    );
+    // And the honesty: what a runner cannot press is written down at the task's
+    // stable spike path.
+    let readme =
+        source("docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/README.md");
+    for section in [
+        "What CI proves",
+        "What still awaits real Windows hardware",
+        "Manual verification",
+    ] {
+        assert!(
+            readme.contains(section),
+            "the spike README must state `{section}`"
+        );
+    }
+    assert!(
+        exists("docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/DECISIONS.md"),
+        "the judgement calls this task made must be recorded beside it"
     );
 }

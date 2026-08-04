@@ -116,6 +116,33 @@ mod windows_smoke {
         window.tick();
     }
 
+    /// Post a key press to the real window, exactly as Windows posts one to the
+    /// focused control: the shortcut layer sees it in the message loop, before
+    /// anything is dispatched.
+    fn post_key(window: &BrowserWindow, virtual_key: u16) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(window.window()),
+                windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                windows::Win32::Foundation::WPARAM(usize::from(virtual_key)),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+    }
+
+    /// Post a mouse SIDE-button press, as Win32 delivers one: the pressed X
+    /// button rides in the HIGH word of `wParam`.
+    fn post_x_button(window: &BrowserWindow, x_button: u16) {
+        unsafe {
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                Some(window.window()),
+                windows::Win32::UI::WindowsAndMessaging::WM_XBUTTONDOWN,
+                windows::Win32::Foundation::WPARAM(usize::from(x_button) << 16),
+                windows::Win32::Foundation::LPARAM(0),
+            );
+        }
+    }
+
     fn wait_until(window: &BrowserWindow, seconds: u32, done: impl Fn() -> bool) -> bool {
         for _ in 0..(seconds * 50) {
             pump(window);
@@ -355,6 +382,51 @@ mod windows_smoke {
             "the page did NOT move or resize across a whole load",
         );
 
+        // The CONVENTIONAL SHORTCUTS (task
+        // `shortcuts-and-mouse-history-buttons-on-the-windows-edge`). What each
+        // input MEANS is `werust_core::shortcuts`', unit-tested on the Ubuntu
+        // gate along with this edge's whole Win32 translation; what only a
+        // Windows box can show is that a real MESSAGE reaches the real window and
+        // really drives the shell. So these post the messages Windows itself
+        // posts and then read the widgets back.
+        println!("the conventional shortcuts, through the real message loop:");
+        // The fixture logs on every load, so a FRESH Console row is a reload
+        // having really happened through the shell.
+        let before = capture.console().len();
+        post_key(&window, werust_windows::shortcuts::VK_F5);
+        let reloaded = wait_until(&window, 30, || {
+            capture.console().len() > before
+                && shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            reloaded,
+            "F5 posted to the real window reloads the page through the shell",
+        );
+
+        // The PAGE-focused half: WebView2 hosts the page in its own process, so
+        // its keys arrive through the engine's accelerator hook instead of this
+        // thread's message loop. A runner cannot press a key over a page, but
+        // everything after that -- translate, claim, post, perform -- is the real
+        // path.
+        let before = capture.console().len();
+        let claimed = window.claim_accelerator_key(werust_windows::shortcuts::VK_F5);
+        let reloaded = wait_until(&window, 30, || {
+            capture.console().len() > before
+                && shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            claimed && reloaded,
+            "a page-focused F5 is claimed from WebView2 and performed on the window's own loop",
+        );
+        check(
+            &mut failures,
+            // VK_TAB: a key werust claims nothing about.
+            !window.claim_accelerator_key(0x09),
+            "a key werust claims nothing about is LEFT to the page",
+        );
+
         println!("the DURABLE profile (not the engine's %TEMP% default):");
         let durable = profile
             .as_ref()
@@ -442,6 +514,29 @@ mod windows_smoke {
             &mut failures,
             !window.trust_text().contains("✓"),
             "a failed load is never reported verified",
+        );
+
+        // The mouse's side buttons, over this window's own chrome: the SAME
+        // resolution and the SAME performer the keyboard uses, gated on the SAME
+        // capability flag the Back button's enabled state reads. There are two
+        // history entries by now (the verified page, then the control), so this
+        // one really navigates.
+        println!("the mouse's back side button (XBUTTON1), through the real window proc:");
+        let can_go_back = shell.borrow().chrome().can_go_back;
+        check(
+            &mut failures,
+            can_go_back,
+            "there is history to go back to after two loads",
+        );
+        post_x_button(&window, werust_windows::shortcuts::XBUTTON1);
+        let went_back = wait_until(&window, 30, || {
+            window.url_text().contains(&honest_cid)
+                && shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            went_back,
+            "mouse button 4 navigates history back through the shell",
         );
 
         println!("closing the debug window drops the slot:");

@@ -41,9 +41,11 @@
 //! AppKit. So:
 //!
 //! * The Ubuntu `verify` gate compiles and unit-tests [`profile`] (the durable
-//!   user-data-folder rule), compiles and tests the whole shared [`paint`] half,
-//!   and runs `tests/windows_window_shape.rs`, the source-shape guard, over the
-//!   Win32 source it cannot compile.
+//!   user-data-folder rule), [`dpi`] (the chrome's scaling arithmetic) and
+//!   [`shortcuts`] (the Win32-to-`werust_core::shortcuts` translation), compiles
+//!   and tests the whole shared [`paint`] half, and runs
+//!   `tests/windows_window_shape.rs`, the source-shape guard, over the Win32
+//!   source it cannot compile.
 //! * `.github/workflows/windows-renderer.yml` builds the real window on a
 //!   `windows-latest` runner, runs its tests, and drives
 //!   `examples/window_smoke.rs` -- a REAL top-level window with the real toolbar,
@@ -105,6 +107,13 @@
 //! * The `web-inspector` capability -- devtools are the PLATFORM's own
 //!   (`OpenDevToolsWindow`), never a werust re-implementation, and gated on a
 //!   debug build exactly as the WebKitGTK, iOS and Android rows are.
+//! * The SHORTCUT RESOLUTION -- what a chord or a mouse side button MEANS is
+//!   `werust_core::shortcuts`, decided once for every edge. This crate
+//!   TRANSLATES ([`shortcuts`]) and PERFORMS ([`window`]), and decides nothing;
+//!   the two delivery paths Windows forces (a message-loop pre-filter for the
+//!   chrome, the engine's `AcceleratorKeyPressed` hook for the page, which lives
+//!   in another process) are recorded in
+//!   `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/DECISIONS.md`.
 //!
 //! # Scope
 //!
@@ -125,6 +134,13 @@ pub use desktop_paint as paint;
 // (task `windows-chrome-must-scale-with-the-display-dpi`).
 pub mod dpi;
 pub mod profile;
+// The Win32 half of the CONVENTIONAL SHORTCUTS (task
+// `shortcuts-and-mouse-history-buttons-on-the-windows-edge`). NOT `cfg`-gated,
+// for the same reason as the two above: translating a virtual-key code and
+// `GetKeyState`'s bits into `werust_core::shortcuts`' toolkit-free vocabulary is
+// pure integer work, so the Ubuntu gate is where it is tested — what a chord
+// MEANS was decided once, in the core, and is not re-decided here.
+pub mod shortcuts;
 
 #[cfg(windows)]
 pub mod chrome;

@@ -56,13 +56,17 @@ use windows::Win32::UI::Controls::{
     ICC_PROGRESS_CLASS, ICC_TAB_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
     NMLVCUSTOMDRAW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{VK_F12, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE, VK_F12, VK_F5,
+    VK_LEFT, VK_LWIN, VK_MENU, VK_RETURN, VK_RIGHT, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use renderer::{OsColorScheme, RendererError};
 use werust_core::debug::DebugCapture;
 use werust_core::menu::MENU_ITEM_DEBUG;
+use werust_core::shortcuts::{self, ChromeAction, Focus};
 use werust_core::BrowserShell;
 
 use crate::chrome::{Chrome, PBM_SETBARCOLOR, PBM_SETRANGE32};
@@ -74,9 +78,10 @@ use crate::paint::{
     console_refresh, install_debug_capture, menu_items, network_refresh, ChromePaint,
     MenuItemPaint, INVALID_ENTRY_COLOR, LOAD_PROGRESS_COLOR,
 };
+use crate::shortcuts::{app_command_pointer_button, shortcut_action, shortcut_pointer_button};
 use crate::win32::{
-    client_rect, colorref, control_rect, is_visible, place, release_font, set_font, show, ui_font,
-    wide, window_dpi, window_text, Theme,
+    client_rect, colorref, control_rect, is_visible, place, release_font, set_font, set_text, show,
+    ui_font, wide, window_dpi, window_text, Theme,
 };
 
 /// The chrome pump cadence, in milliseconds: the same 50ms the GTK and AppKit
@@ -105,6 +110,42 @@ const TTS_ALWAYSTIP: u32 = 0x01;
 const TTS_NOPREFIX: u32 = 0x02;
 /// `winuser.h`: a single-line STATIC that clips rather than wraps.
 const SS_LEFTNOWORDWRAP: u32 = 0x0000_000c;
+/// `winuser.h`: the EDIT control's "select this range" message. Selecting the
+/// whole address is half of what the focus-the-URL-bar shortcut means ("focus
+/// AND select", so the next keystroke replaces it).
+const EM_SETSEL: u32 = 0x00b1;
+
+/// werust's OWN message: perform one [`ChromeAction`], carried as its slot in
+/// [`ChromeAction::ALL`].
+///
+/// It exists for exactly one caller, and for a documented platform reason: a key
+/// pressed while the PAGE has the focus reaches this shell as a WebView2
+/// `AcceleratorKeyPressed` callback that runs SYNCHRONOUSLY with the browser
+/// process blocked, so a COM call back into WebView2 from inside it fails with
+/// `RPC_E_CANTCALLOUT_ININPUTSYNCCALL`. Every chrome action ends in such a call,
+/// so that path POSTS the action here and this window performs it on its own
+/// message loop a moment later, exactly as Microsoft's own sample does.
+const WM_WERUST_CHROME_ACTION: u32 = WM_APP + 1;
+
+/// The virtual-key codes the pure translation ([`crate::shortcuts`]) spells out
+/// as plain `u16`, checked against the SDK's own `VK_*` at COMPILE time.
+///
+/// The translation must stay host-independent so the Ubuntu gate can test it,
+/// which means it cannot use the `windows` crate's constants -- and a mistyped
+/// virtual-key code is a shortcut that silently never fires. This is the cheapest
+/// possible guard: on Windows, where both spellings exist, they must agree.
+const _VIRTUAL_KEY_CODES_MATCH_THE_SDK: () = {
+    assert!(crate::shortcuts::VK_SHIFT == VK_SHIFT.0);
+    assert!(crate::shortcuts::VK_CONTROL == VK_CONTROL.0);
+    assert!(crate::shortcuts::VK_MENU == VK_MENU.0);
+    assert!(crate::shortcuts::VK_ESCAPE == VK_ESCAPE.0);
+    assert!(crate::shortcuts::VK_LEFT == VK_LEFT.0);
+    assert!(crate::shortcuts::VK_RIGHT == VK_RIGHT.0);
+    assert!(crate::shortcuts::VK_LWIN == VK_LWIN.0);
+    assert!(crate::shortcuts::VK_RWIN == VK_RWIN.0);
+    assert!(crate::shortcuts::VK_F5 == VK_F5.0);
+    assert!(crate::shortcuts::VK_F12 == VK_F12.0);
+};
 
 /// Control ids. A click arrives as `WM_COMMAND` carrying one of these in the low
 /// word of `wParam`; the ⋮ menu's items are [`ID_MENU_BASE`] + their index in the
@@ -118,7 +159,6 @@ const ID_MENU_BUTTON: usize = 105;
 const ID_URL_EDIT: usize = 106;
 const ID_URL_ENTER: usize = 107;
 const ID_DEBUG_CLEAR: usize = 108;
-const ID_DEV_TOOLS: usize = 109;
 const ID_MENU_BASE: usize = 2000;
 
 /// The browser window's class name.
@@ -351,6 +391,22 @@ impl Controller {
         }
     }
 
+    /// Which of the two focus contexts the shared resolution distinguishes is
+    /// live, REPORTED as an input to it.
+    ///
+    /// Escape means "stop the load" over the page and "revert my edit" in the URL
+    /// bar, and the core decides which; this edge only answers the one question
+    /// it is asked. Everything that is not the URL bar -- the page, a toolbar
+    /// button, the window itself -- is [`Focus::Page`], so no widget tree is
+    /// classified here.
+    fn focus_context(&self) -> Focus {
+        if unsafe { GetFocus() } == self.chrome.url_edit {
+            Focus::UrlBar
+        } else {
+            Focus::Page
+        }
+    }
+
     /// A ⋮ menu item was chosen: dispatch on the core item's STABLE id, never the
     /// display label.
     fn menu_item_chosen(self: &Rc<Self>, index: usize) {
@@ -429,6 +485,38 @@ unsafe extern "system" fn wndproc(
             handle_command(&controller, id);
             LRESULT(0)
         }
+        // The mouse's side buttons ("4 and 5"), over this window's OWN chrome.
+        // What they MEAN is the shared resolution's; this reads WHICH button off
+        // the message.
+        WM_XBUTTONDOWN => {
+            let claimed = perform_pointer_button(&controller, shortcut_pointer_button(wparam.0));
+            // TRUE is what an X button message expects from a window that took
+            // it.
+            LRESULT(isize::from(claimed))
+        }
+        // The matching release is swallowed so `DefWindowProc` does not ALSO turn
+        // this one click into a `WM_APPCOMMAND` below, which would navigate
+        // twice.
+        WM_XBUTTONUP => LRESULT(1),
+        // The other route the same buttons take: a click that landed on a CHILD
+        // window (WebView2's page window is one, and lives in another process)
+        // reaches this window as an app command instead. Also what a keyboard's
+        // dedicated Back/Forward keys send.
+        WM_APPCOMMAND => {
+            if perform_pointer_button(&controller, app_command_pointer_button(lparam.0)) {
+                LRESULT(1)
+            } else {
+                unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            }
+        }
+        // An action the page's own keystroke resolved to, performed HERE rather
+        // than inside WebView2's synchronous callback.
+        WM_WERUST_CHROME_ACTION => {
+            if let Some(action) = posted_chrome_action(wparam) {
+                perform_chrome_action(&controller, action);
+            }
+            LRESULT(0)
+        }
         WM_DESTROY => {
             unsafe {
                 let _ = KillTimer(Some(window), PUMP_TIMER);
@@ -458,11 +546,6 @@ fn handle_command(controller: &Rc<Controller>, id: usize) {
             let _ = controller.shell.borrow_mut().navigate(&typed);
         }
         ID_MENU_BUTTON => show_browser_menu(controller),
-        ID_DEV_TOOLS => {
-            // The PLATFORM's own devtools, never a werust re-implementation.
-            controller.dev_tools.open();
-            return;
-        }
         ID_DEBUG_CLEAR => {
             controller.capture.clear();
             controller.refresh_debug_view();
@@ -475,6 +558,190 @@ fn handle_command(controller: &Rc<Controller>, id: usize) {
         _ => return,
     }
     controller.refresh_chrome();
+}
+
+/// PERFORM a resolved [`ChromeAction`]: this edge's half of the shortcut layer,
+/// shared by the keyboard, the mouse's side buttons and the page's accelerator
+/// keys.
+///
+/// Every action is performed the SAME way the equivalent toolbar control performs
+/// it: through the shared [`BrowserShell`] (and therefore the `Renderer` seam),
+/// gated on the SAME `ChromeState` capability flags the buttons take their
+/// enabled state from, then a chrome repaint. Nothing here re-decides what the
+/// action was for; the `match` is exhaustive over [`ChromeAction`], so an action
+/// added to the shared vocabulary stops this edge compiling until it is handled.
+fn perform_chrome_action(controller: &Rc<Controller>, action: ChromeAction) {
+    let chrome = &controller.chrome;
+    match action {
+        ChromeAction::FocusUrlBar => {
+            // Focus AND select, so the next keystroke replaces the address; no
+            // shell call, so no repaint is owed.
+            unsafe {
+                let _ = SetFocus(Some(chrome.url_edit));
+                SendMessageW(
+                    chrome.url_edit,
+                    EM_SETSEL,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(-1)),
+                );
+            }
+            return;
+        }
+        ChromeAction::Reload => {
+            let _ = controller.shell.borrow_mut().reload();
+        }
+        ChromeAction::GoBack => {
+            // The SAME capability flag the Back button's enabled state reads: a
+            // shortcut must not be able to drive a history move the on-screen
+            // control refuses.
+            let can_go_back = controller.shell.borrow().chrome().can_go_back;
+            if !can_go_back {
+                return;
+            }
+            controller.shell.borrow_mut().go_back();
+        }
+        ChromeAction::GoForward => {
+            let can_go_forward = controller.shell.borrow().chrome().can_go_forward;
+            if !can_go_forward {
+                return;
+            }
+            controller.shell.borrow_mut().go_forward();
+        }
+        ChromeAction::Stop => controller.shell.borrow_mut().stop(),
+        ChromeAction::RevertUrlBar => {
+            // Revert the edit and restore the CURRENT page's URL: the bar goes
+            // back to the shell's `url_text`, the same one fact `Chrome::apply`
+            // paints it from, so Escape can never leave the bar showing something
+            // the chrome does not believe.
+            let url = controller.shell.borrow().chrome().url_text.clone();
+            set_text(chrome.url_edit, &url);
+            let end = url.encode_utf16().count();
+            unsafe {
+                SendMessageW(
+                    chrome.url_edit,
+                    EM_SETSEL,
+                    Some(WPARAM(end)),
+                    Some(LPARAM(end as isize)),
+                );
+            }
+            return;
+        }
+        ChromeAction::OpenWebInspector => {
+            // The PLATFORM's own devtools, never a werust re-implementation.
+            controller.dev_tools.open();
+            return;
+        }
+    }
+    controller.refresh_chrome();
+}
+
+/// Post a resolved action to this window's message loop, carried as its slot in
+/// the core's [`ChromeAction::ALL`] (never a Win32 list of its own, so a new
+/// action cannot be silently dropped here).
+fn post_chrome_action(window: HWND, action: ChromeAction) {
+    let Some(slot) = ChromeAction::ALL
+        .iter()
+        .position(|candidate| *candidate == action)
+    else {
+        return;
+    };
+    unsafe {
+        let _ = PostMessageW(
+            Some(window),
+            WM_WERUST_CHROME_ACTION,
+            WPARAM(slot),
+            LPARAM(0),
+        );
+    }
+}
+
+/// The action a [`WM_WERUST_CHROME_ACTION`] carries, or [`None`] for a slot that
+/// names no action.
+fn posted_chrome_action(wparam: WPARAM) -> Option<ChromeAction> {
+    ChromeAction::ALL.get(wparam.0).copied()
+}
+
+/// Ask the shared resolution what a POINTER button means and perform it.
+///
+/// The mouse's two paths (a raw `WM_XBUTTONDOWN` over this window's own chrome,
+/// and the `WM_APPCOMMAND` a child window's click arrives as) differ only in how
+/// the BUTTON is read off the message; both end here, so neither can drift into
+/// deciding what a button means.
+fn perform_pointer_button(
+    controller: &Rc<Controller>,
+    button: Option<shortcuts::PointerButton>,
+) -> bool {
+    let Some(action) = button.and_then(shortcuts::resolve_pointer_button) else {
+        return false;
+    };
+    perform_chrome_action(controller, action);
+    true
+}
+
+/// Give the shortcut layer FIRST look at a keyboard message this thread is about
+/// to dispatch; `true` when werust CLAIMED it.
+///
+/// The message loop, rather than a window procedure, is this edge's equivalent of
+/// the GTK shell's CAPTURE-phase controller, and for the same reason: a browser's
+/// own chords have to beat the URL bar's text editing (Win32 delivers a key to
+/// the FOCUSED control, so an `EDIT` would otherwise eat Escape) and a focused
+/// toolbar button, which never forwards a key to its parent at all. A claimed
+/// message is dropped before `TranslateMessage`, so no `WM_CHAR` is synthesised
+/// and the URL bar cannot beep at a chord the chrome just consumed. Anything the
+/// resolution does not claim is dispatched untouched.
+///
+/// Only this window and its children are filtered: the debug view is a separate
+/// top-level window with no browsing controls, and a key pressed there must not
+/// drive the browser.
+fn filter_shortcut(controller: &Rc<Controller>, message: &MSG) -> bool {
+    if message.message != WM_KEYDOWN && message.message != WM_SYSKEYDOWN {
+        // A chord holding Alt (the history chords) arrives as WM_SYSKEYDOWN, not
+        // WM_KEYDOWN: the same key press under a different message name.
+        return false;
+    }
+    let window = controller.chrome.window;
+    let ours = message.hwnd == window || unsafe { IsChild(window, message.hwnd) }.as_bool();
+    if !ours {
+        return false;
+    }
+    // `GetKeyState` (not `GetAsyncKeyState`): it reports the modifier state as of
+    // the message being processed, which is the state this key press was made
+    // with.
+    let Some(action) = shortcut_action(
+        (message.wParam.0 & 0xffff) as u16,
+        |virtual_key| unsafe { GetKeyState(i32::from(virtual_key)) },
+        controller.focus_context(),
+    ) else {
+        return false;
+    };
+    perform_chrome_action(controller, action);
+    true
+}
+
+/// A key pressed while the PAGE had the focus, delivered by WebView2 because the
+/// page window belongs to the browser process and its keystrokes never reach this
+/// thread's message loop at all.
+///
+/// The same translation and the same resolution as every other input; only two
+/// things differ, both forced by the platform:
+///
+/// * the focus is the PAGE by definition of this event, so that is what is
+///   reported, and
+/// * `GetAsyncKeyState` reads the modifiers, because this thread's message queue
+///   never saw the key press that `GetKeyState` answers from.
+///
+/// The action is POSTED, never performed here: the handler runs with the browser
+/// process blocked (see [`WM_WERUST_CHROME_ACTION`]).
+fn claim_accelerator_key(controller: &Rc<Controller>, virtual_key: u16) -> bool {
+    let Some(action) = shortcut_action(
+        virtual_key,
+        |virtual_key| unsafe { GetAsyncKeyState(i32::from(virtual_key)) },
+        Focus::Page,
+    ) else {
+        return false;
+    };
+    post_chrome_action(controller.chrome.window, action);
+    true
 }
 
 /// The ⋮ button: pop the core-derived menu up under it.
@@ -496,9 +763,12 @@ fn show_browser_menu(controller: &Rc<Controller>) {
 }
 
 /// The URL bar's subclass: Win32's EDIT control swallows Enter (and dings), so
-/// the keypress is turned into the same `WM_COMMAND` a button click sends. F12
-/// is caught here too, so the platform's OWN devtools open even while the chrome
-/// has the focus.
+/// the keypress is turned into the same `WM_COMMAND` a button click sends.
+///
+/// Enter is ALL it handles. The web inspector used to be caught here too, by this
+/// edge's own F12 branch; it is now a row in the shared shortcut table like every
+/// other chord, reached through [`filter_shortcut`] before this control ever sees
+/// the key.
 unsafe extern "system" fn url_edit_proc(
     control: HWND,
     message: u32,
@@ -510,14 +780,6 @@ unsafe extern "system" fn url_edit_proc(
     match message {
         WM_KEYDOWN if wparam.0 as u16 == VK_RETURN.0 => {
             post_to_parent(control, ID_URL_ENTER);
-            LRESULT(0)
-        }
-        // F12 is the desktop devtools key werust already uses (the GTK shell
-        // binds it to the WebKitGTK inspector). With the focus in the CHROME the
-        // page never sees the keystroke, so the chrome forwards it; with the focus
-        // in the PAGE, WebView2's own F12 handling opens the same window.
-        WM_KEYDOWN if wparam.0 as u16 == VK_F12.0 => {
-            post_to_parent(control, ID_DEV_TOOLS);
             LRESULT(0)
         }
         // Swallow the Enter CHARACTER too, or the control beeps at a keystroke it
@@ -1173,14 +1435,57 @@ impl BrowserWindow {
 
     /// Turn the Win32 message loop until it is empty, so WebView2's events (which
     /// are all delivered through it) actually arrive.
+    ///
+    /// The shortcut layer gets FIRST look at every message here, exactly as it
+    /// does in the product's loop, so the CI smoke drives the SAME path a user
+    /// does.
     pub fn pump_messages(&self) {
         let mut message = MSG::default();
         unsafe {
             while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                if self.filter_shortcut(&message) {
+                    continue;
+                }
                 let _ = TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
+    }
+
+    /// Give the shortcut layer first look at one message the loop is about to
+    /// dispatch; `true` when it CLAIMED it (see [`filter_shortcut`]).
+    #[must_use]
+    pub fn filter_shortcut(&self, message: &MSG) -> bool {
+        filter_shortcut(&self.controller, message)
+    }
+
+    /// Answer the keys the PAGE swallows, through the engine's accelerator hook.
+    ///
+    /// Installed after the window exists, on the handle the shell took from the
+    /// backend before boxing it behind the seam -- the same move the devtools
+    /// affordance makes. Without it the conventional chords would work only while
+    /// the CHROME has the focus, because WebView2 hosts the page in another
+    /// process (see [`claim_accelerator_key`]).
+    pub fn install_accelerator_keys(&self, keys: &windows_renderer::AcceleratorKeys) {
+        // The handler holds the controller, which (through the shell) holds the
+        // backend that holds the handler: a cycle, and a deliberate one. This
+        // window lives for the process's lifetime -- its `Rc` is already handed
+        // to Win32 as a raw pointer in `GWLP_USERDATA` and never reclaimed -- so
+        // a `Weak` here would buy nothing but a shortcut that could silently stop
+        // working.
+        let controller = Rc::clone(&self.controller);
+        keys.on_key(move |virtual_key| claim_accelerator_key(&controller, virtual_key));
+    }
+
+    /// Answer ONE page-focused key exactly as the engine's hook does; `true` when
+    /// werust claimed it.
+    ///
+    /// The CI smoke's entry into that path: no runner can press a key over a real
+    /// page, but the translation, the POST and the performer on the other side of
+    /// it are all real when driven from here.
+    #[must_use]
+    pub fn claim_accelerator_key(&self, virtual_key: u16) -> bool {
+        claim_accelerator_key(&self.controller, virtual_key)
     }
 
     /// Give the page the keyboard focus, so Windows routes scroll / click /
@@ -1417,6 +1722,10 @@ pub fn run(url: &str) -> Result<(), RendererError> {
     // `OpenDevToolsWindow`, and the backend is unreachable once it is behind the
     // seam.
     let dev_tools = backend.dev_tools();
+    // Likewise the hook onto the keys the PAGE has the focus for: WebView2 hosts
+    // the page in its own process, so a chord pressed over it never reaches this
+    // thread's message loop.
+    let accelerator_keys = backend.accelerator_keys();
 
     let shell = Rc::new(RefCell::new(
         BrowserShell::new(Box::new(backend))
@@ -1425,6 +1734,11 @@ pub fn run(url: &str) -> Result<(), RendererError> {
     ));
 
     let window = BrowserWindow::open(shell.clone(), capture, dev_tools, Placement::OnScreen)?;
+    // The CONVENTIONAL BROWSER SHORTCUTS' page-focused half: Ctrl+L, Ctrl+R / F5,
+    // Alt+Left / Alt+Right, Escape and F12 pressed over the page (task
+    // `shortcuts-and-mouse-history-buttons-on-the-windows-edge`). The chrome-focused
+    // half is `filter_shortcut`, in the loop below.
+    window.install_accelerator_keys(&accelerator_keys);
 
     // Navigate through the seam and focus the live view, so Windows routes
     // scroll/click/focus/keyboard input to the page.
@@ -1433,10 +1747,15 @@ pub fn run(url: &str) -> Result<(), RendererError> {
     window.tick();
     window.start_pump();
 
-    // The one message loop: WebView2 delivers EVERY event through it.
+    // The one message loop: WebView2 delivers EVERY event through it, and the
+    // shortcut layer takes its look BEFORE `TranslateMessage`, which is this
+    // edge's equivalent of the GTK shell's capture-phase key controller.
     let mut message = MSG::default();
     unsafe {
         while GetMessageW(&mut message, None, 0, 0).as_bool() {
+            if window.filter_shortcut(&message) {
+                continue;
+            }
             let _ = TranslateMessage(&message);
             DispatchMessageW(&message);
         }

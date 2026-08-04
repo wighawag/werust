@@ -36,8 +36,16 @@
 //! 5. The old per-edge F12 predicate is GONE, folded into the table
 //!    (`the_f12_predicate_is_gone_and_the_web_inspector_is_a_table_row`).
 //! 6. Desktop-scoped + parity-tracked: the matrix row's desktop cell is
-//!    implemented and the other desktop edges are tracked stubs
+//!    implemented and any sibling edge that has not landed yet is a tracked stub
 //!    (`the_desktop_cell_is_implemented_and_the_sibling_edges_are_tracked`).
+//!
+//! AMENDMENT (task `shortcuts-and-mouse-history-buttons-on-the-windows-edge`):
+//! the Windows cell moved from `stubbed` to `implemented` when that edge landed
+//! its own translation (`crates/werust-windows/src/shortcuts.rs`, guarded by
+//! `crates/werust-windows/tests/windows_window_shape.rs`). This file keeps
+//! asserting the property that matters here -- the row exists, desktop is real,
+//! and an edge that has NOT landed still names its task -- rather than freezing
+//! the sibling cells, so the macOS task can flip its own cell the same way.
 
 use std::path::{Path, PathBuf};
 
@@ -309,11 +317,17 @@ fn the_desktop_cell_is_implemented_and_the_sibling_edges_are_tracked() {
             "shortcuts-and-mouse-history-buttons-on-the-windows-edge",
         ),
     ] {
+        // Either the edge has LANDED (its cell is implemented, as the Windows one
+        // now is) or its gap is TRACKED on the sibling task -- never a silent
+        // absence, which is the whole point of the row. Which of the two it is
+        // stays the parity guard's business.
         assert!(
-            row.contains(&format!(
-                "{platform} = {{ state = \"stubbed\", task = \"{task}\" }}"
-            )),
-            "the {platform} edge must be a TRACKED stub on its sibling task: {row:?}"
+            row.contains(&format!("{platform} = {{ state = \"implemented\" }}"))
+                || row.contains(&format!(
+                    "{platform} = {{ state = \"stubbed\", task = \"{task}\" }}"
+                )),
+            "the {platform} edge must be implemented or a TRACKED stub on its sibling task: \
+             {row:?}"
         );
     }
 }

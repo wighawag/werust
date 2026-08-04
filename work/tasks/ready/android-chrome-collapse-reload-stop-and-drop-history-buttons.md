@@ -4,6 +4,7 @@ slug: android-chrome-collapse-reload-stop-and-drop-history-buttons
 spec: chrome-conventional-controls
 blockedBy: [reload-stop-collapse-and-loading-spinner-core-and-gtk]
 covers: [8, 9, 10, 11, 12]
+needsAnswers: true
 ---
 
 ## What to build

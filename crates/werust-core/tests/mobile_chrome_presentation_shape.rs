@@ -43,6 +43,15 @@
 //!   (`both_mobile_edges_announce_the_trust_state_before_its_explanation`).
 //! - One encoder, in the core: neither mobile crate carries a chrome-JSON twin
 //!   (`the_chrome_json_is_encoded_once_in_the_core_not_per_mobile_crate`).
+//!
+//! LATER ARRIVALS: this guard covers the derivation as a WHOLE, not one task's
+//! slice of it, so a chrome fact that later crosses to mobile is registered HERE
+//! rather than guarded off to the side. The collapsed reload/stop control and the
+//! loading spinner joined in [`DERIVED_FIELDS`] and [`every_derived_string`] as
+//! the CONTRACT step of their own expand -> migrate -> contract sequence (task
+//! `register-the-new-chrome-fields-in-the-mobile-presentation-guard`, spec
+//! `chrome-conventional-controls`), once BOTH mobile edges consumed them; before
+//! that, each edge's own guard demanded the fields in the meantime.
 
 use std::path::{Path, PathBuf};
 
@@ -50,7 +59,7 @@ use renderer::{LoadState, TrustPosture};
 use werust_core::pins::{MutableNameTrust, TrustedNamePin};
 use werust_core::{
     invalid_entry_badge_text, load_progress_hint, trust_indicator, trust_indicator_detail,
-    trust_pin_action_label, ChromeState, LoadStep,
+    trust_pin_action_label, ChromeState, LoadStep, ReloadStopControl,
 };
 
 /// Read a source file relative to the repo root. `CARGO_MANIFEST_DIR` is
@@ -117,6 +126,26 @@ const DERIVED_FIELDS: &[&str] = &[
     "loadProgressVisible",
     "loadProgressFraction",
     "loadProgressHint",
+    // The collapsed reload/stop control and the loading spinner (spec
+    // `chrome-conventional-controls`, stories 8 + 10): the glyph the ONE control
+    // wears right now, its accessible name, and whether the spinner shows.
+    // Registered by the CONTRACT step
+    // `register-the-new-chrome-fields-in-the-mobile-presentation-guard`, once BOTH
+    // mobile edges consumed them.
+    //
+    // The mode's stable WIRE NAME (`reloadStopControl`) is deliberately NOT listed:
+    // this list is what every edge must DECODE and PAINT, and a painter that must
+    // not branch on the mode has nothing to do with the wire name — its only
+    // tempting consumer is the `when`/`switch` this whole collapse deletes. Both
+    // mobile edges skip it for that reason, and their own guards forbid reading it
+    // (`no_kotlin_conditional_decides_the_control_mode_or_the_spinner` and its
+    // Swift twin), so requiring it here would demand exactly the wiring the repo
+    // forbids. Its VALUES are not forbidden literals either, for the same reason
+    // `"loading"` is not: a wire name is carrier vocabulary, not a presentation
+    // string.
+    "reloadStopControlLabel",
+    "reloadStopControlDescription",
+    "loadSpinnerVisible",
     // The trust surface's TOFU section: whether the bless is offered, what the
     // action says, and the body naming the name + CIDs.
     "trustPinActionVisible",
@@ -259,6 +288,17 @@ fn every_derived_string() -> Vec<String> {
         produced.push(trust_indicator(&state).to_string());
         produced.push(trust_indicator_detail(&state).to_string());
         produced.push(trust_pin_action_label(&state).to_string());
+    }
+    // The collapsed reload/stop control's own vocabulary: the GLYPH each mode
+    // wears and the accessible NAME it announces. Driven from the core over
+    // `ReloadStopControl::ALL` (kept complete by a compile-time check, like the
+    // posture and step axes above), so a reworded description or a re-drawn glyph
+    // joins this forbidden list without anyone remembering to. Not the mode's
+    // `wire_name`: that is carrier vocabulary the edges must be free to spell,
+    // exactly like a JSON key.
+    for control in ReloadStopControl::ALL {
+        produced.push(control.label().to_string());
+        produced.push(control.description().to_string());
     }
     produced.push(
         invalid_entry_badge_text(&ChromeState {

@@ -44,10 +44,17 @@
 //! - `can_go_back` / `can_go_forward` and the history seam are unchanged; only
 //!   the painter changes
 //!   (`the_history_capability_is_untouched_by_the_button_removal`).
-//! - The mobile presentation guard's field lists are NOT touched here (this is
-//!   the MIGRATE step; `register-the-new-chrome-fields-in-the-mobile-presentation-guard`
-//!   owns the registration once BOTH mobile edges consume the fields)
-//!   (`the_mobile_presentation_guard_field_lists_are_not_registered_here`).
+//! - Every field this edge consumes is registered in the mobile presentation
+//!   guard's `DERIVED_FIELDS`, so the CENTRAL guard (not only this per-edge one)
+//!   demands it of BOTH edges
+//!   (`the_mobile_presentation_guard_registers_the_fields_this_edge_consumes`).
+//!   This assertion was the SEQUENCING hold in the MIGRATE step: it asserted the
+//!   fields were NOT yet registered, so a well-meaning registration could not
+//!   creep in before both edges consumed them. The CONTRACT step
+//!   (`register-the-new-chrome-fields-in-the-mobile-presentation-guard`) landed
+//!   that registration and INVERTED this check, which keeps the coupling live in
+//!   the other direction: a field this edge paints can no longer be quietly
+//!   dropped from the central list to make a gate green.
 
 use std::path::{Path, PathBuf};
 
@@ -69,10 +76,19 @@ const KOTLIN_PAINTER: &str =
 const KOTLIN_BINDING: &str =
     "crates/werust-android/app/src/main/java/com/github/wighawag/werust/WerustCore.kt";
 
-/// The DERIVED chrome-JSON fields this edge starts consuming here. They are
-/// deliberately NOT registered in the mobile presentation guard's `DERIVED_FIELDS`
-/// yet (see `the_mobile_presentation_guard_field_lists_are_not_registered_here`);
-/// this list is what THIS edge's own guard demands in the meantime.
+/// The DERIVED chrome-JSON fields this edge starts consuming here. Registered in
+/// the mobile presentation guard's `DERIVED_FIELDS` by the CONTRACT step
+/// `register-the-new-chrome-fields-in-the-mobile-presentation-guard`, once BOTH
+/// mobile edges consumed them; this list is what THIS edge's own guard demands,
+/// and what
+/// [`the_mobile_presentation_guard_registers_the_fields_this_edge_consumes`]
+/// holds the central guard to.
+///
+/// It deliberately EXCLUDES the mode's stable wire name `reloadStopControl`: a
+/// painter that must not branch on the mode has nothing to do with it, and the
+/// only tempting consumer is the `when` this collapse exists to prevent
+/// (`docs/spikes/android-chrome-collapse-reload-stop-and-drop-history-buttons/DECISIONS.md`
+/// section 4).
 const CONSUMED_DERIVED_FIELDS: &[&str] = &[
     "reloadStopControlLabel",
     "reloadStopControlDescription",
@@ -491,47 +507,50 @@ fn the_control_performs_the_modes_own_action_through_the_core() {
 }
 
 #[test]
-fn the_mobile_presentation_guard_field_lists_are_not_registered_here() {
-    // Acceptance 6, the SEQUENCING trap. `mobile_chrome_presentation_shape.rs`
-    // demands that BOTH mobile bindings decode and BOTH painters paint every
-    // field in `DERIVED_FIELDS`. This task is the MIGRATE step for ONE of the two
-    // edges, so registering the new fields here would red the gate until the iOS
-    // task lands. The CONTRACT step is
-    // `register-the-new-chrome-fields-in-the-mobile-presentation-guard`, which is
-    // blocked on both edges; this assertion is what keeps a well-meaning
-    // registration from creeping in early.
+fn the_mobile_presentation_guard_registers_the_fields_this_edge_consumes() {
+    // Acceptance 6, the SEQUENCING trap, now on its far side.
+    // `mobile_chrome_presentation_shape.rs` demands that BOTH mobile bindings
+    // decode and BOTH painters paint every field in `DERIVED_FIELDS`. While this
+    // edge was the MIGRATE step for ONE of the two edges, registering the new
+    // fields there would have redded the gate until the iOS task landed, so this
+    // assertion ran the other way round and kept a well-meaning registration from
+    // creeping in early. The CONTRACT step
+    // (`register-the-new-chrome-fields-in-the-mobile-presentation-guard`) has since
+    // landed the registration and inverted it: what is worth guarding now is the
+    // OPPOSITE regression, a field this edge paints being dropped from the central
+    // list — the cheapest way to make that guard green after breaking an edge.
     //
-    // It reads the LITERAL half of the scan, and that is the whole difference
-    // between a real guard and a vacuous one: a field name can only ever appear
-    // in that guard AS a string literal (a `FACT_FIELDS` / `DERIVED_FIELDS`
-    // entry, or an FFI signature string), so asserting its absence from the
-    // literal-STRIPPED code view would be an assertion that can never fail. The
-    // positive control below pins that this check really does see a registered
-    // field; it straddles the file (a `DERIVED_FIELDS` entry near the top, the
-    // binding signature it demands near the bottom) because the scanned file is
-    // RUST and `scan` is written for Kotlin, so a construct it does not model
-    // (a byte-char literal such as `b'\"'`) could in principle shift the split
-    // partway through.
+    // It reads the LITERAL half of the scan, because a field name can only ever
+    // appear in that guard AS a string literal (a `FACT_FIELDS` /
+    // `DERIVED_FIELDS` entry, or an FFI signature string), and it demands an
+    // EXACT literal rather than a substring: `reloadStopControlLabel` occurs
+    // inside this very sentence's prose in the guard's comments, and a comment is
+    // not a registration. The positive control below stays from the pre-inversion
+    // shape, where it was what kept the check from being vacuous; it still earns
+    // its place by telling a MISSING entry apart from a scan that lost its place,
+    // since the two controls straddle the file (a `DERIVED_FIELDS` entry near the
+    // top, the binding signature it demands near the bottom) and the scanned file
+    // is RUST while `scan` is written for Kotlin.
     let guard = source("crates/werust-core/tests/mobile_chrome_presentation_shape.rs");
     let (_, literals) = scan(&guard);
     for control in ["loadProgressVisible", "fun loadProgressVisible()"] {
         assert!(
             literals.iter().any(|literal| literal == control),
-            "POSITIVE CONTROL: `{control}` IS registered in the mobile presentation guard \
-             (a `DERIVED_FIELDS` entry, and the binding signature it demands), so this check \
-             must SEE it — otherwise the assertion below could never fail and the \
-             MIGRATE/CONTRACT sequencing would be unguarded. The two controls straddle the \
-             whole file, so a scan that lost its place partway through is caught too."
+            "POSITIVE CONTROL: `{control}` has been registered in the mobile presentation \
+             guard since long before this edge (a `DERIVED_FIELDS` entry, and the binding \
+             signature it demands), so this check must SEE it — if it does not, the scan is \
+             broken and the assertion below is reporting a missing entry it simply cannot \
+             read. The two controls straddle the whole file, so a scan that lost its place \
+             partway through is caught too."
         );
     }
     for field in CONSUMED_DERIVED_FIELDS {
         assert!(
-            !literals.iter().any(|literal| literal.contains(field)),
-            "`{field}` must NOT be registered in the mobile presentation guard yet: the guard \
-             requires BOTH mobile edges to consume a field, and the iOS edge \
-             (`ios-chrome-collapse-reload-stop-and-drop-history-buttons`) has not landed. The \
-             fan-in task `register-the-new-chrome-fields-in-the-mobile-presentation-guard` \
-             owns this registration."
+            literals.iter().any(|literal| literal == field),
+            "`{field}` must be registered in the mobile presentation guard's `DERIVED_FIELDS`: \
+             this edge paints it, and the central guard is what holds the OTHER edge to \
+             reading the same one derivation. Dropping the entry would leave this field the \
+             only chrome fact crossing to mobile without that protection."
         );
     }
 }

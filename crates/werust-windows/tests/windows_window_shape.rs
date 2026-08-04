@@ -59,6 +59,17 @@
 //! `the_page_focused_keys_arrive_through_the_engines_accelerator_hook`,
 //! `the_shortcut_paths_are_exercised_on_the_windows_leg`).
 //!
+//! AMENDMENT (task `reload-stop-collapse-and-spinner-on-the-windows-chrome`):
+//! the separate Reload and Stop controls are ONE control, and a loading spinner
+//! joined the toolbar. Both the control's MODE and the spinner's VISIBILITY are
+//! read off the shared `desktop-paint` snapshot (`reload_stop_control` /
+//! `load_spinner_visible` in `werust-core`), so this edge assigns values where it
+//! used to enable one of a pair on the raw loading fact. A local conditional for
+//! either would be exactly the per-edge twin the one-derivation rule forbids, and
+//! it would compile and pass every unit test, so it is pinned here
+//! (`the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive`,
+//! `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`).
+//!
 //! AMENDMENT (task `windows-gui-subsystem-no-console-window`, 2026-07-31): the
 //! first run on REAL hardware found the binary linking as a CONSOLE-subsystem
 //! app, so Windows opened a console window beside the browser
@@ -222,8 +233,8 @@ fn the_window_carries_every_chrome_surface_over_the_webview2_backend() {
         ("the URL bar", "pub url_edit: HWND"),
         ("Back", "pub back: HWND"),
         ("Forward", "pub forward: HWND"),
-        ("Reload", "pub reload: HWND"),
-        ("Stop", "pub stop: HWND"),
+        ("the ONE reload/stop control", "pub reload_stop: HWND"),
+        ("the loading spinner", "pub spinner: HWND"),
         ("the trust indicator", "pub trust: HWND"),
         ("the invalid-entry badge", "pub invalid_badge: HWND"),
         ("the ⋮ menu", "pub menu_button: HWND"),
@@ -264,12 +275,13 @@ fn the_window_carries_every_chrome_surface_over_the_webview2_backend() {
         );
     }
 
-    // Every control drives the SHARED shell, never the webview.
+    // Every control drives the SHARED shell, never the webview. (The ONE
+    // reload/stop control drives it through the shared performer instead, which
+    // `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`
+    // pins.)
     for (action, drives) in [
         ("ID_BACK", "shell.borrow_mut().go_back()"),
         ("ID_FORWARD", "shell.borrow_mut().go_forward()"),
-        ("ID_RELOAD", "shell.borrow_mut().reload()"),
-        ("ID_STOP", "shell.borrow_mut().stop()"),
         ("ID_URL_ENTER", "shell.borrow_mut().navigate("),
     ] {
         assert!(
@@ -318,6 +330,8 @@ fn the_win32_layer_paints_and_never_derives() {
         "load_progress_fraction(",
         "load_progress_hint(",
         "load_progress_tooltip(",
+        "reload_stop_control(",
+        "load_spinner_visible(",
         "console_row_text(",
         "network_trust_label(",
         "network_status_text(",
@@ -342,6 +356,8 @@ fn the_win32_layer_paints_and_never_derives() {
         "invalid_entry_badge_text(state)",
         "load_progress_visible(state)",
         "load_progress_fraction(state)",
+        "reload_stop_control(state)",
+        "load_spinner_visible(state)",
     ] {
         assert!(
             paint.contains(rule),
@@ -596,6 +612,145 @@ fn progress_lives_in_the_url_bar_and_only_a_failure_moves_the_page() {
 }
 
 #[test]
+fn the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive() {
+    // The collapse (spec `chrome-conventional-controls`, story 10): the two
+    // controls that were enabled on the negation of each other's condition are
+    // ONE control whose MODE the core derives, and the spinner (story 8) joins
+    // the URL bar's progress fraction (story 9, untouched).
+    let chrome = chrome();
+    assert!(
+        chrome.contains("pub reload_stop: HWND") && chrome.contains("pub spinner: HWND"),
+        "the toolbar must carry the ONE reload/stop control and the spinner"
+    );
+    for gone in ["pub reload: HWND", "pub stop: HWND"] {
+        assert!(
+            !chrome.contains(gone),
+            "`{gone}` is the pre-collapse pair; the two controls are one now"
+        );
+    }
+
+    // The paint is a straight assignment from the SNAPSHOT's fields: this edge
+    // reads the mode, its accessible description and the spinner's visibility,
+    // and computes none of them.
+    let apply = between(
+        &chrome,
+        "pub fn apply(&self, paint: &ChromePaint) {",
+        "\n    }\n",
+    );
+    for assignment in [
+        "set_text(self.reload_stop, paint.reload_stop_label)",
+        "self.set_tip(self.reload_stop, paint.reload_stop_description)",
+        "show(self.spinner, paint.spinner_visible)",
+    ] {
+        assert!(
+            apply.contains(assignment),
+            "the paint must assign `{assignment}` from the shared snapshot: {apply:?}"
+        );
+    }
+    // …and the pre-collapse rule -- enable one of a pair on the raw loading fact
+    // -- is GONE, along with any other use of that fact in the paint. Keeping it
+    // beside the derived value is the drift the one-derivation rule forbids.
+    for gone in ["enable(self.stop", "enable(self.reload", "paint.is_loading"] {
+        assert!(
+            !apply.contains(gone),
+            "`{gone}` is this edge deciding the control's mode for itself: {apply:?}"
+        );
+    }
+
+    // The spinner's SLOT is laid out from the DPI seam like every other
+    // rectangle, and permanently: only its VISIBILITY follows the derivation, so
+    // a load starting can never shove the URL bar sideways.
+    let layout = between(&chrome, "pub fn relayout(&self) {", "\n    }\n");
+    assert!(
+        layout.contains("self.reload_stop") && layout.contains("metrics.spinner_width"),
+        "the collapsed control and the spinner must be laid out from the seam: {layout:?}"
+    );
+
+    // Win32 has no spinner control, so this edge ANIMATES one -- on the chrome
+    // pump that already exists. A second timer is what the Android ANR guard and
+    // this crate's one-pump rule forbid.
+    let window = window();
+    assert!(
+        window.contains("self.chrome.spin();"),
+        "the spinner must be advanced from the existing pump tick"
+    );
+    assert_eq!(
+        window.matches("SetTimer(").count(),
+        1,
+        "the spinner must not add a timer of its own"
+    );
+    assert!(
+        exists("docs/spikes/reload-stop-collapse-and-spinner-on-the-windows-chrome/DECISIONS.md"),
+        "how a Win32 control renders a spinner, and where it sits, is a recorded decision"
+    );
+}
+
+#[test]
+fn the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched() {
+    // What the ONE control DOES is the MODE's own `ChromeAction` -- the same
+    // closed vocabulary Ctrl+R and Escape resolve into -- performed by the SAME
+    // performer, so the toolbar cancel and the keyboard cancel are one path.
+    let window = window();
+    assert!(
+        window.contains("const ID_RELOAD_STOP: usize"),
+        "the collapsed control needs ONE command id"
+    );
+    for gone in ["const ID_RELOAD:", "const ID_STOP:"] {
+        assert!(
+            !window.contains(gone),
+            "`{gone}` is the pre-collapse pair's command id"
+        );
+    }
+    let command = between(&window, "fn handle_command(", "/// PERFORM a resolved");
+    assert!(
+        command.contains("ID_RELOAD_STOP =>") && command.contains("perform_chrome_action("),
+        "a click must go through the shared performer: {command:?}"
+    );
+    for decided in ["shell.borrow_mut().stop()", "shell.borrow_mut().reload()"] {
+        assert!(
+            !command.contains(decided),
+            "`{decided}` is this handler deciding which of the two modes the click \
+             is: {command:?}"
+        );
+    }
+    // And the MODE it performs is read off the shared snapshot, never recomputed.
+    let action = between(&window, "fn reload_stop_action(", "\n    }\n");
+    assert!(
+        action.contains("ChromePaint::of(") && action.contains("reload_stop_control.action()"),
+        "the click's action must be the snapshot's own mode: {action:?}"
+    );
+
+    // Back and forward are UNTOUCHED: desktop keeps its history buttons (spec
+    // story 14; only the mobile edges drop them, in their own tasks).
+    let chrome = chrome();
+    assert!(
+        chrome.contains("pub back: HWND") && chrome.contains("pub forward: HWND"),
+        "the desktop toolbar keeps back and forward"
+    );
+    assert!(
+        chrome.contains("enable(self.back, paint.can_go_back)")
+            && chrome.contains("enable(self.forward, paint.can_go_forward)"),
+        "the history buttons still read the core's capability flags"
+    );
+
+    // The interactive half belongs on the `windows-latest` leg: only a real
+    // window can show that the real control re-labels itself and really cancels.
+    let smoke = source("crates/werust-windows/examples/window_smoke.rs");
+    for driven in [
+        "window.reload_stop_label()",
+        "window.reload_stop_description()",
+        "window.spinner_visible()",
+        "activate_reload_stop",
+        "werust_windows::shortcuts::VK_ESCAPE",
+    ] {
+        assert!(
+            smoke.contains(driven),
+            "the smoke must drive `{driven}` against the real window"
+        );
+    }
+}
+
+#[test]
 fn the_shell_passes_a_durable_profile_not_the_engines_temp_default() {
     // Criterion 5 (planted on this task at Gate 3 of the engine task): the engine
     // defaults its WebView2 user-data folder to `%TEMP%\werust-webview2`, which is
@@ -792,6 +947,7 @@ fn the_chrome_scales_from_one_dpi_seam_and_follows_a_dpi_change() {
         ("TRUST_WIDTH", 210),
         ("BADGE_WIDTH", 110),
         ("PROGRESS_HEIGHT", 3),
+        ("SPINNER_WIDTH", 20),
         ("FONT_HEIGHT", 15),
         ("DEFAULT_WIDTH", 1024),
         ("DEFAULT_HEIGHT", 768),

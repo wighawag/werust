@@ -57,7 +57,10 @@ mod windows_smoke {
     use werust_core::debug::DebugCapture;
     use werust_core::ipfs::RedirectSink;
     use werust_core::menu::{BrowserMenu, MENU_ITEM_DEBUG};
-    use werust_core::{status_line, trust_indicator, trust_indicator_detail, BrowserShell};
+    use werust_core::{
+        load_spinner_visible, reload_stop_control, status_line, trust_indicator,
+        trust_indicator_detail, BrowserShell, ReloadStopControl,
+    };
     use werust_windows::dpi::{Dpi, Metrics};
     use werust_windows::paint::install_debug_capture;
     use werust_windows::window::{BrowserWindow, Placement};
@@ -151,6 +154,73 @@ mod windows_smoke {
             }
         }
         false
+    }
+
+    /// What the toolbar's ONE reload/stop control and the spinner beside it did
+    /// across one load, sampled on every pump.
+    struct Watched {
+        /// The widgets NEVER disagreed with the core's derivation for the state
+        /// the shell was in when they were read. This is the property that would
+        /// fail if this edge had grown a conditional of its own.
+        agreed: bool,
+        /// The control really wore its STOP mode while the load was in flight.
+        saw_stop_mode: bool,
+        /// The spinner really showed while the load was in flight.
+        saw_spinner: bool,
+        /// There really was an in-flight load when the cancel was performed (so a
+        /// cancel that "worked" on an already-settled page cannot pass).
+        cancelled_in_flight: bool,
+    }
+
+    /// Start a load, WATCH the collapsed control and the spinner across it, and
+    /// cancel it the way `cancel` says as soon as it is really in flight.
+    ///
+    /// The paint is asked for on every sample (`refresh_chrome`) because a pump
+    /// tick only repaints when the seam had something to say; the point here is
+    /// to read the WIDGETS for the state the shell is in at that instant and
+    /// compare them with what the core derives for it.
+    fn watch_a_load_and_cancel_it(
+        window: &BrowserWindow,
+        shell: &Rc<RefCell<BrowserShell>>,
+        url: &str,
+        cancel: impl Fn(&BrowserWindow),
+    ) -> Watched {
+        let mut watched = Watched {
+            agreed: true,
+            saw_stop_mode: false,
+            saw_spinner: false,
+            cancelled_in_flight: false,
+        };
+        if shell.borrow_mut().navigate(url).is_err() {
+            return watched;
+        }
+        // A load that has not even STARTED after ten seconds of pumping is a
+        // broken run, not a fast one, so the watch is bounded.
+        for _ in 0..(10 * 50) {
+            pump(window);
+            window.refresh_chrome();
+            let (loading, control, spinner) = {
+                let shell = shell.borrow();
+                let state = shell.chrome();
+                (
+                    state.is_loading(),
+                    reload_stop_control(state),
+                    load_spinner_visible(state),
+                )
+            };
+            watched.agreed &= window.reload_stop_label() == control.label()
+                && window.reload_stop_description().as_deref() == Some(control.description())
+                && window.spinner_visible() == spinner;
+            if loading {
+                watched.saw_stop_mode |=
+                    window.reload_stop_label() == ReloadStopControl::Stop.label();
+                watched.saw_spinner |= window.spinner_visible();
+                cancel(window);
+                watched.cancelled_in_flight = true;
+                break;
+            }
+        }
+        watched
     }
 
     /// One assertion, reported rather than panicked, so the run prints every
@@ -298,6 +368,13 @@ mod windows_smoke {
             &mut failures,
             trust.right - trust.left == metrics.trust_width,
             "the trust indicator is exactly the seam's scaled width",
+        );
+        let reload_stop = window.control_rect(window.reload_stop());
+        check(
+            &mut failures,
+            reload_stop.top == metrics.row_y
+                && reload_stop.bottom - reload_stop.top == metrics.row_height,
+            "the ONE reload/stop control sits on the seam's toolbar row",
         );
         // Say plainly what this run can and cannot claim.
         if dpi == 96 {
@@ -537,6 +614,102 @@ mod windows_smoke {
             &mut failures,
             went_back,
             "mouse button 4 navigates history back through the shell",
+        );
+
+        // The COLLAPSE (task `reload-stop-collapse-and-spinner-on-the-windows-chrome`,
+        // spec story 8 + 10): the separate Reload and Stop buttons are ONE control
+        // whose MODE the core derives, and a spinner joins the URL bar's progress
+        // fraction. Both values come off the shared `desktop-paint` snapshot, so
+        // what only a Windows box can add is that the REAL control re-labels
+        // itself across a real load, that the REAL spinner shows, and that
+        // cancelling still works from the toolbar and from the keyboard.
+        println!("the ONE reload/stop control and the spinner beside it:");
+        window.refresh_chrome();
+        let settled_mode = {
+            let shell = shell.borrow();
+            reload_stop_control(shell.chrome())
+        };
+        check(
+            &mut failures,
+            settled_mode == ReloadStopControl::Reload,
+            "a settled page puts the control in its RELOAD mode",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_label() == settled_mode.label(),
+            "the control wears the mode's own glyph, from the core",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_description().as_deref() == Some(settled_mode.description()),
+            "the control carries the core's accessible name as its tooltip",
+        );
+        check(
+            &mut failures,
+            !window.spinner_visible(),
+            "a settled chrome spins nothing",
+        );
+
+        // Cancel from the TOOLBAR: the same `WM_COMMAND` a click sends, so the
+        // mode's own action is what runs.
+        let in_flight_url = format!("ipfs://{honest_cid}/");
+        let watched = watch_a_load_and_cancel_it(
+            &window,
+            &shell,
+            &in_flight_url,
+            BrowserWindow::activate_reload_stop,
+        );
+        check(
+            &mut failures,
+            watched.cancelled_in_flight,
+            "the load really was in flight when the toolbar cancelled it",
+        );
+        check(
+            &mut failures,
+            watched.saw_stop_mode,
+            "the one control becomes STOP while a load is in flight",
+        );
+        check(
+            &mut failures,
+            watched.saw_spinner,
+            "the spinner shows while a load is in flight",
+        );
+        check(
+            &mut failures,
+            watched.agreed,
+            "the control and the spinner never disagreed with the core's derivation",
+        );
+        window.refresh_chrome();
+        let stopped = !shell.borrow().chrome().is_loading();
+        check(
+            &mut failures,
+            stopped,
+            "the toolbar control cancels an in-flight load",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_label() == ReloadStopControl::Reload.label()
+                && !window.spinner_visible(),
+            "the cancelled load leaves the control back in RELOAD with the spinner gone",
+        );
+
+        // Cancel from the KEYBOARD (spec story 5), which the collapse must not
+        // have cost: Escape with the page focused resolves to the same Stop.
+        let watched = watch_a_load_and_cancel_it(&window, &shell, &in_flight_url, |window| {
+            post_key(window, werust_windows::shortcuts::VK_ESCAPE);
+            window.pump_messages();
+        });
+        check(
+            &mut failures,
+            watched.cancelled_in_flight,
+            "the load really was in flight when Escape was pressed",
+        );
+        window.refresh_chrome();
+        let stopped = !shell.borrow().chrome().is_loading();
+        check(
+            &mut failures,
+            stopped,
+            "Escape still cancels an in-flight load from the keyboard",
         );
 
         println!("closing the debug window drops the slot:");

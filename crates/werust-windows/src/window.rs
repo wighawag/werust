@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
-//! │ ◀ ▶ ⟳ ✕ │ URL bar (+ progress) │ ⛔ badge │ trust badge │ ⋮ │  toolbar
+//! │ ◀ ▶ ⟳/✕ ◐ │ URL bar (+ progress) │ ⛔ badge │ trust badge │ ⋮ │  toolbar
 //! ├─────────────────────────────────────────────────────────────┤
 //! │ ⚠ This page failed to load: <protocol-named reason>         │  error banner
 //! ├─────────────────────────────────────────────────────────────┤  (failures only)
@@ -110,6 +110,10 @@ const TTS_ALWAYSTIP: u32 = 0x01;
 const TTS_NOPREFIX: u32 = 0x02;
 /// `winuser.h`: a single-line STATIC that clips rather than wraps.
 const SS_LEFTNOWORDWRAP: u32 = 0x0000_000c;
+/// `winuser.h`: a STATIC that centres its text in its own rectangle. The spinner
+/// is one glyph in a fixed slot, and its frames are not all the same width, so
+/// centring is what keeps it from jittering as it turns.
+const SS_CENTER: u32 = 0x0000_0001;
 /// `winuser.h`: the EDIT control's "select this range" message. Selecting the
 /// whole address is half of what the focus-the-URL-bar shortcut means ("focus
 /// AND select", so the next keystroke replaces it).
@@ -153,8 +157,10 @@ const _VIRTUAL_KEY_CODES_MATCH_THE_SDK: () = {
 /// STABLE id -- never to a label.
 const ID_BACK: usize = 101;
 const ID_FORWARD: usize = 102;
-const ID_RELOAD: usize = 103;
-const ID_STOP: usize = 104;
+/// The ONE reload/stop control, where there were two (task
+/// `reload-stop-collapse-and-spinner-on-the-windows-chrome`). Its MODE, and
+/// therefore what a click on it does, is the shared derivation's.
+const ID_RELOAD_STOP: usize = 103;
 const ID_MENU_BUTTON: usize = 105;
 const ID_URL_EDIT: usize = 106;
 const ID_URL_ENTER: usize = 107;
@@ -212,6 +218,18 @@ impl Controller {
         self.chrome.apply(&paint);
     }
 
+    /// What the ONE reload/stop control does RIGHT NOW: the mode's own
+    /// [`ChromeAction`], taken off the shared snapshot.
+    ///
+    /// The mode is `reload_stop_control`'s call, made once in `werust-core` for
+    /// every edge and carried here by `desktop-paint`; this edge asks the
+    /// snapshot which action the control it just painted performs, and never
+    /// re-decides it from the loading fact.
+    fn reload_stop_action(&self) -> ChromeAction {
+        let shell = self.shell.borrow();
+        ChromePaint::of(shell.chrome()).reload_stop_control.action()
+    }
+
     /// Catch the open debug view up with the shared store (a no-op when it is
     /// closed, and a no-op tick when nothing was captured).
     fn refresh_debug_view(&self) {
@@ -249,6 +267,11 @@ impl Controller {
         // is incremental, so an idle tick over an open view is one sequence
         // comparison.
         self.refresh_debug_view();
+        // The spinner turns on THIS tick rather than on a repaint: a repaint
+        // happens when the seam reports an event, and the load a spinner is for is
+        // the one that reports nothing for seconds. Whether it is showing at all
+        // was decided by the last paint, from the core's rule.
+        self.chrome.spin();
     }
 
     /// `WM_DPICHANGED`: this window was dragged onto a monitor with a different
@@ -534,10 +557,16 @@ fn handle_command(controller: &Rc<Controller>, id: usize) {
     match id {
         ID_BACK => controller.shell.borrow_mut().go_back(),
         ID_FORWARD => controller.shell.borrow_mut().go_forward(),
-        ID_RELOAD => {
-            let _ = controller.shell.borrow_mut().reload();
+        ID_RELOAD_STOP => {
+            // The ONE reload/stop control: what it DOES is the MODE's own
+            // `ChromeAction` (the same closed vocabulary Ctrl+R and Escape
+            // resolve into), performed by the SAME `perform_chrome_action` the
+            // keyboard and the mouse side buttons go through. So this handler
+            // decides nothing, and cancelling a load from the toolbar and
+            // cancelling it with Escape are one path that cannot drift apart.
+            perform_chrome_action(controller, controller.reload_stop_action());
+            return;
         }
-        ID_STOP => controller.shell.borrow_mut().stop(),
         ID_URL_ENTER => {
             // Enter in the URL bar: navigate through the shell, which owns the
             // front-door rule (a bare `.eth` name, a scheme-less host, an invalid
@@ -1259,8 +1288,29 @@ impl BrowserWindow {
 
         let back = control(window, w!("BUTTON"), "◀", WS_VISIBLE, ID_BACK, font_raw);
         let forward = control(window, w!("BUTTON"), "▶", WS_VISIBLE, ID_FORWARD, font_raw);
-        let reload = control(window, w!("BUTTON"), "⟳", WS_VISIBLE, ID_RELOAD, font_raw);
-        let stop = control(window, w!("BUTTON"), "✕", WS_VISIBLE, ID_STOP, font_raw);
+        // The ONE reload/stop control. It is built with NO caption: its glyph is
+        // the shared derivation's (`ChromePaint::reload_stop_label`), and the
+        // `refresh_chrome` below paints it before the window is ever shown — the
+        // same way the trust badge gets its first text.
+        let reload_stop = control(
+            window,
+            w!("BUTTON"),
+            "",
+            WS_VISIBLE,
+            ID_RELOAD_STOP,
+            font_raw,
+        );
+        // The LOADING SPINNER: one glyph in a fixed slot, hidden until the core
+        // says a load is worth reporting (like the invalid-entry badge, which is
+        // the other control this chrome shows conditionally).
+        let spinner = control(
+            window,
+            w!("STATIC"),
+            "",
+            WINDOW_STYLE(SS_CENTER),
+            0,
+            font_raw,
+        );
         let menu_button = control(
             window,
             w!("BUTTON"),
@@ -1356,8 +1406,8 @@ impl BrowserWindow {
             window,
             back,
             forward,
-            reload,
-            stop,
+            reload_stop,
+            spinner,
             menu_button,
             url_edit,
             progress,
@@ -1374,12 +1424,18 @@ impl BrowserWindow {
             error_color: Cell::new(COLORREF(0)),
             error_brush: Cell::new(HBRUSH::default()),
             url_invalid: Cell::new(false),
+            spinner_frame: Cell::new(0),
             // Every rectangle this chrome draws is scaled from here, and
             // `WM_DPICHANGED` replaces it.
             dpi: Cell::new(dpi.raw()),
         };
         chrome.add_tip(trust);
         chrome.add_tip(url_edit);
+        // The collapsed control's ACCESSIBLE NAME ("Reload this page" / "Stop
+        // loading this page") is the core's, and hover is this edge's surface for
+        // it — so the control has to be a tool of the window's one tooltip before
+        // the first paint can give it one.
+        chrome.add_tip(reload_stop);
 
         // `docs/adr/0009`: read the OS setting once here and re-read it on
         // `WM_SETTINGCHANGE`. The reader is the engine crate's ONE registry read,
@@ -1431,6 +1487,17 @@ impl BrowserWindow {
     /// Run ONE pump tick by hand (the CI smoke's entry point).
     pub fn tick(&self) {
         self.controller.tick();
+    }
+
+    /// Repaint the chrome from the shell's current state, exactly as the pump
+    /// does when the seam reports an event.
+    ///
+    /// The smoke's sampling point: a pump tick only repaints when the seam had
+    /// something to say, so a driver that wants to read the widgets for the state
+    /// the shell is in RIGHT NOW asks for the paint rather than hoping one
+    /// happened.
+    pub fn refresh_chrome(&self) {
+        self.controller.refresh_chrome();
     }
 
     /// Turn the Win32 message loop until it is empty, so WebView2's events (which
@@ -1560,6 +1627,12 @@ impl BrowserWindow {
         self.controller.chrome.trust
     }
 
+    /// The ONE reload/stop control (the smoke measures its rectangle).
+    #[must_use]
+    pub fn reload_stop(&self) -> HWND {
+        self.controller.chrome.reload_stop
+    }
+
     /// One control's rectangle in the WINDOW's client coordinates: the same
     /// space the layout placed it in.
     #[must_use]
@@ -1622,6 +1695,38 @@ impl BrowserWindow {
     #[must_use]
     pub fn progress_visible(&self) -> bool {
         is_visible(self.controller.chrome.progress)
+    }
+
+    /// The GLYPH the ONE reload/stop control is currently wearing: `⟳` on a
+    /// settled page, `✕` while a load is in flight. Which of the two is the
+    /// core's call, so the smoke compares this against the core's own label
+    /// rather than against a literal.
+    #[must_use]
+    pub fn reload_stop_label(&self) -> String {
+        window_text(self.controller.chrome.reload_stop)
+    }
+
+    /// That control's ACCESSIBLE NAME, as its tooltip holds it ("Reload this
+    /// page" / "Stop loading this page", the core's wording).
+    #[must_use]
+    pub fn reload_stop_description(&self) -> Option<String> {
+        self.controller
+            .chrome
+            .tip_of(self.controller.chrome.reload_stop)
+    }
+
+    /// Whether the LOADING SPINNER is showing.
+    #[must_use]
+    pub fn spinner_visible(&self) -> bool {
+        is_visible(self.controller.chrome.spinner)
+    }
+
+    /// Activate the ONE reload/stop control, exactly as clicking it does: the
+    /// same `WM_COMMAND` Win32 sends, through the same handler. This is how the
+    /// smoke cancels an in-flight load FROM THE TOOLBAR rather than by calling
+    /// the shell behind the widget's back.
+    pub fn activate_reload_stop(&self) {
+        handle_command(&self.controller, ID_RELOAD_STOP);
     }
 
     /// The page window's rectangle, so the smoke can prove that in-flight

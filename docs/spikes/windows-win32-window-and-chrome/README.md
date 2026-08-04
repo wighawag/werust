@@ -4,6 +4,8 @@ Task: `windows-win32-window-and-chrome`. Decision it executes: [`docs/adr/0011-w
 
 **Read this first.** This work was WRITTEN on Linux, blind, and then RUN on a `windows-latest` runner: the leg this task extends is green against this code (see [What CI proved](#what-ci-proved)). Everything below is split by what proves it, because the three sources prove very different things: an ordinary Ubuntu `verify` run, the LOCAL cross-target type-check, and the `windows-latest` job. Where a claim is a Windows runtime result it names the run; where it is host-independent it says so; where nothing has checked it, it lives under [What still awaits real Windows hardware](#what-still-awaits-real-windows-hardware-stated-plainly).
 
+**Superseded in part.** The separate Reload and Stop controls this task built — the `stop vs reload` row of the paint table below, and manual step 6 — were collapsed into ONE mode-switching control, with a loading spinner beside it, by `reload-stop-collapse-and-spinner-on-the-windows-chrome` (see [that task's README](../reload-stop-collapse-and-spinner-on-the-windows-chrome/README.md)). Everything else below still describes the window as it is.
+
 ## What landed
 
 - **`crates/werust-windows`** — the Win32 window, in two halves:

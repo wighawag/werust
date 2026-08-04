@@ -62,6 +62,12 @@ pub const BADGE_WIDTH: i32 = 110;
 /// The URL bar's progress strip: a few pixels along its bottom edge, INSIDE the
 /// bar, so it takes no height from the page.
 pub const PROGRESS_HEIGHT: i32 = 3;
+/// The LOADING SPINNER's slot on the toolbar row, between the reload/stop
+/// control and the URL bar. Narrower than a nav button because it carries one
+/// glyph and is not a target: it reports, it does not act. The slot is reserved
+/// whether or not the spinner is showing, so a load starting never shifts the URL
+/// bar sideways.
+pub const SPINNER_WIDTH: i32 = 20;
 /// The toolbar row's inset from the strip's top and bottom edges.
 pub const ROW_INSET: i32 = 6;
 /// The narrowest the URL bar may be squeezed to.
@@ -176,6 +182,8 @@ pub struct Metrics {
     pub badge_width: i32,
     /// The URL bar's progress strip.
     pub progress_height: i32,
+    /// The loading spinner's toolbar slot.
+    pub spinner_width: i32,
     /// The narrowest the URL bar may be squeezed to.
     pub min_url_width: i32,
     /// The UI font's height, positive (see [`FONT_HEIGHT`]).
@@ -218,6 +226,7 @@ impl Metrics {
             trust_width: dpi.scale(TRUST_WIDTH),
             badge_width: dpi.scale(BADGE_WIDTH),
             progress_height: dpi.scale(PROGRESS_HEIGHT),
+            spinner_width: dpi.scale(SPINNER_WIDTH),
             min_url_width: dpi.scale(MIN_URL_WIDTH),
             font_height: dpi.scale(FONT_HEIGHT),
             default_width: dpi.scale(DEFAULT_WIDTH),
@@ -315,6 +324,7 @@ mod tests {
         assert_eq!(baseline.trust_width, TRUST_WIDTH);
         assert_eq!(baseline.badge_width, BADGE_WIDTH);
         assert_eq!(baseline.progress_height, PROGRESS_HEIGHT);
+        assert_eq!(baseline.spinner_width, SPINNER_WIDTH);
         assert_eq!(baseline.font_height, FONT_HEIGHT);
         assert_eq!(baseline.default_width, DEFAULT_WIDTH);
         assert_eq!(baseline.default_height, DEFAULT_HEIGHT);
@@ -328,6 +338,7 @@ mod tests {
         assert_eq!(doubled.toolbar_height, 2 * baseline.toolbar_height);
         assert_eq!(doubled.trust_width, 2 * baseline.trust_width);
         assert_eq!(doubled.font_height, 2 * baseline.font_height);
+        assert_eq!(doubled.spinner_width, 2 * baseline.spinner_width);
         assert_eq!(doubled.default_height, 2 * baseline.default_height);
         assert_eq!(doubled.debug_tab_strip, 2 * baseline.debug_tab_strip);
     }

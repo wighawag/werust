@@ -15,6 +15,17 @@
 //! kept drawing a doll's-house chrome on a 200% display while WebView2 drew the
 //! page correctly (task `windows-chrome-must-scale-with-the-display-dpi`).
 //!
+//! **Win32 has no spinner, so this file draws one.** The toolkit offers an
+//! indeterminate MARQUEE progress bar and nothing else; werust already paints a
+//! real progress bar inside the URL bar, so a second bar beside it would say the
+//! same thing twice in the same shape. The spinner is therefore a one-glyph
+//! `STATIC` whose glyph advances a quarter turn per chrome pump
+//! ([`Chrome::spin`]) — the same 50ms tick every other surface here is painted
+//! from, so no timer is added. WHETHER it shows is not decided here: it is
+//! `ChromePaint::spinner_visible`, the core's `load_spinner_visible`. Why a glyph
+//! rather than a marquee, and where it sits:
+//! `docs/spikes/reload-stop-collapse-and-spinner-on-the-windows-chrome/DECISIONS.md`.
+//!
 //! **Only a FAILURE moves the page.** [`Chrome::relayout`] gives the page window
 //! everything between the fixed toolbar and the fixed status line, minus the
 //! error banner's strip when (and only when) the banner is up. In-flight progress
@@ -64,6 +75,17 @@ pub const PBM_SETBARCOLOR: u32 = 0x0400 + 9;
 const TOOL_INFO_V2_SIZE: usize =
     std::mem::size_of::<TTTOOLINFOW>() - std::mem::size_of::<*mut std::ffi::c_void>();
 
+/// The LOADING SPINNER's frames: a quarter turn each, so the four of them are one
+/// rotation. Rendered as text in a `STATIC`, because Win32 has no spinner control
+/// and this toolbar is already a row of glyph controls (`◀ ▶ ⋮` and the core's own
+/// `⟳ ✕`). They are the EDGE's, not the core's: the core decides only whether the
+/// spinner SHOWS (`load_spinner_visible`), and says in as many words that the
+/// animation is the painter's business.
+///
+/// From the same Geometric Shapes block as the toolbar's existing `◀`/`▶`, so a
+/// font that draws this chrome at all draws these too.
+const SPINNER_FRAMES: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
 /// The widgets the pump repaints from [`ChromePaint`], plus the window they live
 /// in.
 ///
@@ -75,8 +97,17 @@ pub struct Chrome {
     pub window: HWND,
     pub back: HWND,
     pub forward: HWND,
-    pub reload: HWND,
-    pub stop: HWND,
+    /// The ONE reload/stop control browsers have: it RELOADS a settled page and
+    /// STOPS a load in flight. WHICH of the two it currently is comes from the
+    /// shared derivation (`ChromePaint::reload_stop_control`), so this edge
+    /// re-labels one control instead of enabling one of a pair on a condition of
+    /// its own (task `reload-stop-collapse-and-spinner-on-the-windows-chrome`).
+    pub reload_stop: HWND,
+    /// The LOADING SPINNER: a one-glyph `STATIC` beside the control, spun by
+    /// [`spin`](Chrome::spin) on the chrome pump. It says werust is WORKING where
+    /// the URL bar's own progress strip says how far it got, which is the half a
+    /// stalled load needs.
+    pub spinner: HWND,
     pub menu_button: HWND,
     pub url_edit: HWND,
     /// The load-progress bar, laid out INSIDE the URL bar (never its own row).
@@ -108,6 +139,11 @@ pub struct Chrome {
     /// carrier's invalid colour, while the typed text is KEPT for the user to
     /// fix).
     pub url_invalid: Cell<bool>,
+    /// Which [`SPINNER_FRAMES`] frame the spinner is showing. Advanced by
+    /// [`spin`](Chrome::spin), never by a paint: a repaint happens when the seam
+    /// reports an event, and the case this spinner exists for is the load that
+    /// reports nothing for seconds.
+    pub spinner_frame: Cell<usize>,
     /// The scale of the display this window is on, as `GetDpiForWindow` last
     /// reported it. Held rather than re-read per rectangle so ONE layout pass
     /// cannot mix two scales, and refreshed on `WM_DPICHANGED`.
@@ -132,8 +168,8 @@ impl Chrome {
         [
             self.back,
             self.forward,
-            self.reload,
-            self.stop,
+            self.reload_stop,
+            self.spinner,
             self.menu_button,
             self.url_edit,
             self.progress,
@@ -165,10 +201,24 @@ impl Chrome {
 
         enable(self.back, paint.can_go_back);
         enable(self.forward, paint.can_go_forward);
-        // Stop is meaningful only while a load is in flight; Reload only once it
-        // has settled.
-        enable(self.stop, paint.is_loading);
-        enable(self.reload, !paint.is_loading);
+        // The ONE reload/stop control: it wears the MODE's own glyph and carries
+        // the MODE's own accessible description. Which mode that is was decided
+        // ONCE, in the core, for every edge — this is an assignment, not the
+        // enable-one-of-a-pair condition it replaced.
+        set_text(self.reload_stop, paint.reload_stop_label);
+        self.set_tip(self.reload_stop, paint.reload_stop_description);
+        // The SPINNER beside it, on the core's wider rule: it reports a load the
+        // URL bar's fraction may not be able to describe yet. Its SLOT is
+        // permanent (the layout places it either way), so showing it never shifts
+        // the URL bar; only its visibility follows the derivation, and its
+        // rotation follows the pump ([`Chrome::spin`]).
+        show(self.spinner, paint.spinner_visible);
+        if !paint.spinner_visible {
+            // Park it on the first frame, so the next load starts turning from
+            // the top rather than resuming mid-rotation.
+            self.spinner_frame.set(0);
+            set_text(self.spinner, SPINNER_FRAMES[0]);
+        }
 
         set_text(self.status, &paint.status_text);
 
@@ -217,6 +267,22 @@ impl Chrome {
             self.badge_visible.set(paint.invalid_entry);
             self.relayout();
         }
+    }
+
+    /// Advance the spinner one frame, if it is showing.
+    ///
+    /// Called from the window's pump tick rather than from [`apply`](Chrome::apply),
+    /// and that is the whole point: the chrome is repainted when the seam reports
+    /// an event, while the load this spinner exists for is the one that reports
+    /// nothing at all for seconds. Riding the pump that already exists is also
+    /// what keeps this edge free of a second timer.
+    pub fn spin(&self) {
+        if !is_visible(self.spinner) {
+            return;
+        }
+        let frame = (self.spinner_frame.get() + 1) % SPINNER_FRAMES.len();
+        self.spinner_frame.set(frame);
+        set_text(self.spinner, SPINNER_FRAMES[frame]);
     }
 
     /// Keep ONE brush for the banner's current severity fill, replacing it only
@@ -275,10 +341,17 @@ impl Chrome {
         let row_y = metrics.row_y;
         let row_height = metrics.row_height;
         let mut x = metrics.margin;
-        for control in [self.back, self.forward, self.reload, self.stop] {
+        for control in [self.back, self.forward, self.reload_stop] {
             place(control, x, row_y, metrics.button_width, row_height);
             x += metrics.button_width + metrics.scale(2);
         }
+        // The spinner sits immediately after the control that acts on the load and
+        // before the URL bar that measures it — never beside the trust badge at
+        // the far end, where motion would read as a claim about the page's TRUST
+        // (the separate-indicators ADR). Its slot is placed whether or not it is
+        // showing.
+        place(self.spinner, x, row_y, metrics.spinner_width, row_height);
+        x += metrics.spinner_width + metrics.scale(2);
         let badge_width = if self.badge_visible.get() {
             metrics.badge_width + metrics.scale(6)
         } else {

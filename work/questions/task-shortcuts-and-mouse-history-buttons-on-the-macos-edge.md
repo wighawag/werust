@@ -133,3 +133,15 @@
 <!-- q12 fields: id=q12 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q13
+
+**'task:shortcuts-and-mouse-history-buttons-on-the-macos-edge' was bounced — how should we proceed?**
+
+> PR/code review (Gate 2) blocked this work:
+> - The focus-sensitive history fix covers only the URL bar. shortcut_focus is two-valued and returns Focus::Page for everything inside the WKWebView, so Cmd+Left while a user is typing in a PAGE text field is still claimed as GoBack and destroys the edit (the same class of regression the previous gate blocked, and something no Mac browser does). That could be an accepted limit, but both records claim the opposite: DECISIONS.md decision 8 (and decision 1) list a page text field among the cases the fix covers, and README manual step 3 instructs the one human who will ever test this that a page text field must behave the same way, which it will not. Record it as a known limit and correct both sentences, or escalate the core-side Focus vocabulary as a decision. (crates/werust-macos/src/window.rs shortcut_focus (only url_field.currentEditor / firstResponder distinguish UrlBar); docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md decision 8; same dir README.md manual step 3)
+> PR/code review (Gate 2) did not reach a unanimous approve across reviewMaxRounds=2 round(s) (a block is terminal and is never re-rolled); forcing needs-attention (never silently merged or looped).
+
+<!-- q13 fields: id=q13 kind=stuck -->
+
+**Your answer** (write below this line):

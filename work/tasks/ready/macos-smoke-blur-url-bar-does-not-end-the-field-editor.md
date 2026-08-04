@@ -55,3 +55,7 @@ The original theory (a surviving field editor makes `shortcut_focus` report `Url
 > Read the diagnosis above and CONFIRM it first. The likely fix is one helper, but verify that `shortcut_focus` is right for a real user before you touch it: the bug is that the TEST cannot get the window into the page-focused state, not necessarily that the edge misreports it.
 >
 > Do not weaken the assertion. Nobody on this project has a Mac (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`), so this check is the whole safety net for the focus half of the shortcut layer.
+
+## Requeue 2026-08-04
+
+The task has been RE-SCOPED in response to your STOP, which was correct and is accepted in full. Your analysis is now the task's diagnosis, and the constraint that blocked you has been lifted: you are explicitly AUTHORISED to replace the symptom assertion with the stronger effect-based pair you proposed (page-focused Escape cancels an in-flight load; bar-focused Escape reverts and does not cancel), following the shape the Windows smoke already uses. Re-read the task body before starting; the corrected diagnosis supersedes the original one.

@@ -8,7 +8,17 @@
 //! Kotlin OS edge handled only the ON-SCREEN `◀` button. The fix registers an
 //! `OnBackPressedCallback` on the Activity's `onBackPressedDispatcher` whose
 //! `isEnabled` tracks the core's `canGoBack` and whose `handleOnBackPressed`
-//! drives the SAME `driveCore { core.goBack() }` path the on-screen button uses.
+//! drives `driveCore { core.goBack() }`, the same off-UI-thread dispatch every
+//! session-driving action on this edge uses.
+//!
+//! SINCE `android-chrome-collapse-reload-stop-and-drop-history-buttons`, THIS IS
+//! THE ONLY BACK AFFORDANCE ANDROID HAS: the on-screen `◀` was removed precisely
+//! BECAUSE the platform's own Back already navigates history, so what used to be
+//! a lockstep between two affordances is now a single one carrying the whole
+//! capability. The assertions below therefore pin the wiring against the CORE's
+//! fact rather than against the departed button, and they got MORE load-bearing,
+//! not less: this behaviour was a field-reported bug once already, and there is
+//! no on-screen fallback left if it regresses.
 //!
 //! WHY A SOURCE-SHAPE GUARD: that wiring lives in Kotlin, inside a live Android
 //! `Activity` — it cannot run in this repo's pure-Rust `verify` gate (`cargo fmt
@@ -34,8 +44,9 @@
 //!    state is the core's `canGoBack`
 //!    (`the_system_back_callback_is_registered_on_the_dispatcher_and_starts_disabled`,
 //!    `the_system_back_enabled_state_is_in_lockstep_with_can_go_back`).
-//! 3. The SAME off-UI-thread path as the on-screen button (the ANR fix is not
-//!    regressed) (`the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button`):
+//! 3. The SAME off-UI-thread path every other session-driving action uses (the
+//!    ANR fix is not regressed)
+//!    (`the_system_back_drives_the_core_off_the_ui_thread_like_every_other_action`):
 //!    `handleOnBackPressed`'s OWN body (brace-matched by [`kotlin_block_body`],
 //!    so it stops at the handler's closing brace) must contain
 //!    `driveCore { core.goBack() }` and, once that dispatch is stripped, must
@@ -44,7 +55,8 @@
 //!    core call beside the dispatch each turn that assertion RED (verified by
 //!    mutation), and [`the_block_extractor_stops_at_the_matching_brace`] pins
 //!    the extractor itself so the guard cannot silently go vacuous again.
-//! 4. Lockstep enablement, set where the on-screen button's is
+//! 4. Enablement in lockstep with the core's `canGoBack`, set in `refreshChrome`
+//!    with every other painted value
 //!    (`the_system_back_enabled_state_is_in_lockstep_with_can_go_back`).
 //! 5. The non-deprecated API only — no `onBackPressed()` override
 //!    (`the_deprecated_on_back_pressed_override_is_not_used`).
@@ -222,31 +234,43 @@ fn the_system_back_callback_is_registered_on_the_dispatcher_and_starts_disabled(
 
 #[test]
 fn the_system_back_enabled_state_is_in_lockstep_with_can_go_back() {
-    // Criterion 4 (and the enabled half of 1/2): the SYSTEM Back affordance and
-    // the ON-SCREEN `◀` button are enabled from the SAME core fact
-    // (`chrome.canGoBack`) in the SAME place (`refreshChrome`), so the two Back
-    // affordances can never disagree — and when `canGoBack` is false the callback
-    // is disabled, which is what lets the default Back exit the app.
+    // Criterion 4 (and the enabled half of 1/2): the SYSTEM Back affordance is
+    // enabled from the core's `chrome.canGoBack`, in `refreshChrome`, where every
+    // other painted value is taken off the SAME one chrome snapshot — so the
+    // affordance can never disagree with the history the core actually has. When
+    // `canGoBack` is false the callback is disabled, which is what lets the
+    // default Back exit the app.
+    //
+    // This line USED to sit beside `backButton.isEnabled = chrome.canGoBack`, and
+    // the lockstep was between the two affordances. Task
+    // `android-chrome-collapse-reload-stop-and-drop-history-buttons` removed the
+    // on-screen button, so the lockstep is now with the FACT, and this line is the
+    // single thing standing between the user and a Back button that exits the app
+    // mid-history (the v0.2.5 field finding).
     let src = browser_activity_source();
     let refresh = kotlin_block_body(&src, "private fun refreshChrome()");
     assert!(
-        refresh.contains("backButton.isEnabled = chrome.canGoBack"),
-        "the on-screen back button's enablement must be the core's `canGoBack`, in `refreshChrome`"
+        refresh.contains("systemBackCallback.isEnabled = chrome.canGoBack"),
+        "the system-back callback's enablement must be the core's `chrome.canGoBack`, set in \
+         `refreshChrome` off the same chrome snapshot as every other painted value"
     );
     assert!(
-        refresh.contains("systemBackCallback.isEnabled = chrome.canGoBack"),
-        "the system-back callback's enablement must be set from the SAME `chrome.canGoBack`, in \
-         the SAME `refreshChrome` — the two Back affordances stay in lockstep"
+        !src.contains("backButton"),
+        "the on-screen back button is gone (task \
+         `android-chrome-collapse-reload-stop-and-drop-history-buttons`); if it ever comes \
+         back, its enablement must be wired from `chrome.canGoBack` in this same place, and \
+         this guard must assert the lockstep between the two affordances again"
     );
 }
 
 #[test]
-fn the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button() {
-    // Criterion 3: system Back must go through the SAME `driveCore { core.goBack() }`
-    // dispatch the on-screen button uses — the ANR fix (task
+fn the_system_back_drives_the_core_off_the_ui_thread_like_every_other_action() {
+    // Criterion 3: system Back must go through the `driveCore { … }` dispatch
+    // every session-driving action on this edge uses — the ANR fix (task
     // `android-anr-main-thread-diagnose-and-unblock`) moved the blocking core
-    // actions off the UI thread, and a second Back entry point calling the core
-    // inline would regress it.
+    // actions off the UI thread, and a Back entry point calling the core inline
+    // would regress it (a history navigation can land on a `.eth` page and re-run
+    // the blocking ENS/IPNS resolve).
     let src = browser_activity_source();
     // POSITION-bounded (brace-matched) so this is the handler's OWN body and
     // nothing else. See `kotlin_block_body` and
@@ -268,12 +292,16 @@ fn the_system_back_drives_the_core_off_the_ui_thread_like_the_on_screen_button()
         "the system Back must not call the core inline on the UI thread (that would regress the \
          ANR fix); the handler has a core call outside `driveCore`: {without_dispatch:?}"
     );
-    // The on-screen button's dispatch is the reference path: both must be the
-    // same expression, so a future change to one is visibly a change to both.
+    // The reference path used to be the on-screen `◀` button's dispatch; that
+    // button is gone (task
+    // `android-chrome-collapse-reload-stop-and-drop-history-buttons`), so the
+    // reference is now the URL bar's Go action — the other user-driven core action
+    // that can block on a name resolve. Both must be the same shape, so a future
+    // change to the dispatch is visibly a change to all of them.
     assert!(
-        src.contains("compactNavButton(\"◀\") { driveCore { core.goBack() } }"),
-        "the on-screen `◀` button must keep driving the core through `driveCore` (the reference \
-         path the system Back mirrors)"
+        src.contains("driveCore { core.navigate(entry) }"),
+        "the URL bar's Go action must keep driving the core through `driveCore` (the reference \
+         off-UI-thread path the system Back mirrors)"
     );
 }
 

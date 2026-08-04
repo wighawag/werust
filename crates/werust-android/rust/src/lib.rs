@@ -43,7 +43,7 @@ pub use backend::{AndroidBackend, AndroidHandle};
 use std::sync::Mutex;
 
 use renderer::Renderer;
-use werust_core::{BrowserShell, ChromeState};
+use werust_core::{BrowserShell, ChromeState, ReloadStopControl};
 
 /// The wire form of a resolved `ipfs://` request handed back to the Kotlin edge:
 /// the MIME type and the verified bytes, or the fail-closed reason.
@@ -159,6 +159,42 @@ impl CoreSession {
     /// Stop the in-flight load, through the seam.
     pub fn stop(&mut self) {
         self.shell.stop();
+    }
+
+    /// Activate werust's ONE reload/stop control: perform whatever the CORE says
+    /// that control does right now (task
+    /// `android-chrome-collapse-reload-stop-and-drop-history-buttons`, spec
+    /// `chrome-conventional-controls`, story 10).
+    ///
+    /// The Kotlin toolbar carries a SINGLE control where it carried a Reload
+    /// button and a Stop button, and which of the two modes it is in is
+    /// [`werust_core::reload_stop_control`]'s call, painted from the chrome JSON.
+    /// This is the matching ACTION half: the edge's click handler calls this one
+    /// entry point, so the mode is decided exactly once, in the core, for both
+    /// what the control SHOWS and what it DOES. Without it the edge would need a
+    /// two-armed Kotlin `when` mapping the carried mode back onto
+    /// [`reload`](CoreSession::reload) / [`stop`](CoreSession::stop) — a
+    /// hand-written twin of a core rule, which is precisely what
+    /// `docs/adr/0011` and the mobile presentation guard exist to prevent. It is
+    /// the mobile counterpart of the GTK edge routing the control's click through
+    /// `ReloadStopControl::action()` into its one `perform_chrome_action`.
+    ///
+    /// Matching on the MODE (rather than on the `ChromeAction` it names) is
+    /// deliberate: `ReloadStopControl` is a closed two-variant enum, so a third
+    /// mode would fail to compile here instead of falling into a silent
+    /// catch-all arm that quietly did nothing. That the two stay in agreement —
+    /// each mode's arm performs what its `action()` names — is asserted in
+    /// `tests/collapsed_control_and_dropped_history_buttons_shape.rs`.
+    pub fn activate_reload_stop_control(&mut self) {
+        match werust_core::reload_stop_control(self.chrome()) {
+            ReloadStopControl::Reload => {
+                // Same as the old Reload button: `false` means there was nothing
+                // to reload, which the edge treats exactly as it always has (it
+                // repaints and shows the unchanged chrome).
+                self.reload();
+            }
+            ReloadStopControl::Stop => self.stop(),
+        }
     }
 
     /// BLESS the current page's mutable name at the CID it resolves to right now
@@ -563,6 +599,14 @@ impl SyncSession {
     /// Stop the in-flight load, under the lock. See [`CoreSession::stop`].
     pub fn stop(&self) {
         self.with(CoreSession::stop);
+    }
+
+    /// Activate the ONE reload/stop control, under the lock. Reading the mode and
+    /// performing it happen in the SAME locked call, so the control can never act
+    /// on a mode that changed between the two. See
+    /// [`CoreSession::activate_reload_stop_control`].
+    pub fn activate_reload_stop_control(&self) {
+        self.with(CoreSession::activate_reload_stop_control);
     }
 
     /// Bless the current mutable name, under the lock. See
@@ -1050,6 +1094,22 @@ mod jni_exports {
         handle: jlong,
     ) {
         unsafe { session(handle) }.stop();
+    }
+
+    /// Activate the ONE reload/stop control the collapsed toolbar shows: the core
+    /// performs whatever its own mode says (reload a settled page, stop a load in
+    /// flight), so the Kotlin click handler never decides which of the two this
+    /// click was (task
+    /// `android-chrome-collapse-reload-stop-and-drop-history-buttons`). Called
+    /// from the edge's background executor like every other session-driving
+    /// action.
+    #[no_mangle]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeActivateReloadStopControl(
+        _env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+    ) {
+        unsafe { session(handle) }.activate_reload_stop_control();
     }
 
     /// BLESS the current page's mutable name (trust-on-first-use): the Kotlin

@@ -36,6 +36,27 @@ class WerustCore : AutoCloseable {
     fun stop() = nativeStop(handle)
 
     /**
+     * Activate werust's ONE reload/stop control: the core performs whatever its
+     * OWN derived mode says that control does right now — reload a settled page,
+     * stop a load in flight (task
+     * `android-chrome-collapse-reload-stop-and-drop-history-buttons`, spec
+     * `chrome-conventional-controls`, story 10).
+     *
+     * The toolbar carries ONE control where it carried a Reload button and a
+     * Stop button. What that control SHOWS is the core's
+     * `reload_stop_control(state)`, carried on the chrome as
+     * [Chrome.reloadStopControlLabel] / [Chrome.reloadStopControlDescription];
+     * this is the matching half, what it DOES. Both come from the ONE derivation,
+     * so the Activity never runs a `when` deciding which of the two a click was —
+     * the hand-written twin `docs/adr/0011` removed from this edge.
+     *
+     * Blocking, like [reload] (a reload re-runs the load path, which may resolve
+     * a name over the network), so the Activity dispatches it on its background
+     * executor exactly as it does [navigate] / [goBack] / [reload].
+     */
+    fun activateReloadStopControl() = nativeActivateReloadStopControl(handle)
+
+    /**
      * BLESS the current page's MUTABLE name at the CID it resolves to right now:
      * the trust surface's "trust this content" action (trust-on-first-use, task
      * `ipns-tofu-pin-and-warn-on-change`). A later resolution to a DIFFERENT CID
@@ -446,6 +467,34 @@ class WerustCore : AutoCloseable {
          */
         val loadProgressHint: String,
         /**
+         * The GLYPH werust's ONE reload/stop control wears right now: the core's
+         * `reload_stop_control(state).label()` (→ the reload glyph on a settled
+         * page, the stop glyph while a load is in flight). The Activity ASSIGNS
+         * it; which mode this is was decided once, in the core, so no `when`
+         * here maps a load state onto a glyph (task
+         * `android-chrome-collapse-reload-stop-and-drop-history-buttons`).
+         */
+        val reloadStopControlLabel: String,
+        /**
+         * What that control DOES, in words: the core's
+         * `reload_stop_control(state).description()`. Deliberately not a
+         * "tooltip" — Android has no hover, so it goes in the platform's
+         * accessible-name slot (`contentDescription`), which is exactly why the
+         * core names the field a DESCRIPTION
+         * (docs/spikes/reload-stop-collapse-and-loading-spinner-core-and-gtk/DECISIONS.md).
+         */
+        val reloadStopControlDescription: String,
+        /**
+         * Whether the LOADING SPINNER shows: the core's `load_spinner_visible`,
+         * a SECOND presentation of the load the URL-bar progress line already
+         * reports (it is exactly `load_progress_visible`, so the two surfaces can
+         * never contradict each other). It covers what the bar cannot: a load
+         * that has reported no phase yet, and the long pre-content
+         * name-resolution window, both of which otherwise read as an idle
+         * browser.
+         */
+        val loadSpinnerVisible: Boolean,
+        /**
          * Whether the trust surface should offer the BLESS action: the core's
          * `trust_pin_action_visible`. An AFFORDANCE inside the surface the user
          * opened by tapping the badge, never a first-visit prompt.
@@ -498,6 +547,9 @@ class WerustCore : AutoCloseable {
                     loadProgressVisible = o.optBoolean("loadProgressVisible", false),
                     loadProgressFraction = o.optDouble("loadProgressFraction", 0.0),
                     loadProgressHint = o.optString("loadProgressHint", ""),
+                    reloadStopControlLabel = o.optString("reloadStopControlLabel", ""),
+                    reloadStopControlDescription = o.optString("reloadStopControlDescription", ""),
+                    loadSpinnerVisible = o.optBoolean("loadSpinnerVisible", false),
                     trustPinActionVisible = o.optBoolean("trustPinActionVisible", false),
                     trustPinActionLabel = o.optString("trustPinActionLabel", ""),
                     trustPinDetail = o.optString("trustPinDetail", ""),
@@ -513,6 +565,7 @@ class WerustCore : AutoCloseable {
     private external fun nativeGoForward(handle: Long)
     private external fun nativeReload(handle: Long): Boolean
     private external fun nativeStop(handle: Long)
+    private external fun nativeActivateReloadStopControl(handle: Long)
     private external fun nativeBlessName(handle: Long): Boolean
     private external fun nativeTakePendingLoad(handle: Long): String
     private external fun nativeDocumentStartScript(handle: Long): String

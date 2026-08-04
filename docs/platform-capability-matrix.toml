@@ -134,6 +134,18 @@ description = "Session history: go_back / go_forward and their availability."
 # snapshot (`EnableWindow`) — the same one fact the on-screen control everywhere
 # else reads. Wired and shape-guarded; nothing in the CI run pressed Back
 # (docs/spikes/windows-win32-window-and-chrome/README.md).
+# Android: the CAPABILITY is unchanged and stays `implemented` — `AndroidBackend`
+# still implements go_back/go_forward/can_go_*, and the core's `can_go_back` /
+# `can_go_forward` are untouched — but since task
+# `android-chrome-collapse-reload-stop-and-drop-history-buttons` the AFFORDANCES
+# differ: BACK is the platform's own system Back button/gesture (row
+# `system-back-navigates-history`, which reads the same `can_go_back` fact the
+# on-screen ◀ used to), and FORWARD has no affordance on this edge at all. That
+# is a deliberate, spec-accepted trade (`chrome-conventional-controls`, story 11:
+# on the width-starved phone toolbar the URL bar is worth more than a control
+# duplicating the platform's Back, and Android offers no forward gesture to
+# duplicate). `go_forward` remains reachable through the seam for the core and
+# for the other edges; only the Android BUTTON is gone.
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
 windows = { state = "implemented" }
@@ -151,10 +163,16 @@ description = "The OS-provided SYSTEM Back affordance (a hardware/gesture Back t
 # Android: `BrowserActivity` registers an AndroidX `OnBackPressedCallback` on the
 # Activity's `onBackPressedDispatcher` (the non-deprecated API; the deprecated
 # `onBackPressed()` override and raw KEYCODE_BACK interception are NOT used); its
-# `isEnabled` is set from `chrome.canGoBack` in `refreshChrome`, right where
-# `backButton.isEnabled` is, and `handleOnBackPressed` runs the SAME
-# `driveCore { core.goBack() }` the on-screen `◀` does — off the UI thread, so the
-# ANR fix (task `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
+# `isEnabled` is set from `chrome.canGoBack` in `refreshChrome`, off the same one
+# chrome snapshot as every other painted value, and `handleOnBackPressed` runs
+# `driveCore { core.goBack() }` — off the UI thread, so the ANR fix (task
+# `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
+# SINCE task `android-chrome-collapse-reload-stop-and-drop-history-buttons` this
+# is the ONLY back affordance on Android: the on-screen `◀` was removed BECAUSE
+# this row is implemented, so what was a lockstep between two affordances is now
+# a single one carrying the whole capability, and its guard (below) got more
+# load-bearing rather than less — there is no on-screen fallback if it regresses,
+# and it regressing is a bug this project has already shipped once.
 # Disabled means the platform default runs, so Back at the start of history exits
 # the app as a normal browser does. The edge wiring is runtime-only (a live
 # Activity) and the Gradle/Kotlin build is not in the gate either, so its ONLY
@@ -1418,4 +1436,17 @@ desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-macos-window" }
 windows = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-windows-chrome" }
 ios = { state = "stubbed", task = "ios-chrome-collapse-reload-stop-and-drop-history-buttons" }
-android = { state = "stubbed", task = "android-chrome-collapse-reload-stop-and-drop-history-buttons" }
+# Android (task `android-chrome-collapse-reload-stop-and-drop-history-buttons`):
+# the toolbar carries ONE `reloadStopButton` whose glyph is the carried
+# `reloadStopControlLabel`, whose accessible name (Android has no hover) is
+# `reloadStopControlDescription`, and whose click activates ONE core entry point
+# (`CoreSession::activate_reload_stop_control`) that performs the mode's own
+# action — so no Kotlin `when` decides the mode, in either its look or its
+# behaviour. Beside it an indeterminate `ProgressBar` spinner in a permanently
+# allocated slot follows `loadSpinnerVisible`. The painter no longer reads the raw
+# `loading` fact at all. Shape-guarded (with the removed history buttons) by
+# crates/werust-android/rust/tests/collapsed_control_and_dropped_history_buttons_shape.rs,
+# whose assertions were re-checked by mutation; the widgets themselves are
+# runtime-only (no Android SDK in the gate), so the device steps are recorded at
+# docs/spikes/android-chrome-collapse-reload-stop-and-drop-history-buttons/README.md.
+android = { state = "implemented" }

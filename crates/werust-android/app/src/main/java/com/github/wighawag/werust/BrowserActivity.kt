@@ -39,8 +39,8 @@ import java.util.concurrent.Executors
 import kotlin.math.roundToInt
 
 /**
- * The Android OS edge: a real `Activity` with a URL bar and
- * Back/Forward/Reload/Stop controls over a live, interactive [WebView].
+ * The Android OS edge: a real `Activity` with a URL bar, ONE reload/stop control
+ * and a loading spinner over a live, interactive [WebView].
  *
  * This is the forced OS edge and NOTHING more: it owns the platform `WebView` and
  * the widgets, but every browsing DECISION is the Rust [WerustCore]'s. On a user
@@ -49,11 +49,20 @@ import kotlin.math.roundToInt
  * [WerustCore.Chrome] ([refreshChrome]). The `WebView`'s real load-lifecycle
  * callbacks are reported straight back into the core, which folds them into the
  * chrome exactly as the desktop GTK pump folds WebKitGTK's signals. The URL bar
- * text, the Back/Forward enablement, and the load status are all read from the
- * core — the edge keeps no history or load state of its own.
+ * text, the reload/stop control's mode, the spinner and the load status are all
+ * read from the core — the edge keeps no history or load state of its own.
  *
- * The SYSTEM Back button is a second view onto the SAME core action the
- * on-screen `◀` drives (see [systemBackCallback]); it is an
+ * There are NO on-screen back/forward buttons: the platform's own Back (hardware
+ * or gesture) already navigates page history through [systemBackCallback], so a
+ * toolbar `◀` would spend scarce phone width duplicating it, and forward — which
+ * has no Android gesture at all — is given up for that width deliberately (spec
+ * `chrome-conventional-controls`, stories 11/12; task
+ * `android-chrome-collapse-reload-stop-and-drop-history-buttons`). The history
+ * CAPABILITY is untouched: `can_go_back` / `can_go_forward` and the core's
+ * history actions are exactly as they were, and system Back rides on them.
+ *
+ * The SYSTEM Back button is therefore the ONE back affordance this edge has (see
+ * [systemBackCallback]); the Activity is an
  * [androidx.activity.ComponentActivity] (rather than a bare `android.app.Activity`)
  * ONLY so the non-deprecated [androidx.activity.OnBackPressedDispatcher] is
  * available — see
@@ -88,10 +97,44 @@ class BrowserActivity : ComponentActivity() {
     private val coreExecutor: ExecutorService = Executors.newSingleThreadExecutor()
 
     private lateinit var urlBar: EditText
-    private lateinit var backButton: Button
-    private lateinit var forwardButton: Button
-    private lateinit var reloadButton: Button
-    private lateinit var stopButton: Button
+
+    /**
+     * The ONE reload/stop control: the single button every browser has, which
+     * reloads a settled page and STOPS a load in flight. It replaces the separate
+     * Reload and Stop buttons, which were one fact ([WerustCore.Chrome.loading])
+     * wearing two widgets, each enabled on the negation of the other's condition.
+     *
+     * WHICH MODE it is in is the core's call
+     * (`werust_core::reload_stop_control`), carried on the chrome JSON: this edge
+     * ASSIGNS the glyph ([WerustCore.Chrome.reloadStopControlLabel]) and the
+     * accessible name ([WerustCore.Chrome.reloadStopControlDescription]) in
+     * [refreshChrome], and its click activates
+     * [WerustCore.activateReloadStopControl], where the SAME derivation decides
+     * what the click does. So nothing here branches on the load state — that
+     * `when` is the hand-written twin `docs/adr/0011` removed from this edge, and
+     * a guard reds the gate if one returns.
+     *
+     * CANCEL is unmoved by the collapse: this control is in its STOP mode on
+     * exactly the fact the separate Stop button took its sensitivity from.
+     */
+    private lateinit var reloadStopButton: Button
+
+    /**
+     * The LOADING SPINNER beside the control: an indeterminate [ProgressBar] that
+     * says werust is WORKING, the half the URL-bar progress line cannot say. The
+     * bar reports how FAR a load got; a load that has reported no phase yet paints
+     * a bare sliver, and the long pre-content name-resolution window (the
+     * `ronan.eth` wait) is exactly where a user needs to see motion.
+     *
+     * Its visibility is the core's [WerustCore.Chrome.loadSpinnerVisible] and
+     * nothing else. Its slot is PERMANENT (INVISIBLE, never GONE) so a load start
+     * or end can never shove the URL bar sideways — the horizontal twin of the
+     * geometry lesson [loadingProgress] learned vertically. No timer either: a
+     * `ProgressBar` animates itself and stops when it is not visible, so the
+     * existing chrome-refresh pump drives it and the Android ANR guard is
+     * untouched.
+     */
+    private lateinit var loadingSpinner: ProgressBar
 
     /**
      * The GENERAL browser menu affordance: the ⋮ button every browser has, at the
@@ -109,15 +152,17 @@ class BrowserActivity : ComponentActivity() {
     private lateinit var trust: TextView
     private lateinit var errorBanner: TextView
     /**
-     * The LOAD-PROGRESS line: a thin determinate bar directly under the URL-bar row,
+     * The LOAD-PROGRESS line (the fine-grained loading signal, beside the coarse
+     * [loadingSpinner]): a thin determinate bar directly under the URL-bar row,
      * whose progress advances with the real pipeline phase while a load is in flight
      * and which goes INVISIBLE (never GONE) once the load settles. It replaces the
      * loading BANNER, which was a full-height bar in this same vertical chrome:
      * showing/hiding it resized the weighted WebView on every navigation, so the
      * page jumped twice per load. Keeping the strip INVISIBLE rather than GONE means
      * its height is reserved permanently, so no load state changes the layout (task
-     * `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
-     * button, enabled exactly while a load is in flight; the phase NAME stays in the
+     * `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar's ONE
+     * reload/stop control ([reloadStopButton]), in its STOP mode exactly while a
+     * load is in flight; the phase NAME stays in the
      * footer status line, which already names it. Driven by the existing
      * chrome-refresh pump (no new timer / poll / tight loop), so the Android ANR
      * guard is not regressed.
@@ -161,23 +206,30 @@ class BrowserActivity : ComponentActivity() {
      *
      * WHY (task `android-hardware-back-button-navigates-history`, field finding
      * v0.2.5 "the android back button do not navigate back in history like it
-     * should"): before this, only the on-screen `◀` [backButton] drove
+     * should"): before this, only an on-screen `◀` button drove
      * [WerustCore.goBack]; nothing handled system Back, so it fell through to the
      * platform default and FINISHED the Activity even mid-history — the app just
      * quit.
      *
-     * HOW IT STAYS COHERENT WITH THE ON-SCREEN BUTTON:
+     * Since task `android-chrome-collapse-reload-stop-and-drop-history-buttons`
+     * this is the ONLY back affordance on Android: the on-screen button is gone,
+     * because duplicating the platform's own Back is not worth phone toolbar
+     * width. That makes the wiring below load-bearing on its own rather than a
+     * second view of a button's, which is why it keeps its own guard
+     * (`crates/werust-android/rust/tests/system_back_wiring_shape.rs`).
+     *
+     * HOW IT STAYS FAITHFUL TO THE CORE:
      * * [OnBackPressedCallback.isEnabled] is the core's `chrome.canGoBack`, set
-     *   in [refreshChrome] right where [backButton]'s enablement is, from the
-     *   SAME fact — the two Back affordances can never disagree. It starts
+     *   in [refreshChrome] from the core's own capability fact. It starts
      *   DISABLED (no history at launch).
      * * When it is DISABLED (nothing to go back to) the dispatcher falls through
      *   to the platform default, so Back at the start of history EXITS the app,
      *   as a normal browser does.
      * * [handleOnBackPressed] drives the core through [driveCore] — the SAME
-     *   off-UI-thread path the on-screen button uses — so this second Back entry
-     *   point does NOT reintroduce a UI-thread-blocking core call and the ANR fix
-     *   (task `android-anr-main-thread-diagnose-and-unblock`) is not regressed.
+     *   off-UI-thread path every other session-driving action uses — so this Back
+     *   entry point does NOT reintroduce a UI-thread-blocking core call and the
+     *   ANR fix (task `android-anr-main-thread-diagnose-and-unblock`) is not
+     *   regressed.
      *
      * WHY THIS API: [androidx.activity.OnBackPressedDispatcher] is the
      * non-deprecated route and the ONE implementation that works across versions
@@ -244,19 +296,59 @@ class BrowserActivity : ComponentActivity() {
 
         val browserChrome = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         // The toolbar row is at least a touch-target tall (48dp), so even though the
-        // nav buttons render as a small square glyph they stay comfortably tappable.
+        // toolbar buttons render as a small square glyph they stay comfortably tappable.
         val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             minimumHeight = dp(TOUCH_TARGET_DP)
         }
 
-        backButton = compactNavButton("◀") { driveCore { core.goBack() } }
-        forwardButton = compactNavButton("▶") { driveCore { core.goForward() } }
-        reloadButton = compactNavButton("⟳") { driveCore { core.reload() } }
-        // Stop is a cheap non-blocking core call (no resolve/network), so it can
-        // run inline on the UI thread; still refresh the chrome afterwards.
-        stopButton = compactNavButton("✕") { core.stop(); afterCoreAction() }
+        // The core's chrome BEFORE anything is painted: the first paint of every
+        // derived value below is the core's OWN derivation for the starting state,
+        // never a Kotlin literal that happens to match it today.
+        val initialChrome = core.chrome()
+
+        // The ONE reload/stop control, where four buttons used to sit. There is no
+        // on-screen ◀ / ▶ any more (the platform's own Back navigates history and
+        // forward has no Android gesture to duplicate — spec
+        // `chrome-conventional-controls`, stories 11/12), and Reload/Stop are the
+        // single control every browser shows. Its glyph, its accessible name and
+        // what its click DOES are all the core's one derivation
+        // (`reload_stop_control`): this edge assigns values and dispatches, it
+        // never asks which mode this is.
+        //
+        // It goes through `driveCore` like every other session-driving action: a
+        // reload re-runs the load path (which may resolve a name over the network),
+        // and even the stop mode takes the native session lock, so neither belongs
+        // on the UI thread (the ANR guard, task
+        // `android-anr-main-thread-diagnose-and-unblock`).
+        reloadStopButton = compactNavButton(initialChrome.reloadStopControlLabel) {
+            driveCore { core.activateReloadStopControl() }
+        }
+        reloadStopButton.contentDescription = initialChrome.reloadStopControlDescription
+        // The LOADING SPINNER, immediately after the control and before the URL
+        // bar: the toolbar's two loading surfaces (the control that stops a load,
+        // the spinner that reports one) stay together, and neither goes near the
+        // trust badge, which must never read as a claim about the load. The layout
+        // the shared decision record fixes for every edge
+        // (docs/spikes/reload-stop-collapse-and-loading-spinner-core-and-gtk/DECISIONS.md).
+        //
+        // Its slot is permanent: only its VISIBILITY follows the derivation, and
+        // INVISIBLE (never GONE) keeps the width reserved, so starting or finishing
+        // a load never shifts the URL bar. It carries no accessibility text of its
+        // own: the load is already announced by the progress line's content
+        // description (the core's phase hint) and named in the footer status line,
+        // and a third announcement of the same fact is noise for a screen-reader
+        // user, so the spinner is a decoration TalkBack skips.
+        loadingSpinner = ProgressBar(
+            this, null, android.R.attr.progressBarStyleSmall
+        ).apply {
+            isIndeterminate = true
+            indeterminateTintList = ColorStateList.valueOf(0xFF1A5FB4.toInt())
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+            layoutParams = LinearLayout.LayoutParams(dp(SPINNER_DP), dp(SPINNER_DP))
+            visibility = View.INVISIBLE
+        }
         // The general browser menu button. Opening the menu is a cheap, non-
         // blocking read of a BUILD constant (no session, no network), so it runs
         // inline on the UI thread — it cannot regress the ANR fix the way a core
@@ -296,10 +388,12 @@ class BrowserActivity : ComponentActivity() {
         // one).
         defaultUrlBarColor = urlBar.currentTextColor
 
-        toolbar.addView(backButton)
-        toolbar.addView(forwardButton)
-        toolbar.addView(reloadButton)
-        toolbar.addView(stopButton)
+        toolbar.addView(reloadStopButton)
+        toolbar.addView(loadingSpinner)
+        // The URL bar is the weighted member of the row, so the width the two
+        // history buttons and the second reload/stop button gave up goes to it
+        // with no arithmetic anywhere — the point of removing them on the
+        // width-starved surface (spec story 11).
         toolbar.addView(urlBar)
         toolbar.addView(invalidBadge)
         // The ⋮ menu sits at the END of the toolbar, where every other browser
@@ -404,8 +498,9 @@ class BrowserActivity : ComponentActivity() {
         // hard-coded "⚠ unverified origin" here would be one more hand-written twin
         // of `trust_indicator`, which is precisely what task
         // `mobile-chrome-presentation-from-one-derivation` removed from this edge.
-        // Every later repaint comes from [refreshChrome].
-        val initialChrome = core.chrome()
+        // Every later repaint comes from [refreshChrome]. (`initialChrome` is the
+        // ONE snapshot taken at the top of `onCreate`, so every first paint agrees
+        // with every other.)
         trust = TextView(this).apply {
             text = initialChrome.trustIndicator
             gravity = Gravity.END
@@ -470,8 +565,9 @@ class BrowserActivity : ComponentActivity() {
         // advances with the real pipeline phase; when nothing is in flight it goes
         // INVISIBLE rather than GONE, so the 3dp strip it occupies is reserved for
         // good and no load state ever resizes the WebView (task
-        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar
-        // Stop button; the phase NAME is in the footer status line.
+        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar's
+        // ONE reload/stop control, in its STOP mode exactly while a load is in
+        // flight; the phase NAME is in the footer status line.
         loadingProgress = ProgressBar(
             this, null, android.R.attr.progressBarStyleHorizontal
         ).apply {
@@ -546,10 +642,11 @@ class BrowserActivity : ComponentActivity() {
     /**
      * A COMPACT nav button: a small fixed square that strips the default Android
      * button's large min-width and horizontal insets ([minWidth]/[minimumWidth] 0,
-     * no horizontal padding), so four of them take a small fixed slice of the row
-     * and the weighted URL bar keeps the majority of the width. The button glyph is
-     * small, but the enclosing toolbar row is [TOUCH_TARGET_DP] tall so the
-     * effective touch target stays >= 48dp.
+     * no horizontal padding), so the two that remain (the reload/stop control and
+     * the ⋮ menu) take a small fixed slice of the row and the weighted URL bar
+     * keeps the rest — which since the history buttons went is most of it. The
+     * button glyph is small, but the enclosing toolbar row is [TOUCH_TARGET_DP]
+     * tall so the effective touch target stays >= 48dp.
      */
     private fun compactNavButton(glyph: String, onClick: () -> Unit): Button =
         Button(this).apply {
@@ -719,14 +816,28 @@ class BrowserActivity : ComponentActivity() {
             urlBar.setTextColor(defaultUrlBarColor)
             urlBar.paintFlags = urlBar.paintFlags and Paint.UNDERLINE_TEXT_FLAG.inv()
         }
-        backButton.isEnabled = chrome.canGoBack
-        // The SYSTEM Back button in LOCKSTEP with the on-screen one: both read the
-        // SAME `canGoBack` fact here, so they never disagree. Disabled = the
-        // platform default runs and Back EXITS (no history left to walk).
+        // The SYSTEM Back button, which since the on-screen ◀ went is the ONLY
+        // back affordance Android has: enabled exactly on the core's `canGoBack`.
+        // Disabled = the platform default runs and Back EXITS (no history left to
+        // walk). The history CAPABILITY behind it is untouched by the button
+        // removal — this line is what turns it into an affordance.
         systemBackCallback.isEnabled = chrome.canGoBack
-        forwardButton.isEnabled = chrome.canGoForward
-        stopButton.isEnabled = chrome.loading
-        reloadButton.isEnabled = !chrome.loading
+        // The ONE reload/stop control: the glyph it wears and what it announces
+        // are the core's derived mode, carried on the chrome
+        // (`reload_stop_control(state).label()` / `.description()`). There is no
+        // `when` here and there must never be one: which mode this is was decided
+        // ONCE, in the toolkit-free core, and the same decision drives what the
+        // click does (`activateReloadStopControl`). Android has no hover, so the
+        // words go in the platform's accessible-name slot rather than a tooltip.
+        reloadStopButton.text = chrome.reloadStopControlLabel
+        reloadStopButton.contentDescription = chrome.reloadStopControlDescription
+        // The SPINNER: a SECOND presentation of the load the progress line already
+        // reports (the core keeps both on one rule, so they cannot contradict each
+        // other), covering what the bar cannot — a load that has reported no phase
+        // yet, and the pre-content name-resolution window. INVISIBLE rather than
+        // GONE keeps its slot, so no load state ever moves the URL bar.
+        loadingSpinner.visibility =
+            if (chrome.loadSpinnerVisible) View.VISIBLE else View.INVISIBLE
         status.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone. The badge's
@@ -752,8 +863,9 @@ class BrowserActivity : ComponentActivity() {
         // window, where the backend has not started yet), and it goes INVISIBLE —
         // never GONE — once the load settles, so the strip it occupies is never
         // given back and a navigation cannot resize the page (task
-        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
-        // button, enabled exactly while a load is in flight; the phase NAME is in
+        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar's
+        // ONE reload/stop control, in its STOP mode exactly while a load is in
+        // flight; the phase NAME is in
         // the footer status line (and this line's content description). Driven by
         // this existing refresh, so no new timer / poll / tight loop (the Android
         // ANR guard is not regressed).
@@ -1170,6 +1282,13 @@ class BrowserActivity : ComponentActivity() {
 
         /** The compact nav-button square edge, in dp (small so the URL bar wins width). */
         private const val NAV_BUTTON_DP = 40
+
+        /**
+         * The loading spinner's square edge, in dp: smaller than a button, since
+         * it is a status indicator rather than a touch target, and a permanently
+         * reserved slot should cost the URL bar as little width as it can.
+         */
+        private const val SPINNER_DP = 20
 
         /** The toolbar row's minimum height, in dp, keeping touch targets >= 48dp. */
         private const val TOUCH_TARGET_DP = 48

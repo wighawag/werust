@@ -1,0 +1,5 @@
+# The Kotlin/Swift source scanner is copy-pasted across the edge shape guards
+
+2026-08-04, noticed while building `android-chrome-collapse-reload-stop-and-drop-history-buttons`.
+
+The comment/string-literal scanner that lets a source-shape guard tell wiring from documentation now exists in at least three near-identical copies: `scan` in `crates/werust-core/tests/mobile_chrome_presentation_shape.rs`, `kotlin_block_body`'s skip logic in `crates/werust-android/rust/tests/system_back_wiring_shape.rs`, and `scan` again in `crates/werust-android/rust/tests/collapsed_control_and_dropped_history_buttons_shape.rs` (this task added the third, in the house style rather than inventing a shared home mid-task). Each copy carries its own guard-on-guard test, so none is unsafe today, but a fix to one (the `◀`-style multi-byte char handling was a real trap) does not reach the others. A shared `tests/common/mod.rs` in the Android crate, or a small dev-dependency crate for the two `werust-core` guards, would collapse them; the awkward part is that they live in three different test binaries across two crates.

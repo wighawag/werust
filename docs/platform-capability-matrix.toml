@@ -1314,9 +1314,24 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # `gdk` translation are unit-tested display-free, while "the key really reaches
 # the window" is a claim no runner in this repo pressed (manual steps at
 # docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/README.md).
-# macOS is the remaining sibling edge task: the resolution (including the Cmd
-# branch) is already shared, so it is a translation of NSEvent input, not a new
-# decision.
+# macOS is the SECOND edge and the only one that reaches the resolution's Cmd
+# branch (task `shortcuts-and-mouse-history-buttons-on-the-macos-edge`): an
+# `NSWindow` subclass whose `sendEvent:` override gives werust's chords the first
+# look at every event (the AppKit analogue of GTK's capture phase, so a page or
+# the URL bar's field editor cannot swallow Escape), over a translation table in
+# crates/werust-macos/src/input.rs that maps NSEvent key codes, modifier flags and
+# side-button numbers 3/4 into the shared vocabulary. That table is deliberately
+# NOT target-gated, so the whole Cmd mapping -- and its DISTINCTNESS from the Ctrl
+# branch -- is unit-tested against the real core on the ordinary Ubuntu gate; the
+# macos-14 leg then presses real NSEvents through the real window
+# (crates/werust-macos/examples/window_smoke.rs), because nobody on this project
+# has a Mac (work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md).
+# ONE action is deliberately unhandled there: macOS reaches no web inspector at
+# all (the `web-inspector` row above), so the chord resolves and the edge simply
+# has no handler, which is the capability-agnostic rule working rather than a gap.
+# Guarded source-shape-wise by crates/werust-macos/tests/macos_shortcut_shape.rs;
+# decisions at
+# docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md.
 # WINDOWS (task `shortcuts-and-mouse-history-buttons-on-the-windows-edge`)
 # translates the SAME vocabulary from Win32: virtual-key codes + `GetKeyState`
 # bits + `XBUTTON1`/`XBUTTON2` in `crates/werust-windows/src/shortcuts.rs`, a PURE
@@ -1343,7 +1358,7 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # edge has a mouse with side buttons. Android's system Back is a different
 # affordance and has its own row (`system-back-navigates-history`).
 desktop = { state = "implemented" }
-macos = { state = "stubbed", task = "shortcuts-and-mouse-history-buttons-on-the-macos-edge" }
+macos = { state = "implemented" }
 windows = { state = "implemented" }
 ios = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The iOS history affordance is the WebKit edge-swipe (enable-the-ios-back-forward-swipe-gesture)." }
 android = { state = "n-a", reason = "No hardware-keyboard shortcuts or mouse side buttons on the mobile edges: the spec chrome-conventional-controls scopes the shortcut layer to the three desktop edges. The Android history affordance is the system Back button (row system-back-navigates-history)." }

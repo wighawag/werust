@@ -45,7 +45,11 @@
 //! `crates/werust-windows/tests/windows_window_shape.rs`). This file keeps
 //! asserting the property that matters here -- the row exists, desktop is real,
 //! and an edge that has NOT landed still names its task -- rather than freezing
-//! the sibling cells, so the macOS task can flip its own cell the same way.
+//! the sibling cells, so the macOS task can flip its own cell the same way.//!
+//! AMENDMENT (task `shortcuts-and-mouse-history-buttons-on-the-macos-edge`):
+//! the macOS cell moved from `stubbed` to `implemented` the same way, and its
+//! own shape guard is `crates/werust-macos/tests/macos_shortcut_shape.rs`, so
+//! this file stays the GTK edge's.
 
 use std::path::{Path, PathBuf};
 
@@ -295,8 +299,13 @@ fn the_f12_predicate_is_gone_and_the_web_inspector_is_a_table_row() {
 fn the_desktop_cell_is_implemented_and_the_sibling_edges_are_tracked() {
     // Criterion 6: this task is DESKTOP-scoped, and the parity matrix says so
     // out loud (enforced by `platform_capability_parity.rs`): the desktop cell is
-    // implemented, and the two other desktop edges are stubs pointing at their
-    // own sibling tasks rather than silent gaps.
+    // implemented, and no other desktop edge is a SILENT gap.
+    //
+    // macOS was a tracked stub here when this landed and is now `implemented`
+    // (task `shortcuts-and-mouse-history-buttons-on-the-macos-edge`, the edge that
+    // finally exercises the Cmd branch), so the assertion is written as "every
+    // desktop cell is implemented OR tracked on its own task" rather than
+    // freezing a snapshot of who had shipped on the day this file was written.
     let matrix = source("docs/platform-capability-matrix.toml");
     let row = between(
         &matrix,

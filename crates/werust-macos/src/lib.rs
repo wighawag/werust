@@ -30,6 +30,21 @@
 //! layer: it assigns those values to `NSTextField`s, `NSButton`s, an
 //! `NSProgressIndicator` and an `NSMenu`, and forwards user actions to the shell.
 //!
+//! # It TRANSLATES input; it does not INTERPRET it
+//!
+//! The same line, drawn through INPUT rather than display (`CONTEXT.md`'s
+//! "shortcut resolution" entry, spec `chrome-conventional-controls`). What a
+//! keyboard chord or a mouse side button MEANS is decided once, in
+//! `werust_core::shortcuts`; this crate only says which key or button a native
+//! `NSEvent` carries and performs the returned `ChromeAction`. [`input`] is the
+//! translation half, and it is deliberately NOT target-gated for the same reason
+//! [`paint`] is not: it takes plain numbers (a virtual key code, the modifier
+//! bits, a button number), so the WHOLE Cmd mapping — the one branch of the
+//! shared resolution only this edge can exercise — is unit-tested against the
+//! real core on the Ubuntu gate rather than resting on "someone will notice" on a
+//! machine nobody here has. [`window`] holds the AppKit half: where the events
+//! are intercepted, and how each action is performed.
+//!
 //! That module STARTED here, as `werust-macos::paint`. Task
 //! `windows-win32-window-and-chrome` extracted it, verbatim and with its tests,
 //! into `crates/desktop-paint`, because the Win32 window would otherwise have
@@ -86,6 +101,8 @@
 /// caller — `window.rs`, `examples/window_smoke.rs` — keeps naming the macOS
 /// window's paint half as it always did.
 pub use desktop_paint as paint;
+
+pub mod input;
 
 #[cfg(target_os = "macos")]
 pub mod window;

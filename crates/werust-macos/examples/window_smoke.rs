@@ -40,17 +40,20 @@ fn main() {
 mod macos {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use fetcher::{cid_v1_raw_sha256, ContentRetriever, RetrieveError, RetrievedContent};
     use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSEventModifierFlags};
     use objc2_foundation::{NSDate, NSRunLoop};
     use renderer::LoadState;
     use werust_core::debug::DebugCapture;
     use werust_core::ipfs::RedirectSink;
     use werust_core::menu::{BrowserMenu, MENU_ITEM_DEBUG};
+    use werust_core::shortcuts::Focus;
     use werust_core::{status_line, trust_indicator, trust_indicator_detail, BrowserShell};
+    use werust_macos::input;
     use werust_macos::paint::install_debug_capture;
     use werust_macos::window::{BrowserWindow, Placement};
 
@@ -71,10 +74,21 @@ mod macos {
         honest: Vec<u8>,
         tampered_cid: String,
         tampered: Vec<u8>,
+        /// How many retrievals this fixture has served. A RELOAD is otherwise
+        /// indistinguishable from "the page was already loaded", so the shortcut
+        /// checks below watch this rather than a settled load state.
+        retrievals: AtomicUsize,
+    }
+
+    impl PinnedRetriever {
+        fn retrievals(&self) -> usize {
+            self.retrievals.load(Ordering::SeqCst)
+        }
     }
 
     impl ContentRetriever for PinnedRetriever {
         fn retrieve(&self, cid: &str, _path: &str) -> Result<RetrievedContent, RetrieveError> {
+            self.retrievals.fetch_add(1, Ordering::SeqCst);
             let bytes = if cid == self.honest_cid {
                 &self.honest
             } else if cid == self.tampered_cid {
@@ -148,7 +162,11 @@ mod macos {
             honest,
             tampered_cid: tampered_cid.clone(),
             tampered: b"tampered bytes that do not hash to the cid".to_vec(),
+            retrievals: AtomicUsize::new(0),
         });
+        // A second handle on the SAME fixture, kept out of the closure so the
+        // shortcut checks can watch what the page really fetched.
+        let served = Arc::clone(&retriever);
 
         let Ok(mut backend) = macos_renderer::MacosRenderer::new() else {
             eprintln!("could not create the macOS backend (is this the main thread?)");
@@ -270,6 +288,159 @@ mod macos {
             &mut failures,
             window.page_frame() == page_before,
             "the page view did NOT move or resize across a whole load",
+        );
+
+        println!("the conventional shortcuts, pressed as REAL NSEvents on this window:");
+        // The one thing no Linux gate can do for the shortcut layer: build an
+        // actual `NSEvent` and push it through the real window's `sendEvent:`,
+        // which is where werust's chords beat the focused page and the URL bar's
+        // field editor. The translation TABLE behind them (`werust_macos::input`)
+        // is unit-tested against the real core on every Ubuntu run; what is
+        // proved HERE is that a pressed key reaches the resolution at all and
+        // that the resolved action really moves the chrome.
+        //
+        // The modifier flags come from AppKit's OWN `NSEventModifierFlags`, so
+        // this also checks the plain-bit constants the Linux-side table is
+        // written against against the real thing.
+        check(
+            &mut failures,
+            NSEventModifierFlags::Command.bits() as u64 == input::MODIFIER_FLAG_COMMAND
+                && NSEventModifierFlags::Control.bits() as u64 == input::MODIFIER_FLAG_CONTROL
+                && NSEventModifierFlags::Option.bits() as u64 == input::MODIFIER_FLAG_OPTION
+                && NSEventModifierFlags::Shift.bits() as u64 == input::MODIFIER_FLAG_SHIFT,
+            "the translation table's modifier bits are AppKit's own NSEventModifierFlags",
+        );
+
+        // Story 1 / 4: Cmd+L, the chord this whole edge exists for, and the ONLY
+        // place the shared resolution's Cmd branch is reached by a real key press
+        // anywhere in this project.
+        window.blur_url_bar();
+        pump(&window);
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::Page,
+            "the window reports PAGE focus while the URL bar is not being edited",
+        );
+        window.press_key(0, "l", NSEventModifierFlags::Command);
+        pump(&window);
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::UrlBar,
+            "Cmd+L focuses the URL bar",
+        );
+
+        // The NEGATIVE CONTROL for the Cmd branch: a Mac user's Ctrl+L is NOT a
+        // browser shortcut. Without this, "Cmd+L works" would pass just as well
+        // on an edge that claimed the key under any modifier at all.
+        window.blur_url_bar();
+        pump(&window);
+        window.press_key(0, "l", NSEventModifierFlags::Control);
+        pump(&window);
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::Page,
+            "Ctrl+L is NOT the Mac URL-bar chord and leaves focus alone",
+        );
+
+        // Story 6: Escape in the URL bar REVERTS the edit and restores the URL
+        // the chrome believes, and navigates nowhere.
+        let believed = shell.borrow().chrome().url_text.clone();
+        let typed = "rubbish the user typed and thought better of";
+        window.focus_url_bar();
+        window.set_url_text(typed);
+        pump(&window);
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::UrlBar,
+            "the window reports URL-BAR focus while the bar is being edited",
+        );
+        window.press_key(
+            input::KEY_CODE_ESCAPE,
+            "\u{1b}",
+            NSEventModifierFlags::empty(),
+        );
+        pump(&window);
+        check(
+            &mut failures,
+            window.url_text() == believed,
+            "Escape in the URL bar restores the URL the chrome believes",
+        );
+        check(
+            &mut failures,
+            shell.borrow().chrome().url_text == believed,
+            "…and reverting the bar navigates nowhere",
+        );
+
+        // Story 5, and the DISCRIMINATING half of the focus input: the SAME key,
+        // the same window, a different reported focus must do something else. With
+        // the page focused Escape is Stop, so a half-typed URL is left exactly
+        // where it was -- if this edge reported focus wrongly (or, worse, decided
+        // Escape itself), the bar would revert here too and this check would fail.
+        window.set_url_text(typed);
+        window.blur_url_bar();
+        pump(&window);
+        window.press_key(
+            input::KEY_CODE_ESCAPE,
+            "\u{1b}",
+            NSEventModifierFlags::empty(),
+        );
+        check(
+            &mut failures,
+            window.url_text() == typed,
+            "Escape with the PAGE focused stops the load instead of reverting the bar",
+        );
+        // The next repaint puts the bar back to what the chrome believes.
+        pump(&window);
+
+        // Story 2: Cmd+R reloads. Watched at the FIXTURE, because a settled load
+        // state cannot tell a reload from "it was already loaded".
+        let served_before = served.retrievals();
+        window.press_key(0, "r", NSEventModifierFlags::Command);
+        let reloaded = wait_until(&window, 20, || served.retrievals() > served_before);
+        check(
+            &mut failures,
+            reloaded,
+            "Cmd+R really re-fetches the page through the shell",
+        );
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(&mut failures, settled, "the reloaded page settles again");
+
+        // Story 7: the mouse's side buttons navigate history, through the SAME
+        // resolution and the SAME performer. AppKit's synthetic-mouse constructor
+        // carries no `buttonNumber`, so this drives the production path from the
+        // number onwards (see `press_side_button`).
+        check(
+            &mut failures,
+            window.press_side_button(input::BUTTON_NUMBER_BACK),
+            "the rear side button is claimed by the chrome",
+        );
+        check(
+            &mut failures,
+            window.press_side_button(input::BUTTON_NUMBER_FORWARD),
+            "the forward side button is claimed by the chrome",
+        );
+        check(
+            &mut failures,
+            !window.press_side_button(2),
+            "an ordinary (middle) button stays the page's",
+        );
+
+        // The web inspector is DELIBERATELY unhandled on this edge: macOS reaches
+        // no inspector at all (`docs/platform-capability-matrix.toml`, owned by
+        // `macos-web-inspector-safari-devtools`). F12 must therefore open nothing
+        // and disturb nothing, rather than crash or claim the key.
+        window.press_key(
+            input::KEY_CODE_F12,
+            "\u{f70f}",
+            NSEventModifierFlags::empty(),
+        );
+        pump(&window);
+        check(
+            &mut failures,
+            window.debug_row_counts().is_none(),
+            "F12 opens no inspector here (macOS has none) and opens no other window",
         );
 
         println!("the debug view, opened through the core menu's Debug entry:");

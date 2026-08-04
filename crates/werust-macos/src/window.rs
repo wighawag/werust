@@ -46,6 +46,29 @@
 //! READ-ONLY: every row is a non-editable label. A typeable REPL is Safari's Web
 //! Inspector's job.
 //!
+//! # The shortcut layer: intercept, translate, perform
+//!
+//! The conventional browser chords (Cmd+L, Cmd+R / F5, Cmd+Left / Cmd+Right,
+//! Escape by focus) and the mouse's back/forward side buttons are handled by
+//! [`ShortcutWindow`], an `NSWindow` subclass whose `sendEvent:` override gets
+//! the FIRST look at every event this window receives. That is the AppKit
+//! analogue of the CAPTURE phase the GTK edge's controllers sit in, and for the
+//! same reason: a browser's own chords have to beat the focused page (a page can
+//! bind Escape, and `WKWebView` would otherwise swallow it) and the URL bar's
+//! field editor, whose own Escape is AppKit's `cancelOperation:`. Anything the
+//! shared resolution does not claim is forwarded to `super` untouched, so
+//! ordinary typing, page keys and the menu bar's own key equivalents behave
+//! exactly as before.
+//!
+//! Nothing here decides what an input MEANS. [`crate::input`] translates the
+//! `NSEvent` into `werust_core::shortcuts`'s toolkit-neutral vocabulary, the core
+//! resolves it, and [`WindowController::perform_chrome_action`] performs the
+//! result through the SAME `BrowserShell` calls and the SAME `ChromeState`
+//! capability flags the toolbar buttons use. One action has no handler here on
+//! purpose: macOS reaches no web inspector at all, which is the
+//! capability-agnostic rule working as designed (see the performer, and
+//! `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md`).
+//!
 //! # ADR-0009: what this file does NOT do
 //!
 //! It never sets an `NSAppearance`, on any window, view or webview. AppKit
@@ -59,21 +82,24 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSButton,
-    NSColor, NSFont, NSMenu, NSMenuItem, NSProgressIndicator, NSProgressIndicatorStyle,
-    NSScrollView, NSTabView, NSTabViewItem, NSTextField, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFont, NSMenu, NSMenuItem,
+    NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSTabView, NSTabViewItem,
+    NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
-    NSNotification, NSPoint, NSRect, NSSize, NSString, NSTimeInterval, NSTimer,
+    NSNotification, NSPoint, NSRange, NSRect, NSSize, NSString, NSTimeInterval, NSTimer,
 };
 
 use renderer::RendererError;
 use werust_core::debug::DebugCapture;
 use werust_core::menu::MENU_ITEM_DEBUG;
+use werust_core::shortcuts::{self, ChromeAction, Focus};
 use werust_core::BrowserShell;
+
+use crate::input;
 
 use crate::paint::{
     console_refresh, install_debug_capture, menu_items, network_refresh, ChromePaint,
@@ -152,6 +178,154 @@ impl FlippedView {
     }
 }
 
+/// What [`ShortcutWindow`] needs to reach when an event arrives: the controller
+/// that owns the chrome and the shell.
+///
+/// It is filled in AFTER construction (the controller cannot exist before the
+/// widgets it paints), exactly as [`wire_actions`] points the controls at it.
+/// The reference is one-way on purpose: the window holds the controller, and the
+/// controller no longer holds the window back, so there is no retain cycle
+/// between them.
+struct ShortcutIvars {
+    controller: RefCell<Option<Retained<WindowController>>>,
+}
+
+define_class!(
+    // SAFETY:
+    // - `NSWindow` has no subclassing requirements beyond main-thread use.
+    // - `ShortcutWindow` does not implement `Drop`.
+    #[unsafe(super(NSWindow))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "WerustMacBrowserWindow"]
+    #[ivars = ShortcutIvars]
+    struct ShortcutWindow;
+
+    unsafe impl NSObjectProtocol for ShortcutWindow {}
+
+    impl ShortcutWindow {
+        /// The browser's own chords get the FIRST look at every event, before
+        /// AppKit routes it to a key equivalent, to the URL bar's field editor or
+        /// to the `WKWebView`.
+        ///
+        /// This is the AppKit analogue of the CAPTURE phase the GTK edge puts
+        /// its controllers in, and it is what makes the claim "Escape stops the
+        /// load" true over a page that binds Escape itself. Everything werust
+        /// does NOT claim is forwarded to `NSWindow`'s own implementation
+        /// untouched.
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            if self.claim(event) {
+                return;
+            }
+            // SAFETY: forwarding the same message, with the same argument, to
+            // the superclass implementation being overridden.
+            unsafe { msg_send![super(self), sendEvent: event] }
+        }
+    }
+);
+
+impl ShortcutWindow {
+    /// Build the browser window itself. The style mask is the product's, exactly
+    /// as it was before the subclass existed.
+    fn new(mtm: MainThreadMarker, frame: NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ShortcutIvars {
+            controller: RefCell::new(None),
+        });
+        // SAFETY: `NSWindow`'s designated initialiser, called on a freshly
+        // allocated instance of this subclass.
+        unsafe {
+            msg_send![super(this), initWithContentRect: frame,
+                styleMask: NSWindowStyleMask::Titled
+                    | NSWindowStyleMask::Closable
+                    | NSWindowStyleMask::Miniaturizable
+                    | NSWindowStyleMask::Resizable,
+                backing: NSBackingStoreType::Buffered,
+                defer: false]
+        }
+    }
+
+    /// Point the window at the controller that performs what the resolution
+    /// returns. Until this is called the window claims nothing at all.
+    fn adopt(&self, controller: &WindowController) {
+        *self.ivars().controller.borrow_mut() = Some(controller.retain());
+    }
+
+    /// Ask the SHARED resolution what this event means, perform it if it means
+    /// anything, and report whether it was claimed.
+    ///
+    /// Translation and dispatch only: every `if` here is about which KIND of
+    /// native event arrived, never about what a particular key or button does.
+    fn claim(&self, event: &NSEvent) -> bool {
+        match event.r#type() {
+            NSEventType::KeyDown => {
+                // `charactersIgnoringModifiers` is the layout's character with
+                // the modifiers taken off, which is how a letter chord (Cmd+L)
+                // reaches the shared vocabulary as `Character('l')`.
+                let characters = event.charactersIgnoringModifiers().map(|s| s.to_string());
+                self.claim_key(
+                    event.keyCode(),
+                    characters.as_deref(),
+                    modifier_bits(event.modifierFlags()),
+                )
+            }
+            // The side buttons the user's mouse already has; every other button
+            // (left, right, middle) stays the page's.
+            NSEventType::OtherMouseDown => self.claim_pointer_button(event.buttonNumber()),
+            _ => false,
+        }
+    }
+
+    /// The KEY half of [`claim`], from the numbers an `NSEvent` carries onwards.
+    fn claim_key(&self, key_code: u16, characters: Option<&str>, flags: u64) -> bool {
+        let controller = self.ivars().controller.borrow();
+        let Some(controller) = controller.as_ref() else {
+            return false;
+        };
+        let Some(action) = input::action(
+            key_code,
+            characters,
+            flags,
+            // Focus is REPORTED, never branched on here: the core decides what
+            // Escape means in each context.
+            controller.shortcut_focus(),
+        ) else {
+            return false;
+        };
+        controller.perform_chrome_action(action);
+        true
+    }
+
+    /// The SIDE-BUTTON half of [`claim`], from the button number onwards.
+    ///
+    /// Split out at exactly the point AppKit stops being involved, because a
+    /// synthesised `NSEvent` cannot carry a `buttonNumber` (the AppKit
+    /// constructor takes none), so this is the deepest point the `macos-14` leg
+    /// can drive the side buttons from. Everything after it -- the translation,
+    /// the shared resolution and the performer -- is the production path.
+    fn claim_pointer_button(&self, button_number: isize) -> bool {
+        let controller = self.ivars().controller.borrow();
+        let Some(controller) = controller.as_ref() else {
+            return false;
+        };
+        let Some(action) =
+            input::pointer_button(button_number).and_then(shortcuts::resolve_pointer_button)
+        else {
+            return false;
+        };
+        controller.perform_chrome_action(action);
+        true
+    }
+}
+
+/// AppKit's modifier flags as the plain bits [`crate::input`] reads.
+///
+/// The one place the AppKit type meets the host-independent translation table,
+/// kept to a single cast so the mapping itself stays on the half the Ubuntu gate
+/// compiles and tests.
+fn modifier_bits(flags: NSEventModifierFlags) -> u64 {
+    flags.bits() as u64
+}
+
 /// A non-editable, single-line label: the building block of every read-only
 /// surface here (the trust badge, the invalid badge, the status line, the error
 /// banner and every debug row).
@@ -176,7 +350,6 @@ fn button(mtm: MainThreadMarker, title: &str) -> Retained<NSButton> {
 /// shell's state — the same shape the GTK edge's `Chrome` has, for the same
 /// reason: a half-applied chrome is how a stale badge survives a transition.
 struct Chrome {
-    window: Retained<NSWindow>,
     content: Retained<FlippedView>,
     toolbar: Retained<FlippedView>,
     back: Retained<NSButton>,
@@ -799,6 +972,123 @@ impl WindowController {
         self.refresh_debug_view();
     }
 
+    /// Report which of the two focus contexts the shared resolution
+    /// distinguishes is live, so Escape can mean "stop the load" over the page
+    /// and "revert my edit" in the URL bar without this edge deciding either.
+    ///
+    /// AppKit hands an edited `NSTextField`'s keyboard to a shared FIELD EDITOR
+    /// (an `NSText` the window lends out), so "is the bar focused?" is asked of
+    /// the control (`currentEditor`) rather than of the first responder, which is
+    /// the editor and not the field while the user is typing. The field itself
+    /// can also be first responder for the instant before the editor is
+    /// installed, so both are checked; everything else -- the page, a toolbar
+    /// button, the menu -- is [`Focus::Page`], which is the whole of the
+    /// two-valued question the core asks.
+    fn shortcut_focus(&self) -> Focus {
+        let field = &self.ivars().chrome.url_field;
+        if field.currentEditor().is_some() {
+            return Focus::UrlBar;
+        }
+        let Some(window) = field.window() else {
+            return Focus::Page;
+        };
+        let Some(responder) = window.firstResponder() else {
+            return Focus::Page;
+        };
+        let responder: *const AnyObject = Retained::as_ptr(&responder).cast();
+        let field: *const AnyObject = (&**field as *const NSTextField).cast();
+        if std::ptr::eq(responder, field) {
+            Focus::UrlBar
+        } else {
+            Focus::Page
+        }
+    }
+
+    /// PERFORM a resolved [`ChromeAction`]: this edge's half of the shortcut
+    /// layer, shared by the key path and the mouse's side buttons.
+    ///
+    /// Every action is performed the SAME way the equivalent toolbar control
+    /// performs it: through the [`BrowserShell`] (and therefore the `Renderer`
+    /// seam), gated on the SAME `ChromeState` capability flags the buttons take
+    /// their enabled state from, then a chrome repaint. Nothing here re-decides
+    /// what the action was for; the `match` is exhaustive over [`ChromeAction`],
+    /// so an action added to the shared vocabulary stops this edge compiling
+    /// until it is handled or explicitly declined.
+    fn perform_chrome_action(&self, action: ChromeAction) {
+        let chrome = &self.ivars().chrome;
+        match action {
+            ChromeAction::FocusUrlBar => {
+                // Focus AND select, so the next keystroke replaces the address
+                // (story 1); no shell call, so no repaint is owed.
+                let Some(window) = chrome.url_field.window() else {
+                    return;
+                };
+                let _ = window.makeFirstResponder(Some(&chrome.url_field));
+                if let Some(editor) = chrome.url_field.currentEditor() {
+                    editor.setSelectedRange(NSRange::new(0, editor.string().length()));
+                }
+            }
+            ChromeAction::Reload => {
+                let _ = self.ivars().shell.borrow_mut().reload();
+                self.refresh_chrome();
+            }
+            ChromeAction::GoBack => {
+                // The SAME capability flag the Back button's enabled state reads:
+                // a shortcut must not be able to drive a history move the
+                // on-screen control refuses.
+                let can_go_back = self.ivars().shell.borrow().chrome().can_go_back;
+                if can_go_back {
+                    self.ivars().shell.borrow_mut().go_back();
+                    self.refresh_chrome();
+                }
+            }
+            ChromeAction::GoForward => {
+                let can_go_forward = self.ivars().shell.borrow().chrome().can_go_forward;
+                if can_go_forward {
+                    self.ivars().shell.borrow_mut().go_forward();
+                    self.refresh_chrome();
+                }
+            }
+            ChromeAction::Stop => {
+                self.ivars().shell.borrow_mut().stop();
+                self.refresh_chrome();
+            }
+            ChromeAction::RevertUrlBar => {
+                // Revert the edit and restore the CURRENT page's URL (story 6):
+                // the bar goes back to the shell's `url_text`, the same one fact
+                // `Chrome::apply` paints it from, so Escape can never leave the
+                // bar showing something the chrome does not believe.
+                let url = self.ivars().shell.borrow().chrome().url_text.clone();
+                chrome.url_field.setStringValue(&ns(&url));
+                // While the bar is being typed in, the visible text belongs to
+                // the FIELD EDITOR, so it is set too and the caret is left at the
+                // end (the GTK edge's `set_position(-1)`).
+                if let Some(editor) = chrome.url_field.currentEditor() {
+                    editor.setString(&ns(&url));
+                    let end = editor.string().length();
+                    editor.setSelectedRange(NSRange::new(end, 0));
+                }
+            }
+            ChromeAction::OpenWebInspector => {
+                // DELIBERATELY NO HANDLER, and explicit rather than silent.
+                //
+                // macOS is the one edge that reaches no web inspector at all:
+                // `docs/platform-capability-matrix.toml` records `web-inspector`
+                // as `state = "stubbed"` here, owned by
+                // `macos-web-inspector-safari-devtools`, and neither this crate
+                // nor `crates/macos-renderer` touches `WKPreferences` or
+                // `isInspectable`. So there is nothing for the action to open.
+                //
+                // The chord still RESOLVES -- the shared resolution is
+                // capability-agnostic by settled design, and teaching it about
+                // this absence would fork it per platform and re-mint exactly the
+                // per-edge branching the seam exists to delete. When
+                // `macos-web-inspector-safari-devtools` lands, wiring this arm is
+                // a one-line follow-on and needs no change to the resolution.
+            }
+        }
+    }
+
     /// Open (or raise) the debug view.
     fn open_debug_view(&self) {
         let mtm = MainThreadMarker::from(self);
@@ -927,6 +1217,11 @@ fn install_main_menu(mtm: MainThreadMarker, controller: &WindowController) {
 /// asserts what the real widgets show, which is the only way this file gets
 /// EXECUTED anywhere before a human opens it.
 pub struct BrowserWindow {
+    /// The browser window itself, held HERE rather than inside [`Chrome`]: the
+    /// window holds the controller (so its `sendEvent:` override can perform a
+    /// resolved action), and a controller holding the window back would close
+    /// that into a retain cycle.
+    window: Retained<ShortcutWindow>,
     controller: Retained<WindowController>,
 }
 
@@ -957,18 +1252,11 @@ impl BrowserWindow {
             Placement::OnScreen => rect(0.0, 0.0, size.width, size.height),
             Placement::OffScreen => rect(-20_000.0, -20_000.0, size.width, size.height),
         };
-        let window = unsafe {
-            NSWindow::initWithContentRect_styleMask_backing_defer(
-                NSWindow::alloc(mtm),
-                frame,
-                NSWindowStyleMask::Titled
-                    | NSWindowStyleMask::Closable
-                    | NSWindowStyleMask::Miniaturizable
-                    | NSWindowStyleMask::Resizable,
-                NSBackingStoreType::Buffered,
-                false,
-            )
-        };
+        // The browser window is a `ShortcutWindow`: an `NSWindow` that gives
+        // werust's own chords and the mouse's side buttons the first look at
+        // every event (see the module docs). It decides nothing until it is
+        // handed the controller below.
+        let window = ShortcutWindow::new(mtm, frame);
         window.setTitle(&ns("werust"));
         window.setMinSize(NSSize::new(520.0, 320.0));
         // A programmatically created `NSWindow` defaults to releasing itself when
@@ -1039,7 +1327,6 @@ impl BrowserWindow {
         let menu = build_browser_menu(mtm, &items);
 
         let chrome = Chrome {
-            window: window.clone(),
             content,
             toolbar,
             back,
@@ -1061,6 +1348,9 @@ impl BrowserWindow {
 
         let controller = WindowController::new(mtm, shell, capture, chrome, items);
         wire_actions(&controller);
+        // The shortcut layer's other half: from here on, an event this window
+        // receives is offered to the SHARED resolution before AppKit routes it.
+        window.adopt(&controller);
         window.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         controller.ivars().chrome.relayout();
         controller.refresh_chrome();
@@ -1075,7 +1365,7 @@ impl BrowserWindow {
             Placement::OffScreen => window.orderBack(None),
         }
 
-        Self { controller }
+        Self { window, controller }
     }
 
     /// Start the 50ms chrome pump on the run loop (the product path; the smoke
@@ -1129,7 +1419,88 @@ impl BrowserWindow {
     /// The window itself (the smoke closes it; the product hands it to AppKit).
     #[must_use]
     pub fn window(&self) -> Retained<NSWindow> {
-        self.controller.ivars().chrome.window.clone()
+        Retained::into_super(self.window.clone())
+    }
+
+    /// Deliver a synthetic KEY PRESS to the real window, exactly as AppKit
+    /// delivers a real one: through `sendEvent:`, and therefore through the
+    /// shortcut layer's interception.
+    ///
+    /// This exists because nobody on this project has a Mac
+    /// (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`),
+    /// so CI is the only evidence this edge will ever get and "press Cmd+L and
+    /// see" is not available. The `macos-14` leg presses the chords for real
+    /// through `examples/window_smoke.rs`; the translation TABLE behind them is
+    /// unit-tested on every Ubuntu gate run in [`crate::input`].
+    ///
+    /// `characters` is what `charactersIgnoringModifiers` would report (the
+    /// layout's character with the modifiers taken off).
+    pub fn press_key(&self, key_code: u16, characters: &str, flags: NSEventModifierFlags) {
+        let characters = ns(characters);
+        let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+            NSEventType::KeyDown,
+            NSPoint::new(0.0, 0.0),
+            flags,
+            0.0,
+            self.window.windowNumber(),
+            None,
+            &characters,
+            &characters,
+            false,
+            key_code,
+        );
+        if let Some(event) = event {
+            self.window.sendEvent(&event);
+        }
+    }
+
+    /// Press one of the mouse's SIDE BUTTONS (AppKit's `buttonNumber` 3 and 4
+    /// are the ones a mouse engraves Back and Forward), driving the production
+    /// path from the button number onwards.
+    ///
+    /// It stops one step shallower than [`press_key`](Self::press_key): AppKit's
+    /// synthetic-mouse-event constructor takes no `buttonNumber`, so a
+    /// synthesised `otherMouseDown` cannot carry the one field that matters. The
+    /// one step this does not cover is `NSEvent::buttonNumber()` itself; what CI
+    /// proves versus what awaits a Mac is written down in
+    /// `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/README.md`.
+    ///
+    /// Returns whether the chrome CLAIMED the button, so an ordinary button can
+    /// be asserted to stay the page's.
+    pub fn press_side_button(&self, button_number: isize) -> bool {
+        self.window.claim_pointer_button(button_number)
+    }
+
+    /// Which focus context this window REPORTS to the shared resolution right
+    /// now (the input that makes Escape mean two things).
+    #[must_use]
+    pub fn reported_focus(&self) -> Focus {
+        self.controller.shortcut_focus()
+    }
+
+    /// Give the URL bar the keyboard, as clicking into it does, so the smoke can
+    /// drive the URL-bar half of Escape.
+    pub fn focus_url_bar(&self) {
+        let field = &self.controller.ivars().chrome.url_field;
+        if let Some(window) = field.window() {
+            let _ = window.makeFirstResponder(Some(field));
+        }
+    }
+
+    /// Take the keyboard away from the URL bar (AppKit makes the window itself
+    /// first responder), so the smoke can drive the PAGE half of Escape.
+    pub fn blur_url_bar(&self) {
+        let _ = self.window.makeFirstResponder(None);
+    }
+
+    /// Type into the URL bar without navigating, so the smoke can prove Escape
+    /// REVERTS an in-progress edit rather than merely leaving it alone.
+    pub fn set_url_text(&self, text: &str) {
+        let field = &self.controller.ivars().chrome.url_field;
+        field.setStringValue(&ns(text));
+        if let Some(editor) = field.currentEditor() {
+            editor.setString(&ns(text));
+        }
     }
 
     /// What the URL bar currently SHOWS.

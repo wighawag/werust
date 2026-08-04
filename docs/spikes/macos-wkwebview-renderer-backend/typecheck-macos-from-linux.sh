@@ -266,6 +266,102 @@ pub mod menu {
     }
 }
 
+pub mod shortcuts {
+    // The SHARED shortcut resolution (`crates/werust-core/src/shortcuts.rs`): the
+    // macOS window TRANSLATES its NSEvents into this vocabulary and PERFORMS what
+    // comes back, so a stand-in must carry its shape (not its table). The real
+    // table -- including the Cmd branch this edge is the first to exercise -- is
+    // unit-tested against the REAL core on the Ubuntu gate, both in
+    // `werust-core` and in `crates/werust-macos/src/input.rs`, which is
+    // deliberately NOT target-gated for exactly that reason.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Key {
+        Character(char),
+        Escape,
+        F5,
+        F12,
+        ArrowLeft,
+        ArrowRight,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct Modifiers {
+        pub control: bool,
+        pub alt: bool,
+        pub shift: bool,
+        pub meta: bool,
+    }
+    impl Modifiers {
+        pub const NONE: Modifiers = Modifiers {
+            control: false,
+            alt: false,
+            shift: false,
+            meta: false,
+        };
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PrimaryModifier {
+        Control,
+        Meta,
+    }
+    impl PrimaryModifier {
+        pub fn for_target() -> Self {
+            PrimaryModifier::Control
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum Focus {
+        #[default]
+        Page,
+        UrlBar,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Chord {
+        pub key: Key,
+        pub modifiers: Modifiers,
+    }
+    impl Chord {
+        pub const fn new(key: Key, modifiers: Modifiers) -> Self {
+            Self { key, modifiers }
+        }
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PointerButton {
+        Back,
+        Forward,
+    }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ChromeAction {
+        FocusUrlBar,
+        Reload,
+        GoBack,
+        GoForward,
+        Stop,
+        RevertUrlBar,
+        OpenWebInspector,
+    }
+    impl ChromeAction {
+        pub const ALL: [ChromeAction; 7] = [
+            ChromeAction::FocusUrlBar,
+            ChromeAction::Reload,
+            ChromeAction::GoBack,
+            ChromeAction::GoForward,
+            ChromeAction::Stop,
+            ChromeAction::RevertUrlBar,
+            ChromeAction::OpenWebInspector,
+        ];
+    }
+    pub fn resolve_chord(
+        _chord: Chord,
+        _focus: Focus,
+        _primary: PrimaryModifier,
+    ) -> Option<ChromeAction> {
+        None
+    }
+    pub fn resolve_pointer_button(_button: PointerButton) -> Option<ChromeAction> {
+        None
+    }
+}
+
 pub mod debug {
     use renderer::TrustPosture;
     pub const CAPTURE_BRIDGE: &str = "werustDebug";
@@ -472,6 +568,44 @@ pub fn load_progress_fraction(_state: &ChromeState) -> f64 {
 pub fn load_progress_hint(_state: &ChromeState) -> &'static str {
     ""
 }
+pub fn load_spinner_visible(_state: &ChromeState) -> bool {
+    false
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadStopControl {
+    Reload,
+    Stop,
+}
+impl ReloadStopControl {
+    pub const ALL: [ReloadStopControl; 2] = [ReloadStopControl::Reload, ReloadStopControl::Stop];
+    pub fn wire_name(self) -> &'static str {
+        ""
+    }
+    pub fn label(self) -> &'static str {
+        ""
+    }
+    pub fn description(self) -> &'static str {
+        ""
+    }
+    pub fn action(self) -> crate::shortcuts::ChromeAction {
+        match self {
+            ReloadStopControl::Reload => crate::shortcuts::ChromeAction::Reload,
+            ReloadStopControl::Stop => crate::shortcuts::ChromeAction::Stop,
+        }
+    }
+}
+pub fn reload_stop_control(_state: &ChromeState) -> ReloadStopControl {
+    ReloadStopControl::Reload
+}
+pub fn trust_pin_action_visible(_state: &ChromeState) -> bool {
+    false
+}
+pub fn trust_pin_action_label(_state: &ChromeState) -> &'static str {
+    ""
+}
+pub fn trust_pin_detail(_state: &ChromeState) -> String {
+    String::new()
+}
 pub const STOP_AFFORDANCE_LABEL: &str = "";
 pub fn load_progress_tooltip(_state: &ChromeState, _stop_label: &str) -> Option<String> {
     None
@@ -635,6 +769,10 @@ sed -n "/^\[target\.'cfg(target_os = \"macos\")'\.dependencies\]/,\$p" \
 mkdir -p "$SCRATCH/window/src" "$SCRATCH/window/examples"
 ln -sf "$REPO/crates/werust-macos/src/lib.rs" "$SCRATCH/window/src/lib.rs"
 ln -sf "$REPO/crates/werust-macos/src/window.rs" "$SCRATCH/window/src/window.rs"
+# The shortcut layer's TRANSLATION half. It is not target-gated (the Ubuntu gate
+# compiles and unit-tests it against the REAL core), but `lib.rs` declares it, so
+# the scratch workspace needs it present or nothing here builds.
+ln -sf "$REPO/crates/werust-macos/src/input.rs" "$SCRATCH/window/src/input.rs"
 ln -sf "$REPO/crates/werust-macos/examples/window_smoke.rs" \
   "$SCRATCH/window/examples/window_smoke.rs"
 

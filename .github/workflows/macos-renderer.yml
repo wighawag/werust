@@ -156,7 +156,7 @@ jobs:
         # asserts a tampered CID FAILS the load and is never reported verified.
         run: cargo run -p macos-renderer --example trust_hooks_smoke
 
-      - name: Build and drive the REAL AppKit window (chrome, menu, debug view)
+      - name: Build and drive the REAL AppKit window (chrome, menu, debug view, shortcuts)
         # The window half's only execution anywhere: it opens a real `NSWindow`
         # FAR off-screen (accessory app: no Dock icon, no focus stolen), loads a
         # pinned, in-memory hash-verified `ipfs://` page through the production
@@ -166,6 +166,15 @@ jobs:
         # page's own `console.log`. Then a negative control (bytes that do not
         # hash to their CID) must FAIL, raise the error banner and displace the
         # page. Offline and deterministic.
+        #
+        # It also PRESSES the conventional shortcuts as real `NSEvent`s through
+        # the real window's `sendEvent:` (task
+        # `shortcuts-and-mouse-history-buttons-on-the-macos-edge`): Cmd+L, Cmd+R,
+        # Escape in both focus contexts, the mouse's side buttons, and Ctrl+L as
+        # the negative control that keeps "Cmd works" from being free. That is the
+        # only place a werust chord is ever pressed on a Mac -- nobody on this
+        # project has one -- while the translation table behind it is unit-tested
+        # on every Ubuntu gate run (`crates/werust-macos/src/input.rs`).
         run: cargo run -p werust-macos --example window_smoke
 
       - name: Measure the WKURLSchemeHandler origin behaviour and assert the recorded verdict

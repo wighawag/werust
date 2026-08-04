@@ -62,8 +62,15 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSCell",
   "NSColor",
   "NSControl",
+  # The shortcut layer's native input: `NSEvent`'s key codes, modifier flags and
+  # side-button numbers, translated by `src/input.rs` into the shared
+  # `werust_core::shortcuts` vocabulary. `NSGraphicsContext` comes with it
+  # because AppKit's synthetic-event constructors (which the window smoke uses to
+  # press a real Cmd+L on the macos-14 leg) take a now-unused context argument.
+  "NSEvent",
   "NSFont",
   "NSGraphics",
+  "NSGraphicsContext",
   "NSLayoutConstraint",
   "NSMenu",
   "NSMenuItem",

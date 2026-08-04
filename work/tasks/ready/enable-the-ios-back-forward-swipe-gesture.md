@@ -52,3 +52,13 @@ dorfl claim enable-the-ios-back-forward-swipe-gesture --arbiter origin
 git fetch origin && git switch -c work/enable-the-ios-back-forward-swipe-gesture origin/main
 git mv work/tasks/ready/enable-the-ios-back-forward-swipe-gesture.md work/tasks/done/enable-the-ios-back-forward-swipe-gesture.md
 ```
+
+## Requeue 2026-08-04
+
+Gate 2 BLOCKED the previous attempt with two findings. Your committed work on this branch is kept and is being CONTINUED: build on it, do not restart.
+
+FIX 1 (main-frame guard, correctness + security). The new decidePolicyFor hook in crates/werust-ios/App/Sources/WKWebViewShellController.swift (~:681-702) reports ANY .backForward navigation into the core, including SUBFRAME ones. On a back navigation to a page with iframes (or an iframe calling history.back()), WebKit issues a .backForward policy decision per child frame carrying that FRAME's url; the core then sees a non-adjacent target, takes the drift branch, truncates forward history and pushes the iframe url as the current entry. The URL bar then shows a subresource address the user is not on (attacker-controlled for a hostile iframe). Guard on navigationAction.targetFrame?.isMainFrame == true. The idiom is ALREADY used in this same file for the _blank case (~:650), so follow it. Pin the guard in back_forward_gesture_wiring_shape.rs.
+
+FIX 2 (acceptance criterion 3 is not met: the chrome DOES go stale after a swipe). on_history_navigated emits only LoadEvent::UrlChanged, and in BrowserShell the UrlChanged / Committed / Finished arms never reset chrome.last_error (only Started does). BrowserShell::go_back DOES clear last_error and invalid_entry explicitly. Repro: load a, navigate to b which FAILS (error banner shown), swipe back to a; the failed page's banner keeps showing over a page that loaded fine. Make a gesture-driven history move reach the same chrome state a button-driven one does. The existing test the_chrome_after_a_swipe_back_matches_the_chrome_after_a_button_back over-claims parity because it only exercises an ERROR-FREE history: extend it to cover the failed-load case so the parity claim is real.
+
+Constraints that still bind: do NOT weaken or edit crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain (rust-toolchain.toml is pinned). Keep user-facing chrome strings coming from the ONE core derivation. Conventional-commit subjects.

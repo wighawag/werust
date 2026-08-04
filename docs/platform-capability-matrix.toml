@@ -1491,7 +1491,7 @@ desktop = { state = "implemented" }
 # in-flight load). Decisions + what still awaits a Mac:
 # docs/spikes/reload-stop-collapse-and-spinner-on-the-macos-window/.
 macos = { state = "implemented" }
-windows = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-windows-chrome" }
+windows = { state = "implemented" }
 # iOS (task `ios-chrome-collapse-reload-stop-and-drop-history-buttons`): the
 # toolbar carries ONE `reloadStopButton` whose glyph is the carried
 # `reloadStopControlLabel`, whose accessible name (iOS has no hover) is

@@ -63,3 +63,25 @@ dorfl claim reload-stop-collapse-and-loading-spinner-core-and-gtk --arbiter orig
 git fetch origin && git switch -c work/reload-stop-collapse-and-loading-spinner-core-and-gtk origin/main
 git mv work/tasks/ready/reload-stop-collapse-and-loading-spinner-core-and-gtk.md work/tasks/done/reload-stop-collapse-and-loading-spinner-core-and-gtk.md
 ```
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, first attempt. Gate 1 and Gate 2 both green; reviewed the merged diff against each criterion.
+
+- Control mode derived in the toolkit-free core: `ReloadStopControl` + `reload_stop_control(state)` in `werust-core`. The GTK edge CALLS it, never recomputes it. MET.
+- Spinner derived from the same loading fact: `load_spinner_visible(state)`; the URL-bar progress bar is untouched. MET.
+- BOTH carriers export the new facts. `desktop-paint`: `reload_stop_control`, `reload_stop_label`, `reload_stop_description`, `spinner_visible`. chrome JSON: `reloadStopControl`, `reloadStopControlLabel`, `reloadStopControlDescription`, `loadSpinnerVisible`. MET.
+- The mobile presentation guard is NOT touched and NOT weakened: `crates/werust-core/tests/mobile_chrome_presentation_shape.rs` is absent from the diff entirely. MET (this was the explicit conductor watch-item).
+- Gate green with this task alone, mobile edges not yet updated. MET.
+- GTK painter shows ONE control plus the spinner, reading only derived values: single `reload_stop: Button` whose icon and tooltip come from `reload_stop_control(state)`, plus a `Spinner`. MET.
+- Back and forward buttons untouched: `back: Button` / `forward: Button` still driven by `can_go_back` / `can_go_forward`. MET.
+- Cancelling an in-flight load still works, including from the keyboard: the control's click handler resolves `reload_stop_control(...).action()` into the shared `ChromeAction` vocabulary and calls `perform_chrome_action`, the same path Escape-with-page-focus takes from `shortcut-resolution-in-core-and-the-gtk-edge`. MET.
+- Carriers assert agreement with the core (e.g. `assert_eq!(paint.reload_stop_control, reload_stop_control(state))`). MET.
+
+`rust-toolchain.toml` NOT touched. Conventional-commit subject.
+
+### Conductor note: the guard exposure this OPENS
+
+Four chrome JSON keys now cross to the Kotlin and Swift edges with NO guard coverage: `reloadStopControl`, `reloadStopControlLabel`, `reloadStopControlDescription`, `loadSpinnerVisible`. That is by design for this expand step, and it CLOSES only when `register-the-new-chrome-fields-in-the-mobile-presentation-guard` lands. Until then the guard silently under-protects the new fields.
+
+Six non-blocking Gate-2 nits are in `work/notes/observations/review-nits-reload-stop-collapse-and-loading-spinner-core-and-gtk-2026-08-04.md`. The agent also filed `mobile-guard-forbidden-literals-are-a-hand-picked-rule-list-2026-08-04.md`, which is load-bearing for the fan-in task; a forward-note has been planted there.

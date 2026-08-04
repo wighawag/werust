@@ -42,6 +42,32 @@ Until this lands, the new fields are the ONLY chrome facts crossing to mobile wi
 >
 > FIRST, check this task against current reality (it is a launch snapshot and may have DRIFTED): confirm the two fields exist in the chrome JSON with the names the earlier task gave them, that both mobile edges really read them, and that the guard still uses the hardcoded-list shape described here. If a sibling task already registered them, this task is done and should say so rather than duplicating.
 
+## FORWARD-POINTER (planted by the drive-tasks conductor, after the expand step landed)
+
+> Registering `FACT_FIELDS` / `DERIVED_FIELDS` is NOT the whole contract. The guard in
+> `crates/werust-core/tests/mobile_chrome_presentation_shape.rs` has a THIRD list that this
+> task's acceptance criteria do not currently name: `every_derived_string()`, the
+> forbidden-literal set a mobile edge must never hardcode.
+>
+> `every_derived_string()` is exhaustive over the ENUM AXES (`TrustPosture::ALL`,
+> `LoadStep::ALL`) but it names the RULES it drives BY HAND (`trust_indicator`,
+> `trust_indicator_detail`, `load_progress_hint`, `trust_pin_action_label`,
+> `invalid_entry_badge_text`). The new `ReloadStopControl::label()` /
+> `ReloadStopControl::description()` strings are NOT on that list, so today a Kotlin or
+> Swift edge could hardcode "⟳", "Reload this page" or "Stop loading this page" and the
+> guard would stay GREEN. That is exactly the twin-drift this guard exists to stop.
+>
+> So this task must ALSO add the new presentation rules to `every_derived_string()`, not
+> just the two field lists. Registering the fields while leaving the literal half unguarded
+> would close the fan-in only halfway.
+>
+> Full detail: `work/notes/observations/mobile-guard-forbidden-literals-are-a-hand-picked-rule-list-2026-08-04.md`.
+>
+> The four chrome JSON keys awaiting registration are `reloadStopControl`,
+> `reloadStopControlLabel`, `reloadStopControlDescription` and `loadSpinnerVisible`.
+> This task is the ONE place the guard may be edited; the sibling tasks are forbidden to touch it.
+
+
 ---
 
 ### Claiming this task

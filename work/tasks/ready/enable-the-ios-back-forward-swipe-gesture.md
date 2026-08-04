@@ -4,6 +4,7 @@ slug: enable-the-ios-back-forward-swipe-gesture
 spec: chrome-conventional-controls
 blockedBy: []
 covers: [13]
+needsAnswers: true
 ---
 
 ## What to build

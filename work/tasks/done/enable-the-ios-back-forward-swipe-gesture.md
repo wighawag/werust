@@ -62,3 +62,22 @@ FIX 1 (main-frame guard, correctness + security). The new decidePolicyFor hook i
 FIX 2 (acceptance criterion 3 is not met: the chrome DOES go stale after a swipe). on_history_navigated emits only LoadEvent::UrlChanged, and in BrowserShell the UrlChanged / Committed / Finished arms never reset chrome.last_error (only Started does). BrowserShell::go_back DOES clear last_error and invalid_entry explicitly. Repro: load a, navigate to b which FAILS (error banner shown), swipe back to a; the failed page's banner keeps showing over a page that loaded fine. Make a gesture-driven history move reach the same chrome state a button-driven one does. The existing test the_chrome_after_a_swipe_back_matches_the_chrome_after_a_button_back over-claims parity because it only exercises an ERROR-FREE history: extend it to cover the failed-load case so the parity claim is real.
 
 Constraints that still bind: do NOT weaken or edit crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain (rust-toolchain.toml is pinned). Keep user-facing chrome strings coming from the ONE core derivation. Conventional-commit subjects.
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, on the SECOND attempt. Gate 2 blocked the first attempt with two findings; both are fixed and pinned.
+
+- `allowsBackForwardNavigationGestures` enabled: `WKWebViewShellController.swift:276`. MET.
+- Assertion that it stays enabled, makeable by CI with no human at a Mac: `the_shell_enables_the_back_forward_swipe_gesture_on_its_webview` reads the Swift source. MET.
+- Gesture navigation reports through the SAME load-lifecycle path, chrome does not go stale: `go_back`/`go_forward` and the reported gesture move now share ONE `BrowserShell::enter_history_entry()`, which applies the per-entry chrome reset (`last_error`, `invalid_entry`). MET.
+- Tests network-isolated, repo test style. MET.
+
+Gate-2 block 1 (MAIN-FRAME guard) FIXED: `navigationAction.targetFrame?.isMainFrame == true` at `WKWebViewShellController.swift:700`, pinned by `only_a_main_frame_history_navigation_is_reported_as_the_page_the_user_is_on`, which asserts the guard's presence in the Swift source. Without it a hostile iframe's `.backForward` decision could push a subresource URL into the URL bar and truncate history.
+
+Gate-2 block 2 (stale error banner) FIXED: the parity test no longer over-claims. `the_chrome_after_a_swipe_back_off_a_failed_load_matches_the_button_back` covers the failed-load case, and `the_chrome_after_a_swipe_back_off_a_rejected_url_entry_matches_the_button_back` covers the orthogonal invalid-entry axis.
+
+Guard check: `crates/werust-core/tests/mobile_chrome_presentation_shape.rs` NOT touched. `rust-toolchain.toml` NOT touched.
+
+CI VERIFIED on main (the Linux gate never compiles Swift, so this is the real evidence): `mobile-ios` SUCCESS, plus `macos-renderer`, `windows-renderer` and `verify` all SUCCESS on commit `feat(enable-the-ios-back-forward-swipe-gesture)`.
+
+Six non-blocking Gate-2 nits are in `work/notes/observations/review-nits-enable-the-ios-back-forward-swipe-gesture-2026-08-04.md`, plus two new agent-filed observations (`ios-stop-does-not-stop-the-wkwebview`, `ios-webview-initiated-navigation-keeps-the-previous-postures`).

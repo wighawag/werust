@@ -157,3 +157,28 @@ What to change, documentation only (plus the optional binding below):
 4. RECOMMENDED and in scope now, because it is the honest mitigation for exactly this limit: also bind Cmd+[ to history back and Cmd+] to history forward for the Meta platform in the shared core table. Those two chords are the macOS browser convention and they do NOT collide with any text-editing binding, so they give a Mac user a history chord that is always safe, including inside a page text field. Add them in werust_core::shortcuts for PrimaryModifier::Meta ONLY, with table tests covering both focus states, and wire the macOS edge to translate them. If this turns out not to be clean, leave it out and say so explicitly in DECISIONS.md rather than half-doing it.
 
 HARD CONSTRAINTS, unchanged: do NOT edit or weaken crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain. The edge translates and performs; it never decides what a chord means. Keep the resolution CAPABILITY-AGNOSTIC. Do not regress the Ctrl platforms: Alt+Arrow must still resolve to history in BOTH focus states, and the four-case table test must still pass. Conventional-commit subjects.
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE ON THE CODE, on the FOURTH attempt, but it leaves `main` with a RED `macos-renderer` leg (one check), tasked as `macos-smoke-blur-url-bar-does-not-end-the-field-editor`.
+
+History of this item, because it is the one that fought back:
+1. Gate 2 blocked: `Cmd+Left`/`Cmd+Right` claimed unconditionally, stealing macOS's move-to-line-start/end binding from the URL bar. The reviewer correctly said the fix belonged in the core this task may not fork, so it needed a decision.
+2. The kept branch was then STRANDED by a rebase conflict against latest `main`; `requeue --reconcile` could not auto-resolve it. Resolved by hand ON the branch (both conflicts were additive-registry collisions with the Windows edge task: the capability matrix now reads `macos = implemented` AND `windows = implemented`, each task having flipped only its own cell), verified `fmt` + `clippy` + the conflicted test, and force-pushed. 2,026 lines of macOS work preserved rather than `--reset`.
+3. Gate 2 blocked again, narrower: the fix covered only the URL bar, while the RECORDS claimed it also covered page text fields.
+4. Approved.
+
+The design decision (made by the conductor, implemented by the agent):
+
+History chords are focus-sensitive ONLY on platforms where the history chord collides with text editing, expressed once as `PrimaryModifier::history_chord_is_a_text_editing_binding` (`Control => false`, `Meta => true`). Gating on `Focus::Page` unconditionally would have been shorter and would have REGRESSED GTK and Windows, where `Alt+Arrow` is nobody's text binding and navigating from the URL bar is correct browser behaviour.
+
+Verified on the diff:
+- The four-case table is pinned exactly: MAC + Cmd+Left + Page -> GoBack; MAC + Cmd+Left + UrlBar -> None (the new guarantee); CTRL + Alt+Left + Page -> GoBack; CTRL + Alt+Left + UrlBar -> **GoBack, unchanged** (the no-regression case), plus both directions and cross-platform negatives. MET.
+- The recommended mitigation was implemented: `Cmd+[` / `Cmd+]` via `PrimaryModifier::history_is_also_spelled_with_brackets`, Meta-only. These collide with no text binding, so a Mac user always has a history chord that works even inside a page text field.
+- The known limit is now recorded HONESTLY (decision 8): `Focus` is two-valued, a host cannot see what a WKWebView has focused, and werust gives the chrome first look at every event rather than letting the page consume first. It correctly notes that fixing this properly is a whole-product event-order decision belonging in its own spec, not a macOS detail.
+- The edge decides no chord: translation lives in `crates/werust-macos/src/input.rs`, deliberately not target-gated so the Cmd branch is unit-tested on the Ubuntu gate.
+- Guard file and `rust-toolchain.toml` NOT touched.
+
+CI: `macos-renderer` FAILS on exactly one check, "Escape with the PAGE focused stops the load instead of reverting the bar". Diagnosed as a SMOKE-HARNESS defect, not a product defect: `blur_url_bar` only calls `makeFirstResponder(None)` and discards the result, which does not reliably tear down the field editor that `shortcut_focus` checks first, so the harness cannot reach the page-focused state it is trying to test. Tasked separately; the check must be fixed, never weakened.
+
+Four non-blocking Gate-2 nits: `work/notes/observations/review-nits-shortcuts-and-mouse-history-buttons-on-the-macos-edge-2026-08-04.md`.

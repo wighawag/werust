@@ -1289,7 +1289,7 @@ android = { state = "implemented" }
 
 [[capability]]
 name = "conventional-shortcuts"
-description = "The keyboard shortcuts every browser has, plus the mouse's back/forward side buttons: focus-and-select the URL bar, reload, history back/forward, stop, and the web inspector, with Escape FOCUS-dependent (stop the load with the page focused, revert the edit and restore the current URL with the URL bar focused) and the platform's own accelerator (Ctrl on Linux/Windows, Cmd on macOS)."
+description = "The keyboard shortcuts every browser has, plus the mouse's back/forward side buttons: focus-and-select the URL bar, reload, history back/forward, stop, and the web inspector, with Escape FOCUS-dependent (stop the load with the page focused, revert the edit and restore the current URL with the URL bar focused) and the platform's own accelerator (Ctrl on Linux/Windows, Cmd on macOS, where the history chord is additionally focus-sensitive because Cmd+Arrow is macOS's own caret binding and Cmd+[ / Cmd+] are bound beside it)."
 # The MEANING of every chord and side button is ONE toolkit-free resolution in
 # `werust_core::shortcuts` (`resolve_chord` / `resolve_pointer_button`), pinned by
 # a display-free table test that drives BOTH accelerator conventions, so each edge
@@ -1337,6 +1337,15 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # (`PrimaryModifier::history_chord_is_a_text_editing_binding`), not an edge
 # branch, and Alt+Arrow on desktop/Windows is unaffected: it is nobody's text
 # binding, so it still navigates from the URL bar there.
+# KNOWN, ACCEPTED LIMIT of that yielding: it protects the URL BAR's field editor
+# only. A text field INSIDE the page still loses Cmd+Arrow to history, because the
+# chrome decides synchronously in `sendEvent:` and the WKWebView is opaque to its
+# host at that point (DECISIONS.md decision 8). The mitigation is the Mac's other
+# history spelling, also bound here for the Meta convention ONLY: Cmd+[ / Cmd+]
+# navigate back/forward in EITHER focus, because no text field claims them
+# (`PrimaryModifier::history_is_also_spelled_with_brackets`, decision 9);
+# desktop/Windows are unchanged, since Ctrl+[ is those platforms' ESC and no
+# browser there binds it to history.
 # Guarded source-shape-wise by crates/werust-macos/tests/macos_shortcut_shape.rs;
 # decisions at
 # docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md.

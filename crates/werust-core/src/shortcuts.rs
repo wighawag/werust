@@ -41,7 +41,12 @@
 //! Alt+Arrow (nobody's text binding) keeps navigating from the URL bar. That is
 //! one platform FACT, stated once here as
 //! `PrimaryModifier::history_chord_is_a_text_editing_binding`, rather than a
-//! Mac-shaped exception each edge would have to re-derive.
+//! Mac-shaped exception each edge would have to re-derive. Because that yielding
+//! reaches only the chrome's OWN text field (a host cannot see what a web view
+//! has focused), the Mac convention also binds the history spelling that never
+//! has to yield, Cmd+`[` / Cmd+`]`
+//! (`PrimaryModifier::history_is_also_spelled_with_brackets`), which is what a
+//! user typing inside a PAGE can still press.
 //!
 //! # Capability-agnostic, deliberately
 //!
@@ -238,6 +243,29 @@ impl PrimaryModifier {
             PrimaryModifier::Meta => true,
         }
     }
+
+    /// Whether this platform ALSO spells history as the primary modifier plus
+    /// the square brackets (`⌘[` / `⌘]`).
+    ///
+    /// The last axis of the same platform split, and the honest MITIGATION for
+    /// the one above: because Cmd+Arrow must yield to text being edited, a Mac
+    /// user needs a history chord that never has to yield, and Safari, Chrome
+    /// and Firefox all give them the same one. `⌘[` / `⌘]` are nobody's
+    /// text-editing binding, so they resolve in EITHER focus, which is what
+    /// still reaches history from inside a PAGE's own text field, where
+    /// [`Focus`] cannot see (decision 9 in
+    /// `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md`).
+    ///
+    /// Meta only, deliberately: `Ctrl+[` is the Ctrl platforms' ESC (`^[`), and
+    /// no Linux or Windows browser binds it to history, so claiming it there
+    /// would be inventing a shortcut instead of following a convention.
+    #[must_use]
+    const fn history_is_also_spelled_with_brackets(self) -> bool {
+        match self {
+            PrimaryModifier::Control => false,
+            PrimaryModifier::Meta => true,
+        }
+    }
 }
 
 /// Where the keyboard focus is when the key is pressed: an INPUT to the
@@ -379,6 +407,8 @@ const _CHROME_ACTION_ALL_IS_EVERY_ACTION_IN_SLOT_ORDER: () = {
 /// | Ctrl+R / Cmd+R, or F5 | any | [`Reload`](ChromeAction::Reload) |
 /// | Alt+Left / Cmd+Left | any / page only | [`GoBack`](ChromeAction::GoBack) |
 /// | Alt+Right / Cmd+Right | any / page only | [`GoForward`](ChromeAction::GoForward) |
+/// | (Mac only) Cmd+`[` | any | [`GoBack`](ChromeAction::GoBack) |
+/// | (Mac only) Cmd+`]` | any | [`GoForward`](ChromeAction::GoForward) |
 /// | Escape | page | [`Stop`](ChromeAction::Stop) |
 /// | Escape | URL bar | [`RevertUrlBar`](ChromeAction::RevertUrlBar) |
 /// | F12 | any | [`OpenWebInspector`](ChromeAction::OpenWebInspector) |
@@ -390,7 +420,10 @@ const _CHROME_ACTION_ALL_IS_EVERY_ACTION_IN_SLOT_ORDER: () = {
 /// page text field) is being typed in would eat the caret move a Mac user
 /// expects, which no Mac browser does. Alt+Arrow is nobody's text binding, so it
 /// still navigates from the URL bar on Linux and Windows, as those platforms'
-/// browsers do.
+/// browsers do. The Mac's OTHER pair of history chords, `⌘[` / `⌘]`, exists for
+/// exactly that reason and is unconditional: no text field claims them, so they
+/// are the spelling that always reaches history (`PrimaryModifier`'s
+/// `history_is_also_spelled_with_brackets`).
 ///
 /// A [`None`] must be PASSED ON by the edge (the page and the URL bar keep every
 /// key werust does not claim), which is also what leaves GTK4's interactive
@@ -405,6 +438,8 @@ pub fn resolve_chord(chord: Chord, focus: Focus, primary: PrimaryModifier) -> Op
     // user is editing (Cmd+Arrow on a Mac); see the table above.
     let history_wins = modifiers.is_exactly(primary.history())
         && (matches!(focus, Focus::Page) || !primary.history_chord_is_a_text_editing_binding());
+    // …and the bracket pair, which no text field claims, therefore never has to.
+    let bracket_history = primary_only && primary.history_is_also_spelled_with_brackets();
 
     match chord.key {
         Key::Character(c) if primary_only && c.eq_ignore_ascii_case(&'l') => {
@@ -416,6 +451,8 @@ pub fn resolve_chord(chord: Chord, focus: Focus, primary: PrimaryModifier) -> Op
         Key::F5 if unmodified => Some(ChromeAction::Reload),
         Key::ArrowLeft if history_wins => Some(ChromeAction::GoBack),
         Key::ArrowRight if history_wins => Some(ChromeAction::GoForward),
+        Key::Character('[') if bracket_history => Some(ChromeAction::GoBack),
+        Key::Character(']') if bracket_history => Some(ChromeAction::GoForward),
         // The FOCUS-dependent one, and the reason focus is in this signature at
         // all: abandon a hanging page from the keyboard (story 5), or undo what
         // you were typing in the bar and get the current URL back (story 6).
@@ -704,6 +741,89 @@ mod tests {
                 Chord::new(Key::ArrowLeft, META),
                 Focus::Page,
                 CTRL_PLATFORM,
+                None,
+            ),
+        ];
+        for (chord, focus, primary, expected) in table {
+            assert_eq!(
+                resolve_chord(chord, focus, primary),
+                expected,
+                "{chord:?} with {focus:?} focused on {primary:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_mac_spells_history_a_second_way_that_no_text_field_ever_claims() {
+        // The honest MITIGATION for the limit above: Cmd+Arrow has to yield to
+        // the caret while the user is typing, and this edge cannot see INSIDE a
+        // page's own text fields at all (`Focus` is two-valued and a web view is
+        // opaque to its host), so on the Mac convention werust also binds the
+        // OTHER pair of chords every Mac browser has -- Cmd+[ and Cmd+] -- which
+        // are nobody's text-editing binding and therefore navigate history in
+        // EITHER focus, including inside a page text field.
+        //
+        // Meta-only, deliberately: Ctrl+[ is the Ctrl platforms' Escape
+        // (`^[` is ESC on a terminal) and no Linux/Windows browser binds it, so
+        // claiming it there would be inventing a shortcut rather than following a
+        // convention.
+        let table = [
+            (
+                Chord::new(Key::Character('['), META),
+                Focus::Page,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoBack),
+            ),
+            (
+                Chord::new(Key::Character('['), META),
+                Focus::UrlBar,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoBack),
+            ),
+            (
+                Chord::new(Key::Character(']'), META),
+                Focus::Page,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoForward),
+            ),
+            (
+                Chord::new(Key::Character(']'), META),
+                Focus::UrlBar,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoForward),
+            ),
+            // Not a Ctrl-platform chord, in either focus.
+            (
+                Chord::new(Key::Character('['), CONTROL),
+                Focus::Page,
+                CTRL_PLATFORM,
+                None,
+            ),
+            (
+                Chord::new(Key::Character(']'), CONTROL),
+                Focus::UrlBar,
+                CTRL_PLATFORM,
+                None,
+            ),
+            // …and matching stays EXACT, so Safari's own Cmd+Shift+[ (switch
+            // tab) and ordinary bracket typing are left alone.
+            (
+                Chord::new(
+                    Key::Character('['),
+                    Modifiers {
+                        meta: true,
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+                Focus::Page,
+                MAC_PLATFORM,
+                None,
+            ),
+            (
+                Chord::new(Key::Character('['), Modifiers::NONE),
+                Focus::UrlBar,
+                MAC_PLATFORM,
                 None,
             ),
         ];

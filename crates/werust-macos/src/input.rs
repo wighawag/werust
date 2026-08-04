@@ -364,6 +364,64 @@ mod tests {
     }
 
     #[test]
+    fn the_bracket_history_chords_reach_history_from_either_focus() {
+        // The Mac's OTHER history chords, and the honest mitigation for the
+        // limit above: Cmd+Left has to yield to text being edited, and this edge
+        // cannot see a text field INSIDE the page at all (`shortcut_focus`
+        // answers `Page` for the whole `WKWebView`, which is opaque to its host
+        // at `sendEvent:` time), so a Mac user needs a history chord that never
+        // yields. Cmd+[ / Cmd+] are that chord in every Mac browser, and no text
+        // field claims them, so they resolve in BOTH focus contexts.
+        //
+        // They need no new translation: a bracket is a CHARACTER key, so it
+        // arrives through the same `charactersIgnoringModifiers` path a letter
+        // does (and inherits the same layout limit). What is asserted here is
+        // that this edge's real translation reaches the core's bracket rows.
+        const KEY_CODE_LEFT_BRACKET: u16 = 0x21;
+        const KEY_CODE_RIGHT_BRACKET: u16 = 0x1E;
+        for (key_code, characters, expected, what) in [
+            (
+                KEY_CODE_LEFT_BRACKET,
+                Some("["),
+                ChromeAction::GoBack,
+                "Cmd+[",
+            ),
+            (
+                KEY_CODE_RIGHT_BRACKET,
+                Some("]"),
+                ChromeAction::GoForward,
+                "Cmd+]",
+            ),
+        ] {
+            for focus in [Focus::Page, Focus::UrlBar] {
+                assert_eq!(
+                    mac_action(key_code, characters, MODIFIER_FLAG_COMMAND, focus),
+                    Some(expected),
+                    "{what} navigates history with {focus:?} focused: no text field claims it"
+                );
+            }
+            // Not the Ctrl platforms' chord (Ctrl+[ is their ESC), and Safari's
+            // own Cmd+Shift+[ tab switch is left alone by the EXACT match.
+            let ctrl = chord(key_code, characters, MODIFIER_FLAG_CONTROL).expect("a chord");
+            assert_eq!(
+                shortcuts::resolve_chord(ctrl, Focus::Page, shortcuts::PrimaryModifier::Control),
+                None,
+                "{what} is a MAC convention only"
+            );
+            assert_eq!(
+                mac_action(
+                    key_code,
+                    characters,
+                    MODIFIER_FLAG_COMMAND | MODIFIER_FLAG_SHIFT,
+                    Focus::Page
+                ),
+                None,
+                "Shift+{what} is not {what}"
+            );
+        }
+    }
+
+    #[test]
     fn the_platform_convention_is_the_cores_call_and_this_edge_adds_nothing() {
         // The edge must not restate "a Mac is the Cmd platform", and must not
         // wrap the resolution in a decision of its own: `action` is EXACTLY the

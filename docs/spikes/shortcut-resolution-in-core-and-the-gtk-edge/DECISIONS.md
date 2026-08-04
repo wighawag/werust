@@ -39,6 +39,8 @@ Task `shortcut-resolution-in-core-and-the-gtk-edge`, spec `chrome-conventional-c
 
 **Not adopted:** Cmd+`[` / Cmd+`]` as a second Mac history chord. It is real muscle memory, but no story asks for it and it needs bracket keys in the vocabulary; the macOS edge task can add one row here if it wants it, which is the point of the table being shared.
 
+> **AMENDED by `shortcuts-and-mouse-history-buttons-on-the-macos-edge`:** it did add them, for the Meta convention only, and not for the muscle memory: Cmd+Arrow had to become focus-sensitive there (it is macOS's own caret binding), and Cmd+`[` / Cmd+`]` are the history spelling that never has to yield. No key vocabulary was needed after all, since `Key::Character` already spells a bracket. Decisions 8 and 9 in `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md`; the Ctrl platforms resolve exactly as this decision left them.
+
 **Touches:** the macOS and Windows edge tasks.
 
 ## 4. Focus is an INPUT with exactly two values

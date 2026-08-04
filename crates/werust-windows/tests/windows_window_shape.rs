@@ -70,6 +70,18 @@
 //! (`the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive`,
 //! `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`).
 //!
+//! AMENDMENT (task `windows-smoke-mouse-back-check-runs-after-a-failed-load`,
+//! 2026-08-04): the mouse-back check above turned the whole leg RED on `main`,
+//! not because the edge was wrong but because the smoke asked for history it had
+//! never created -- it ran straight after the TAMPERED load, which fails CLOSED
+//! (no response is set, built-in error pages are off), so WebView2 commits no
+//! document and therefore adds no back entry, and the reloads before it replace
+//! the current entry rather than adding one. A SEQUENCE is invisible to the
+//! compiler and to every Linux unit test, and the Windows leg can only report
+//! FAIL after the fact, so the section's precondition -- that it establishes its
+//! own two verified entries, and bounds the wait on the failure path -- is pinned
+//! here (`the_mouse_back_check_establishes_the_history_it_asks_for`).
+//!
 //! AMENDMENT (task `windows-gui-subsystem-no-console-window`, 2026-07-31): the
 //! first run on REAL hardware found the binary linking as a CONSOLE-subsystem
 //! app, so Windows opened a console window beside the browser
@@ -1500,5 +1512,60 @@ fn the_shortcut_paths_are_exercised_on_the_windows_leg() {
     assert!(
         exists("docs/spikes/shortcuts-and-mouse-history-buttons-on-the-windows-edge/DECISIONS.md"),
         "the judgement calls this task made must be recorded beside it"
+    );
+}
+
+#[test]
+fn the_mouse_back_check_establishes_the_history_it_asks_for() {
+    // The amendment above. A back check is only evidence if there is somewhere to
+    // go back TO, and the two ways this smoke can reach the section with an empty
+    // session list are both silent: a FAILED load (the tampered control) commits
+    // nothing, and a RELOAD (the F5 checks) replaces the current entry. So the
+    // section must create its OWN two verified entries, whatever precedes it,
+    // rather than inheriting a history from the checks above.
+    let smoke = source("crates/werust-windows/examples/window_smoke.rs");
+    let section = between(&smoke, "the mouse's back side button", "// The COLLAPSE");
+    assert!(
+        section.matches("load_and_settle(").count() >= 2,
+        "the section must perform TWO successful loads of its own before it asks whether \
+         there is history: {section:?}"
+    );
+    assert!(
+        section.contains("second_cid") && section.contains("honest_cid"),
+        "the two loads must be DIFFERENT pages, or `back` has nothing to move between \
+         and the URL bar cannot tell a move from a no-op: {section:?}"
+    );
+    // And the check itself is NOT weakened: the precondition is still asserted (a
+    // section that quietly tolerated `can_go_back == false` would go green while
+    // proving nothing), and the side button is still what drives the move.
+    assert!(
+        section.contains("chrome().can_go_back")
+            && section.contains("post_x_button(&window, werust_windows::shortcuts::XBUTTON1)"),
+        "the section must still assert the precondition and still drive the real button: \
+         {section:?}"
+    );
+    // The FAILURE path is BOUNDED. When the action correctly refuses (which is
+    // what a regression here looks like: the product declining a history move the
+    // Back button would decline too), the wait can only end by timing out, so the
+    // budget is what a regression COSTS in CI.
+    let waited = between(section, "post_x_button(", "\"mouse button 4");
+    let seconds: u32 = waited
+        .split("wait_until(&window, ")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .and_then(|seconds| seconds.trim().parse().ok())
+        .unwrap_or_else(|| {
+            panic!("the back wait must be a `wait_until(&window, <seconds>, …)`: {waited:?}")
+        });
+    assert!(
+        seconds <= 10,
+        "a back navigation to an already-fetched, in-memory page lands in well under a \
+         second, so a {seconds}-second budget only buys a SLOW failure"
+    );
+    // The confirmed diagnosis and the judgement calls are recorded at the task's
+    // stable spike path, beside the sibling edges' own.
+    assert!(
+        exists("docs/spikes/windows-smoke-mouse-back-check-runs-after-a-failed-load/README.md"),
+        "the diagnosis this fix rests on must be written down where the next reader looks"
     );
 }

@@ -74,23 +74,33 @@ mod windows_smoke {
 </body></html>
 "#;
 
-    /// A pinned, in-memory `ContentRetriever`: the fixture is served from RAM and
-    /// still goes through the production per-block verify, so the run is offline
-    /// and a tampered CID genuinely fails.
+    /// A SECOND canned page, so the history checks have two DISTINCT verified
+    /// entries to move between. Different bytes mean a different CID, therefore a
+    /// different URL in the bar -- which is how "the window really went back" is
+    /// told apart from "the window never moved".
+    const SECOND_PAGE: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>werust windows window smoke, page two</title></head>
+<body><p>werust Windows window smoke, page two</p>
+</body></html>
+"#;
+
+    /// A pinned, in-memory `ContentRetriever`: every fixture is served from RAM
+    /// and still goes through the production per-block verify, so the run is
+    /// offline and a tampered CID genuinely fails.
+    ///
+    /// The blocks are a LIST rather than one field per page because the smoke now
+    /// pins three of them (two honest pages and the negative control) and the
+    /// per-page `else if` chain that shape produces is the same code four times.
     struct PinnedRetriever {
-        honest_cid: String,
-        honest: Vec<u8>,
-        tampered_cid: String,
-        tampered: Vec<u8>,
+        /// `(cid, bytes)`. The honest pages really hash to the CID they are filed
+        /// under; the negative control deliberately does NOT, and the production
+        /// verify below is what catches it.
+        blocks: Vec<(String, Vec<u8>)>,
     }
 
     impl ContentRetriever for PinnedRetriever {
         fn retrieve(&self, cid: &str, _path: &str) -> Result<RetrievedContent, RetrieveError> {
-            let bytes = if cid == self.honest_cid {
-                &self.honest
-            } else if cid == self.tampered_cid {
-                &self.tampered
-            } else {
+            let Some((_, bytes)) = self.blocks.iter().find(|(pinned, _)| pinned == cid) else {
                 return Err(RetrieveError::MissingBlock {
                     cid: cid.to_string(),
                 });
@@ -154,6 +164,36 @@ mod windows_smoke {
             }
         }
         false
+    }
+
+    /// The window has SETTLED ON the page named by `cid`: the load finished AND
+    /// the URL bar really carries that CID.
+    ///
+    /// Both halves are needed. A settled PREVIOUS load leaves `load_state` at
+    /// `Finished`, so a wait on the state alone returns instantly and reports the
+    /// page before this one as this one -- which is exactly how a load that never
+    /// happened passes for a load that did.
+    ///
+    /// The paint is ASKED for, for the same reason
+    /// [`watch_a_load_and_cancel_it`] asks for it: a pump tick only repaints when
+    /// the seam had something to say, and this reads the WIDGET.
+    fn settled_on(window: &BrowserWindow, shell: &Rc<RefCell<BrowserShell>>, cid: &str) -> bool {
+        window.refresh_chrome();
+        shell.borrow().chrome().load_state == LoadState::Finished && window.url_text().contains(cid)
+    }
+
+    /// Navigate to `url` and wait until the window has really settled on it.
+    fn load_and_settle(
+        window: &BrowserWindow,
+        shell: &Rc<RefCell<BrowserShell>>,
+        url: &str,
+        cid: &str,
+        seconds: u32,
+    ) -> bool {
+        if shell.borrow_mut().navigate(url).is_err() {
+            return false;
+        }
+        wait_until(window, seconds, || settled_on(window, shell, cid))
     }
 
     /// What the toolbar's ONE reload/stop control and the spinner beside it did
@@ -241,11 +281,19 @@ mod windows_smoke {
         // must FAIL and the window must say so.
         let claimed = b"the page this cid actually names".to_vec();
         let tampered_cid = cid_v1_raw_sha256(&claimed).expect("derive the control cid");
+        // A SECOND verified page, for the history checks: a back navigation needs
+        // somewhere to come FROM and somewhere to land.
+        let second = SECOND_PAGE.as_bytes().to_vec();
+        let second_cid = cid_v1_raw_sha256(&second).expect("derive the second fixture cid");
         let retriever = Arc::new(PinnedRetriever {
-            honest_cid: honest_cid.clone(),
-            honest,
-            tampered_cid: tampered_cid.clone(),
-            tampered: b"tampered bytes that do not hash to the cid".to_vec(),
+            blocks: vec![
+                (honest_cid.clone(), honest),
+                (second_cid.clone(), second),
+                (
+                    tampered_cid.clone(),
+                    b"tampered bytes that do not hash to the cid".to_vec(),
+                ),
+            ],
         });
 
         // The SHELL's durable profile, not the engine's `%TEMP%` default: the
@@ -595,10 +643,32 @@ mod windows_smoke {
 
         // The mouse's side buttons, over this window's own chrome: the SAME
         // resolution and the SAME performer the keyboard uses, gated on the SAME
-        // capability flag the Back button's enabled state reads. There are two
-        // history entries by now (the verified page, then the control), so this
-        // one really navigates.
+        // capability flag the Back button's enabled state reads.
+        //
+        // The section ESTABLISHES ITS OWN HISTORY here and inherits none, because
+        // neither of the things that ran before it leaves an entry behind: the
+        // tampered load FAILS, and the scheme route fails CLOSED with WebView2's
+        // built-in error pages off, so no document commits and no back entry
+        // appears; the F5 checks RELOAD, which replaces the current entry rather
+        // than adding one. Reading `can_go_back` after them (as this section once
+        // did) asks about a session list that only ever held ONE entry, so the
+        // precondition was false and the check below could never run.
         println!("the mouse's back side button (XBUTTON1), through the real window proc:");
+        // The page BEHIND (loaded first, the one Back must land on) and the page
+        // in FRONT of it. In THIS order deliberately: the window is still showing
+        // the verified page from the checks above, so loading the OTHER fixture
+        // first makes both of these genuine cross-URL navigations, rather than
+        // opening with a repeat of the URL already committed -- which the engine
+        // is entitled to treat as a reload and REPLACE, adding no entry.
+        let behind = format!("ipfs://{second_cid}/");
+        let in_front = format!("ipfs://{honest_cid}/");
+        let two_loads = load_and_settle(&window, &shell, &behind, &second_cid, 30)
+            && load_and_settle(&window, &shell, &in_front, &honest_cid, 30);
+        check(
+            &mut failures,
+            two_loads,
+            "two verified pages load in order, so this window has real history",
+        );
         let can_go_back = shell.borrow().chrome().can_go_back;
         check(
             &mut failures,
@@ -606,10 +676,11 @@ mod windows_smoke {
             "there is history to go back to after two loads",
         );
         post_x_button(&window, werust_windows::shortcuts::XBUTTON1);
-        let went_back = wait_until(&window, 30, || {
-            window.url_text().contains(&honest_cid)
-                && shell.borrow().chrome().load_state == LoadState::Finished
-        });
+        // BOUNDED, and deliberately short: the page behind is already fetched and
+        // is served from memory, so a real back navigation lands in well under a
+        // second. This wait can only END by timing out when the move correctly
+        // does not happen, so its budget is what a REGRESSION here costs CI.
+        let went_back = wait_until(&window, 10, || settled_on(&window, &shell, &second_cid));
         check(
             &mut failures,
             went_back,

@@ -79,3 +79,21 @@ dorfl claim reload-stop-collapse-and-spinner-on-the-windows-chrome --arbiter ori
 git fetch origin && git switch -c work/reload-stop-collapse-and-spinner-on-the-windows-chrome origin/main
 git mv work/tasks/ready/reload-stop-collapse-and-spinner-on-the-windows-chrome.md work/tasks/done/reload-stop-collapse-and-spinner-on-the-windows-chrome.md
 ```
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, first attempt.
+
+- ONE control replacing the separate Reload/Stop pair, plus the spinner. MET, and verified on REAL Windows: the live Win32 smoke reports "the ONE reload/stop control sits on the seam's toolbar row", "the one control becomes STOP while a load is in flight" and "the spinner shows while a load is in flight".
+- Mode and spinner visibility READ from the painted snapshot, computed in neither: pinned by `the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive` and `the_control_mode_and_the_spinner_are_derived_once_and_carried_by_both_carriers`, both green on the Windows runner.
+- Cancelling an in-flight load still possible from the toolbar and the keyboard: `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`. MET.
+- Back and forward controls untouched. MET.
+- The URL-bar progress bar is unchanged: `the_spinner_never_changes_what_the_url_bar_progress_bar_does`. MET.
+
+Guard file and `rust-toolchain.toml` NOT touched.
+
+CI on the merge commit: `windows-renderer` FAILS on EXACTLY the two pre-existing checks inherited from `shortcuts-and-mouse-history-buttons-on-the-windows-edge` ("there is history to go back to after two loads", "mouse button 4 navigates history back through the shell"), and on NOTHING else. That was the baseline stated in the conductor's forward-note, so this task introduced no regression; every check it added passes. The task chose the allowed option of leaving the mis-sequenced mouse section alone rather than fixing it.
+
+`main` therefore still carries a RED `windows-renderer` leg, owned by the earlier task and diagnosed in `work/notes/observations/windows-smoke-mouse-back-check-is-sequenced-after-a-failed-load-2026-08-04.md`. It is NOT attributable to this task.
+
+Six non-blocking Gate-2 nits: `work/notes/observations/review-nits-reload-stop-collapse-and-spinner-on-the-windows-chrome-2026-08-04.md`.

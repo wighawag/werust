@@ -64,6 +64,15 @@
 //!     from every other leg — with the application MANIFEST (comctl32 v6 +
 //!     per-monitor-v2 DPI awareness) embedded by the MSVC linker at build time,
 //!     and no second version source anywhere.
+//! 12. The published release BODY is the conventional-commit changelog
+//!     `.goreleaser.yaml` prepares, not GitHub's auto-notes: the four artifact
+//!     legs create the Release with an EMPTY placeholder body (never
+//!     `--generate-notes`, whose winner of the create race used to own the
+//!     body), GoReleaser `release.mode: replace`s it, a re-run replaces its own
+//!     first attempt's assets instead of failing 422, and the changelog's
+//!     exclude filters are SCOPE-AWARE and drop the runner's bookkeeping
+//!     commits (task
+//!     `release-notes-lose-the-conventional-commit-changelog-to-a-race`).
 //!
 //! The whole test is NETWORK-ISOLATED: it only parses files in this repo (it
 //! never runs Gradle, never reads a secret's value, and performs no I/O beyond
@@ -2553,4 +2562,412 @@ fn the_windows_artifact_check_is_executable() {
         mode & 0o111 != 0,
         "{WINDOWS_ARTIFACT_CHECK} must be executable (the release workflow runs it by path)"
     );
+}
+
+// --- Criterion 12: the published BODY is the conventional-commit changelog ----
+//
+// Task `release-notes-lose-the-conventional-commit-changelog-to-a-race`;
+// decisions, the alternatives weighed, and the next-real-tag confirmation
+// checklist live in
+// `docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/README.md`.
+//
+// TWO DEFECTS, both of which made a release page LIE about what shipped, and
+// NEITHER of which the `workflow_dispatch` dry run can see (GoReleaser's
+// `--snapshot` never touches the forge, so no release body is ever written on
+// that path; see the spike README's "What the dry run cannot prove"):
+//
+//   1. A RACE for who CREATES the Release. Every artifact leg is deliberately
+//      decoupled (`needs: verify`), so each one guarantees the Release exists
+//      before uploading into it. That create used to pass `--generate-notes`,
+//      so whichever leg won the race filled the body with GITHUB's auto-notes,
+//      and GoReleaser (which by default `keep-existing`s a non-empty body)
+//      attached its artifacts and threw away the changelog it had prepared.
+//      `v0.3.1` shipped a body that was one compare link; `v0.3.0`, a release
+//      that added two desktop platforms, shipped a body naming one PR.
+//   2. SCOPE-BLIND exclude filters. The changelog GROUPS were scope-aware
+//      (`feat(\(.+\))??!?:`) but the excludes were bare `^chore:` / `^ci:` /
+//      `^test:` / `^docs:`, and this repo scopes nearly every housekeeping
+//      commit, so over `v0.3.2..main` they matched 0, 0, 0 and 1 of 22
+//      respectively, and `v0.3.2` published an `### Others` section full of the
+//      exact commits the filters existed to delete.
+//
+// The assertions below are deliberately SEMANTIC where they can be: rather than
+// eyeballing the patterns, `ChangelogRules` COMPILES the ones in the config and
+// APPLIES them to real commit subjects, because "the filter looks right" is
+// precisely the mistake that shipped defect 2.
+
+/// The four artifact legs that may have to CREATE the Release they upload into.
+///
+/// They are decoupled from the desktop leg on purpose (`needs: verify`), which
+/// is what makes any of them a potential creator, so the body they create with
+/// is a property of ALL FOUR, never of whichever one happens to be quickest.
+const ARTIFACT_LEGS: [&str; 4] = ["android-apk", "ios-simulator-app", MACOS_LEG, WINDOWS_LEG];
+
+/// The one `gh release create` command line inside a leg.
+fn release_create_command(leg: &str) -> String {
+    let j = job(leg);
+    let found: Vec<String> = strings_of(&j)
+        .into_iter()
+        .filter(|s| s.contains("gh release create"))
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "the `{leg}` leg must carry exactly ONE `gh release create` (the Release-EXISTENCE \
+         guarantee); found {}",
+        found.len()
+    );
+    found.into_iter().next().expect("one create command")
+}
+
+#[test]
+fn the_artifact_legs_create_an_empty_bodied_release_never_githubs_auto_notes() {
+    // The fix for defect 1, and the reason it is asserted on all four legs at
+    // once: the race has no fixed winner, so ONE leg still passing
+    // `--generate-notes` is enough to lose the changelog again, in a way only a
+    // real tag would reveal.
+    for leg in ARTIFACT_LEGS {
+        let create = release_create_command(leg);
+        assert!(
+            !create.contains("--generate-notes"),
+            "the `{leg}` leg must NOT create the Release with `--generate-notes`: whichever leg \
+             wins the race would fill the body with GitHub's auto-notes, and GoReleaser would \
+             then attach its artifacts to a Release whose body is not the conventional-commit \
+             changelog. Create it EMPTY and let GoReleaser write the body.\n{create}"
+        );
+        assert!(
+            !create.contains("--notes-from-tag") && !create.contains("--notes-file"),
+            "the `{leg}` leg must not source a body from anywhere else either: the body belongs \
+             to GoReleaser (`release.mode: replace`).\n{create}"
+        );
+        assert!(
+            create.contains("--notes \"\"") || create.contains("--notes ''"),
+            "the `{leg}` leg must create the Release with an EXPLICIT empty body (`--notes \"\"`): \
+             `gh release create` needs a body flag to run non-interactively, and an empty one is \
+             the placeholder GoReleaser then fills.\n{create}"
+        );
+        // The create must stay idempotent + non-fatal: it is an existence
+        // guarantee, and three of the four legs will lose the race.
+        assert!(
+            create.contains("|| true"),
+            "the `{leg}` leg's create must stay non-fatal (`|| true`): three of the four legs \
+             lose the race, and losing it is the normal case, not a failure.\n{create}"
+        );
+    }
+}
+
+#[test]
+fn goreleaser_writes_the_body_of_a_release_a_leg_already_created() {
+    // The OTHER half of the fix, and the half that is easy to leave out: an
+    // empty placeholder body is only enough by accident. GoReleaser's default
+    // `mode: keep-existing` returns the EXISTING body whenever it is non-empty
+    // (`internal/client/release_notes.go`), so the changelog survives today only
+    // because the placeholder happens to be empty, which is exactly the implicit
+    // coupling that produced this defect. `replace` states the ownership
+    // outright: the body of this repo's releases is GoReleaser's to write.
+    let cfg = load_yaml(".goreleaser.yaml");
+    let release = cfg
+        .get("release")
+        .expect(".goreleaser.yaml must declare a `release:` block");
+    assert_eq!(
+        release.get("mode").and_then(Value::as_str),
+        Some("replace"),
+        "`release.mode` must be `replace`: GoReleaser defaults to `keep-existing`, which hands the \
+         body to whichever artifact leg created the Release first"
+    );
+}
+
+#[test]
+fn a_rerun_of_the_tag_build_replaces_the_assets_its_first_attempt_uploaded() {
+    // The recorded sibling defect (evidence + the two runs:
+    // `docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/README.md`,
+    // "The sibling defect"): `v0.2.9` is red because the re-run hit
+    // `422 Validation Failed [{Resource:ReleaseAsset Field:name Code:already_exists}]`
+    // on `checksums.txt` and the tarball ITS OWN first attempt had uploaded. The
+    // four artifact legs were made idempotent on purpose (`gh release upload
+    // --clobber`); the desktop leg is the one that was not, and it is the one
+    // that is red. GoReleaser's own knob does the same job: on a 422 it deletes
+    // the colliding asset and retries the upload.
+    let cfg = load_yaml(".goreleaser.yaml");
+    let release = cfg
+        .get("release")
+        .expect(".goreleaser.yaml must declare a `release:` block");
+    assert_eq!(
+        release
+            .get("replace_existing_artifacts")
+            .and_then(Value::as_bool),
+        Some(true),
+        "`release.replace_existing_artifacts` must be true, or a re-run of a tag build fails with \
+         422 already_exists on the assets its own first attempt uploaded (the `v0.2.9` red), while \
+         every OTHER leg re-runs cleanly with `gh release upload --clobber`"
+    );
+}
+
+/// The changelog rules, COMPILED from `.goreleaser.yaml` exactly as GoReleaser
+/// compiles them, so a subject can be run through them instead of eyeballed.
+///
+/// Faithfulness notes, from GoReleaser's own source
+/// (`internal/pipe/changelog/changelog.go`):
+///
+/// * Both the exclude filters and the group regexps are matched against
+///   `entry.Message`, the commit SUBJECT alone, with no SHA prefix. (The
+///   groups' leading `^.*?` is vestigial; it is kept because a group's shape is
+///   the style the excludes now mirror.)
+/// * Excludes run FIRST (`filterEntries`), then the surviving entries are
+///   assigned to groups in CONFIG order, each group consuming what it matches;
+///   a group with no `regexp` takes everything left. `order` only sorts the
+///   rendered sections, so config order is what decides membership.
+struct ChangelogRules {
+    /// (pattern source, compiled). The source is quoted in failure messages so
+    /// a red test names the filter that fired.
+    exclude: Vec<(String, regex::Regex)>,
+    /// (group title, compiled regexp). `None` is the catch-all group.
+    groups: Vec<(String, Option<regex::Regex>)>,
+}
+
+impl ChangelogRules {
+    fn load() -> Self {
+        let cfg = load_yaml(".goreleaser.yaml");
+        let changelog = cfg
+            .get("changelog")
+            .expect(".goreleaser.yaml must declare a `changelog:` block");
+
+        let compile = |pattern: &str| {
+            regex::Regex::new(pattern).unwrap_or_else(|e| {
+                panic!("changelog pattern `{pattern}` is not a valid regexp: {e}")
+            })
+        };
+
+        let exclude = changelog
+            .get("filters")
+            .and_then(|f| f.get("exclude"))
+            .and_then(Value::as_sequence)
+            .expect("`changelog.filters.exclude` must list what never reaches a release page")
+            .iter()
+            .map(|v| {
+                let p = v
+                    .as_str()
+                    .expect("every `changelog.filters.exclude` entry must be a string");
+                (p.to_string(), compile(p))
+            })
+            .collect();
+
+        let groups = changelog
+            .get("groups")
+            .and_then(Value::as_sequence)
+            .expect("`changelog.groups` must classify conventional-commit types")
+            .iter()
+            .map(|g| {
+                let title = g
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .expect("every changelog group must have a `title`")
+                    .to_string();
+                let re = g.get("regexp").and_then(Value::as_str).map(compile);
+                (title, re)
+            })
+            .collect();
+
+        Self { exclude, groups }
+    }
+
+    /// The exclude PATTERN that removes this subject, if any.
+    fn excluded_by(&self, subject: &str) -> Option<&str> {
+        self.exclude
+            .iter()
+            .find(|(_, re)| re.is_match(subject))
+            .map(|(src, _)| src.as_str())
+    }
+
+    /// Where this subject lands in the published body. `None` when a filter
+    /// removes it entirely.
+    fn section_of(&self, subject: &str) -> Option<&str> {
+        if self.excluded_by(subject).is_some() {
+            return None;
+        }
+        for (title, re) in &self.groups {
+            match re {
+                Some(re) if re.is_match(subject) => return Some(title),
+                None => return Some(title),
+                Some(_) => {}
+            }
+        }
+        panic!(
+            "no changelog group claims `{subject}`, and there is no catch-all group: it would \
+             vanish from the body with no filter having decided to drop it"
+        )
+    }
+}
+
+#[test]
+fn the_housekeeping_excludes_are_scope_aware() {
+    // Defect 2, stated as the property rather than as the patterns: this repo
+    // writes `chore(some-task):`, not `chore:`, so an exclude that only knows
+    // the unscoped form is a filter that never fires. Both forms (and the
+    // breaking-change `!` the group regexps already tolerate) must drop out,
+    // and the unscoped form must KEEP working (it is what `docs:` commits and
+    // any hand-typed commit use).
+    let rules = ChangelogRules::load();
+    for ty in ["chore", "ci", "test", "docs"] {
+        for subject in [
+            format!("{ty}: an unscoped housekeeping commit"),
+            format!("{ty}(some-scope): a scoped housekeeping commit"),
+            format!("{ty}(some-scope)!: a scoped breaking housekeeping commit"),
+            format!("{ty}!: an unscoped breaking housekeeping commit"),
+        ] {
+            assert!(
+                rules.excluded_by(&subject).is_some(),
+                "`{subject}` must be excluded from the changelog: the filters must treat the \
+                 SCOPED and unscoped forms of `{ty}` identically, exactly as the GROUP regexps \
+                 already do"
+            );
+        }
+    }
+}
+
+#[test]
+fn no_exclude_filter_can_eat_a_feature_or_a_fix() {
+    // The teeth on the OTHER side. The excludes just grew broader; a pattern
+    // that also swallowed `feat`/`fix` would empty the release body while every
+    // other assertion here stayed green, and only a real tag would show it.
+    let rules = ChangelogRules::load();
+    for (ty, section) in [("feat", "Features"), ("fix", "Bug fixes")] {
+        for subject in [
+            format!("{ty}: an unscoped change"),
+            format!("{ty}(some-task): a scoped change"),
+            format!("{ty}(some-task)!: a scoped breaking change"),
+            format!("{ty}!: an unscoped breaking change"),
+        ] {
+            assert_eq!(
+                rules.section_of(&subject),
+                Some(section),
+                "`{subject}` must survive every filter and land under `{section}`: the excludes \
+                 must never reach a user-facing commit"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_configured_filters_sort_real_history_the_way_the_release_page_should_read() {
+    // The corpus is REAL: every subject below is taken from this repo's own
+    // history (the `v0.3.2..main` range wherever the shape occurs there, earlier
+    // history for the shapes that do not), one per distinct SHAPE. A handful of
+    // very long ones are cut at a clause boundary to keep this table readable;
+    // the PREFIX, the only part any filter or group regexp reads, is untouched
+    // in every entry. The
+    // full-range measurement over all 77 commits, with the command that produces
+    // it, is recorded in
+    // `docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/README.md`;
+    // this test is the part that runs in the `verify` gate on every change.
+    //
+    // `None` = filtered out, and MUST be: none of these tell a user anything
+    // about what the release does.
+    const CORPUS: &[(&str, Option<&str>)] = &[
+        // --- user-facing: the whole point of the body -----------------------
+        (
+            "feat(reload-stop-collapse-and-spinner-on-the-windows-chrome): The Windows chrome \
+             collapses Reload/Stop into one control and shows the spinner, reading the painted \
+             snapshot; done",
+            Some("Features"),
+        ),
+        (
+            "fix(chrome): show load progress in the URL bar instead of a displacing banner",
+            Some("Bug fixes"),
+        ),
+        (
+            "fix: cargo fmt — wrap the long Infura URL line",
+            Some("Bug fixes"),
+        ),
+        // --- housekeeping conventional types, SCOPED (defect 2) -------------
+        (
+            "chore(enable-the-ios-back-forward-swipe-gesture): requeue handoff note",
+            None,
+        ),
+        (
+            "ci(android-apk): the key alias is a variable, and the signature check records the \
+             scheme matrix",
+            None,
+        ),
+        (
+            "docs(work): record the Gate-3 verdict for the Windows chrome collapse",
+            None,
+        ),
+        // --- the same types UNSCOPED, which must keep working ---------------
+        ("chore: add mobile chrome URL-bar-crowding fix task", None),
+        (
+            "docs: add werust provider mimic and inspector for dapp testing",
+            None,
+        ),
+        // --- work/-contract bookkeeping: an item moved, not a change --------
+        (
+            "task: the release notes lose the conventional-commit changelog to a race",
+            None,
+        ),
+        (
+            "task(backlog): close the aggregate and tooltip gaps in the shared chrome derivation",
+            None,
+        ),
+        (
+            "tasking(ens-to-ipfs-resolution-phase1-rpc-skeleton): werust: ENS name -> IPFS \
+             resolution (Phase 1 — the EthereumProvider seam + trusted-RPC skeleton); tasked",
+            None,
+        ),
+        (
+            "notes(gate-3): provider refuses honestly (APPROVE after requeue) — and it corrected \
+             me twice",
+            None,
+        ),
+        (
+            "obs(field): v0.2.1 manual test surfaced 4 real render/UX issues (main-thread freeze, \
+             broken styling, invisible IPNS error, black mobile page)",
+            None,
+        ),
+        (
+            "findings: werust ran on REAL Windows hardware, and the sweep found three defects in \
+             five minutes",
+            None,
+        ),
+        (
+            "spec(proposed): signed-multi-platform-builds — Android signed APK, macOS desktop \
+             (signed + notarized), Windows deferred (GTK blocker)",
+            None,
+        ),
+        (
+            "review(spec): in-app-debug-menu — fix covers map (all were [2]; now \
+             store[5,6]/menu[2]/capture[4,5]/views[1,3]), APPROVE, move proposed->tasked",
+            None,
+        ),
+        (
+            "task+notes: ipfs-site-mobile-black-page closed by v0.2.7 origin-map fix — \
+             mandalas.eth renders on mobile per human re-test",
+            None,
+        ),
+        (
+            "findings+task: window.localStorage is null on Android — DOM storage was never enabled",
+            None,
+        ),
+        // --- dorfl runner lifecycle: pure bookkeeping pushed to main --------
+        (
+            "surface task:macos-smoke-blur-url-bar-does-not-end-the-field-editor (stuck): The \
+             task's diagnosis is incomplete at a load-bearing point, and acceptance criterion 3 as \
+             written is unachievable by the sanctioned fix.",
+            None,
+        ),
+        ("dorfl sync", None),
+        // --- and the pre-existing merge filter, still doing its job ---------
+        ("Merge branch 'main' of github.com:wighawag/werust", None),
+    ];
+
+    let rules = ChangelogRules::load();
+    for (subject, expected) in CORPUS {
+        let got = rules.section_of(subject);
+        assert_eq!(
+            got,
+            *expected,
+            "the changelog puts this subject in {got:?}, expected {expected:?}:\n  {subject}\n\
+             (excluded by: {:?})",
+            rules.excluded_by(subject)
+        );
+    }
 }

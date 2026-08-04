@@ -73,6 +73,17 @@ serde_bytes = "0.11"
 # `tests/release_plumbing_shape.rs`. Dev-only: it never enters the shipped
 # binary, only `cargo test` (the verify gate).
 serde_yaml = "0.9"
+# Compiles the `.goreleaser.yaml` changelog GROUP and EXCLUDE patterns so the
+# release-plumbing shape test can APPLY them to real commit subjects instead of
+# eyeballing them (task
+# `release-notes-lose-the-conventional-commit-changelog-to-a-race`: the previous
+# scope-blind filters looked right and matched nothing). GoReleaser compiles
+# those same patterns with Go's `regexp`, which is RE2; this crate implements the
+# same RE2 syntax family (no backreferences, no lookaround either), and the
+# patterns stay inside the common subset, so the test measures what GoReleaser
+# will do. Dev-only, like the two parsers above: it never enters the shipped
+# binary, only `cargo test` (the verify gate).
+regex = "1"
 # Parses the checked-in platform-capability parity matrix
 # (`docs/platform-capability-matrix.toml`) for the parity guard in
 # `tests/platform_capability_parity.rs`. Dev-only, like `serde_yaml` above: it

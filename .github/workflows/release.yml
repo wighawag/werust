@@ -29,6 +29,27 @@ name: release
 #   verify -> macos-desktop-app (macos-14, universal unsigned `Werust.app`)
 #   verify -> windows-desktop-app (windows-latest, unsigned `werust-windows.exe` zip)
 #
+# THE RELEASE BODY BELONGS TO GORELEASER, AND THAT IS A CONSEQUENCE OF THE
+# DECOUPLING ABOVE. Because no artifact leg waits for the desktop leg, each of
+# the four guarantees the Release exists before uploading into it, so on a tag
+# whichever leg is quickest CREATES it. They therefore create it with an
+# EXPLICITLY EMPTY body (`gh release create "$tag" --notes ""`) and never with
+# `--generate-notes`: with auto-notes, the winner of that race owned the body,
+# GoReleaser found a Release that already existed and (its default
+# `mode: keep-existing`) attached its artifacts without writing the changelog it
+# had prepared. `v0.3.1` published a lone compare link; `v0.3.0`, the release
+# that added macOS and Windows, published a single PR title. `.goreleaser.yaml`
+# now also sets `release.mode: replace`, so the changelog cannot be lost again
+# to whoever writes first. `--notes ""` is not decoration: `gh release create`
+# needs a body flag to run non-interactively at all.
+#
+# THIS IS THE ONE THING THE DRY RUN CANNOT CHECK. `workflow_dispatch` runs
+# GoReleaser with `--snapshot`, which never touches the forge, so no release
+# body is written on that path and a green dispatch says NOTHING about the
+# release notes. It is confirmed on the next REAL tag, by reading the published
+# body; the checklist is in
+# docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/README.md.
+#
 # THE macOS DESKTOP ARTIFACT IS UNSIGNED, DELIBERATELY. `macos-desktop-app`
 # attaches a universal (`x86_64` + `arm64`) `Werust.app` with NO code signature
 # and NO notarization: both need an Apple Developer account and are a separate
@@ -394,6 +415,10 @@ jobs:
       # error when the desktop leg or the other mobile leg got there first). This
       # is a Release-EXISTENCE guarantee, NOT a desktop-build dependency.
       #
+      # `--notes ""` creates it EMPTY-BODIED so GoReleaser writes the
+      # conventional-commit changelog into it; never `--generate-notes` (the
+      # header explains why, and what to check on the next real tag).
+      #
       # Which APKs exist depends on the signing path above, so the upload takes
       # whichever of the three names is on disk (signed: app-release.apk +
       # app-debug.apk; unsigned: app-debug-unsigned.apk alone).
@@ -402,7 +427,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release create "${GITHUB_REF_NAME}" --notes "" 2>/dev/null || true
           apks=()
           for apk in \
             crates/werust-android/app/build/outputs/apk/release/app-release.apk \
@@ -481,13 +506,15 @@ jobs:
       # TAG PATH: attach the zipped `.app` to the Release. This leg no longer
       # `needs: goreleaser`, so idempotently ensure the Release exists first
       # (`|| true` swallows the "already exists" error). A Release-EXISTENCE
-      # guarantee, NOT a desktop-build dependency.
+      # guarantee, NOT a desktop-build dependency. Created EMPTY-BODIED
+      # (`--notes ""`, never `--generate-notes`) so the body stays GoReleaser's
+      # to write; see the header.
       - name: Attach the Simulator .app zip to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release create "${GITHUB_REF_NAME}" --notes "" 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" crates/werust-ios/build/WerustShell-Simulator.app.zip --clobber
 
       # DRY-RUN PATH: upload the zipped `.app` as a workflow artifact, publish
@@ -575,13 +602,15 @@ jobs:
 
       # TAG PATH: attach the zipped `.app` to the Release, idempotently ensuring
       # the Release exists first (`|| true` swallows the "already exists" error
-      # when another leg got there first).
+      # when another leg got there first). Created EMPTY-BODIED (`--notes ""`,
+      # never `--generate-notes`) so the body stays GoReleaser's to write; see
+      # the header.
       - name: Attach the macOS .app zip to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release create "${GITHUB_REF_NAME}" --notes "" 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" crates/werust-macos/build/Werust-macos-universal-unsigned.app.zip --clobber
 
       # DRY-RUN PATH: upload the zipped `.app` as a workflow artifact, publish
@@ -703,14 +732,16 @@ jobs:
 
       # TAG PATH: attach the zip to the Release, idempotently ensuring the
       # Release exists first (`|| true` swallows the "already exists" error when
-      # another leg got there first).
+      # another leg got there first). Created EMPTY-BODIED (`--notes ""`, never
+      # `--generate-notes`) so the body stays GoReleaser's to write; see the
+      # header.
       - name: Attach the Windows zip to the Release (tag)
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" --generate-notes 2>/dev/null || true
+          gh release create "${GITHUB_REF_NAME}" --notes "" 2>/dev/null || true
           gh release upload "${GITHUB_REF_NAME}" crates/werust-windows/build/werust-windows-x86_64-unsigned.zip --clobber
 
       # DRY-RUN PATH: upload the zip as a workflow artifact, publish nothing.

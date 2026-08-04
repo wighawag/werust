@@ -68,15 +68,48 @@ checksum:
 # The changelog is generated FROM conventional-commit git history — there are NO
 # per-change changeset files (CONTEXT.md Conventions; the load-bearing
 # conventional-commit rule). Grouped by conventional-commit type.
+#
+# THE EXCLUDE FILTERS ARE SCOPE-AWARE, and that is load-bearing rather than
+# tidy. GoReleaser matches BOTH the group regexps and the exclude filters
+# against the raw commit SUBJECT (its `internal/pipe/changelog`: excludes run
+# first, then each group consumes what it matches, in CONFIG order). The groups
+# here always knew about scopes (`feat(\(.+\))??!?:`), but the excludes used to
+# be bare `^chore:` / `^ci:` / `^test:` / `^docs:`, and this repo scopes nearly
+# every housekeeping commit, so they matched almost nothing: measured over the
+# 77 commits in `v0.3.2..main`, `^chore:` matched 0 of 7, `^ci:` 0, `^test:` 0
+# and `^docs:` 1 of 22. `v0.3.2` therefore published an `### Others` section
+# full of `ci(android-apk):` and `task:` lines: the exact commits the filters
+# existed to delete. Each pattern below now MIRRORS the groups' own
+# `(\(.+\))??!?:` shape, so the scoped and unscoped forms drop out identically,
+# rather than inventing a second convention.
+#
+# Measurement + decisions:
+# docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/.
+# Pinned semantically (the patterns are COMPILED and applied to real subjects,
+# not eyeballed) by `crates/werust-core/tests/release_plumbing_shape.rs`.
 changelog:
   use: git
   sort: asc
   filters:
     exclude:
-      - "^chore:"
-      - "^ci:"
-      - "^test:"
-      - "^docs:"
+      # Housekeeping conventional types, scoped or not, breaking or not.
+      - '^chore(\(.+\))??!?:'
+      - '^ci(\(.+\))??!?:'
+      - '^test(\(.+\))??!?:'
+      - '^docs(\(.+\))??!?:'
+      # work/-contract bookkeeping: an ITEM moved between status folders, which
+      # says nothing about what the software does. These subjects are not
+      # conventional-commit types at all (`task:`, `notes(gate-3):`,
+      # `findings+task:`, `review(spec):` …), so no group regexp would ever
+      # claim them and every one of them landed in `Others`.
+      - '^(tasking|task|notes|obs|findings|spec|review)(\+[a-z]+)?(\(.+\))??!?:'
+      # dorfl runner lifecycle commits pushed straight to `main`. There are ~30
+      # `surface task:<slug> (stuck): …` commits in `v0.3.2..main` alone (see
+      # work/notes/observations/dorfl-bounce-surface-duplicates-the-stuck-question-and-spams-main-2026-08-04.md);
+      # they are the runner talking to itself, and each carries a multi-KB
+      # review verdict as its SUBJECT.
+      - '^surface task:'
+      - '^dorfl '
       - "Merge "
   groups:
     - title: Features
@@ -100,6 +133,37 @@ release:
   # draft that they cannot upload into, and don't auto-finalize before they run.
   draft: false
   prerelease: auto
+  # THE BODY OF THIS REPO'S RELEASES IS GORELEASER'S TO WRITE, even when it did
+  # not create the Release. All four artifact legs are decoupled from this one
+  # (`needs: verify`), so each guarantees the Release exists before uploading
+  # into it, and on a tag one of THEM usually wins that race. GoReleaser's
+  # default `mode: keep-existing` returns the EXISTING body whenever it is
+  # non-empty (`internal/client/release_notes.go`), so the changelog prepared
+  # here was simply discarded: `v0.3.1` published a lone compare link and
+  # `v0.3.0`, the release that added macOS and Windows, published one PR
+  # title. The legs now create with an EMPTY body (`--notes ""`, no
+  # `--generate-notes`), which alone would be enough; `replace` states the
+  # ownership outright so the changelog cannot go missing again the moment some
+  # future leg, retry or hand-edit puts ANY text there first.
+  #
+  # The cost, named: a human edit to a published body is overwritten if that
+  # tag's workflow is ever re-run. That is the right trade for a derived
+  # changelog (CONTEXT.md Conventions), but it is why the `v0.3.0` backfill is
+  # done by hand on an old tag rather than by re-firing its workflow; see
+  # docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/.
+  mode: replace
+  # A RE-RUN OF A TAG BUILD MUST NOT FAIL ON ITS OWN FIRST ATTEMPT'S ASSETS.
+  # `v0.2.9` is still red for exactly that: both runs ended in
+  # `422 Validation Failed [{Resource:ReleaseAsset Field:name Code:already_exists}]`
+  # on `checksums.txt` and the tarball the FIRST attempt had already uploaded
+  # (evidence + runs:
+  # docs/spikes/release-notes-lose-the-conventional-commit-changelog-to-a-race/README.md,
+  # "The sibling defect").
+  # Every other leg was made idempotent on purpose (`gh release upload
+  # --clobber`); this is the same guarantee in GoReleaser's own vocabulary: on
+  # a 422 it deletes the colliding asset and retries the upload. GitHub-only,
+  # which is the only forge this repo publishes to.
+  replace_existing_artifacts: true
 
 # A snapshot build (the dispatch dry-run) needs a deterministic version name
 # since there is no tag.

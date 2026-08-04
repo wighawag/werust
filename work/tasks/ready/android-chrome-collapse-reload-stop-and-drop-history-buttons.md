@@ -60,3 +60,21 @@ dorfl claim android-chrome-collapse-reload-stop-and-drop-history-buttons --arbit
 git fetch origin && git switch -c work/android-chrome-collapse-reload-stop-and-drop-history-buttons origin/main
 git mv work/tasks/ready/android-chrome-collapse-reload-stop-and-drop-history-buttons.md work/tasks/done/android-chrome-collapse-reload-stop-and-drop-history-buttons.md
 ```
+
+## Requeue 2026-08-04
+
+Gate 2 BLOCKED the previous attempt with ONE finding. Your committed work on this branch is kept and is being CONTINUED: build on it, do not restart, and do not redo the parts that were fine.
+
+THE FINDING: the new test the_mobile_presentation_guard_field_lists_are_not_registered_here in crates/werust-android/rust/tests/collapsed_control_and_dropped_history_buttons_shape.rs is VACUOUS - it can never fail, so the migrate/contract sequencing it advertises is in fact unguarded.
+
+Why it cannot fail: it does scan(guard) and then asserts !code.contains(field). But scan() strips string literals OUT of the  view and collects them separately into . A field name can only ever appear in mobile_chrome_presentation_shape.rs AS a string literal (a DERIVED_FIELDS / FACT_FIELDS entry). Proof: the already-registered loadProgressVisible appears at lines 117, 334 and 362 of that guard, all three inside literals, so the  view contains it nowhere. Registering loadSpinnerVisible tomorrow would leave this assertion GREEN.
+
+THE FIX (either is acceptable, pick one and make it honest):
+(a) Assert against the LITERALS half instead - scan() already returns it - so the test really does detect a field being registered early; or
+(b) DROP the assertion entirely and stop documenting it as protection.
+
+If you keep it (option a), also correct DECISIONS.md section 7, which currently claims asserting the absence is what stops a well-meaning later change from registering the field early, and the spike README, which says the suite was mutation-checked (its five listed mutations do not include this one). A mutation-check claim must cover this mutation: registering the field early MUST turn the test red.
+
+HARD CONSTRAINT, unchanged and load-bearing: do NOT edit, weaken or special-case crates/werust-core/tests/mobile_chrome_presentation_shape.rs. This task must NOT register the new fields; registration is owned by the fan-in task register-the-new-chrome-fields-in-the-mobile-presentation-guard. You are only asserting, honestly, that they are not registered YET.
+
+Also unchanged: do not re-select the toolchain (rust-toolchain.toml is pinned); user-facing chrome strings must come from the ONE core derivation (reloadStopControlLabel / reloadStopControlDescription / loadSpinnerVisible via chrome JSON), never a per-edge literal; conventional-commit subjects.

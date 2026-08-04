@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
-//! │ ◀ ▶ ⟳ ✕ │ URL bar (+ progress) │ ⛔ badge │ trust badge │ ⋮ │  toolbar
+//! │ ◀ ▶ ⟳/✕ ◌ │ URL bar (+ progress) │ ⛔ badge │ trust badge │ ⋮ │  toolbar
 //! ├─────────────────────────────────────────────────────────────┤
 //! │ ⚠ This page failed to load: <protocol-named reason>         │  error banner
 //! ├─────────────────────────────────────────────────────────────┤  (failures only)
@@ -35,6 +35,23 @@
 //! fixed-height toolbar, so a navigation never resizes the page view and content
 //! cannot jump under the pointer (task
 //! `loading-progress-in-the-url-bar-not-a-banner`).
+//!
+//! # The ONE reload/stop control, and the spinner beside it
+//!
+//! The toolbar carries a SINGLE control where it carried a Reload button and a
+//! Stop button, each enabled on the negation of the other's condition (task
+//! `reload-stop-collapse-and-spinner-on-the-macos-window`, spec
+//! `chrome-conventional-controls`, story 10). WHICH mode it is in — the glyph it
+//! wears, the accessible name it announces, and the action a click performs — is
+//! the shared derivation's call, carried here as `ChromePaint::reload_stop_*`;
+//! this file assigns it. Beside it, a LOADING SPINNER on the core's wider rule
+//! (`ChromePaint::spinner_visible`): it reports that werust is working where the
+//! URL bar's fraction says how far it got, which is the half a stalled load
+//! needs. It is AppKit's OWN indeterminate `NSProgressIndicator`, so the
+//! animation is the toolkit's and this edge adds no timer; only its VISIBILITY
+//! follows the derivation, and its slot is laid out either way so a load starting
+//! never shifts the URL bar. Why the toolkit's indicator, and where it sits:
+//! `docs/spikes/reload-stop-collapse-and-spinner-on-the-macos-window/DECISIONS.md`.
 //!
 //! # The debug view
 //!
@@ -85,7 +102,7 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezelStyle, NSButton,
-    NSColor, NSEvent, NSEventModifierFlags, NSEventType, NSFont, NSMenu, NSMenuItem,
+    NSColor, NSControlSize, NSEvent, NSEventModifierFlags, NSEventType, NSFont, NSMenu, NSMenuItem,
     NSProgressIndicator, NSProgressIndicatorStyle, NSScrollView, NSTabView, NSTabViewItem,
     NSTextField, NSView, NSWindow, NSWindowDelegate, NSWindowStyleMask,
 };
@@ -125,6 +142,14 @@ const BADGE_WIDTH: f64 = 110.0;
 /// The URL bar's progress strip: a few points along its bottom edge, INSIDE the
 /// bar, so it takes no height from the page.
 const PROGRESS_HEIGHT: f64 = 3.0;
+/// The LOADING SPINNER's slot in the toolbar row. Narrower than a nav button
+/// because it carries no glyph of its own and is not a click target; allocated
+/// whether or not the spinner is showing, so starting a load never moves the URL
+/// bar sideways.
+const SPINNER_WIDTH: f64 = 20.0;
+/// The spinning indicator itself, centred in [`SPINNER_WIDTH`]: AppKit's small
+/// control size draws a 16pt spinner.
+const SPINNER_SIZE: f64 = 16.0;
 /// One debug-view row's height.
 const ROW_HEIGHT: f64 = 18.0;
 /// The debug view's initial size.
@@ -354,8 +379,17 @@ struct Chrome {
     toolbar: Retained<FlippedView>,
     back: Retained<NSButton>,
     forward: Retained<NSButton>,
-    reload: Retained<NSButton>,
-    stop: Retained<NSButton>,
+    /// The ONE reload/stop control browsers have: it RELOADS a settled page and
+    /// STOPS a load in flight. WHICH of the two it currently is comes from the
+    /// shared derivation (`ChromePaint::reload_stop_control`), so this edge
+    /// re-titles one button instead of enabling one of a pair on a condition of
+    /// its own (task `reload-stop-collapse-and-spinner-on-the-macos-window`).
+    reload_stop: Retained<NSButton>,
+    /// The LOADING SPINNER: AppKit's own indeterminate `NSProgressIndicator` in
+    /// its spinning style, beside the control. It says werust is WORKING where
+    /// the URL bar's own progress strip says how far it got, which is the half a
+    /// stalled load needs. AppKit animates it; nothing here does.
+    spinner: Retained<NSProgressIndicator>,
     menu_button: Retained<NSButton>,
     url_field: Retained<NSTextField>,
     /// The load-progress strip, laid out INSIDE the URL bar (never its own row).
@@ -401,10 +435,29 @@ impl Chrome {
 
         self.back.setEnabled(paint.can_go_back);
         self.forward.setEnabled(paint.can_go_forward);
-        // Stop is meaningful only while a load is in flight; Reload only once it
-        // has settled.
-        self.stop.setEnabled(paint.is_loading);
-        self.reload.setEnabled(!paint.is_loading);
+        // The ONE reload/stop control: it wears the MODE's own glyph and carries
+        // the MODE's own accessible description (hover is this edge's surface for
+        // it). Which mode that is was decided ONCE, in the core, for every edge —
+        // this is an assignment, not the enable-one-of-a-pair condition it
+        // replaced.
+        self.reload_stop.setTitle(&ns(paint.reload_stop_label));
+        self.reload_stop
+            .setToolTip(Some(&ns(paint.reload_stop_description)));
+        // The SPINNER beside it, on the core's wider rule: it reports a load the
+        // URL bar's fraction may not be able to describe yet (the pre-content
+        // name-resolution window). Its SLOT is permanent — `relayout` places it
+        // either way — so showing it never shifts the URL bar; only its
+        // visibility follows the derivation, and the ROTATION is AppKit's own.
+        self.spinner.setHidden(!paint.spinner_visible);
+        // SAFETY: `startAnimation:`/`stopAnimation:` take an optional sender; nil
+        // is what a programmatic caller passes.
+        unsafe {
+            if paint.spinner_visible {
+                self.spinner.startAnimation(None);
+            } else {
+                self.spinner.stopAnimation(None);
+            }
+        }
 
         self.status.setStringValue(&ns(&paint.status_text));
 
@@ -481,10 +534,21 @@ impl Chrome {
         let row_y = 6.0;
         let row_height = TOOLBAR_HEIGHT - 12.0;
         let mut x = MARGIN;
-        for control in [&self.back, &self.forward, &self.reload, &self.stop] {
+        for control in [&self.back, &self.forward, &self.reload_stop] {
             control.setFrame(rect(x, row_y, BUTTON_WIDTH, row_height));
             x += BUTTON_WIDTH + 2.0;
         }
+        // The spinner sits immediately after the control that ACTS on the load and
+        // before the URL bar that measures it — never beside the trust badge at
+        // the far end, where motion would read as a claim about the page's TRUST
+        // (`docs/adr/0012`). Its slot is placed whether or not it is showing.
+        self.spinner.setFrame(rect(
+            x + (SPINNER_WIDTH - SPINNER_SIZE) / 2.0,
+            row_y + ((row_height - SPINNER_SIZE) / 2.0).max(0.0),
+            SPINNER_SIZE,
+            SPINNER_SIZE,
+        ));
+        x += SPINNER_WIDTH + 2.0;
         let badge_width = if self.badge_visible.get() {
             BADGE_WIDTH + 6.0
         } else {
@@ -793,16 +857,15 @@ define_class!(
             self.refresh_chrome();
         }
 
-        #[unsafe(method(reloadPage:))]
-        fn reload_page(&self, _sender: Option<&AnyObject>) {
-            let _ = self.ivars().shell.borrow_mut().reload();
-            self.refresh_chrome();
-        }
-
-        #[unsafe(method(stopLoading:))]
-        fn stop_loading(&self, _sender: Option<&AnyObject>) {
-            self.ivars().shell.borrow_mut().stop();
-            self.refresh_chrome();
+        /// The ONE reload/stop control: what it DOES is the MODE's own
+        /// [`ChromeAction`] (the same closed vocabulary Cmd+R and Escape resolve
+        /// into), performed by the SAME [`WindowController::perform_chrome_action`]
+        /// the keyboard and the mouse side buttons go through. So this handler
+        /// decides nothing, and cancelling a load from the toolbar and cancelling
+        /// it with Escape are one path that cannot drift apart.
+        #[unsafe(method(reloadOrStop:))]
+        fn reload_or_stop(&self, _sender: Option<&AnyObject>) {
+            self.perform_chrome_action(self.reload_stop_action());
         }
 
         /// Enter in the URL bar: navigate through the shell, which owns the
@@ -919,6 +982,18 @@ impl WindowController {
             Retained::as_ptr(&object).cast::<AnyObject>(),
             Retained::as_ptr(&debug.window).cast::<AnyObject>(),
         )
+    }
+
+    /// What the ONE reload/stop control does RIGHT NOW: the mode's own
+    /// [`ChromeAction`], taken off the shared snapshot.
+    ///
+    /// The mode is `reload_stop_control`'s call, made once in `werust-core` for
+    /// every edge and carried here by `desktop-paint`; this edge asks the
+    /// snapshot which action the control it just painted performs, and never
+    /// re-decides it from the loading fact.
+    fn reload_stop_action(&self) -> ChromeAction {
+        let shell = self.ivars().shell.borrow();
+        ChromePaint::of(shell.chrome()).reload_stop_control.action()
     }
 
     /// Repaint the chrome from the shell's current `ChromeState`, through the
@@ -1158,8 +1233,7 @@ fn wire_actions(controller: &WindowController) {
         for (control, action) in [
             (&chrome.back, sel!(goBack:)),
             (&chrome.forward, sel!(goForward:)),
-            (&chrome.reload, sel!(reloadPage:)),
-            (&chrome.stop, sel!(stopLoading:)),
+            (&chrome.reload_stop, sel!(reloadOrStop:)),
             (&chrome.menu_button, sel!(showBrowserMenu:)),
         ] {
             control.setTarget(Some(target));
@@ -1285,12 +1359,25 @@ impl BrowserWindow {
 
         let back = button(mtm, "◀");
         let forward = button(mtm, "▶");
-        let reload = button(mtm, "⟳");
-        let stop = button(mtm, "✕");
+        // The ONE reload/stop control. It is built with NO title: its glyph is the
+        // shared derivation's (`ChromePaint::reload_stop_label`), and the
+        // `refresh_chrome` below paints it before the window is ever shown — the
+        // same way the trust badge gets its first text.
+        let reload_stop = button(mtm, "");
         let menu_button = button(mtm, "⋮");
-        for control in [&back, &forward, &reload, &stop, &menu_button] {
+        for control in [&back, &forward, &reload_stop, &menu_button] {
             toolbar.addSubview(control);
         }
+
+        // The LOADING SPINNER: AppKit's OWN indeterminate progress indicator in
+        // its spinning style, hidden until the core says there is a load worth
+        // reporting. The toolkit animates it, so this edge starts no timer.
+        let spinner = NSProgressIndicator::new(mtm);
+        spinner.setStyle(NSProgressIndicatorStyle::Spinning);
+        spinner.setControlSize(NSControlSize::Small);
+        spinner.setIndeterminate(true);
+        spinner.setHidden(true);
+        toolbar.addSubview(&spinner);
 
         let url_field = NSTextField::new(mtm);
         url_field.setEditable(true);
@@ -1331,8 +1418,8 @@ impl BrowserWindow {
             toolbar,
             back,
             forward,
-            reload,
-            stop,
+            reload_stop,
+            spinner,
             menu_button,
             url_field,
             progress,
@@ -1388,6 +1475,17 @@ impl BrowserWindow {
     /// Run ONE pump tick by hand (the CI smoke's entry point).
     pub fn tick(&self) {
         self.controller.tick();
+    }
+
+    /// Repaint the chrome from the shell's current state, exactly as the pump
+    /// does when the seam reports an event.
+    ///
+    /// The smoke's sampling point: a pump tick only repaints when the seam had
+    /// something to say, so a driver that wants to read the widgets for the state
+    /// the shell is in RIGHT NOW asks for the paint rather than hoping one
+    /// happened.
+    pub fn refresh_chrome(&self) {
+        self.controller.refresh_chrome();
     }
 
     /// Give the page view the keyboard focus, so AppKit routes scroll / click /
@@ -1534,6 +1632,55 @@ impl BrowserWindow {
             .url_field
             .stringValue()
             .to_string()
+    }
+
+    /// The GLYPH the ONE reload/stop control is currently wearing: `⟳` on a
+    /// settled page, `✕` while a load is in flight. Which of the two is the
+    /// core's call, so the smoke compares this against the core's own label
+    /// rather than against a literal.
+    #[must_use]
+    pub fn reload_stop_label(&self) -> String {
+        self.controller
+            .ivars()
+            .chrome
+            .reload_stop
+            .title()
+            .to_string()
+    }
+
+    /// That control's ACCESSIBLE NAME, as its tooltip holds it ("Reload this
+    /// page" / "Stop loading this page", the core's wording).
+    #[must_use]
+    pub fn reload_stop_description(&self) -> Option<String> {
+        self.controller
+            .ivars()
+            .chrome
+            .reload_stop
+            .toolTip()
+            .map(|tip| tip.to_string())
+    }
+
+    /// Whether the LOADING SPINNER is showing.
+    #[must_use]
+    pub fn spinner_visible(&self) -> bool {
+        !self.controller.ivars().chrome.spinner.isHidden()
+    }
+
+    /// Activate the ONE reload/stop control, exactly as clicking it does: AppKit's
+    /// own `performClick:`, which sends the control's target/action the same way a
+    /// real mouse click does. This is how the smoke cancels an in-flight load FROM
+    /// THE TOOLBAR rather than by calling the shell behind the widget's back.
+    pub fn activate_reload_stop(&self) {
+        // SAFETY: `performClick:` takes an optional sender; nil is what a
+        // programmatic caller passes, and the control's target/action were wired
+        // by `wire_actions`.
+        unsafe {
+            self.controller
+                .ivars()
+                .chrome
+                .reload_stop
+                .performClick(None);
+        }
     }
 
     /// What the trust indicator currently SHOWS.

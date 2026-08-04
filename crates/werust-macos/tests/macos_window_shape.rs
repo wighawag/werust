@@ -40,6 +40,18 @@
 //!    (`the_ci_leg_builds_tests_and_runs_the_window`,
 //!    `the_verification_honesty_is_recorded`).
 //! 7. The gate stays green (this file is a plain `cargo test`).
+//!
+//! AMENDMENT (task `reload-stop-collapse-and-spinner-on-the-macos-window`, spec
+//! `chrome-conventional-controls`): the separate Reload and Stop buttons are ONE
+//! control, and a loading spinner joined the toolbar. Both the control's MODE and
+//! the spinner's VISIBILITY are READ off the shared `desktop-paint` snapshot
+//! (`werust_core::reload_stop_control` / `load_spinner_visible`), so this edge
+//! assigns values where it used to enable one of a pair on the raw loading fact.
+//! A local conditional for either would be exactly the per-edge twin the
+//! one-derivation rule forbids -- and it would compile, pass every unit test, and
+//! be invisible to a project with no Mac -- so it is pinned here
+//! (`the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive`,
+//! `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`).
 
 use std::path::{Path, PathBuf};
 
@@ -125,8 +137,14 @@ fn the_window_carries_every_chrome_surface_over_the_wkwebview_backend() {
         ("the URL bar", "url_field: Retained<NSTextField>"),
         ("Back", "back: Retained<NSButton>"),
         ("Forward", "forward: Retained<NSButton>"),
-        ("Reload", "reload: Retained<NSButton>"),
-        ("Stop", "stop: Retained<NSButton>"),
+        (
+            "the ONE reload/stop control",
+            "reload_stop: Retained<NSButton>",
+        ),
+        (
+            "the loading spinner",
+            "spinner: Retained<NSProgressIndicator>",
+        ),
         ("the trust indicator", "trust: Retained<NSTextField>"),
         (
             "the invalid-entry badge",
@@ -168,12 +186,13 @@ fn the_window_carries_every_chrome_surface_over_the_wkwebview_backend() {
         );
     }
 
-    // Every control drives the SHARED shell, never the webview.
+    // Every control drives the SHARED shell, never the webview. (The ONE
+    // reload/stop control drives it through the shared performer instead, which
+    // `the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched`
+    // pins.)
     for (action, drives) in [
         ("goBack:", "shell.borrow_mut().go_back()"),
         ("goForward:", "shell.borrow_mut().go_forward()"),
-        ("reloadPage:", "shell.borrow_mut().reload()"),
-        ("stopLoading:", "shell.borrow_mut().stop()"),
         ("urlEntered:", "shell.borrow_mut().navigate("),
     ] {
         assert!(
@@ -221,6 +240,8 @@ fn the_appkit_layer_paints_and_never_derives() {
         "load_progress_visible(",
         "load_progress_fraction(",
         "load_progress_hint(",
+        "reload_stop_control(",
+        "load_spinner_visible(",
         "console_row_text(",
         "network_trust_label(",
         "network_status_text(",
@@ -245,6 +266,8 @@ fn the_appkit_layer_paints_and_never_derives() {
         "invalid_entry_badge_text(state)",
         "load_progress_visible(state)",
         "load_progress_fraction(state)",
+        "reload_stop_control(state)",
+        "load_spinner_visible(state)",
     ] {
         assert!(
             paint.contains(rule),
@@ -506,6 +529,168 @@ fn progress_lives_in_the_url_bar_and_only_a_failure_moves_the_page() {
     assert!(
         paint.contains("error_visible: error_banner_visible(state)"),
         "the banner's visibility is the core's failure rule, not a macOS choice"
+    );
+}
+
+#[test]
+fn the_chrome_carries_one_reload_stop_control_and_a_spinner_it_does_not_derive() {
+    // The collapse (spec `chrome-conventional-controls`, story 10): the two
+    // buttons that were enabled on the negation of each other's condition are ONE
+    // control whose MODE the core derives, and the spinner (story 8) joins the URL
+    // bar's progress fraction (story 9, untouched).
+    let window = window();
+    assert!(
+        window.contains("reload_stop: Retained<NSButton>")
+            && window.contains("spinner: Retained<NSProgressIndicator>"),
+        "the toolbar must carry the ONE reload/stop control and the spinner"
+    );
+    // Anchored on the field declaration's own indentation, so `reload_stop:` (the
+    // collapsed control) cannot satisfy the check for the pair it replaced.
+    for gone in [
+        "\n    reload: Retained<NSButton>",
+        "\n    stop: Retained<NSButton>",
+    ] {
+        assert!(
+            !window.contains(gone),
+            "`{gone}` is the pre-collapse pair; the two controls are one now"
+        );
+    }
+
+    // The paint is a straight assignment from the SNAPSHOT's fields: this edge
+    // reads the mode's glyph, its accessible description and the spinner's
+    // visibility, and computes none of them.
+    let apply = between(
+        &window,
+        "fn apply(&self, paint: &ChromePaint) {",
+        "\n    }\n",
+    );
+    for assignment in [
+        "self.reload_stop.setTitle(&ns(paint.reload_stop_label));",
+        "paint.reload_stop_description",
+        "self.spinner.setHidden(!paint.spinner_visible);",
+    ] {
+        assert!(
+            apply.contains(assignment),
+            "the paint must assign `{assignment}` from the shared snapshot: {apply:?}"
+        );
+    }
+    // …and the pre-collapse rule -- enable one of a pair on the raw loading fact
+    // -- is GONE, along with any other use of that fact in the paint. Keeping it
+    // beside the derived value is the drift the one-derivation rule forbids.
+    for gone in [
+        "self.stop.setEnabled",
+        "self.reload.setEnabled",
+        "paint.is_loading",
+    ] {
+        assert!(
+            !apply.contains(gone),
+            "`{gone}` is this edge deciding the control's mode for itself: {apply:?}"
+        );
+    }
+
+    // Both sit in the toolbar's hand-computed row, and the spinner's SLOT is
+    // placed whether or not it is showing: only its VISIBILITY follows the
+    // derivation, so a load starting can never shove the URL bar sideways (the
+    // horizontal reading of `loading-progress-in-the-url-bar-not-a-banner`).
+    let layout = between(&window, "fn relayout(&self) {", "\n    }\n");
+    assert!(
+        layout.contains("&self.reload_stop") && layout.contains("self.spinner.setFrame("),
+        "the collapsed control and the spinner must both be laid out: {layout:?}"
+    );
+    assert!(
+        !layout.contains("spinner_visible"),
+        "the spinner's SLOT must not depend on whether it is showing, or a load \
+         starting would shove the URL bar sideways: {layout:?}"
+    );
+
+    // Unlike Win32, AppKit HAS a spinner: the toolkit's own indeterminate
+    // `NSProgressIndicator`, which animates itself. So this edge draws no frames
+    // and — like every other surface here — adds no timer.
+    assert!(
+        window.contains("NSProgressIndicatorStyle::Spinning"),
+        "the spinner must be AppKit's own spinning progress indicator"
+    );
+    assert_eq!(
+        window.matches("scheduledTimerWithTimeInterval").count(),
+        1,
+        "the spinner must not add a timer of its own: AppKit animates it"
+    );
+    assert!(
+        exists("docs/spikes/reload-stop-collapse-and-spinner-on-the-macos-window/DECISIONS.md"),
+        "whether the spinner is AppKit's own indicator, and where it sits, is a recorded decision"
+    );
+}
+
+#[test]
+fn the_collapsed_control_performs_the_modes_own_action_and_history_is_untouched() {
+    // What the ONE control DOES is the MODE's own `ChromeAction` -- the same
+    // closed vocabulary Cmd+R and Escape resolve into -- performed by the SAME
+    // performer, so the toolbar cancel and the keyboard cancel are one path.
+    let window = window();
+    assert!(
+        window.contains("sel!(reloadOrStop:)"),
+        "the collapsed control needs ONE action, wired to the one control"
+    );
+    for gone in ["reloadPage:", "stopLoading:"] {
+        assert!(
+            !window.contains(gone),
+            "`{gone}` is the pre-collapse pair's action"
+        );
+    }
+    let handler = between(
+        &window,
+        "fn reload_or_stop(&self, _sender: Option<&AnyObject>) {",
+        "\n        }",
+    );
+    assert!(
+        handler.contains("perform_chrome_action("),
+        "a click must go through the shared performer: {handler:?}"
+    );
+    for decided in ["shell.borrow_mut().stop()", "shell.borrow_mut().reload()"] {
+        assert!(
+            !handler.contains(decided),
+            "`{decided}` is this handler deciding which of the two modes the click \
+             is: {handler:?}"
+        );
+    }
+    // And the MODE it performs is read off the shared snapshot, never recomputed
+    // from the loading fact.
+    let action = between(&window, "fn reload_stop_action(", "\n    }");
+    assert!(
+        action.contains("ChromePaint::of(") && action.contains("reload_stop_control.action()"),
+        "the click's action must be the snapshot's own mode: {action:?}"
+    );
+
+    // Back and forward are UNTOUCHED: desktop keeps its history buttons (spec
+    // story 14; only the mobile edges drop them, in their own tasks).
+    assert!(
+        window.contains("self.back.setEnabled(paint.can_go_back);")
+            && window.contains("self.forward.setEnabled(paint.can_go_forward);"),
+        "the history buttons must still read the core's capability flags"
+    );
+
+    // The interactive half belongs on the `macos-14` leg: only a real window can
+    // show that the real control re-labels itself and really cancels. Nobody here
+    // has a Mac, so this is the ONLY evidence this edge will get.
+    let smoke = source("crates/werust-macos/examples/window_smoke.rs");
+    for driven in [
+        "window.reload_stop_label()",
+        "window.reload_stop_description()",
+        "window.spinner_visible()",
+        "window.activate_reload_stop()",
+        "press_escape(&window)",
+    ] {
+        assert!(
+            smoke.contains(driven),
+            "the smoke must drive `{driven}` against the real window"
+        );
+    }
+    // The smoke compares the real widgets against the CORE's own mode vocabulary
+    // rather than against a literal glyph, so a change to the label lands in one
+    // place and this check follows it.
+    assert!(
+        smoke.contains("ReloadStopControl::Stop") && smoke.contains("ReloadStopControl::Reload"),
+        "the smoke must assert against the core's modes, not against a hardcoded glyph"
     );
 }
 

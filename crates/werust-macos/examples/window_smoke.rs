@@ -52,7 +52,9 @@ mod macos {
     use werust_core::ipfs::RedirectSink;
     use werust_core::menu::{BrowserMenu, MENU_ITEM_DEBUG};
     use werust_core::shortcuts::Focus;
-    use werust_core::{status_line, trust_indicator, trust_indicator_detail, BrowserShell};
+    use werust_core::{
+        status_line, trust_indicator, trust_indicator_detail, BrowserShell, ReloadStopControl,
+    };
     use werust_macos::input;
     use werust_macos::paint::install_debug_capture;
     use werust_macos::window::{BrowserWindow, Placement};
@@ -299,6 +301,113 @@ mod macos {
             &mut failures,
             window.page_frame() == page_before,
             "the page view did NOT move or resize across a whole load",
+        );
+
+        println!("the ONE reload/stop control and the spinner, on the real widgets:");
+        // The collapse (spec stories 8, 9, 10), which no Linux gate can see: ONE
+        // `NSButton` that RE-TITLES itself, and AppKit's own spinning
+        // `NSProgressIndicator` beside it. Both values are the CORE's, so every
+        // check below compares the real widget against `ReloadStopControl`'s own
+        // vocabulary rather than against a glyph literal -- a smoke that hardcoded
+        // `"⟳"` would pass just as well on an edge that decided the mode itself.
+        window.refresh_chrome();
+        check(
+            &mut failures,
+            window.reload_stop_label() == ReloadStopControl::Reload.label(),
+            "the ONE control wears the RELOAD mode's glyph on a settled page",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_description().as_deref()
+                == Some(ReloadStopControl::Reload.description()),
+            "…and carries that mode's accessible name from the core",
+        );
+        check(
+            &mut failures,
+            !window.spinner_visible(),
+            "a settled chrome spins nothing",
+        );
+
+        // IN FLIGHT: the SAME control becomes Stop and the spinner shows. Nothing
+        // pumps between the navigation and the paint, so the load is genuinely
+        // running at the seam when the widgets are read.
+        let started = shell.borrow_mut().navigate(&url).is_ok();
+        window.refresh_chrome();
+        check(
+            &mut failures,
+            started && shell.borrow().chrome().is_loading(),
+            "a load is in flight when the collapsed control is read",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_label() == ReloadStopControl::Stop.label(),
+            "the ONE control becomes STOP while a load is in flight",
+        );
+        check(
+            &mut failures,
+            window.reload_stop_description().as_deref()
+                == Some(ReloadStopControl::Stop.description()),
+            "…and announces the STOP mode's accessible name",
+        );
+        check(
+            &mut failures,
+            window.spinner_visible(),
+            "the spinner shows while a load is in flight",
+        );
+
+        // CANCEL FROM THE TOOLBAR: `performClick:`, the same target/action message
+        // AppKit sends on a real click. The separate Stop button was werust's
+        // documented cancel affordance, so this is the check that the collapse did
+        // not cost the user their cancel (the keyboard route is asserted by the
+        // Escape pair below).
+        window.activate_reload_stop();
+        check(
+            &mut failures,
+            !shell.borrow().chrome().is_loading(),
+            "clicking the ONE control while loading CANCELS the in-flight load",
+        );
+        window.refresh_chrome();
+        check(
+            &mut failures,
+            window.reload_stop_label() == ReloadStopControl::Reload.label()
+                && !window.spinner_visible(),
+            "…and the control goes back to RELOAD with the spinner gone",
+        );
+
+        // Back to a loaded page before the RELOAD half, exactly as the Escape
+        // pair does after its own cancel: a reload needs a settled page to
+        // re-fetch, and cancelling one mid-flight is not that.
+        if shell.borrow_mut().navigate(&url).is_err() {
+            eprintln!("the shell refused the fixture URL");
+            return 1;
+        }
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            settled,
+            "the page is loaded again after the control cancelled a load",
+        );
+
+        // IDLE: the same one control RELOADS. Watched at the FIXTURE, because a
+        // settled load state cannot tell a reload from "it was already loaded".
+        let served_before = served.retrievals();
+        window.activate_reload_stop();
+        let reloaded = wait_until(&window, 20, || served.retrievals() > served_before);
+        check(
+            &mut failures,
+            reloaded,
+            "clicking the ONE control on a settled page RELOADS through the shell",
+        );
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(&mut failures, settled, "the reloaded page settles");
+        check(
+            &mut failures,
+            window.page_frame() == page_before,
+            "neither the collapsed control nor the spinner ever displaced the page view",
         );
 
         println!("the conventional shortcuts, pressed as REAL NSEvents on this window:");

@@ -4,6 +4,8 @@ Task: `macos-appkit-window-and-chrome`. Decision it executes: [`docs/adr/0011-we
 
 **Read this first.** This work was WRITTEN on Linux, blind, and it has since been RUN on a Mac: the `macos-14` leg this task extends is green against this branch ([run 30572253620](https://github.com/wighawag/werust/actions/runs/30572253620), see [What CI proved](#what-ci-proved)). Everything below is still split by what proves it, because the three sources prove very different things: an ORDINARY Ubuntu `verify` run, the LOCAL cross-target type-check, and the `macos-14` job. Where a claim is a macOS runtime result it names the run; where it is host-independent it says so; where nothing has checked it, it lives under [What still awaits a Mac](#what-still-awaits-a-mac-stated-plainly). The engine task's own earlier measurement is cited only where it is genuinely the engine's result, not this window's.
 
+**Superseded in part.** The separate Reload and Stop buttons this task built — the `stop vs reload` row of the paint table below, and the parts of manual step 1 and step 3 about them — were collapsed into ONE mode-switching control, with a loading spinner beside it, by `reload-stop-collapse-and-spinner-on-the-macos-window` (see [that task's README](../reload-stop-collapse-and-spinner-on-the-macos-window/README.md)). Everything else below still describes the window as it is.
+
 ## What landed
 
 - **`crates/werust-macos`** — the AppKit window, in two halves:

@@ -1475,7 +1475,22 @@ description = "The chrome shows ONE control that reloads a settled page and STOP
 # The other four cells are the sibling edge tasks: each is a PAINTER change over
 # a carrier that already holds the values, not a new decision.
 desktop = { state = "implemented" }
-macos = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-macos-window" }
+# macOS (task `reload-stop-collapse-and-spinner-on-the-macos-window`): the AppKit
+# toolbar carries ONE `NSButton` whose title is the carried `reload_stop_label`,
+# whose tooltip (this edge's hover surface) is `reload_stop_description`, and
+# whose click performs the mode's own `ChromeAction` through the SAME
+# `perform_chrome_action` the keyboard and the mouse side buttons use — so the
+# toolbar cancel and Escape-cancel are one path. Beside it, AppKit's OWN
+# indeterminate `NSProgressIndicator` in spinning style follows `spinner_visible`
+# in a permanently allocated slot (the toolkit animates it, so no timer joins the
+# one 50ms chrome pump). The painter no longer reads the raw `is_loading` fact at
+# all; back/forward stay (story 14). Shape-guarded by
+# crates/werust-macos/tests/macos_window_shape.rs; the real widgets are driven on
+# the `macos-14` leg by crates/werust-macos/examples/window_smoke.rs (the control
+# re-titles itself, the spinner shows, and clicking it really cancels an
+# in-flight load). Decisions + what still awaits a Mac:
+# docs/spikes/reload-stop-collapse-and-spinner-on-the-macos-window/.
+macos = { state = "implemented" }
 windows = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-windows-chrome" }
 # iOS (task `ios-chrome-collapse-reload-stop-and-drop-history-buttons`): the
 # toolbar carries ONE `reloadStopButton` whose glyph is the carried

@@ -72,3 +72,27 @@ dorfl claim shortcuts-and-mouse-history-buttons-on-the-windows-edge --arbiter or
 git fetch origin && git switch -c work/shortcuts-and-mouse-history-buttons-on-the-windows-edge origin/main
 git mv work/tasks/ready/shortcuts-and-mouse-history-buttons-on-the-windows-edge.md work/tasks/done/shortcuts-and-mouse-history-buttons-on-the-windows-edge.md
 ```
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE ON THE CODE, but the task is NOT truly done: it leaves `main` with a RED `windows-renderer` CI leg.
+
+Criteria met, on the diff:
+- The edge speaks the SHARED resolution and decides no chord of its own: `crates/werust-windows/src/shortcuts.rs` is pure TRANSLATION (`shortcut_key` maps Win32 virtual keys to `shortcuts::Key`, `shortcut_modifiers` maps key state) and defers every meaning to `shortcuts::resolve_chord` / `resolve_pointer_button`. `crates/werust-core/src/shortcuts.rs` is NOT modified, so the core seam was not forked. MET.
+- Keyboard + mouse history both routed: `shortcut_pointer_button` (`WM_XBUTTONDOWN`) and `app_command_pointer_button` (`WM_APPCOMMAND`). MET.
+- History gated on the same capability the on-screen control reads: `perform_chrome_action` returns early unless `can_go_back` / `can_go_forward`. MET.
+- Coverage test `every_conventional_chord_the_core_defines_is_reachable_from_a_win32_key_press` pins the whole table from the Win32 side. MET.
+- The forward-note planted by the conductor was honoured: no capability parameter was added to the core, the Latin-layout limit was not "fixed" unilaterally, and `ChromeAction` was not bridged to the menu vocabulary.
+- Guard file and `rust-toolchain.toml` NOT touched.
+
+CI CHECK (caution: the Linux gate never compiles the Win32 edge, so this leg is the only real evidence):
+- `macos-renderer` SUCCESS, `verify` SUCCESS.
+- `windows-renderer` **FAILURE** — a regression introduced by this task, on the smoke section this task itself added.
+
+The three new KEYBOARD smoke checks pass on the real Win32 message loop. The two failures are both in the new MOUSE section, which is sequenced AFTER the tampered-CID negative control and assumes that failed load left a history entry. It did not, so `can_go_back` is false, the precondition check fails, and the button check then burns its full 30s timeout waiting for a navigation that correctly never happens.
+
+This is a TEST-SEQUENCING defect, not a product defect: `window.rs:593-601` deliberately refuses a history move the on-screen control would refuse, so XBUTTON1 doing nothing with empty history is the specified behaviour.
+
+Full diagnosis and the fix: `work/notes/observations/windows-smoke-mouse-back-check-is-sequenced-after-a-failed-load-2026-08-04.md`. NEEDS-ATTENTION: it was already merged under `--merge` (lock released, so not `requeue`-able) and a fix falls outside this drive's ten-task scope.
+
+Three non-blocking Gate-2 nits: `work/notes/observations/review-nits-shortcuts-and-mouse-history-buttons-on-the-windows-edge-2026-08-04.md`.

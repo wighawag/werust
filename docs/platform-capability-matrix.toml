@@ -1329,6 +1329,14 @@ description = "The keyboard shortcuts every browser has, plus the mouse's back/f
 # ONE action is deliberately unhandled there: macOS reaches no web inspector at
 # all (the `web-inspector` row above), so the chord resolves and the edge simply
 # has no handler, which is the capability-agnostic rule working rather than a gap.
+# ONE chord is deliberately focus-sensitive, and only on this platform: Cmd+Arrow
+# is macOS's own move-to-beginning/end-of-line binding, so the shared resolution
+# hands back history for it with the page focused and NOTHING while the URL bar is
+# being edited (the caret move stays the field editor's, as in every Mac app).
+# That is one platform fact in the core
+# (`PrimaryModifier::history_chord_is_a_text_editing_binding`), not an edge
+# branch, and Alt+Arrow on desktop/Windows is unaffected: it is nobody's text
+# binding, so it still navigates from the URL bar there.
 # Guarded source-shape-wise by crates/werust-macos/tests/macos_shortcut_shape.rs;
 # decisions at
 # docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md.

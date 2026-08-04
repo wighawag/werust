@@ -321,6 +321,49 @@ mod tests {
     }
 
     #[test]
+    fn the_mac_history_chord_is_left_to_the_field_editor_while_the_url_bar_is_edited() {
+        // Cmd+Left / Cmd+Right are macOS's OWN move-to-beginning/end-of-line
+        // keys, so a user editing an address must get the caret move, not a
+        // history navigation that throws the edit away -- which is what every Mac
+        // browser does, and what this edge's `sendEvent:` interception would
+        // otherwise take away, because it gets the key BEFORE the URL bar's field
+        // editor.
+        //
+        // The rule itself is the CORE's (`PrimaryModifier::
+        // history_chord_is_a_text_editing_binding`); what is asserted here is
+        // that it reaches this edge through its real translation, so `claim_key`
+        // returns false for these and `sendEvent:` forwards them to AppKit
+        // untouched. Alt+Arrow on the Ctrl platforms is unaffected: it is nobody's
+        // text binding (pinned in the core's own table).
+        for (key_code, characters, on_the_page, what) in [
+            (
+                KEY_CODE_ARROW_LEFT,
+                Some("\u{f702}"),
+                ChromeAction::GoBack,
+                "Cmd+Left",
+            ),
+            (
+                KEY_CODE_ARROW_RIGHT,
+                Some("\u{f703}"),
+                ChromeAction::GoForward,
+                "Cmd+Right",
+            ),
+        ] {
+            let flags = MODIFIER_FLAG_COMMAND | FUNCTION_BITS;
+            assert_eq!(
+                mac_action(key_code, characters, flags, Focus::UrlBar),
+                None,
+                "{what} while the URL bar is edited is the caret's, not history's"
+            );
+            assert_eq!(
+                mac_action(key_code, characters, flags, Focus::Page),
+                Some(on_the_page),
+                "{what} with the page focused still navigates history"
+            );
+        }
+    }
+
+    #[test]
     fn the_platform_convention_is_the_cores_call_and_this_edge_adds_nothing() {
         // The edge must not restate "a Mac is the Cmd platform", and must not
         // wrap the resolution in a decision of its own: `action` is EXACTLY the

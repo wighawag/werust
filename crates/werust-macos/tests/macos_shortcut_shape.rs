@@ -526,27 +526,30 @@ fn the_macos_leg_presses_the_chords_on_a_real_window() {
 }
 
 #[test]
-fn the_macos_cell_is_implemented_and_the_windows_sibling_is_still_tracked() {
+fn the_macos_cell_is_implemented_beside_its_desktop_siblings() {
     // Criterion 7 (enforced end to end by
     // `crates/werust-core/tests/platform_capability_parity.rs`): this edge is no
-    // longer a stub, and the ONE remaining desktop edge is still a tracked stub
-    // on its own sibling task rather than a silent gap.
+    // longer a stub. Its Windows sibling
+    // (`shortcuts-and-mouse-history-buttons-on-the-windows-edge`) landed while
+    // this task was in flight, so all three DESKTOP cells now read implemented
+    // and the mobile ones stay explicitly `n-a` with their reason, rather than
+    // any edge being a silent gap.
     let matrix = source("docs/platform-capability-matrix.toml");
     let row = between(
         &matrix,
         "name = \"conventional-shortcuts\"",
         "\n[[capability]]",
     );
-    for implemented in ["desktop", "macos"] {
+    for implemented in ["desktop", "macos", "windows"] {
         assert!(
             row.contains(&format!("{implemented} = {{ state = \"implemented\" }}")),
             "the {implemented} edge's shortcuts must be marked implemented: {row:?}"
         );
     }
-    assert!(
-        row.contains(
-            "windows = { state = \"stubbed\", task = \"shortcuts-and-mouse-history-buttons-on-the-windows-edge\" }"
-        ),
-        "the Windows edge must still be a TRACKED stub on its sibling task: {row:?}"
-    );
+    for mobile in ["ios", "android"] {
+        assert!(
+            row.contains(&format!("{mobile} = {{ state = \"n-a\", reason = ")),
+            "the {mobile} edge must stay an explicit, REASONED n-a: {row:?}"
+        );
+    }
 }

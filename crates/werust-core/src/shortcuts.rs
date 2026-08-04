@@ -34,6 +34,15 @@
 //! own Escape branch, which is precisely the per-edge decision this module
 //! deletes. So the edge REPORTS focus and this module decides.
 //!
+//! Focus is load-bearing for a second reason, and only on ONE platform: macOS
+//! spells its history chord Cmd+Arrow, which is ALSO the system's
+//! move-to-beginning/end-of-line binding in every text field, so the history
+//! rows yield to the text being edited there while Linux's and Windows'
+//! Alt+Arrow (nobody's text binding) keeps navigating from the URL bar. That is
+//! one platform FACT, stated once here as
+//! `PrimaryModifier::history_chord_is_a_text_editing_binding`, rather than a
+//! Mac-shaped exception each edge would have to re-derive.
+//!
 //! # Capability-agnostic, deliberately
 //!
 //! A chord resolves to an action regardless of whether the asking edge can
@@ -204,6 +213,31 @@ impl PrimaryModifier {
             },
         }
     }
+
+    /// Whether this platform's HISTORY chord is ALSO one of its standard
+    /// TEXT-EDITING bindings, and therefore may not be claimed while the user is
+    /// typing.
+    ///
+    /// A third axis of the same platform split, and the reason the history rows
+    /// consult [`Focus`] at all: on macOS, Cmd+Left / Cmd+Right are the system's
+    /// move-to-beginning/end-of-line keys in EVERY text field, so a browser that
+    /// claimed them unconditionally would swallow the caret move a Mac user
+    /// expects while editing an address. On Linux and Windows, Alt+Arrow is no
+    /// text binding at all, and those platforms' browsers navigate from the URL
+    /// bar too.
+    ///
+    /// A platform FACT, stated ONCE here rather than per edge, exactly like
+    /// `history` beside it (decision 8 in
+    /// `docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md`).
+    #[must_use]
+    const fn history_chord_is_a_text_editing_binding(self) -> bool {
+        match self {
+            // Alt+Arrow moves no caret on Linux or Windows.
+            PrimaryModifier::Control => false,
+            // Cmd+Arrow is move-to-line-start/end in every Cocoa text field.
+            PrimaryModifier::Meta => true,
+        }
+    }
 }
 
 /// Where the keyboard focus is when the key is pressed: an INPUT to the
@@ -343,11 +377,20 @@ const _CHROME_ACTION_ALL_IS_EVERY_ACTION_IN_SLOT_ORDER: () = {
 /// |---|---|---|
 /// | Ctrl+L / Cmd+L | any | [`FocusUrlBar`](ChromeAction::FocusUrlBar) |
 /// | Ctrl+R / Cmd+R, or F5 | any | [`Reload`](ChromeAction::Reload) |
-/// | Alt+Left / Cmd+Left | any | [`GoBack`](ChromeAction::GoBack) |
-/// | Alt+Right / Cmd+Right | any | [`GoForward`](ChromeAction::GoForward) |
+/// | Alt+Left / Cmd+Left | any / page only | [`GoBack`](ChromeAction::GoBack) |
+/// | Alt+Right / Cmd+Right | any / page only | [`GoForward`](ChromeAction::GoForward) |
 /// | Escape | page | [`Stop`](ChromeAction::Stop) |
 /// | Escape | URL bar | [`RevertUrlBar`](ChromeAction::RevertUrlBar) |
 /// | F12 | any | [`OpenWebInspector`](ChromeAction::OpenWebInspector) |
+///
+/// The history rows read "page only" on the Mac convention and "any" on the Ctrl
+/// one for ONE reason, stated once on `PrimaryModifier`'s
+/// `history_chord_is_a_text_editing_binding`: Cmd+Arrow is macOS's own
+/// move-to-beginning/end-of-line binding, so claiming it while the URL bar (or a
+/// page text field) is being typed in would eat the caret move a Mac user
+/// expects, which no Mac browser does. Alt+Arrow is nobody's text binding, so it
+/// still navigates from the URL bar on Linux and Windows, as those platforms'
+/// browsers do.
 ///
 /// A [`None`] must be PASSED ON by the edge (the page and the URL bar keep every
 /// key werust does not claim), which is also what leaves GTK4's interactive
@@ -358,7 +401,10 @@ pub fn resolve_chord(chord: Chord, focus: Focus, primary: PrimaryModifier) -> Op
     let modifiers = chord.modifiers;
     let primary_only = modifiers.is_exactly(Modifiers::only(primary));
     let unmodified = modifiers.is_exactly(Modifiers::NONE);
-    let history = modifiers.is_exactly(primary.history());
+    // The history chord wins unless it would be TAKING a key from the text the
+    // user is editing (Cmd+Arrow on a Mac); see the table above.
+    let history_wins = modifiers.is_exactly(primary.history())
+        && (matches!(focus, Focus::Page) || !primary.history_chord_is_a_text_editing_binding());
 
     match chord.key {
         Key::Character(c) if primary_only && c.eq_ignore_ascii_case(&'l') => {
@@ -368,8 +414,8 @@ pub fn resolve_chord(chord: Chord, focus: Focus, primary: PrimaryModifier) -> Op
             Some(ChromeAction::Reload)
         }
         Key::F5 if unmodified => Some(ChromeAction::Reload),
-        Key::ArrowLeft if history => Some(ChromeAction::GoBack),
-        Key::ArrowRight if history => Some(ChromeAction::GoForward),
+        Key::ArrowLeft if history_wins => Some(ChromeAction::GoBack),
+        Key::ArrowRight if history_wins => Some(ChromeAction::GoForward),
         // The FOCUS-dependent one, and the reason focus is in this signature at
         // all: abandon a hanging page from the keyboard (story 5), or undo what
         // you were typing in the bar and get the current URL back (story 6).
@@ -588,24 +634,86 @@ mod tests {
         // Alt+Arrow is the Ctrl-platform convention, Cmd+Arrow the Mac one
         // (recorded in docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/DECISIONS.md,
         // decision 3). Both live HERE, so no edge decides it.
-        assert_eq!(
-            resolve_chord(Chord::new(Key::ArrowLeft, META), Focus::Page, MAC_PLATFORM),
-            Some(ChromeAction::GoBack)
-        );
-        assert_eq!(
-            resolve_chord(Chord::new(Key::ArrowRight, META), Focus::Page, MAC_PLATFORM),
-            Some(ChromeAction::GoForward)
-        );
-        assert_eq!(
-            resolve_chord(Chord::new(Key::ArrowLeft, ALT), Focus::Page, MAC_PLATFORM),
-            None,
-            "Option+Left is not the Mac history chord"
-        );
-        assert_eq!(
-            resolve_chord(Chord::new(Key::ArrowLeft, META), Focus::Page, CTRL_PLATFORM),
-            None,
-            "Super+Left is not the Linux/Windows history chord"
-        );
+        //
+        // …and so does the CONSEQUENCE of that split, pinned below in all four
+        // combinations of platform and focus: on a Mac, Cmd+Arrow is ALSO the
+        // system's move-to-beginning/end-of-line binding, so claiming it while
+        // the user is typing an address would eat the edit (the regression this
+        // test exists for, caught on the macOS edge). Alt+Arrow is no such
+        // binding on Linux/Windows, so it navigates from the URL bar too, which
+        // is what those platforms' browsers do and what this must NOT regress.
+        let table = [
+            // The Mac: history on the page, the caret while typing.
+            (
+                Chord::new(Key::ArrowLeft, META),
+                Focus::Page,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoBack),
+            ),
+            (
+                Chord::new(Key::ArrowLeft, META),
+                Focus::UrlBar,
+                MAC_PLATFORM,
+                None,
+            ),
+            (
+                Chord::new(Key::ArrowRight, META),
+                Focus::Page,
+                MAC_PLATFORM,
+                Some(ChromeAction::GoForward),
+            ),
+            (
+                Chord::new(Key::ArrowRight, META),
+                Focus::UrlBar,
+                MAC_PLATFORM,
+                None,
+            ),
+            // Linux/Windows: history from EITHER place, unchanged.
+            (
+                Chord::new(Key::ArrowLeft, ALT),
+                Focus::Page,
+                CTRL_PLATFORM,
+                Some(ChromeAction::GoBack),
+            ),
+            (
+                Chord::new(Key::ArrowLeft, ALT),
+                Focus::UrlBar,
+                CTRL_PLATFORM,
+                Some(ChromeAction::GoBack),
+            ),
+            (
+                Chord::new(Key::ArrowRight, ALT),
+                Focus::Page,
+                CTRL_PLATFORM,
+                Some(ChromeAction::GoForward),
+            ),
+            (
+                Chord::new(Key::ArrowRight, ALT),
+                Focus::UrlBar,
+                CTRL_PLATFORM,
+                Some(ChromeAction::GoForward),
+            ),
+            // And each platform's chord is nothing at all on the other one.
+            (
+                Chord::new(Key::ArrowLeft, ALT),
+                Focus::Page,
+                MAC_PLATFORM,
+                None,
+            ),
+            (
+                Chord::new(Key::ArrowLeft, META),
+                Focus::Page,
+                CTRL_PLATFORM,
+                None,
+            ),
+        ];
+        for (chord, focus, primary, expected) in table {
+            assert_eq!(
+                resolve_chord(chord, focus, primary),
+                expected,
+                "{chord:?} with {focus:?} focused on {primary:?}"
+            );
+        }
     }
 
     #[test]

@@ -4,7 +4,7 @@ Task `shortcuts-and-mouse-history-buttons-on-the-macos-edge`, spec `chrome-conve
 
 ## Where things live
 
-- **The decision** (what an input MEANS): `crates/werust-core/src/shortcuts.rs`. Unchanged by this task.
+- **The decision** (what an input MEANS): `crates/werust-core/src/shortcuts.rs`. Changed by this task in exactly one respect, and for the whole product rather than for this edge: the history rows now yield to text editing on the platforms where the history chord IS a text-editing binding, which is macOS only (`DECISIONS.md`, decision 8).
 - **The translation** (`NSEvent` -> the shared vocabulary): `crates/werust-macos/src/input.rs`. Deliberately NOT target-gated, so the Ubuntu `verify` gate compiles and unit-tests it against the real core.
 - **The interception and the doing**: `crates/werust-macos/src/window.rs`. `ShortcutWindow` (an `NSWindow` subclass) overrides `sendEvent:`; `WindowController::shortcut_focus` reports which of the two focus contexts is live; `WindowController::perform_chrome_action` performs the result through the same `BrowserShell` calls the toolbar buttons drive.
 - **The guard** that this edge decides nothing: `crates/werust-macos/tests/macos_shortcut_shape.rs`.
@@ -17,7 +17,8 @@ Task `shortcuts-and-mouse-history-buttons-on-the-macos-edge`, spec `chrome-conve
 |---|---|
 | Cmd+L | focus the URL bar and select its contents |
 | Cmd+R, F5 | reload |
-| Cmd+Left / Cmd+Right | history back / forward (only when that move is available) |
+| Cmd+Left / Cmd+Right, page focused | history back / forward (only when that move is available) |
+| Cmd+Left / Cmd+Right, URL bar focused | NOT werust's: the field editor moves the caret to the start / end of the line, as it does in every Mac app |
 | Escape, page focused | stop the in-flight load |
 | Escape, URL bar focused | revert the edit, restore the current page's URL |
 | mouse Back / Forward side buttons | history back / forward |
@@ -34,6 +35,7 @@ Anything not in the table above is forwarded to AppKit untouched, so ordinary ty
 
 1. The whole translation table: `NSEvent` key codes (Escape, F5, F12, the arrows) and `charactersIgnoringModifiers` letters into `shortcuts::Key`; `NSEventModifierFlags` bits into `shortcuts::Modifiers`; AppKit `buttonNumber` 3/4 into `PointerButton::Back`/`Forward`.
 2. **The Cmd branch of the shared resolution, reached through THIS edge's real translation** — Cmd+L, Cmd+R, F5, Cmd+Left, Cmd+Right, Escape in both focus contexts — and its DISTINCTNESS from the Ctrl branch (Ctrl+L, Ctrl+R, Option+Arrow resolve to nothing on a Mac, while the same translated chord resolves on the Ctrl convention).
+   Including the one rule this edge's review added: Cmd+Left / Cmd+Right resolve to history with the page focused and to NOTHING while the URL bar is edited, so the caret move survives — pinned for both platforms in both focus states in the core's own table (`history_follows_each_platforms_own_convention_from_the_same_one_branch`), and through this edge's translation in `the_mac_history_chord_is_left_to_the_field_editor_while_the_url_bar_is_edited`.
 3. That AppKit's own `Function` / `NumericPad` / Caps Lock bits, which a Mac really sends with every arrow and function key, are dropped in translation and therefore cannot make a chord unmatchable against the core's EXACT modifier comparison.
 4. That the mouse side buttons resolve to history through the core.
 5. Source-shape (`macos_shortcut_shape.rs`): the AppKit layer names no key and no key code; every `ChromeAction` has an arm; the web-inspector arm is EMPTY and says why; focus is reported and never branched on outside the reporter; history goes through the existing seam and its capability flags; no werust chord is installed as an AppKit key equivalent; the shared resolution grew no platform or capability branch.
@@ -55,6 +57,7 @@ These are true of every macOS surface in this repo (`docs/adr/0011` Amendment 1,
 
 - **That the interception really beats a page that binds the key.** The smoke's fixture does not fight for Escape. The claim rests on `sendEvent:` running before the view hierarchy and the first responder, which is documented AppKit behaviour, not something this repo measured. A page that binds Escape is the practical check.
 - **That the interception really beats the URL bar's field editor.** Same shape: the smoke drives the field editor, but not a case where AppKit's own `cancelOperation:` would otherwise win.
+- **That Cmd+Left really reaches the field editor and moves the caret** when werust declines it. What CI proves is that werust RESOLVES nothing for it while the URL bar is focused, so `sendEvent:` forwards the event to `NSWindow` untouched; that AppKit then applies its standard `moveToLeftEndOfLine:` binding is documented AppKit behaviour this repo cannot press (manual step 3 below).
 - **`NSEvent.buttonNumber()` itself.** AppKit's synthetic-mouse constructor carries no button number, so the smoke drives the side buttons from the number onwards (`BrowserWindow::press_side_button`); reading the number off a real event is the one unexercised token. See `DECISIONS.md`, decision 7.
 
 ## Manual verification (needs a Mac; nothing in this repo can do it)
@@ -63,7 +66,8 @@ Build and run: `cargo run -p werust-macos` on a Mac.
 
 1. **Cmd+L**: the URL bar takes focus and its whole text is selected; typing replaces the address. **Ctrl+L** does not do this (it is the Ctrl platform's chord).
 2. **Cmd+R** and **F5**: the page reloads (watch the URL-bar progress and the status line).
-3. Navigate to a second page, then **Cmd+Left**: it goes back; **Cmd+Right**: forward. At the start of history Cmd+Left does nothing (the same capability flag that greys the Back button). **Option+Left** does nothing: it is not the Mac history chord.
+3. Navigate to a second page, then, **with the page focused**, **Cmd+Left**: it goes back; **Cmd+Right**: forward. At the start of history Cmd+Left does nothing (the same capability flag that greys the Back button). **Option+Left** does nothing: it is not the Mac history chord.
+   Then click into the **URL bar**, type an address, and press **Cmd+Left** and **Cmd+Right** there: the CARET must move to the start and the end of the line, exactly as in any Mac text field, and the browser must NOT navigate or lose the edit. That is the half werust deliberately does not claim (`DECISIONS.md`, decision 8); a page text field must behave the same way.
 4. **Escape with the page focused**, during a slow load: the load stops, exactly as the Stop button does. Try it on a page that binds Escape itself (a full-screen or modal-heavy site): werust must still stop the load.
 5. **Escape with the URL bar focused**, after typing rubbish into it: the bar snaps back to the current page's URL and nothing navigates. AppKit's own field-editor cancel must not get there first.
 6. **F12**: nothing happens, and no window opens. That is correct on this platform until `macos-web-inspector-safari-devtools` lands.

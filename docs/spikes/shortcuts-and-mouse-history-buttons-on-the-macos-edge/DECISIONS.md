@@ -12,7 +12,9 @@ The DECISION about what a chord means is not among them, and could not be: it li
 
 **Alternatives considered:** (a) `NSEvent.addLocalMonitorForEventsMatchingMask:handler:`, which is the other documented pre-dispatch hook. Rejected on scope: a local monitor is APPLICATION-wide, so it would also claim Cmd+R while the DEBUG window is key, and the fix would be to compare `event.window` inside the monitor, i.e. to re-derive "is this the browser window?" that a window subclass answers by construction. It would also add a `block2` dependency for the handler block. (b) `performKeyEquivalent:` on the content view, which AppKit only calls for command-modified keys, so Escape, F5, F12 and the bare arrows would never arrive. (c) `keyDown:` on the content view, which is the BUBBLE phase wearing another name: the page would get the key first.
 
-**Cost, recorded honestly:** the same trade the GTK edge recorded. A page can no longer see the chords werust claims (Cmd+L, Cmd+R, F5, Cmd+Arrow, Escape, F12), which is the conventional browser trade and why the claimed set is kept to the spec's list.
+**Cost, recorded honestly:** the same trade the GTK edge recorded. A page can no longer see the chords werust claims (Cmd+L, Cmd+R, F5, Escape, F12), which is the conventional browser trade and why the claimed set is kept to the spec's list.
+
+Cmd+Arrow is the one chord that is NOT claimed unconditionally, and that is not a property of this interception point: it is macOS's own move-to-beginning/end-of-line binding, so claiming it while the URL bar's field editor (or a page text field) has the keyboard would eat the caret move and the user's edit, which no Mac browser does. Because a chord means what the core says it means, the fix is the core's and not a special case here: the resolution simply returns nothing for Cmd+Arrow while the URL bar has focus, `claim` forwards the event to `NSWindow` untouched, and AppKit moves the caret. See decision 8.
 
 **Touches:** the Windows sibling task will face the same question (its analogue is the message loop / `WM_KEYDOWN` before `TranslateAccelerator`), and the answer there should be reasoned from the same "must beat the focused page" property rather than copied.
 
@@ -65,6 +67,24 @@ Everything that is not the URL bar — the page, a toolbar button, the menu — 
 **Why:** AppKit's synthetic-mouse constructor (`+mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:`) takes no `buttonNumber`, so a synthesised `otherMouseDown` cannot carry the one field that matters. Driving the resolution from the number keeps EVERYTHING after `NSEvent.buttonNumber()` on the production path — translation, resolution, performer — and leaves exactly one unexercised token, which is named in `README.md` beside this file rather than quietly implied to be covered.
 
 **Alternative considered:** building the event through `CGEvent` (`kCGMouseEventButtonNumber`) and `+[NSEvent eventWithCGEvent:]`, which CAN carry a button number. Rejected for this task: it adds a Core Graphics dependency and a second event-synthesis path to a leg nobody here can debug, to cover one accessor. Worth revisiting if the side buttons ever grow behaviour of their own.
+
+## 8. The Mac history chord yields to text editing, and that rule lives in the CORE
+
+**Chosen:** `crates/werust-core/src/shortcuts.rs` gained `PrimaryModifier::history_chord_is_a_text_editing_binding` (false for `Control`, true for `Meta`), and the `ArrowLeft` / `ArrowRight` rows resolve only when the chord is not a text-editing binding on that platform OR the page has focus. On a Mac, Cmd+Left / Cmd+Right therefore navigate history with the page focused and resolve to NOTHING while the URL bar is being edited, so this edge's `sendEvent:` forwards them to AppKit and the field editor moves the caret. Alt+Left / Alt+Right on Linux and Windows are UNCHANGED: they navigate from either focus.
+
+**Why it could not be fixed in this edge:** the whole point of the seam is that a chord means one thing, decided once (`werust_core::shortcuts`). "Except on macOS, where the edge drops Cmd+Arrow while the URL bar has focus" would be a second table wearing an AppKit costume, i.e. exactly the per-edge decision the seam deletes. The collision is not an AppKit implementation detail either: it is a PLATFORM CONVENTION (Cmd+Arrow is move-to-line-start/end in every Cocoa text field), which is the same kind of fact `PrimaryModifier::history` already carries, so it belongs beside it.
+
+**Why it is gated on the platform and not on focus alone:** gating the history rows on `Focus::Page` unconditionally would have been one line shorter and would have REGRESSED the two sibling edges. Alt+Arrow is nobody's text-editing binding, and Firefox and Chrome on Linux/Windows navigate history from the URL bar happily; taking that away to fix a Mac problem would be paying for macOS's key-binding history with the other two platforms' behaviour. The condition is therefore "does this platform's history chord collide with text editing", which is the fact that actually differs.
+
+**Refines** decision 3 in `docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/DECISIONS.md` (which chose Cmd+Arrow as the Mac history chord) rather than reversing it: the chord is unchanged, its focus sensitivity is new.
+
+**Alternatives considered:** (a) claim Cmd+Arrow unconditionally, as the first attempt did. Rejected: a user editing an address who presses Cmd+Left would get a navigation and lose the edit. (b) let the edge inspect the field editor and decline the key itself. Rejected as above: a second decision site. (c) make the core capability- or widget-aware. Rejected: the resolution stays capability-agnostic (module docs), and "is a text field being edited" is already answered by `Focus`.
+
+**Touches:** every edge that consumes `resolve_chord`. GTK (`crates/werust/src/main.rs`) and Windows (`crates/werust-windows/src/shortcuts.rs`) are unaffected by construction, and their tests were re-run to confirm it; neither encoded an assumption that history is focus-independent (both assert their history rows with `Focus::Page`).
+
+**Asserted, not just written down:** `crates/werust-core/src/shortcuts.rs`, `history_follows_each_platforms_own_convention_from_the_same_one_branch` (all four platform/focus combinations, in both directions), and through this edge's own translation in `crates/werust-macos/src/input.rs`, `the_mac_history_chord_is_left_to_the_field_editor_while_the_url_bar_is_edited`.
+
+**Deliberately NOT taken:** Cmd+`[` / Cmd+`]`, the Mac's other back/forward chords, which do not collide with text editing. No story asks for them, they need bracket keys in the shared `Key` vocabulary, and adding vocabulary for an unasked chord while fixing a regression widens this change for nothing. Decision 3 in the sibling file already left the door open, and the door stays open.
 
 ## What was measured, and what was not
 

@@ -127,3 +127,11 @@ Concretely, in crates/werust-core/src/shortcuts.rs:
 OPTIONAL, only if it falls out cleanly and is covered by tests: macOS browsers ALSO bind Cmd+[ and Cmd+] to back/forward, and those do not collide with text editing. If you add them, add them in the core table for the Meta platform only, with tests. If it is not clean, leave it out and note it; it is not required by this task.
 
 HARD CONSTRAINTS, unchanged: do NOT edit or weaken crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain (rust-toolchain.toml is pinned). The edge translates and performs; it never decides what a chord means. Keep the resolution CAPABILITY-AGNOSTIC (no capability parameter in the core). User-facing chrome strings come from the ONE core derivation. Conventional-commit subjects.
+
+## Requeue 2026-08-04
+
+Conductor note: the kept branch was STRANDED by a rebase conflict against latest main (requeue --reconcile could not auto-resolve it). The conflict has now been resolved BY HAND on the branch itself and force-pushed, so the branch is rebased cleanly onto main and its tip is verified: cargo fmt --check clean, cargo clippy --all-targets -D warnings clean, and the previously-conflicted test crates/werust-core/tests/shortcut_edge_wiring_shape.rs passes all 7 cases.
+
+The two conflicts were both additive-registry collisions with the Windows edge task that landed meanwhile, resolved to keep BOTH intents: docs/platform-capability-matrix.toml now records the conventional-shortcuts row with macos = implemented AND windows = implemented (each task had flipped only its own cell), and both platform description blocks are kept with each side's now-stale 'X is the remaining sibling edge task' sentence dropped. In shortcut_edge_wiring_shape.rs the generalised amendment from main was kept and a macOS amendment added beside it.
+
+Your 2026 lines of macOS work are INTACT. Continue from this tip and implement the DESIGN DECISION recorded in the requeue note above (the focus-sensitive history chord in werust_core::shortcuts). Do not redo the edge wiring that is already there.

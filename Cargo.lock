@@ -434,7 +434,7 @@ dependencies = [
 
 [[package]]
 name = "desktop-paint"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "renderer",
  "werust-core",
@@ -586,7 +586,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fetcher"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "cid",
@@ -1464,7 +1464,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "macos-origin-probe"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "objc2",
  "objc2-app-kit",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "macos-renderer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "objc2",
@@ -1581,7 +1581,7 @@ dependencies = [
 
 [[package]]
 name = "native-renderer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "cssparser",
  "fetcher",
@@ -2067,7 +2067,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "renderer"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "rfc6979"
@@ -2208,7 +2208,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "script-engine"
-version = "0.3.1"
+version = "0.4.0"
 
 [[package]]
 name = "sec1"
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "webview-renderer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "gtk4",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "webview-shared"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "renderer",
@@ -2938,7 +2938,7 @@ dependencies = [
 
 [[package]]
 name = "werust"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "gtk4",
@@ -2952,7 +2952,7 @@ dependencies = [
 
 [[package]]
 name = "werust-android-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "jni",
@@ -2962,7 +2962,7 @@ dependencies = [
 
 [[package]]
 name = "werust-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "chrono",
  "cid",
@@ -2989,7 +2989,7 @@ dependencies = [
 
 [[package]]
 name = "werust-ios-core"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "renderer",
@@ -2998,7 +2998,7 @@ dependencies = [
 
 [[package]]
 name = "werust-macos"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "desktop-paint",
  "fetcher",
@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "werust-windows"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "desktop-paint",
  "fetcher",
@@ -3118,7 +3118,7 @@ dependencies = [
 
 [[package]]
 name = "windows-origin-probe"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -3128,7 +3128,7 @@ dependencies = [
 
 [[package]]
 name = "windows-renderer"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "fetcher",
  "renderer",

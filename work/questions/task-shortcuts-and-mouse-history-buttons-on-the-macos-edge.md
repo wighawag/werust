@@ -79,3 +79,13 @@
 <!-- q7 fields: id=q7 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q8
+
+**'task:shortcuts-and-mouse-history-buttons-on-the-macos-edge' was bounced — how should we proceed?**
+
+> continuing the kept work/task-shortcuts-and-mouse-history-buttons-on-the-macos-edge: rebase onto the latest main conflicted (aborted, never auto-resolved) — run `requeue --reconcile` to non-destructively re-sync the mirror and retry the rebase (keeps the work). Last resort: `requeue --reset` DESTRUCTIVELY discards the branch and starts fresh.
+
+<!-- q8 fields: id=q8 kind=stuck -->
+
+**Your answer** (write below this line):

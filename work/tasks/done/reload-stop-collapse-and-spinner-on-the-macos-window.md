@@ -53,3 +53,17 @@ dorfl claim reload-stop-collapse-and-spinner-on-the-macos-window --arbiter origi
 git fetch origin && git switch -c work/reload-stop-collapse-and-spinner-on-the-macos-window origin/main
 git mv work/tasks/ready/reload-stop-collapse-and-spinner-on-the-macos-window.md work/tasks/done/reload-stop-collapse-and-spinner-on-the-macos-window.md
 ```
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, first attempt. The last of the ten chrome tasks.
+
+- ONE control replacing the separate Reload/Stop pair, plus the spinner: a single `reload_stop: Retained<NSButton>` with an `NSProgressIndicator` spinner beside it. MET.
+- Mode and spinner visibility READ from the painted snapshot, derived in neither: driven by `ChromePaint::reload_stop_control` / `ChromePaint::spinner_visible`, with the module doc stating plainly that this edge decides nothing of its own. MET.
+- The layout does not shift when the spinner appears, so starting a load never moves the URL bar. MET.
+- Back and forward controls untouched. MET.
+- Guard file and `rust-toolchain.toml` NOT touched.
+
+CI VERIFIED: `macos-renderer` SUCCESS on the merge commit (the Ubuntu gate never compiles AppKit, so this is the real evidence).
+
+Eight non-blocking Gate-2 nits: `work/notes/observations/review-nits-reload-stop-collapse-and-spinner-on-the-macos-window-2026-08-04.md`. The agent also filed two observations, one of which (`windows-capability-cell-still-reads-stubbed-after-its-collapse-task-landed`) the conductor has since fixed and closed.

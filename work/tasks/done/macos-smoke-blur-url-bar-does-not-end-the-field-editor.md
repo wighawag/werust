@@ -59,3 +59,19 @@ The original theory (a surviving field editor makes `shortcut_focus` report `Url
 ## Requeue 2026-08-04
 
 The task has been RE-SCOPED in response to your STOP, which was correct and is accepted in full. Your analysis is now the task's diagnosis, and the constraint that blocked you has been lifted: you are explicitly AUTHORISED to replace the symptom assertion with the stronger effect-based pair you proposed (page-focused Escape cancels an in-flight load; bar-focused Escape reverts and does not cancel), following the shape the Windows smoke already uses. Re-read the task body before starting; the corrected diagnosis supersedes the original one.
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, on the second attempt, and the first attempt's STOP was the most valuable event in it.
+
+This task was authored by the conductor to fix a RED `macos-renderer` leg. Its ORIGINAL diagnosis was WRONG, and the build agent refused it with evidence rather than building the wrong thing: it showed that `press_key -> sendEvent -> perform_chrome_action` is synchronous, that `Stop` calls `refresh_chrome` -> `Chrome::apply`, which overwrites the URL field with `ChromePaint::url_text`, and therefore that the asserted `url_text() == typed` was unreachable in BOTH focus states. The check had never discriminated focus at all. That is exactly the drift-detection the STOP mechanism exists for, and it was correct.
+
+The task was re-scoped to accept that analysis and to LIFT the constraint that blocked the agent (the original body forbade touching the assertion). Verified on the merged diff:
+
+- `blur_url_bar` hardened: ends the field-editor session explicitly and honours the `makeFirstResponder` result instead of discarding it. MET.
+- PRIMARY check added: `window.reported_focus()` is asserted directly, in both states, so a future failure names the CAUSE rather than a symptom. MET.
+- The symptom assertion is REPLACED by the stronger effect-based pair, as authorised: "Escape with the PAGE focused CANCELS the in-flight load" and, for the bar, "…and does NOT cancel the in-flight load". Strictly stronger and genuinely discriminating, so the safety net is larger than before, not smaller. MET.
+- Production repaint behaviour NOT changed (correctly out of scope: the GTK edge behaves identically and it is a cross-edge product decision). MET.
+- The pre-existing gap is recorded durably in `work/notes/observations/the-macos-page-focused-escape-check-was-never-discriminating-2026-08-04.md`, which correctly notes the focus half of the macOS shortcut layer was unguarded from the day it landed until this task.
+
+CI VERIFIED: `macos-renderer` SUCCESS. The leg is green again.

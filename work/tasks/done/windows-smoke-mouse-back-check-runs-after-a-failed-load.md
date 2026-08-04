@@ -50,3 +50,19 @@ The PRODUCT is correct. `perform_chrome_action` (`crates/werust-windows/src/wind
 > Read the diagnosis above and CONFIRM it first. This is a test-SEQUENCING fix; resist the urge to change the product, which is behaving as specified. If you conclude otherwise, say so explicitly and show why.
 >
 > Full background: `work/notes/observations/windows-smoke-mouse-back-check-is-sequenced-after-a-failed-load-2026-08-04.md`.
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, first attempt.
+
+Authored by the conductor to fix the RED `windows-renderer` leg left by `shortcuts-and-mouse-history-buttons-on-the-windows-edge`, whose new mouse-back section was sequenced after the tampered-CID negative control and so asserted against a precondition it never established (a failed load creates no history entry, so `can_go_back` was false).
+
+- The mouse-back section now runs with two SUCCESSFUL loads in history. MET.
+- Both previously-failing checks pass on the real `windows-latest` runner: there IS history to go back to, and XBUTTON1 really navigates back through the shell. MET.
+- The check was NOT weakened: it still proves mouse button 4 genuinely navigates, which is the only evidence this project ever gets for that behaviour. MET.
+- The negative-control (tampered CID) checks still run and still pass. MET.
+- Guard file and `rust-toolchain.toml` NOT touched.
+
+CI VERIFIED: `windows-renderer` SUCCESS. The leg is green again.
+
+Three non-blocking Gate-2 nits: `work/notes/observations/review-nits-windows-smoke-mouse-back-check-runs-after-a-failed-load-2026-08-04.md`.

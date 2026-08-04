@@ -389,6 +389,86 @@ impl IosHandle {
         });
     }
 
+    /// Report that the platform `WKWebView` navigated its OWN back-forward list:
+    /// the user's EDGE-SWIPE gesture (`allowsBackForwardNavigationGestures`), or a
+    /// page calling `history.back()`/`forward()`. Called from Swift's
+    /// `decidePolicyFor` when the navigation type is `.backForward`, with the
+    /// target URL — the earliest signal WebKit gives, before the new document's
+    /// bytes are resolved.
+    ///
+    /// This is a history MOVE, not a new entry, and that is the whole difference
+    /// from [`on_url_changed`](IosHandle::on_url_changed): a swipe RE-ENTERS an
+    /// entry the session already has, so the cursor must move onto it. Reported as
+    /// an ordinary URL change (which pushes), a swipe back from `b` to `a` would
+    /// leave the history `[a, b, a]`: Forward would read false while the user can
+    /// plainly swipe forward, and every swipe would leak another entry.
+    ///
+    /// The move is resolved by matching `url` against the ADJACENT entries rather
+    /// than by a direction the edge reports, because `WKNavigationAction` names a
+    /// navigation `.backForward` without saying WHICH way it went. Back is checked
+    /// first, so an ambiguous history (`[a, b, a]` standing on `b`, swiping to
+    /// `a`) resolves as a step BACK — the far commoner gesture, and either reading
+    /// leaves the bar on the same URL.
+    ///
+    /// A target that is NEITHER neighbour means WebKit's back-forward list and the
+    /// session history have DRIFTED (a core-driven history move is performed as a
+    /// fresh `WKWebView.load`, which APPENDS to WebKit's list rather than moving
+    /// its cursor). The bar then FOLLOWS the page the user is actually looking at,
+    /// by pushing, exactly as [`on_url_changed`](IosHandle::on_url_changed) does:
+    /// a browser whose thesis is an honest address must never show an address the
+    /// user is not on.
+    ///
+    /// It moves the cursor and RESETS the per-load trust axes — the target is a
+    /// DIFFERENT document, so the current one's `ContentVerified` /
+    /// `NameViaTrustedRpc` posture must not be carried onto it — but it does NOT
+    /// touch the load state and queues NO pending load: WebKit is already
+    /// performing this navigation, and re-issuing it would fight the gesture. The
+    /// load state is moved by the ordinary `didCommit`/`didFinish` signals that
+    /// follow (a cross-document swipe), or by nothing at all (a same-document
+    /// entry, which fires neither) — which is why a `Started` is deliberately NOT
+    /// emitted here: it would leave a same-document swipe stuck "loading" forever.
+    ///
+    /// Idempotent: reporting the entry the session is ALREADY on does nothing, so
+    /// the KVO `url` observer and the commit signal that follow the same gesture
+    /// cannot walk the cursor a second time.
+    pub fn on_history_navigated(&self, url: &str) {
+        let mut b = self.inner.borrow_mut();
+        if b.current().map(String::as_str) == Some(url) {
+            return;
+        }
+        let back = b
+            .cursor
+            .filter(|c| *c > 0)
+            .filter(|c| b.history[c - 1] == url);
+        let forward = b
+            .cursor
+            .filter(|c| c + 1 < b.history.len())
+            .filter(|c| b.history[c + 1] == url);
+        match (back, forward) {
+            (Some(c), _) => b.cursor = Some(c - 1),
+            (None, Some(c)) => b.cursor = Some(c + 1),
+            (None, None) => {
+                // The two stacks have drifted: follow the URL as a new entry, the
+                // same shape a webview-initiated navigation takes.
+                let next = b.cursor.map_or(0, |c| c + 1);
+                b.history.truncate(next);
+                b.history.push(url.to_string());
+                b.cursor = Some(b.history.len() - 1);
+            }
+        }
+        // A different document is being entered, so the CURRENT one's posture must
+        // not be carried onto it. Resetting understates trust when WebKit restores
+        // a verified page from its page cache (no scheme task re-runs, so nothing
+        // re-marks it) and that is the fail-closed direction: werust may show less
+        // trust than a page has, never more (`docs/adr/0006`).
+        b.posture = TrustPosture::UnverifiedOrigin;
+        b.ens_origin = false;
+        b.mutable_name = false;
+        b.events.push_back(LoadEvent::UrlChanged {
+            url: url.to_string(),
+        });
+    }
+
     /// Report that the platform `WKWebView` committed the load on `url` (the
     /// effective URL after any redirects): advance to [`LoadState::Committed`] and
     /// emit [`LoadEvent::Committed`]. Called from Swift's `didCommit`.
@@ -825,6 +905,97 @@ mod tests {
 
         h.on_url_changed("ipfs://bafyroot/portfolio");
         assert_eq!(b.poll_event(), None, "an unchanged URL emits no event");
+    }
+
+    #[test]
+    fn a_gesture_history_move_lands_the_cursor_without_queuing_a_load() {
+        // The EDGE-SWIPE gesture (task `enable-the-ios-back-forward-swipe-gesture`):
+        // WebKit navigates its OWN back-forward list, so the edge REPORTS the
+        // target rather than driving `go_back`. The cursor must land on the entry
+        // swiped to (not push a duplicate), the event is a URL change (not a fresh
+        // load lifecycle), and NOTHING may be queued for the WKWebView — a pending
+        // load here would re-navigate on top of the navigation WebKit is already
+        // performing.
+        let mut b = IosBackend::new();
+        let h = b.handle();
+        b.navigate("https://a.example/").unwrap();
+        settle(&mut b, &h);
+        b.navigate("https://b.example/").unwrap();
+        settle(&mut b, &h);
+
+        h.on_history_navigated("https://a.example/");
+        assert_eq!(b.current_url().as_deref(), Some("https://a.example/"));
+        assert!(!b.can_go_back(), "the cursor MOVED back, it did not push");
+        assert!(
+            b.can_go_forward(),
+            "the entry swiped away from is still ahead"
+        );
+        assert_eq!(
+            b.poll_event(),
+            Some(LoadEvent::UrlChanged {
+                url: "https://a.example/".into()
+            })
+        );
+        assert_eq!(
+            b.load_state(),
+            LoadState::Finished,
+            "no load transition of its own: a cross-document swipe's didCommit / \
+             didFinish move the state, and a same-document one fires neither — \
+             emitting a Started here would strand the latter as forever-loading"
+        );
+        assert_eq!(h.take_pending_load(), None, "WebKit is already navigating");
+
+        // Idempotent: the KVO url observer and the commit signal report the same
+        // URL moments later, and must not walk the cursor a second time.
+        h.on_history_navigated("https://a.example/");
+        assert_eq!(b.poll_event(), None);
+        assert!(!b.can_go_back());
+        assert!(b.can_go_forward());
+
+        // Forward, the direction Android's system Back has no equivalent for.
+        h.on_history_navigated("https://b.example/");
+        assert_eq!(b.current_url().as_deref(), Some("https://b.example/"));
+        assert!(b.can_go_back());
+        assert!(!b.can_go_forward());
+
+        // A target neither neighbour holds means WebKit's list and the session
+        // history have DRIFTED; follow it rather than show an address the user is
+        // not on.
+        h.on_history_navigated("https://c.example/");
+        assert_eq!(b.current_url().as_deref(), Some("https://c.example/"));
+        assert!(b.can_go_back());
+        assert!(!b.can_go_forward());
+    }
+
+    #[test]
+    fn a_gesture_history_move_never_carries_the_previous_documents_trust_posture() {
+        // The subtler half of the same bug: a swipe enters a DIFFERENT document,
+        // so the posture of the one being left must not travel with it. Swiping
+        // back from a hash-verified `ipfs://` page onto a plain served page would
+        // otherwise leave the badge claiming content-verified for bytes nobody
+        // verified — the overclaim `docs/adr/0006` exists to forbid.
+        let mut b = IosBackend::new();
+        let h = b.handle();
+        b.navigate("https://plain.example/").unwrap();
+        settle(&mut b, &h);
+        b.navigate("ipfs://bafycid/").unwrap();
+        b.mark_ens_origin();
+        h.mark_content_verified();
+        settle(&mut b, &h);
+        assert_eq!(b.trust_posture(), TrustPosture::NameViaTrustedRpc);
+
+        h.on_history_navigated("https://plain.example/");
+        assert_eq!(
+            b.trust_posture(),
+            TrustPosture::UnverifiedOrigin,
+            "the verified page's posture must not follow the user back onto a \
+             served one"
+        );
+        // The per-load AXES are cleared with it, so a later verification on the
+        // entered document surfaces ITS own posture, not the previous entry's ENS
+        // origin.
+        h.mark_content_verified();
+        assert_eq!(b.trust_posture(), TrustPosture::ContentVerified);
     }
 
     #[test]

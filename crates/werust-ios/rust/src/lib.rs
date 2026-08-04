@@ -397,6 +397,24 @@ impl CoreSession {
         self.shell.pump();
     }
 
+    /// Report that the platform `WKWebView` navigated its OWN back-forward list
+    /// (the user's EDGE-SWIPE gesture, or a page's `history.back()`), then fold
+    /// the resulting event into the chrome.
+    ///
+    /// A swipe never passes through [`go_back`](CoreSession::go_back): WebKit
+    /// performs it internally, so this is how the gesture reaches the core at all.
+    /// It is a history MOVE (the cursor lands on the entry the user swiped to),
+    /// distinct from [`on_url_changed`](CoreSession::on_url_changed), which PUSHES
+    /// — see [`IosHandle::on_history_navigated`] for why that distinction is the
+    /// whole point, and
+    /// `docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md` for
+    /// what WebKit does and does not tell the edge about a gesture navigation.
+    /// Called from Swift's `decidePolicyFor` on a `.backForward` navigation.
+    pub fn on_history_navigated(&mut self, url: &str) {
+        self.backend.on_history_navigated(url);
+        self.shell.pump();
+    }
+
     /// Report the platform `WKWebView`'s error signal into the core.
     pub fn on_page_failed(&mut self, url: &str, reason: &str) {
         self.backend.on_page_failed(url, reason);
@@ -1055,6 +1073,24 @@ mod ffi {
         let url = read(url);
         if let Some(s) = session_mut(session) {
             s.on_url_changed(&url);
+        }
+    }
+
+    /// Report that the platform `WKWebView` navigated its own back-forward list
+    /// (the edge-swipe gesture, or a page's `history.back()`) into the core, then
+    /// fold it into the chrome. Called from Swift's `decidePolicyFor` on a
+    /// `.backForward` navigation.
+    ///
+    /// # Safety
+    /// `session` is a live handle; `url` is a valid NUL-terminated C string.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_on_history_navigated(
+        session: *mut CoreSession,
+        url: *const c_char,
+    ) {
+        let url = read(url);
+        if let Some(s) = session_mut(session) {
+            s.on_history_navigated(&url);
         }
     }
 
@@ -2003,6 +2039,45 @@ mod tests {
             assert!(werust_ios_chrome_json(std::ptr::null_mut()).is_null());
             werust_ios_session_free(std::ptr::null_mut());
             werust_ios_string_free(std::ptr::null_mut());
+        }
+    }
+
+    /// Drive the EDGE-SWIPE gesture's report across the raw C-ABI export exactly
+    /// as the Swift navigation delegate does from `decidePolicyFor`, proving the
+    /// new marshalling shim reaches the core's history move (and tolerates a null
+    /// session like every other export).
+    #[test]
+    fn the_c_abi_reports_a_gesture_history_move_and_tolerates_a_null_session() {
+        use super::ffi::*;
+        use std::ffi::{CStr, CString};
+
+        unsafe {
+            let s = werust_ios_session_new();
+            let a = CString::new("https://a.example/").unwrap();
+            let b = CString::new("https://b.example/").unwrap();
+            for url in [&a, &b] {
+                assert!(werust_ios_navigate(s, url.as_ptr()));
+                let pending = werust_ios_take_pending_load(s);
+                werust_ios_string_free(pending);
+                werust_ios_on_page_committed(s, url.as_ptr());
+                werust_ios_on_page_finished(s, url.as_ptr());
+            }
+
+            // The swipe back, as the edge reports it.
+            werust_ios_on_history_navigated(s, a.as_ptr());
+            let json_ptr = werust_ios_chrome_json(s);
+            let json = CStr::from_ptr(json_ptr).to_str().unwrap().to_owned();
+            werust_ios_string_free(json_ptr);
+            assert!(json.contains("\"url\":\"https://a.example/\""), "{json}");
+            assert!(json.contains("\"canGoBack\":false"), "{json}");
+            assert!(json.contains("\"canGoForward\":true"), "{json}");
+            assert!(
+                werust_ios_take_pending_load(s).is_null(),
+                "the gesture must queue no load: WebKit is already navigating"
+            );
+
+            werust_ios_session_free(s);
+            werust_ios_on_history_navigated(std::ptr::null_mut(), a.as_ptr());
         }
     }
 

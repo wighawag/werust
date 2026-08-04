@@ -1,0 +1,5 @@
+# iOS: a webview-initiated cross-document navigation keeps the PREVIOUS document's trust posture (2026-08-04)
+
+Noticed while wiring the edge-swipe gesture (task `enable-the-ios-back-forward-swipe-gesture`): on iOS a plain in-page LINK click never passes through `CoreSession::navigate`, so `IosBackend`'s `begin()` (which resets `posture` / `ens_origin` / `mutable_name`) never runs for it. The only signals are the KVO `url` observer, which is contracted as SAME-DOCUMENT and deliberately leaves the posture alone, and `didCommit`, which does not touch it either — so clicking a link from a hash-verified `ipfs://` page onto a plain `https://` one appears to leave the trust badge claiming `content-verified` for bytes nobody verified (`docs/adr/0006`'s overclaim). The gesture path was fixed in scope (`IosHandle::on_history_navigated` resets the axes); the link-click twin was NOT, since it needs a cross-document signal the edge does not have today and touches the same rule on Android.
+
+Unverified: no Mac/simulator on this project, so this is read off the code, not observed.

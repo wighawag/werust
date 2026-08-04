@@ -213,6 +213,21 @@ final class WerustCore {
         url.withCString { werust_ios_on_url_changed(handle, $0) }
     }
 
+    /// Report that the platform `WKWebView` navigated its OWN back-forward list:
+    /// the user's EDGE-SWIPE gesture (`allowsBackForwardNavigationGestures`), or a
+    /// page calling `history.back()`. Reported from the navigation delegate's
+    /// `decidePolicyFor` when the navigation type is `.backForward`, with the
+    /// target URL.
+    ///
+    /// A history MOVE, not a new entry: the core lands its cursor on the entry
+    /// swiped to, which is what keeps the URL bar, the trust posture and the
+    /// Back/Forward flags describing the page now shown. Distinct from
+    /// ``onUrlChanged(_:)``, which PUSHES (an SPA rewriting its address is a new
+    /// entry; a swipe is a return to one the session already has).
+    func onHistoryNavigated(_ url: String) {
+        url.withCString { werust_ios_on_history_navigated(handle, $0) }
+    }
+
     /// Report the platform `WKWebView`'s error signal into the core.
     func onPageFailed(_ url: String, _ reason: String) {
         url.withCString { u in

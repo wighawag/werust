@@ -31,3 +31,5 @@ It fails unless the path is a real `.app` bundle carrying its `Info.plist`, the 
 ## Design decisions
 
 See `docs/spikes/mobile-ios-shell-and-static-lib/DECISIONS.md`.
+
+The EDGE-SWIPE history gesture (`allowsBackForwardNavigationGestures`, enabled in `WKWebViewShellController.layoutChrome`) has its own set, because WebKit performs a gesture navigation itself and reports it differently from a programmatic one: `docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md`. Both the flag and the wiring that keeps the chrome honest after a swipe are pinned in the pure-Rust gate by `rust/tests/back_forward_gesture_wiring_shape.rs`, since no human on this project has a Mac to notice a regression.

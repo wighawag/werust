@@ -154,6 +154,21 @@ void werust_ios_on_page_failed(WerustCoreSession *session, const char *url,
  * C string. */
 void werust_ios_on_url_changed(WerustCoreSession *session, const char *url);
 
+/* Report that the WKWebView navigated its OWN back-forward list: the user's
+ * edge-swipe gesture (allowsBackForwardNavigationGestures), or a page calling
+ * history.back(). Reported from the WKNavigationDelegate's decidePolicyFor when
+ * the navigation type is .backForward, with the TARGET url (a borrowed C
+ * string).
+ *
+ * A history MOVE, not a new entry: the core lands its cursor on the entry swiped
+ * to, so the URL bar, the trust posture and the Back/Forward flags describe the
+ * page now shown (reported as a plain url change, which PUSHES, a swipe back
+ * would leave a duplicate entry behind and read Forward as unavailable). WebKit
+ * performs the navigation itself, so this queues NO pending load; the ordinary
+ * commit/finish signals that follow move the load state. Idempotent. */
+void werust_ios_on_history_navigated(WerustCoreSession *session,
+                                     const char *url);
+
 /* The current chrome as a heap C string (JSON: url / loadState / loading /
  * canGoBack / canGoForward / trustPosture / error), for Swift to paint the URL
  * bar, nav-control enablement, status line, and the trust indicator. Free with

@@ -258,6 +258,22 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // below load the request into THIS same webView. See
         // webView(_:createWebViewWith:for:windowFeatures:).
         webView.uiDelegate = self
+        // EDGE-SWIPE HISTORY NAVIGATION (task
+        // `enable-the-ios-back-forward-swipe-gesture`, spec
+        // `chrome-conventional-controls` story 13): the swipe-from-the-edge every
+        // other iOS browser has, and the first thing an iOS user reaches for.
+        // `WKWebView` defaults this to FALSE, so leaving it unset (as werust did)
+        // means the gesture does nothing at all and history is reachable only
+        // through the on-screen ◀/▶ buttons — which the sibling task
+        // `ios-chrome-collapse-reload-stop-and-drop-history-buttons` REMOVES on
+        // the strength of this line existing. Nobody here has a Mac to notice a
+        // regression by using the app
+        // (work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md),
+        // so the flag is pinned by
+        // `crates/werust-ios/rust/tests/back_forward_gesture_wiring_shape.rs` in
+        // the pure-Rust gate. WebKit performs the navigation itself; the edge only
+        // REPORTS it into the core (see `decidePolicyFor` below).
+        webView.allowsBackForwardNavigationGestures = true
         webView.translatesAutoresizingMaskIntoConstraints = false
         // WEB INSPECTOR (task enable-web-inspector-devtools-all-platforms): make
         // the page inspectable via Safari's Web Inspector (the SAME WebKit devtools
@@ -637,6 +653,50 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // Return nil: create NO new WKWebView, so there is no second window — the
         // navigation happened in the current view above.
         return nil
+    }
+
+    // --- WKNavigationDelegate: a navigation the WEBVIEW drove -----------------
+    // The EDGE-SWIPE gesture (enabled in `layoutChrome`) navigates the WKWebView's
+    // OWN back-forward list internally: it calls none of the shell's actions, so
+    // without this hook the core never learns the user moved, and the URL bar, the
+    // trust posture and the Back/Forward flags would all keep describing the page
+    // the user just swiped AWAY from.
+    //
+    // `decidePolicyFor` is the one callback that NAMES a navigation `.backForward`
+    // (the swipe, and a page's own `history.back()`/`forward()`), and it is the
+    // EARLIEST one: it fires before the target document's bytes are resolved, so
+    // reporting here resets the per-load trust axes without clobbering the
+    // verification the `ipfs` scheme handler performs for the NEW page moments
+    // later. A core-driven load (`WKWebView.load`, what every toolbar action and
+    // the pending-load pump produce) arrives as `.other`, so it is untouched here
+    // and keeps flowing through `syncPendingLoad` exactly as before.
+    //
+    // The navigation is always ALLOWED: WebKit is performing it, and the edge only
+    // reports it. Cancelling to re-drive `core.goBack()` was the obvious
+    // alternative and is wrong twice over — it snaps the interactive gesture back
+    // and re-LOADS the page instead of restoring it — and `refreshChrome()` (not
+    // `afterCoreAction()`) is used deliberately, so no pending load can be issued
+    // on top of the navigation WebKit is already running. See
+    // docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md.
+    func webView(
+        _ wv: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        if navigationAction.navigationType == .backForward,
+            let target = navigationAction.request.url?.absoluteString, !target.isEmpty
+        {
+            // A history MOVE, not a new entry: the core lands its cursor on the
+            // entry the user swiped to, so Back/Forward availability and the trust
+            // posture describe the page now shown. The following didCommit /
+            // didFinish (cross-document) or the KVO url observer (a same-document
+            // entry) then report the SAME navigation through the SAME lifecycle
+            // path a button-driven move takes; the core's move is idempotent, so
+            // those repeats cost nothing.
+            core.onHistoryNavigated(target)
+            refreshChrome()
+        }
+        decisionHandler(.allow)
     }
 
     // --- WKNavigationDelegate -> Rust core ------------------------------------

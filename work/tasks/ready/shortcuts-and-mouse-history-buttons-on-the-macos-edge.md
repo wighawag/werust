@@ -135,3 +135,25 @@ Conductor note: the kept branch was STRANDED by a rebase conflict against latest
 The two conflicts were both additive-registry collisions with the Windows edge task that landed meanwhile, resolved to keep BOTH intents: docs/platform-capability-matrix.toml now records the conventional-shortcuts row with macos = implemented AND windows = implemented (each task had flipped only its own cell), and both platform description blocks are kept with each side's now-stale 'X is the remaining sibling edge task' sentence dropped. In shortcut_edge_wiring_shape.rs the generalised amendment from main was kept and a macOS amendment added beside it.
 
 Your 2026 lines of macOS work are INTACT. Continue from this tip and implement the DESIGN DECISION recorded in the requeue note above (the focus-sensitive history chord in werust_core::shortcuts). Do not redo the edge wiring that is already there.
+
+## Requeue 2026-08-04
+
+Gate 2 BLOCKED again, on a NARROWER point than last time. The focus-sensitive history fix itself is ACCEPTED and stays. Your work on the branch is kept and continued: do not restart, do not revert the core change.
+
+THE FINDING: the fix covers only the URL bar. shortcut_focus in crates/werust-macos/src/window.rs is two-valued and returns Focus::Page for everything inside the WKWebView, so Cmd+Left while a user is typing in a PAGE text field is still claimed as GoBack and destroys the edit. The CODE is acceptable; the RECORDS are not, because both of them claim the opposite:
+- docs/spikes/shortcuts-and-mouse-history-buttons-on-the-macos-edge/DECISIONS.md decision 8 (and decision 1) list a page text field among the cases the fix covers.
+- The README in that same directory, manual step 3, instructs the one human who will ever test this that a page text field behaves the same way. It will not.
+
+THE DECISION (made by the conductor; implement exactly this): ACCEPT the limit and record it HONESTLY. Do NOT try to add a third Focus value for a page text field. The edge decides synchronously inside the sendEvent: override, and the app cannot know what is focused INSIDE the WKWebView without asking the web content asynchronously, so a PageTextField focus value is not implementable at that decision point. Do not escalate the core Focus vocabulary.
+
+What to change, documentation only (plus the optional binding below):
+
+1. DECISIONS.md decision 8 and decision 1: correct the claim. State plainly that the focus-sensitive history chord protects the URL BAR's field editor ONLY, and that a text field INSIDE the page still loses Cmd+Left / Cmd+Right to history navigation. Say WHY it is not fixable here: Focus is two-valued in the shared core, the WKWebView is opaque to the host at sendEvent: time, and werust's model gives the CHROME first look at every event (the AppKit analogue of the GTK capture phase) rather than letting the page consume the key first, which is how real browsers avoid this. Record it as a KNOWN, ACCEPTED LIMIT with that reasoning, not as a covered case.
+
+2. README manual step 3: correct the instruction so the human tests what is actually true. The URL bar case must behave (caret moves, no navigation). Add the page-text-field case as a KNOWN limit the tester should expect and NOT report as a bug.
+
+3. Add the same limit as a one-line note to the capability matrix row for conventional-shortcuts if that row's macOS prose describes the focus behaviour, so the matrix does not over-claim either.
+
+4. RECOMMENDED and in scope now, because it is the honest mitigation for exactly this limit: also bind Cmd+[ to history back and Cmd+] to history forward for the Meta platform in the shared core table. Those two chords are the macOS browser convention and they do NOT collide with any text-editing binding, so they give a Mac user a history chord that is always safe, including inside a page text field. Add them in werust_core::shortcuts for PrimaryModifier::Meta ONLY, with table tests covering both focus states, and wire the macOS edge to translate them. If this turns out not to be clean, leave it out and say so explicitly in DECISIONS.md rather than half-doing it.
+
+HARD CONSTRAINTS, unchanged: do NOT edit or weaken crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain. The edge translates and performs; it never decides what a chord means. Keep the resolution CAPABILITY-AGNOSTIC. Do not regress the Ctrl platforms: Alt+Arrow must still resolve to history in BOTH focus states, and the four-case table test must still pass. Conventional-commit subjects.

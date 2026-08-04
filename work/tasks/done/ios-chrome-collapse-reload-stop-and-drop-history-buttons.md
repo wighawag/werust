@@ -65,3 +65,20 @@ dorfl claim ios-chrome-collapse-reload-stop-and-drop-history-buttons --arbiter o
 git fetch origin && git switch -c work/ios-chrome-collapse-reload-stop-and-drop-history-buttons origin/main
 git mv work/tasks/ready/ios-chrome-collapse-reload-stop-and-drop-history-buttons.md work/tasks/done/ios-chrome-collapse-reload-stop-and-drop-history-buttons.md
 ```
+
+## Gate-3 conductor verdict (drive-tasks)
+
+APPROVE, first attempt. Gate 1 and Gate 2 both green.
+
+- Reload and Stop collapsed into ONE control, with the spinner added: `reloadStopButton` + `loadingSpinner` (`UIActivityIndicatorView`) in `WKWebViewShellController.swift`. MET.
+- The on-screen back/forward buttons are DROPPED: no live references remain; the removed controls survive only in comments explaining WHY they went. Safe because the edge-swipe gesture landed first in `enable-the-ios-back-forward-swipe-gesture`, which is exactly the ordering this task's `blockedBy` encoded. MET.
+- Strings come from the ONE core derivation, never a per-edge literal: the title is the carried `reloadStopControlLabel`, the accessible name the carried `reloadStopControlDescription`, spinner visibility is `loadSpinnerVisible` "and nothing else", and a tap performs whatever the core says via `WerustCore.activateReloadStopControl`. A grep for the derived strings as Swift literals finds none. MET.
+- Cancelling an in-flight load is still reachable, and the control deliberately does NOT turn INTO the spinner (which would make it unavailable exactly when Stop is needed). MET.
+
+Guard check: `crates/werust-core/tests/mobile_chrome_presentation_shape.rs` NOT touched. `rust-toolchain.toml` NOT touched.
+
+CI VERIFIED on main (the Linux gate never compiles Swift, so this is the real evidence): `mobile-ios` SUCCESS and `verify` SUCCESS on the merge commit.
+
+Four non-blocking Gate-2 nits: `work/notes/observations/review-nits-ios-chrome-collapse-reload-stop-and-drop-history-buttons-2026-08-04.md`.
+
+With this and the Android migrate step landed, the fan-in `register-the-new-chrome-fields-in-the-mobile-presentation-guard` is UNBLOCKED. Until it lands, the four new chrome JSON keys cross to both mobile edges with no guard coverage.

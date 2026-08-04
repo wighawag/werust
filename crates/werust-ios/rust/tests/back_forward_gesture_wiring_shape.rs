@@ -30,9 +30,12 @@
 //! 3. A swipe reports through the SAME load-lifecycle path a button-driven move
 //!    does, so the chrome does not go stale
 //!    (`a_gesture_driven_history_navigation_is_reported_into_the_core`,
+//!    `only_a_main_frame_history_navigation_is_reported_as_the_page_the_user_is_on`,
 //!    `the_lifecycle_handlers_a_gesture_navigation_lands_on_report_into_the_core`,
 //!    and the headless chrome assertions below, which drive the SAME
-//!    `CoreSession` the Swift edge drives across the C-ABI).
+//!    `CoreSession` the Swift edge drives across the C-ABI — including the two
+//!    STICKY per-entry axes, the error banner and the invalid-entry badge, which
+//!    a swipe used to carry onto the page it landed on).
 //! 4. CI-runner-checkable without a Mac: source-shape + headless core, no Xcode.
 //! 5. Network-isolated, in the repo's existing style.
 //!
@@ -144,6 +147,61 @@ fn session_on_b_with_a_behind() -> CoreSession {
     s
 }
 
+/// The same two-entry history, but `b` FAILED to load: the chrome is showing an
+/// error banner for the entry the user is about to leave. This is the state the
+/// error-free fixture above cannot express, and the one a swipe used to carry
+/// onto the page it landed on.
+fn session_on_a_failed_b_with_a_behind() -> CoreSession {
+    let mut s = CoreSession::new();
+    assert!(s.navigate("https://a.example/"));
+    settle(&mut s);
+    assert!(s.navigate("https://b.example/"));
+    let url = s
+        .take_pending_load()
+        .expect("a pending load to apply to the WKWebView");
+    s.on_page_failed(&url, "the host could not be reached");
+    assert!(
+        s.chrome().last_error.is_some(),
+        "the fixture must actually be showing an error banner"
+    );
+    s
+}
+
+/// Every chrome field a history move can move, compared field by field so a
+/// failure NAMES the one that drifted rather than dumping two structs.
+///
+/// This is the parity claim of criterion 3 in one place: whatever the user swipes
+/// OFF (a settled page, a failed one, a rejected URL-bar entry), the chrome must
+/// land where the `◀` button would have left it.
+fn assert_same_chrome(button: &CoreSession, swipe: &CoreSession, case: &str) {
+    let (b, s) = (button.chrome(), swipe.chrome());
+    assert_eq!(b.url_text, s.url_text, "{case}: the URL bar");
+    assert_eq!(b.can_go_back, s.can_go_back, "{case}: Back availability");
+    assert_eq!(
+        b.can_go_forward, s.can_go_forward,
+        "{case}: Forward availability"
+    );
+    assert_eq!(b.load_state, s.load_state, "{case}: the load state");
+    assert_eq!(b.load_step, s.load_step, "{case}: the load step");
+    assert_eq!(
+        b.trust_posture, s.trust_posture,
+        "{case}: the trust posture"
+    );
+    assert_eq!(b.last_error, s.last_error, "{case}: the error banner");
+    assert_eq!(
+        b.invalid_entry, s.invalid_entry,
+        "{case}: the invalid-entry badge"
+    );
+}
+
+/// Drive a swipe back onto `a` exactly as the Swift edge does: the policy hook
+/// reports the gesture's target, then WebKit's own commit/finish land on it.
+fn swipe_back_to_a(s: &mut CoreSession) {
+    s.on_history_navigated("https://a.example/");
+    s.on_page_committed("https://a.example/");
+    s.on_page_finished("https://a.example/");
+}
+
 #[test]
 fn the_shell_enables_the_back_forward_swipe_gesture_on_its_webview() {
     // Criterion 1, and the whole reason this file exists: the flag is SET, on the
@@ -204,6 +262,39 @@ fn a_gesture_driven_history_navigation_is_reported_into_the_core() {
              navigation itself, the edge only REPORTS it; it reads:\n{policy}"
         );
     }
+}
+
+#[test]
+fn only_a_main_frame_history_navigation_is_reported_as_the_page_the_user_is_on() {
+    // Criterion 3's correctness floor, and a security one. WebKit issues a policy
+    // decision PER FRAME, and a back navigation onto a page that has iframes (or
+    // an iframe of the current page calling `history.back()`) produces
+    // `.backForward` decisions carrying the SUBFRAME's url. Reported into the
+    // core, that url is neither of the current entry's neighbours, so the move
+    // takes the drift branch: it TRUNCATES the forward history and pushes the
+    // subresource as the current entry, and the URL bar then shows an address the
+    // user is not on — chosen by whoever wrote the iframe, on a browser whose
+    // whole thesis is an honest address. Only the MAIN FRAME's navigation is the
+    // page the user is on, and the guard must come BEFORE the report.
+    let src = shell_controller_source();
+    let policy = swift_block_body(&src, "decidePolicyFor navigationAction");
+    assert!(
+        policy.contains("targetFrame?.isMainFrame == true"),
+        "the policy hook must report only MAIN-FRAME back-forward navigations \
+         (the same `targetFrame` idiom the `_blank` hook in this file already \
+         uses); it reads:\n{policy}"
+    );
+    let guard = policy
+        .find("targetFrame?.isMainFrame == true")
+        .expect("the main-frame guard, asserted above");
+    let report = policy
+        .find("core.onHistoryNavigated(")
+        .expect("the report into the core, asserted below");
+    assert!(
+        guard < report,
+        "the main-frame guard must be checked BEFORE the core is told the user \
+         moved, or a subframe's url still reaches the URL bar; it reads:\n{policy}"
+    );
 }
 
 #[test]
@@ -285,19 +376,72 @@ fn the_chrome_after_a_swipe_back_matches_the_chrome_after_a_button_back() {
     settle(&mut button);
 
     let mut swipe = session_on_b_with_a_behind();
-    swipe.on_history_navigated("https://a.example/");
-    swipe.on_page_committed("https://a.example/");
-    swipe.on_page_finished("https://a.example/");
+    swipe_back_to_a(&mut swipe);
 
-    assert_eq!(button.chrome().url_text, swipe.chrome().url_text);
-    assert_eq!(button.chrome().can_go_back, swipe.chrome().can_go_back);
+    assert_same_chrome(&button, &swipe, "after a swipe back over a settled load");
+}
+
+#[test]
+fn the_chrome_after_a_swipe_back_off_a_failed_load_matches_the_button_back() {
+    // The case the error-free parity test above CANNOT see, and the one that was
+    // wrong: load `a`, navigate to `b`, which FAILS (the error banner is up), then
+    // leave `b` by swiping. `BrowserShell::go_back` clears `last_error` because a
+    // history move that proceeds is not the failed load's problem — so a swipe
+    // that only reported a URL change left the dead page's red banner standing
+    // over a page that loaded perfectly well. The user cannot dismiss it: nothing
+    // short of another navigation clears it.
+    let mut button = session_on_a_failed_b_with_a_behind();
+    button.go_back();
+    settle(&mut button);
     assert_eq!(
-        button.chrome().can_go_forward,
-        swipe.chrome().can_go_forward
+        button.chrome().last_error,
+        None,
+        "the button-driven move is the reference: it clears the banner"
     );
-    assert_eq!(button.chrome().load_state, swipe.chrome().load_state);
-    assert_eq!(button.chrome().trust_posture, swipe.chrome().trust_posture);
-    assert_eq!(button.chrome().last_error, swipe.chrome().last_error);
+
+    let mut swipe = session_on_a_failed_b_with_a_behind();
+    swipe_back_to_a(&mut swipe);
+    assert_eq!(
+        swipe.chrome().last_error,
+        None,
+        "the swipe must clear the failed page's banner too: it is showing over a \
+         page that loaded fine, and no chrome control on iOS can dismiss it"
+    );
+
+    assert_same_chrome(&button, &swipe, "after a swipe back off a failed load");
+}
+
+#[test]
+fn the_chrome_after_a_swipe_back_off_a_rejected_url_entry_matches_the_button_back() {
+    // The other sticky per-entry axis, orthogonal to the error banner: a typed URL
+    // the core REFUSED leaves the invalid-entry badge up and PINS the typed text
+    // in the bar (`fail_invalid_entry`). A history move the user then performs is
+    // them moving on, so `go_back` drops both — and the swipe must, or iOS shows a
+    // badge and a bar full of the rejected text over the page it swiped to.
+    let mut button = session_on_b_with_a_behind();
+    button.navigate("not-a-url");
+    assert!(
+        button.chrome().invalid_entry.is_some(),
+        "the fixture must actually be showing the invalid-entry badge"
+    );
+    button.go_back();
+    settle(&mut button);
+
+    let mut swipe = session_on_b_with_a_behind();
+    swipe.navigate("not-a-url");
+    swipe_back_to_a(&mut swipe);
+    assert_eq!(
+        swipe.chrome().invalid_entry,
+        None,
+        "the swipe must drop the rejected entry's badge"
+    );
+    assert_eq!(
+        swipe.chrome().url_text,
+        "https://a.example/",
+        "and the bar must follow the page swiped to, not keep the rejected text"
+    );
+
+    assert_same_chrome(&button, &swipe, "after a swipe back off a rejected entry");
 }
 
 #[test]
@@ -330,6 +474,17 @@ fn a_repeated_report_of_the_current_entry_changes_nothing() {
     assert_eq!(s.chrome().url_text, "https://a.example/");
     assert!(!s.chrome().can_go_back);
     assert!(s.chrome().can_go_forward);
+
+    // "Changes nothing" includes the chrome reset a real move makes: the entry
+    // being reported is the one already shown, so ITS own failure is current and a
+    // repeat report must not quietly dismiss the banner the user needs to see.
+    s.on_page_failed("https://a.example/", "the host could not be reached");
+    assert!(s.chrome().last_error.is_some(), "the fixture's own failure");
+    s.on_history_navigated("https://a.example/");
+    assert!(
+        s.chrome().last_error.is_some(),
+        "a repeat report moved nothing, so nothing about this entry is stale"
+    );
 }
 
 #[test]

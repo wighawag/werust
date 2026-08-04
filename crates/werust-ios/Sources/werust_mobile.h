@@ -157,8 +157,9 @@ void werust_ios_on_url_changed(WerustCoreSession *session, const char *url);
 /* Report that the WKWebView navigated its OWN back-forward list: the user's
  * edge-swipe gesture (allowsBackForwardNavigationGestures), or a page calling
  * history.back(). Reported from the WKNavigationDelegate's decidePolicyFor when
- * the navigation type is .backForward, with the TARGET url (a borrowed C
- * string).
+ * the navigation type is .backForward AND it targets the MAIN FRAME (a policy
+ * decision for a subframe carries that frame's url, which is not the page the
+ * user is on), with the TARGET url (a borrowed C string).
  *
  * A history MOVE, not a new entry: the core lands its cursor on the entry swiped
  * to, so the URL bar, the trust posture and the Back/Forward flags describe the

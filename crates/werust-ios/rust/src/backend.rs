@@ -431,10 +431,17 @@ impl IosHandle {
     /// Idempotent: reporting the entry the session is ALREADY on does nothing, so
     /// the KVO `url` observer and the commit signal that follow the same gesture
     /// cannot walk the cursor a second time.
-    pub fn on_history_navigated(&self, url: &str) {
+    ///
+    /// Returns whether the session actually MOVED, which is what tells the caller
+    /// ([`CoreSession::on_history_navigated`](crate::CoreSession::on_history_navigated))
+    /// to apply the chrome reset a history move makes
+    /// ([`BrowserShell::note_history_navigated`](werust_core::BrowserShell::note_history_navigated)).
+    /// A repeat report must clear no error banner: the entry is unchanged, so
+    /// nothing about it is stale.
+    pub fn on_history_navigated(&self, url: &str) -> bool {
         let mut b = self.inner.borrow_mut();
         if b.current().map(String::as_str) == Some(url) {
-            return;
+            return false;
         }
         let back = b
             .cursor
@@ -467,6 +474,7 @@ impl IosHandle {
         b.events.push_back(LoadEvent::UrlChanged {
             url: url.to_string(),
         });
+        true
     }
 
     /// Report that the platform `WKWebView` committed the load on `url` (the
@@ -923,7 +931,11 @@ mod tests {
         b.navigate("https://b.example/").unwrap();
         settle(&mut b, &h);
 
-        h.on_history_navigated("https://a.example/");
+        assert!(
+            h.on_history_navigated("https://a.example/"),
+            "the session MOVED, which is what tells the caller to apply the \
+             chrome reset a history move makes"
+        );
         assert_eq!(b.current_url().as_deref(), Some("https://a.example/"));
         assert!(!b.can_go_back(), "the cursor MOVED back, it did not push");
         assert!(
@@ -947,7 +959,10 @@ mod tests {
 
         // Idempotent: the KVO url observer and the commit signal report the same
         // URL moments later, and must not walk the cursor a second time.
-        h.on_history_navigated("https://a.example/");
+        assert!(
+            !h.on_history_navigated("https://a.example/"),
+            "a repeat report moved nothing, so the caller resets no chrome"
+        );
         assert_eq!(b.poll_event(), None);
         assert!(!b.can_go_back());
         assert!(b.can_go_forward());

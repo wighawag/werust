@@ -216,8 +216,13 @@ final class WerustCore {
     /// Report that the platform `WKWebView` navigated its OWN back-forward list:
     /// the user's EDGE-SWIPE gesture (`allowsBackForwardNavigationGestures`), or a
     /// page calling `history.back()`. Reported from the navigation delegate's
-    /// `decidePolicyFor` when the navigation type is `.backForward`, with the
-    /// target URL.
+    /// `decidePolicyFor` when the navigation type is `.backForward` AND it targets
+    /// the MAIN FRAME (WebKit issues a policy decision per frame, and a subframe's
+    /// carries that frame's url, not the page the user is on), with the target URL.
+    ///
+    /// A move that really happened also clears the per-entry chrome the entry being
+    /// LEFT owns (its error banner, its rejected-URL badge), so a swipe lands on
+    /// the same chrome the `◀` button leaves.
     ///
     /// A history MOVE, not a new entry: the core lands its cursor on the entry
     /// swiped to, which is what keeps the URL bar, the trust posture and the

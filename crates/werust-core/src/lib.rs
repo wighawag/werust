@@ -2398,31 +2398,78 @@ impl BrowserShell {
         self.back_skip = self.redirects.redirect_sources();
         self.back_skip_issued = None;
         self.renderer.go_back();
-        // A user-initiated history move starts a FRESH redirect chain.
-        self.redirects.reset();
-        self.note_top_level_navigation();
-        // History navigation follows the backend's URL, not the pinned ENS name.
-        self.url_override = None;
-        self.pinned_root_key = None;
-        self.resolving_step = None;
-        self.chrome.last_error = None;
-        // A history move proceeds, so any prior invalid-entry badge is cleared.
-        self.chrome.invalid_entry = None;
-        self.refresh_chrome();
+        self.enter_history_entry();
     }
 
     /// Go one step forward in session history, through the seam.
     pub fn go_forward(&mut self) {
         self.renderer.go_forward();
-        self.redirects.reset();
         // Forward is the user overruling the skip: whatever entry they are heading
         // to, they asked for it explicitly.
         self.end_back_skip();
+        self.enter_history_entry();
+    }
+
+    /// Note that the BACKEND moved its own session history without the shell
+    /// driving it, and settle the chrome on the entry it moved to.
+    ///
+    /// This is [`go_back`](BrowserShell::go_back)/[`go_forward`](BrowserShell::go_forward)
+    /// with the navigation already done: it performs NO navigation of its own (the
+    /// backend has already moved its cursor and the platform view is already
+    /// showing the entry), it only applies the per-entry chrome reset a history
+    /// move makes. Everything else — the URL bar, the load state, Back/Forward
+    /// availability, the trust posture — is re-read from the seam as usual, here
+    /// and again on the next [`pump`](BrowserShell::pump).
+    ///
+    /// # Why this exists
+    ///
+    /// The iOS edge-swipe gesture (`allowsBackForwardNavigationGestures`, task
+    /// `enable-the-ios-back-forward-swipe-gesture`) is performed INSIDE WebKit: it
+    /// calls none of the shell's actions, so the platform edge can only REPORT that
+    /// the user moved. Without this, the reported move settled the URL bar and the
+    /// history flags but left the STICKY per-entry chrome standing — the previous
+    /// entry's error banner and its rejected-URL badge — so a swipe away from a
+    /// page that failed showed that failure's banner over a page that had loaded
+    /// perfectly well, with no control on a phone able to dismiss it. A
+    /// gesture-driven history move must reach the same chrome a button-driven one
+    /// does; that is the parity this method IS.
+    ///
+    /// Android needs no equivalent: its system Back is intercepted into
+    /// [`go_back`](BrowserShell::go_back), so its WebView never moves its own
+    /// back-forward list. Why this lives here rather than as a new `LoadEvent`
+    /// variant on the seam, and the two other shapes that were rejected:
+    /// `docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md`
+    /// (decision 6).
+    pub fn note_history_navigated(&mut self) {
+        // The user drove this history move themselves, overtaking any Back the
+        // shell was still stepping through — the same rule
+        // [`go_forward`](BrowserShell::go_forward) applies, and the one that keeps
+        // the shell from issuing a further backend Back on top of a navigation the
+        // platform is already performing.
+        self.end_back_skip();
+        self.enter_history_entry();
+    }
+
+    /// The chrome reset every history move makes, whoever drove it: shared by
+    /// [`go_back`](BrowserShell::go_back), [`go_forward`](BrowserShell::go_forward)
+    /// and [`note_history_navigated`](BrowserShell::note_history_navigated) so a
+    /// gesture-driven move and a button-driven one cannot drift apart.
+    ///
+    /// The in-flight Back skip is deliberately NOT touched here: `go_back` ARMS it
+    /// immediately before calling this, while the other two callers end it first.
+    fn enter_history_entry(&mut self) {
+        // A user-initiated history move starts a FRESH redirect chain.
+        self.redirects.reset();
         self.note_top_level_navigation();
+        // History navigation follows the backend's URL, not the pinned ENS name
+        // (nor a rejected entry's pinned typed text).
         self.url_override = None;
         self.pinned_root_key = None;
         self.resolving_step = None;
+        // The entry being LEFT owns its failure; the entry being entered does not
+        // inherit it.
         self.chrome.last_error = None;
+        // A history move proceeds, so any prior invalid-entry badge is cleared.
         self.chrome.invalid_entry = None;
         self.refresh_chrome();
     }
@@ -4701,6 +4748,57 @@ mod tests {
         assert_eq!(shell.chrome().url_text, "https://b.example/");
         assert!(shell.chrome().can_go_back);
         assert!(!shell.chrome().can_go_forward, "back at the tip of history");
+    }
+
+    #[test]
+    fn a_platform_driven_history_move_resets_the_chrome_a_button_back_resets() {
+        // The iOS edge-swipe gesture (task
+        // `enable-the-ios-back-forward-swipe-gesture`): WebKit performs the history
+        // move ITSELF, so the shell cannot drive it through `go_back` — the edge
+        // can only report that it happened. The per-ENTRY chrome must still land
+        // where `go_back` would have left it, or the page the user swipes to wears
+        // the previous entry's error banner and rejected-URL badge with no control
+        // on the phone able to dismiss them.
+        let (mut shell, handle) = shell_with_backend();
+        shell.navigate("https://a.example/").unwrap();
+        settle(&mut shell, &handle);
+        shell.navigate("https://b.example/").unwrap();
+        handle.drive_to_failed("the host could not be reached");
+        shell.pump();
+        assert!(
+            shell.chrome().last_error.is_some(),
+            "the failed load raised the banner this move must clear"
+        );
+        shell.navigate("not-a-url").unwrap();
+        assert!(
+            shell.chrome().has_invalid_entry(),
+            "and the rejected entry raised the badge, on its own axis"
+        );
+        let (back, forward) = (shell.chrome().can_go_back, shell.chrome().can_go_forward);
+
+        // The platform moved its own back-forward list; the shell is only told.
+        shell.note_history_navigated();
+
+        assert_eq!(
+            shell.chrome().last_error,
+            None,
+            "a history move that proceeds is not the failed load's problem \
+             (`go_back` clears it, so this must too)"
+        );
+        assert!(
+            !shell.chrome().has_invalid_entry(),
+            "the user moved on from the rejected entry"
+        );
+        assert_eq!(
+            shell.chrome().url_text,
+            "https://b.example/",
+            "the bar follows the backend's entry again, dropping the pinned \
+             rejected text"
+        );
+        // It REPORTS, it does not navigate: driving the backend here would be a
+        // second navigation on top of the one the platform already performed.
+        assert_eq!(shell.chrome().can_go_back, back, "no navigation was driven");
+        assert_eq!(shell.chrome().can_go_forward, forward);
     }
 
     #[test]

@@ -678,12 +678,26 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     // `afterCoreAction()`) is used deliberately, so no pending load can be issued
     // on top of the navigation WebKit is already running. See
     // docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md.
+    //
+    // ONLY THE MAIN FRAME IS THE PAGE THE USER IS ON. WebKit issues a policy
+    // decision PER FRAME, so a back navigation onto a page carrying iframes — or an
+    // iframe of the current page calling `history.back()` — also delivers
+    // `.backForward` decisions whose request url is the SUBFRAME's. Reported into
+    // the core, such a url is neither neighbour of the current entry, so the move
+    // takes its drift branch: it truncates the forward history and pushes the
+    // subresource as the current entry, putting an address the user is not on (and,
+    // for a hostile iframe, one an attacker chose) in the URL bar of a browser
+    // whose thesis is an honest address. `targetFrame?.isMainFrame == true` is the
+    // same `targetFrame` idiom the `_blank` hook above already uses, and it is
+    // checked BEFORE the report, pinned in that order by
+    // `crates/werust-ios/rust/tests/back_forward_gesture_wiring_shape.rs`.
     func webView(
         _ wv: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
         if navigationAction.navigationType == .backForward,
+            navigationAction.targetFrame?.isMainFrame == true,
             let target = navigationAction.request.url?.absoluteString, !target.isEmpty
         {
             // A history MOVE, not a new entry: the core lands its cursor on the

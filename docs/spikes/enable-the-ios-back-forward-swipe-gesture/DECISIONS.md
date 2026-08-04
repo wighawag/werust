@@ -8,7 +8,7 @@ Task `enable-the-ios-back-forward-swipe-gesture`, spec `chrome-conventional-cont
 
 ## 1. A gesture navigation is REPORTED into the core, never intercepted and re-driven
 
-**Chosen:** the navigation delegate implements `decidePolicyFor` and, when `navigationAction.navigationType == .backForward`, reports the target URL into the core (`core.onHistoryNavigated(target)`) and then always `decisionHandler(.allow)`s. WebKit performs the navigation; the core is told it happened.
+**Chosen:** the navigation delegate implements `decidePolicyFor` and, when `navigationAction.navigationType == .backForward` **and the navigation targets the MAIN FRAME**, reports the target URL into the core (`core.onHistoryNavigated(target)`) and then always `decisionHandler(.allow)`s. WebKit performs the navigation; the core is told it happened.
 
 **Why:** the swipe is handled entirely inside WebKit. It calls none of the shell's actions, so unless the edge reports it the core never learns the user moved, and the URL bar, the trust posture and the Back/Forward capability flags all keep describing the document the user just swiped AWAY from. That is the "subtler version of the same bug" the task names.
 
@@ -16,7 +16,7 @@ Task `enable-the-ios-back-forward-swipe-gesture`, spec `chrome-conventional-cont
 
 **Why `decidePolicyFor` and not `didCommit`:** it is the only callback that NAMES the navigation `.backForward` (a commit cannot tell a swipe from a link click to the same URL), and it is the EARLIEST — it fires before the target document's bytes are resolved, which is what lets decision 4's posture reset happen without clobbering the verification the `ipfs` scheme handler performs for the NEW page moments later.
 
-**Touches:** the iOS C-ABI surface (a new `werust_ios_on_history_navigated` export + its header declaration + the `WerustCore.swift` binding). Nothing outside the iOS edge: Android needs no twin, because its system Back is INTERCEPTED into `core.goBack()` and its WebView therefore never drives its own back-forward list.
+**Touches:** the iOS C-ABI surface (a new `werust_ios_on_history_navigated` export + its header declaration + the `WerustCore.swift` binding), and one new `BrowserShell` method in the shared core (decision 6). Android needs no twin, because its system Back is INTERCEPTED into `core.goBack()` and its WebView therefore never drives its own back-forward list.
 
 ## 2. A gesture navigation is a history MOVE, matched against the ADJACENT entries
 
@@ -40,6 +40,8 @@ Task `enable-the-ios-back-forward-swipe-gesture`, spec `chrome-conventional-cont
 
 **Open question (unmeasurable here):** whether WebKit calls `decidePolicyFor` at all for a SAME-DOCUMENT back/forward. If it does, the entry is handled exactly as above; if it does not, that swipe keeps arriving on the KVO `url` observer and pushes, as it does today. Either way nothing regresses, which is why the shape above was chosen over one that depends on the answer.
 
+**Consequence, and where it is paid:** emitting no `Started` is also what made the first attempt at this task get the CHROME wrong, because `Started` is the one lifecycle arm that clears the error banner. That is fixed properly in decision 6 rather than by emitting a load event that did not happen.
+
 ## 4. Entering a document by gesture RESETS the per-load trust axes
 
 **Chosen:** the move resets `TrustPosture` to `UnverifiedOrigin` and clears the ENS / mutable-name axes, the same reset a fresh `begin()` performs.
@@ -57,3 +59,35 @@ Task `enable-the-ios-back-forward-swipe-gesture`, spec `chrome-conventional-cont
 **Why:** the matrix already speaks about this gesture, deliberately, from OUTSIDE its rows: the `system-back-navigates-history` row marks iOS and macOS `n-a` and says in both cells that the WKWebView swipe is "a distinct affordance with its own enablement (`allowsBackForwardNavigationGestures`)", tracked in the observation notes rather than folded into that row. Adding a `back-forward-gesture` capability now would force a cell for all five platforms, and three of those cells are other people's open questions (the macOS two-finger swipe in `work/notes/observations/macos-swipe-back-gesture-not-enabled-2026-07-31.md`, the WebView2 touch swipe in `windows-back-affordances-not-bound-2026-07-31.md`, and whatever GTK's answer is). Answering three platforms' questions as a side effect of turning on one flag is precisely the wrong layer for that decision.
 
 **What a reviewer should push back on:** if the matrix is meant to be the one index of "which platform has which affordance", this gesture belongs in it and the row should be minted by a task that can answer all five cells. This note is here so that stays a visible choice rather than an omission.
+
+## 6. The chrome reset a history move makes is SHARED, through one new `BrowserShell` method
+
+*Added by the 2026-08-04 requeue: Gate 2 found that acceptance criterion 3 was not actually met.*
+
+**The bug it fixes.** `on_history_navigated` emits only `LoadEvent::UrlChanged` (decision 3), and in `BrowserShell::pump` the `UrlChanged` / `Committed` / `Finished` arms never touch `chrome.last_error` — only `Started` does. `BrowserShell::go_back` clears `last_error` and `invalid_entry` explicitly, so the two paths disagreed exactly where it hurts: load `a`, navigate to `b`, which FAILS (the red banner is up), swipe back to `a`, and the dead page's banner keeps showing over a page that loaded fine. On a phone there is no chrome control that dismisses it. The same held for the invalid-entry badge and its PINNED typed text (`fail_invalid_entry` sets `url_override`), so a rejected URL-bar entry survived the swipe too.
+
+**Chosen:** one new public method on the shared shell, `BrowserShell::note_history_navigated()`, and a private `enter_history_entry()` that `go_back`, `go_forward` and it all call. It is `go_back` **with the navigation already done**: it drives no backend navigation, it only applies the per-entry chrome reset (fresh redirect chain, drop the pinned name/typed text, clear the resolving step, clear `last_error`, clear `invalid_entry`, refresh). The iOS `CoreSession::on_history_navigated` calls it when — and only when — the backend actually MOVED, which is why `IosHandle::on_history_navigated` now returns a bool: a repeat report of the entry already shown must not silently dismiss THAT entry's own error banner.
+
+**Why the shared core and not the iOS crate:** `last_error` / `invalid_entry` / `url_override` are private `BrowserShell` state, and rightly so. The alternative was to make the reset reachable per-field, which is a wider and worse surface than one method whose contract is "a history move happened".
+
+**Alternative considered and rejected — emit `LoadEvent::Started`:** it would clear the banner through the existing pump arm and need no new API at all, but it CLAIMS a load began. A swipe onto a same-document entry starts no load and fires no `didCommit`/`didFinish`, so the chrome would spin forever (decision 3), and the debug console's load-lifecycle view would show a load that never existed. A lie on the seam to reuse a side effect.
+
+**Alternative considered and rejected — a new `LoadEvent::HistoryMoved` variant:** the honest version of the above, and the shape to reach for if a SECOND backend ever moves its own history. Rejected as too wide for this task: `LoadEvent` is the cross-backend seam, so every backend and every consumer (GTK, macOS, Windows, native, Android) would grow a variant only iOS can emit, for a difference that is entirely about chrome bookkeeping and not about the load lifecycle at all. Recorded here as the migration if that changes.
+
+**Alternative considered and rejected — re-drive `shell.go_back()` and drain the pending load:** it reuses the exact button path, but it re-arms the redirect back-skip (which can issue a FURTHER backend Back, i.e. a real navigation fighting WebKit's gesture) and it races the Swift edge for `take_pending_load`. `note_history_navigated` instead ENDS any in-flight back-skip, on the same rule `go_forward` uses: the user has taken the history over themselves.
+
+**Touches:** `BrowserShell`'s public surface (one method), the iOS `CoreSession` + `IosHandle` (the bool), and nothing else — `go_back`/`go_forward` keep their exact behaviour, now expressed through the shared helper so the gesture path and the button path cannot drift apart again. Pinned by `a_platform_driven_history_move_resets_the_chrome_a_button_back_resets` (core) and the three `the_chrome_after_a_swipe_back_*_matches_the_button_back` parity tests (iOS), which now cover a settled load, a FAILED one and a REJECTED entry — the first attempt's single error-free case is what let the claim be false.
+
+## 7. Only a MAIN-FRAME back-forward navigation is reported
+
+*Added by the 2026-08-04 requeue: Gate 2 found this as a correctness + security defect.*
+
+**The bug it fixes.** WebKit issues a policy decision PER FRAME. A back navigation onto a page carrying iframes — or an iframe of the current page calling `history.back()` — therefore delivers `.backForward` decisions whose `request.url` is the SUBFRAME's. The first attempt reported every one of them. Since a subframe url is neither neighbour of the current entry, the core took decision 2's DRIFT branch: it truncated the forward history and pushed the subresource as the current entry, so the URL bar showed an address the user was not on — for a hostile iframe, one the attacker chose. That is precisely the overclaim a browser whose thesis is an honest address cannot make.
+
+**Chosen:** `navigationAction.targetFrame?.isMainFrame == true`, checked BEFORE the report. The idiom is already used in this same file for the `_blank` case (`targetFrame == nil`), so the edge now reads one way about frames.
+
+**Why the guard is in Swift and not in the core:** the core has no frame model at all (nothing on the `Renderer` seam carries one), and inventing one to defend against a signal the edge should never have sent would be the wrong layer. The edge's job is to report the page the user is on; only the edge knows which frame that is.
+
+**Why `targetFrame` and not `sourceFrame`:** the target frame is the one being navigated, which is the question being asked. `sourceFrame` is whoever initiated it, and a main-frame navigation initiated BY a subframe (an iframe calling `top.history.back()`) is a real main-frame move that must still be reported.
+
+**Pinned by** `only_a_main_frame_history_navigation_is_reported_as_the_page_the_user_is_on`, which asserts both the guard and its ORDER relative to the report — a guard placed after the call would be no guard at all.

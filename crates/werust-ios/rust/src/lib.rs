@@ -409,9 +409,19 @@ impl CoreSession {
     /// whole point, and
     /// `docs/spikes/enable-the-ios-back-forward-swipe-gesture/DECISIONS.md` for
     /// what WebKit does and does not tell the edge about a gesture navigation.
-    /// Called from Swift's `decidePolicyFor` on a `.backForward` navigation.
+    /// Called from Swift's `decidePolicyFor` on a MAIN-FRAME `.backForward`
+    /// navigation.
+    ///
+    /// A move that really happened also applies the shell's per-entry chrome reset
+    /// ([`BrowserShell::note_history_navigated`](werust_core::BrowserShell::note_history_navigated)),
+    /// which is what makes a swipe land on the SAME chrome the `◀` button leaves:
+    /// the entry being left owns its error banner and its rejected-URL badge, and
+    /// neither may follow the user onto the page they swiped to. A REPEAT report of
+    /// the entry already shown moves nothing and therefore resets nothing.
     pub fn on_history_navigated(&mut self, url: &str) {
-        self.backend.on_history_navigated(url);
+        if self.backend.on_history_navigated(url) {
+            self.shell.note_history_navigated();
+        }
         self.shell.pump();
     }
 

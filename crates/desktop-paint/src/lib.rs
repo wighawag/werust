@@ -77,9 +77,10 @@ use werust_core::menu::{BrowserMenu, MenuItemKind};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
     invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip,
-    load_progress_visible, status_line, trust_indicator, trust_indicator_css_class,
-    trust_indicator_detail, trust_pin_action_label, trust_pin_action_visible, trust_pin_detail,
-    ChromeState, STOP_AFFORDANCE_LABEL,
+    load_progress_visible, load_spinner_visible, reload_stop_control, status_line, trust_indicator,
+    trust_indicator_css_class, trust_indicator_detail, trust_pin_action_label,
+    trust_pin_action_visible, trust_pin_detail, ChromeState, ReloadStopControl,
+    STOP_AFFORDANCE_LABEL,
 };
 
 /// A colour, as three 0.0–1.0 components.
@@ -209,6 +210,27 @@ pub struct ChromePaint {
     /// Whether a load is in flight: Stop is enabled exactly then, Reload exactly
     /// when it is not.
     pub is_loading: bool,
+    /// Which mode werust's ONE reload/stop control is in
+    /// ([`reload_stop_control`]): it RELOADS a settled page and STOPS a load in
+    /// flight, so the window builds one button and re-labels it instead of
+    /// enabling one of a pair. The cancel affordance is unmoved: `Stop` is
+    /// offered on exactly the fact the separate Stop button was enabled on.
+    pub reload_stop_control: ReloadStopControl,
+    /// The glyph that mode's affordance wears ([`ReloadStopControl::label`]). An
+    /// edge with a themed icon set may draw its own icon for the mode instead;
+    /// the ACCESSIBLE name is still
+    /// [`reload_stop_description`](ChromePaint::reload_stop_description).
+    pub reload_stop_label: &'static str,
+    /// What the control does, in words ([`ReloadStopControl::description`]): the
+    /// window's tooltip / accessible name for it.
+    pub reload_stop_description: &'static str,
+    /// Whether the chrome's LOADING SPINNER is showing
+    /// ([`load_spinner_visible`]): a second PRESENTATION of the load the URL bar
+    /// already reports, on the same rule as
+    /// [`progress_visible`](ChromePaint::progress_visible), never a second truth.
+    /// The window shows/hides (and spins) its own indicator from this; nothing
+    /// here starts a timer.
+    pub spinner_visible: bool,
     /// The one-line status shown under the page view.
     pub status_text: String,
     /// The trust indicator's badge text.
@@ -273,6 +295,10 @@ impl ChromePaint {
         // can cancel — not a second copy here; this edge contributes only the
         // label its own Stop button carries (`window::build`, a "✕" title).
         let progress_tooltip = load_progress_tooltip(state, STOP_AFFORDANCE_LABEL);
+        // The ONE reload/stop control: the core says which mode it is in, what it
+        // wears and what it does, so the window re-labels a single button rather
+        // than enabling one of a pair on a condition of its own.
+        let reload_stop = reload_stop_control(state);
         Self {
             url_text: state.url_text.clone(),
             invalid_entry: invalid_entry_badge_visible(state),
@@ -280,6 +306,10 @@ impl ChromePaint {
             can_go_back: state.can_go_back,
             can_go_forward: state.can_go_forward,
             is_loading: state.is_loading(),
+            reload_stop_control: reload_stop,
+            reload_stop_label: reload_stop.label(),
+            reload_stop_description: reload_stop.description(),
+            spinner_visible: load_spinner_visible(state),
             status_text: status_line(state),
             trust_text: trust_indicator(state),
             trust_detail: trust_indicator_detail(state),
@@ -661,6 +691,13 @@ mod tests {
             assert_eq!(paint.can_go_back, state.can_go_back);
             assert_eq!(paint.can_go_forward, state.can_go_forward);
             assert_eq!(paint.is_loading, state.is_loading());
+            assert_eq!(paint.reload_stop_control, reload_stop_control(state));
+            assert_eq!(paint.reload_stop_label, reload_stop_control(state).label());
+            assert_eq!(
+                paint.reload_stop_description,
+                reload_stop_control(state).description()
+            );
+            assert_eq!(paint.spinner_visible, load_spinner_visible(state));
             // Every class painted is one the core exports, so the colour lookup
             // can never be a name only this edge knows.
             assert!(TRUST_INDICATOR_CSS_CLASSES.contains(&paint.trust_class));
@@ -717,6 +754,59 @@ mod tests {
             ..Default::default()
         };
         assert!(ChromePaint::of(&failed).error_visible);
+    }
+
+    #[test]
+    fn one_control_reloads_a_settled_page_and_stops_a_load_with_the_spinner_beside_it() {
+        // Acceptance for the native-widget desktops (task
+        // `reload-stop-collapse-and-loading-spinner-core-and-gtk`): the snapshot
+        // carries the collapsed control's MODE and the spinner's visibility, so
+        // the AppKit and Win32 windows build ONE button and re-label it instead of
+        // enabling one of a pair on a condition of their own. Both are the core's
+        // rules, driven here on the Ubuntu gate with no Mac and no Windows box.
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            ..Default::default()
+        };
+        let paint = ChromePaint::of(&settled);
+        assert_eq!(paint.reload_stop_control, ReloadStopControl::Reload);
+        assert_eq!(
+            paint.reload_stop_label,
+            werust_core::RELOAD_AFFORDANCE_LABEL
+        );
+        assert!(!paint.spinner_visible, "a settled chrome spins nothing");
+
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..Default::default()
+        };
+        let paint = ChromePaint::of(&loading);
+        assert_eq!(
+            paint.reload_stop_control,
+            ReloadStopControl::Stop,
+            "the cancel affordance survives the collapse, on the same fact Stop was enabled on"
+        );
+        assert_eq!(paint.reload_stop_label, STOP_AFFORDANCE_LABEL);
+        assert_eq!(
+            paint.reload_stop_control.action(),
+            werust_core::shortcuts::ChromeAction::Stop,
+            "activating it drives the SAME chrome action Escape resolves to"
+        );
+        assert!(paint.spinner_visible);
+
+        // The pre-content resolution window: work is in flight (so the spinner
+        // turns, beside the URL bar's own progress) but there is no backend load
+        // for Stop to act on yet, so the control still offers Reload — exactly
+        // what the core's progress tooltip promises there.
+        let resolving = ChromeState {
+            load_state: LoadState::Idle,
+            load_step: LoadStep::ResolvingName,
+            ..Default::default()
+        };
+        let paint = ChromePaint::of(&resolving);
+        assert!(paint.spinner_visible && paint.progress_visible);
+        assert_eq!(paint.reload_stop_control, ReloadStopControl::Reload);
     }
 
     #[test]

@@ -838,15 +838,30 @@ pub fn load_progress_hint(state: &ChromeState) -> &'static str {
     }
 }
 
-/// The label werust's Stop control carries on every edge today: the GTK toolbar
-/// button (the themed `process-stop-symbolic` cross), the AppKit toolbar button,
-/// and both mobile Stop buttons all read as this glyph.
+/// The label werust's Stop affordance carries on every edge today: the cross the
+/// GTK toolbar control shows (as the themed `process-stop-symbolic` icon), the
+/// AppKit toolbar button, and both mobile Stop buttons all read as this glyph.
+/// Since the collapse it is the STOP half of the one reload/stop control
+/// ([`ReloadStopControl::label`]), not a button of its own.
 ///
 /// It exists so the ONE progress sentence ([`load_progress_tooltip`]) names the
 /// SAME affordance everywhere rather than each painter passing its own literal —
 /// the parameter is there for an edge whose Stop control really is labelled
 /// differently, not as an invitation to fork the wording.
 pub const STOP_AFFORDANCE_LABEL: &str = "✕";
+
+/// The label werust's RELOAD affordance carries: the RELOAD half of the one
+/// reload/stop control ([`ReloadStopControl::label`]), the counterpart of
+/// [`STOP_AFFORDANCE_LABEL`].
+///
+/// A glyph rather than a word for the same reason the stop cross is one: the
+/// control is a small toolbar square on every edge, and a glyph needs no
+/// translation. An edge with a themed icon set (GTK's `view-refresh-symbolic`)
+/// may draw its own icon for the mode instead — that is a resource lookup on the
+/// core's decision, exactly like `desktop-paint`'s colour lookup on the core's
+/// class name — but the accessible NAME it announces is still the core's
+/// ([`ReloadStopControl::description`]).
+pub const RELOAD_AFFORDANCE_LABEL: &str = "⟳";
 
 /// The URL bar's progress TOOLTIP for the current load: the phase name (the
 /// shared [`load_progress_hint`] vocabulary), plus a cancel hint naming the Stop
@@ -877,6 +892,161 @@ pub fn load_progress_tooltip(state: &ChromeState, stop_label: &str) -> Option<St
     } else {
         format!("{hint}…")
     })
+}
+
+/// Which of its two modes werust's ONE reload/stop control is in.
+///
+/// Browsers show a SINGLE control that reloads a settled page and stops a load in
+/// flight; werust used to carry two buttons, each enabled on the negation of the
+/// other's condition. That is one fact wearing two widgets, so the collapse is a
+/// presentation rule ([`reload_stop_control`]) rather than a new chrome fact:
+/// nothing new is tracked, and no edge re-decides it (spec
+/// `chrome-conventional-controls`, story 10).
+///
+/// The mode carries its own painter vocabulary — a stable [`wire_name`](ReloadStopControl::wire_name)
+/// for the mobile carrier, the [`label`](ReloadStopControl::label) glyph the
+/// affordance already wore, an accessible [`description`](ReloadStopControl::description),
+/// and the [`action`](ReloadStopControl::action) it performs — so an edge assigns
+/// values instead of branching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReloadStopControl {
+    /// The page is settled: the control RELOADS it.
+    Reload,
+    /// A load is in flight: the control STOPS it. This is werust's cancel
+    /// affordance, unmoved by the collapse — it is offered on exactly the fact
+    /// the separate Stop button took its sensitivity from.
+    Stop,
+}
+
+impl ReloadStopControl {
+    /// Both modes. The single source of truth for "which modes exist", so a
+    /// painter's coverage check (or a test drive) iterates THIS instead of
+    /// re-listing them. Kept complete by the const check below.
+    pub const ALL: [ReloadStopControl; 2] = [ReloadStopControl::Reload, ReloadStopControl::Stop];
+
+    /// The stable, lower-case wire name for the chrome JSON, so a mobile edge
+    /// reads a value where it would otherwise have run a `when`/`switch`
+    /// (mirroring [`LoadStep::wire_name`]).
+    #[must_use]
+    pub fn wire_name(self) -> &'static str {
+        match self {
+            ReloadStopControl::Reload => "reload",
+            ReloadStopControl::Stop => "stop",
+        }
+    }
+
+    /// The glyph this mode's affordance wears
+    /// ([`RELOAD_AFFORDANCE_LABEL`] / [`STOP_AFFORDANCE_LABEL`]), so the one
+    /// control reads the same on every edge and the progress sentence's cancel
+    /// hint names the very glyph the user is looking at.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            ReloadStopControl::Reload => RELOAD_AFFORDANCE_LABEL,
+            ReloadStopControl::Stop => STOP_AFFORDANCE_LABEL,
+        }
+    }
+
+    /// The control's ACCESSIBLE NAME: what the control does, in words.
+    ///
+    /// Deliberately not called a tooltip: a desktop painter hangs it on hover,
+    /// but the mobile edges have no hover and put it in the platform's
+    /// accessible-name slot (Android's `contentDescription`, iOS's
+    /// `accessibilityLabel`), which is the same string for the same reason the
+    /// trust badge's state name is shared.
+    #[must_use]
+    pub fn description(self) -> &'static str {
+        match self {
+            ReloadStopControl::Reload => "Reload this page",
+            ReloadStopControl::Stop => "Stop loading this page",
+        }
+    }
+
+    /// The [`ChromeAction`](crate::shortcuts::ChromeAction) this mode performs
+    /// when activated: the SAME closed vocabulary the keyboard resolves into, so
+    /// the toolbar control and Ctrl+R / Escape drive one performer per edge and
+    /// cannot drift apart. The mode is what the control SHOWS; this is what it
+    /// DOES, and both are decided here rather than at each edge.
+    #[must_use]
+    pub fn action(self) -> crate::shortcuts::ChromeAction {
+        match self {
+            ReloadStopControl::Reload => crate::shortcuts::ChromeAction::Reload,
+            ReloadStopControl::Stop => crate::shortcuts::ChromeAction::Stop,
+        }
+    }
+}
+
+/// Keeps [`ReloadStopControl::ALL`] EXHAUSTIVE at compile time, by exactly the
+/// construction [`LoadStep::ALL`]'s check uses (see it for the full reasoning).
+const _RELOAD_STOP_CONTROL_ALL_IS_EVERY_MODE_IN_SLOT_ORDER: () = {
+    const fn listed(control: ReloadStopControl) -> ReloadStopControl {
+        match control {
+            ReloadStopControl::Reload => ReloadStopControl::ALL[0],
+            ReloadStopControl::Stop => ReloadStopControl::ALL[1],
+        }
+    }
+    let mut i = 0;
+    while i < ReloadStopControl::ALL.len() {
+        assert!(
+            listed(ReloadStopControl::ALL[i]) as u8 == ReloadStopControl::ALL[i] as u8,
+            "ReloadStopControl::ALL must hold every mode, once, in slot order"
+        );
+        i += 1;
+    }
+};
+
+/// Which mode werust's ONE reload/stop control is in: [`Stop`](ReloadStopControl::Stop)
+/// while a backend load is in flight, [`Reload`](ReloadStopControl::Reload) on a
+/// settled page.
+///
+/// The rule is the SAME [`ChromeState::is_loading`] fact the two separate buttons
+/// took their sensitivity from (Stop enabled exactly while loading, Reload
+/// exactly when not), so the collapse changes the WIDGET COUNT and nothing else:
+/// cancel is still offered on precisely the states where there is a backend load
+/// to cancel, and never promised where there is not.
+///
+/// It is deliberately NOT [`load_progress_visible`]: during the PRE-CONTENT
+/// resolution window (a name being resolved before the backend load starts) there
+/// is nothing for `Renderer::stop` to cancel, which is the same reason
+/// [`load_progress_tooltip`] withholds its cancel hint there. The SPINNER, which
+/// only reports, follows the wider rule ([`load_spinner_visible`]).
+///
+/// Pure, for the same reason as [`status_line`]: an edge paints the returned mode
+/// (its glyph or its own themed icon, its accessible description) and performs
+/// its [`action`](ReloadStopControl::action); no edge decides which of the two
+/// this is.
+#[must_use]
+pub fn reload_stop_control(state: &ChromeState) -> ReloadStopControl {
+    if state.is_loading() {
+        ReloadStopControl::Stop
+    } else {
+        ReloadStopControl::Reload
+    }
+}
+
+/// Whether the chrome's LOADING SPINNER is showing.
+///
+/// A SECOND PRESENTATION of the load the URL bar already shows, never a second
+/// source of truth: it is exactly [`load_progress_visible`], so the two surfaces
+/// cannot contradict each other, and the URL bar's own progress rules
+/// ([`load_progress_fraction`] / [`load_progress_hint`]) are untouched by its
+/// arrival — the fine-grained bar is the liked signal and stays.
+///
+/// It exists because a bar and a spinner say different things. The bar reports
+/// HOW FAR a load got; a spinner reports THAT werust is working, which is the
+/// half a stalled load needs: a load that has reported no phase yet paints a bare
+/// sliver that reads as a decoration, and the long pre-content name-resolution
+/// window (the `ronan.eth` freeze) is where a user most needs to see motion. Both
+/// of those are in flight under [`load_progress_visible`], which is why the
+/// spinner follows that rule rather than the narrower
+/// [`ChromeState::is_loading`] the CONTROL uses.
+///
+/// Animation is the edge's business: this says only whether the spinner is
+/// SHOWN. Painters drive it from the existing chrome-refresh pump like every
+/// other value here, so no edge adds a timer (the Android ANR guard).
+#[must_use]
+pub fn load_spinner_visible(state: &ChromeState) -> bool {
+    load_progress_visible(state)
 }
 
 /// The one-line status shown in the chrome: a surfaced failure wins, otherwise a
@@ -1378,7 +1548,9 @@ const _CSS_CLASS_FAMILY_ALL_IS_EVERY_FAMILY_IN_SLOT_ORDER: () = {
 ///   "trustIndicatorDetail": "…", "errorBannerVisible": false, "errorBannerText": "",
 ///   "invalidEntryBadgeVisible": false, "invalidEntryBadgeText": "",
 ///   "loadProgressVisible": false, "loadProgressFraction": 0.0, "loadProgressHint": "",
-///   "trustPinActionVisible": false, "trustPinActionLabel": "", "trustPinDetail": ""
+///   "trustPinActionVisible": false, "trustPinActionLabel": "", "trustPinDetail": "",
+///   "reloadStopControl": "reload", "reloadStopControlLabel": "⟳",
+///   "reloadStopControlDescription": "Reload this page", "loadSpinnerVisible": false
 /// }
 /// ```
 ///
@@ -1453,6 +1625,10 @@ pub fn chrome_json(state: &ChromeState) -> String {
         "loadProgressVisible": load_progress_visible(state),
         "loadProgressFraction": load_progress_fraction(state),
         "loadProgressHint": load_progress_hint(state),
+        "reloadStopControl": reload_stop_control(state).wire_name(),
+        "reloadStopControlLabel": reload_stop_control(state).label(),
+        "reloadStopControlDescription": reload_stop_control(state).description(),
+        "loadSpinnerVisible": load_spinner_visible(state),
         "trustPinActionVisible": trust_pin_action_visible(state),
         "trustPinActionLabel": trust_pin_action_label(state),
         "trustPinDetail": trust_pin_detail(state),
@@ -6889,6 +7065,161 @@ mod tests {
         );
     }
 
+    #[test]
+    fn reload_and_stop_are_one_control_whose_mode_is_the_loading_fact() {
+        // Acceptance (task `reload-stop-collapse-and-loading-spinner-core-and-gtk`,
+        // spec `chrome-conventional-controls` story 10): the separate Reload and
+        // Stop buttons collapse into ONE control, and WHICH of the two it is is
+        // decided HERE, from the same `is_loading` fact the two buttons' enabled
+        // states already read — so no edge grows a `when`/`switch` for it.
+
+        // A settled chrome (idle / finished / failed) offers RELOAD, exactly where
+        // the old Reload button was sensitive.
+        for settled in [
+            ChromeState::default(),
+            ChromeState {
+                load_state: LoadState::Finished,
+                ..ChromeState::default()
+            },
+            ChromeState {
+                load_state: LoadState::Failed,
+                last_error: Some("name not resolved".into()),
+                ..ChromeState::default()
+            },
+        ] {
+            assert_eq!(reload_stop_control(&settled), ReloadStopControl::Reload);
+            assert_eq!(
+                reload_stop_control(&settled).action(),
+                shortcuts::ChromeAction::Reload,
+                "the control performs the SAME chrome action the keyboard resolves"
+            );
+        }
+
+        // A BACKEND load in flight offers STOP, exactly where the old Stop button
+        // was sensitive — so the cancel affordance survives the collapse unmoved.
+        for load_state in [LoadState::Started, LoadState::Committed] {
+            let loading = ChromeState {
+                load_state,
+                load_step: LoadStep::FetchingContent,
+                ..ChromeState::default()
+            };
+            assert!(loading.is_loading());
+            assert_eq!(reload_stop_control(&loading), ReloadStopControl::Stop);
+            assert_eq!(
+                reload_stop_control(&loading).action(),
+                shortcuts::ChromeAction::Stop
+            );
+        }
+
+        // The whole axis, pinned against the ONE fact rather than against a list
+        // of states this test happens to have thought of.
+        for state in every_chrome_state_shape() {
+            let expected = if state.is_loading() {
+                ReloadStopControl::Stop
+            } else {
+                ReloadStopControl::Reload
+            };
+            assert_eq!(
+                reload_stop_control(&state),
+                expected,
+                "the control mode is the loading fact and nothing else: {state:?}"
+            );
+        }
+
+        // The PRE-CONTENT resolution window keeps the behaviour the two buttons
+        // had: there is no backend load to stop yet (`load_progress_tooltip`
+        // refuses to promise a cancel there for the same reason), so the control
+        // is still Reload — it does not offer a cancel it cannot perform.
+        let resolving = ChromeState {
+            load_state: LoadState::Idle,
+            load_step: LoadStep::ResolvingName,
+            ..ChromeState::default()
+        };
+        assert!(!resolving.is_loading());
+        assert_eq!(reload_stop_control(&resolving), ReloadStopControl::Reload);
+
+        // Each mode names itself once, for every painter: a stable wire name (the
+        // mobile carrier), the glyph the affordance already wears on every edge,
+        // and an accessible description. The STOP half reuses the existing
+        // `STOP_AFFORDANCE_LABEL` rather than minting a second stop glyph.
+        assert_eq!(ReloadStopControl::Stop.label(), STOP_AFFORDANCE_LABEL);
+        assert_eq!(ReloadStopControl::Reload.label(), RELOAD_AFFORDANCE_LABEL);
+        let mut wire_names = std::collections::BTreeSet::new();
+        for control in ReloadStopControl::ALL {
+            assert!(
+                wire_names.insert(control.wire_name()),
+                "{control:?} must have its own wire name"
+            );
+            assert!(!control.label().is_empty());
+            assert!(
+                control.description().len() > control.label().len(),
+                "{control:?} needs a readable description for the edges with no hover"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loading_spinner_is_a_second_view_of_the_load_the_url_bar_already_shows() {
+        // Acceptance (spec `chrome-conventional-controls` stories 8 + 9): a
+        // spinner joins the URL-bar progress bar, driven by the SAME loading fact
+        // rather than a second truth — and the progress bar itself is untouched.
+        //
+        // The spinner is deliberately visible on exactly `load_progress_visible`,
+        // the rule the URL-bar bar already uses, so the two loading surfaces can
+        // never contradict each other and the PRE-CONTENT resolution window (the
+        // long `ronan.eth` freeze, where `is_loading()` is still false) is the one
+        // place a stalled load most needs to read as "working".
+        for state in every_chrome_state_shape() {
+            assert_eq!(
+                load_spinner_visible(&state),
+                load_progress_visible(&state),
+                "the spinner and the URL-bar bar show the SAME load: {state:?}"
+            );
+        }
+
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            ..ChromeState::default()
+        };
+        assert!(!load_spinner_visible(&settled));
+
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..ChromeState::default()
+        };
+        assert!(load_spinner_visible(&loading));
+
+        // The case the progress bar cannot cover on its own: a load in flight with
+        // no phase reported yet, and a name resolution before the backend load
+        // starts. Both spin.
+        for stalled in [
+            ChromeState {
+                load_state: LoadState::Started,
+                load_step: LoadStep::Idle,
+                ..ChromeState::default()
+            },
+            ChromeState {
+                load_state: LoadState::Idle,
+                load_step: LoadStep::ResolvingName,
+                ..ChromeState::default()
+            },
+        ] {
+            assert!(
+                load_spinner_visible(&stalled),
+                "a load with nothing to report yet must still read as working: {stalled:?}"
+            );
+        }
+
+        // The URL bar's own progress rules are UNCHANGED by the spinner's arrival:
+        // same visibility, same fractions, same hints (the bar is liked, and it is
+        // the fine-grained signal).
+        assert_eq!(load_progress_fraction(&settled), 0.0);
+        assert_eq!(load_progress_hint(&settled), "");
+        assert_eq!(load_progress_fraction(&loading), 0.7);
+        assert_eq!(load_progress_hint(&loading), "fetching content");
+    }
+
     /// One failure REASON per [`FailureKind`], plus `None` (nothing failed): the
     /// failure-severity axis of [`every_chrome_state_shape`].
     ///
@@ -7222,6 +7553,19 @@ mod tests {
                 ),
                 ("trustPinActionLabel", trust_pin_action_label(&state).into()),
                 ("trustPinDetail", trust_pin_detail(&state).into()),
+                (
+                    "reloadStopControl",
+                    reload_stop_control(&state).wire_name().into(),
+                ),
+                (
+                    "reloadStopControlLabel",
+                    reload_stop_control(&state).label().into(),
+                ),
+                (
+                    "reloadStopControlDescription",
+                    reload_stop_control(&state).description().into(),
+                ),
+                ("loadSpinnerVisible", load_spinner_visible(&state).into()),
             ];
             for (field, expected) in derived {
                 assert_eq!(
@@ -7315,6 +7659,13 @@ mod tests {
                 "trustPinActionVisible": false,
                 "trustPinActionLabel": "",
                 "trustPinDetail": "",
+                // The collapsed reload/stop control and the loading spinner
+                // (task `reload-stop-collapse-and-loading-spinner-core-and-gtk`):
+                // an idle chrome offers RELOAD and spins nothing.
+                "reloadStopControl": "reload",
+                "reloadStopControlLabel": RELOAD_AFFORDANCE_LABEL,
+                "reloadStopControlDescription": ReloadStopControl::Reload.description(),
+                "loadSpinnerVisible": false,
             })
         );
     }

@@ -1,7 +1,8 @@
 //! The `werust` browser binary: the day-one product shell.
 //!
-//! werust opens a real window with a URL bar and back/forward/reload/stop
-//! controls over a LIVE, interactive page view, driven ENTIRELY through the
+//! werust opens a real window with a URL bar, back/forward controls and the ONE
+//! reload/stop control browsers have (it reloads a settled page and stops a load
+//! in flight), over a LIVE, interactive page view, driven ENTIRELY through the
 //! [`Renderer`] seam (`CONTEXT.md`, `docs/adr/0001`). The seam-facing logic — the
 //! URL bar, the nav controls, and the chrome that reflects load state — lives in
 //! [`shell`] as a GTK-free [`BrowserShell`]; this file is the thin GTK view over
@@ -49,7 +50,7 @@ use gtk4::pango::EllipsizeMode;
 use gtk4::prelude::*;
 use gtk4::{
     gdk, glib, Application, ApplicationWindow, Box as GtkBox, Button, CssProvider, Entry, Label,
-    ListBox, MenuButton, Notebook, Orientation, Popover, ScrolledWindow, Widget, Window,
+    ListBox, MenuButton, Notebook, Orientation, Popover, ScrolledWindow, Spinner, Widget, Window,
 };
 
 use webkit6::prelude::WebViewExt;
@@ -71,9 +72,10 @@ use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG};
 use werust_core::shortcuts::{self, Chord, ChromeAction, Focus, Modifiers, PointerButton};
 use werust_core::{
     error_banner_css_class, error_banner_text, error_banner_visible, invalid_entry_badge_text,
-    invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip, status_line,
-    trust_indicator, trust_indicator_css_class, trust_indicator_detail, trust_pin_action_label,
-    trust_pin_action_visible, trust_pin_detail, BrowserShell, ChromeState,
+    invalid_entry_badge_visible, load_progress_fraction, load_progress_tooltip,
+    load_spinner_visible, reload_stop_control, status_line, trust_indicator,
+    trust_indicator_css_class, trust_indicator_detail, trust_pin_action_label,
+    trust_pin_action_visible, trust_pin_detail, BrowserShell, ChromeState, ReloadStopControl,
     ERROR_BANNER_CSS_CLASSES, STOP_AFFORDANCE_LABEL, TRUST_INDICATOR_CSS_CLASSES,
 };
 
@@ -995,6 +997,24 @@ fn main() -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
+/// The freedesktop ICON NAME this toolkit draws for a reload/stop control mode.
+///
+/// A RESOURCE LOOKUP on the core's decision, never a second decision: the core
+/// says WHICH mode the one control is in (and what it does, and what to call it);
+/// the icon THEME is this edge's, exactly as the hex colour for a core CSS class
+/// belongs to `APP_CSS` here and to `desktop-paint`'s palette on the native-widget
+/// desktops. An edge with no icon theme paints the core's own
+/// [`ReloadStopControl::label`] glyph instead.
+///
+/// Total over the mode, so a third mode would not compile until this edge drew
+/// it.
+fn reload_stop_icon(control: ReloadStopControl) -> &'static str {
+    match control {
+        ReloadStopControl::Reload => "view-refresh-symbolic",
+        ReloadStopControl::Stop => "process-stop-symbolic",
+    }
+}
+
 /// The widgets the pump refreshes from [`ChromeState`]: the URL bar, the nav
 /// controls, and the load indicator. Grouped so a single [`refresh_chrome`] call
 /// keeps every piece of chrome in step with the seam's state.
@@ -1007,8 +1027,17 @@ struct Chrome {
     url_entry: Entry,
     back: Button,
     forward: Button,
-    reload: Button,
-    stop: Button,
+    /// The ONE reload/stop control browsers have: it RELOADS a settled page and
+    /// STOPS a load in flight. Which of the two it currently is comes from the
+    /// shared derivation ([`reload_stop_control`]), so this edge re-labels one
+    /// button instead of enabling one of a pair on a condition of its own (task
+    /// `reload-stop-collapse-and-loading-spinner-core-and-gtk`, story 10).
+    reload_stop: Button,
+    /// The LOADING SPINNER: the second presentation of the same in-flight load
+    /// the URL bar already reports as a fraction ([`load_spinner_visible`]). It
+    /// says werust is WORKING where the bar says how far it got, which is the
+    /// half a stalled load needs (story 8; the URL-bar bar is unchanged, story 9).
+    spinner: Spinner,
     status: Label,
     /// The trust indicator: shows whether the current page was content-verified
     /// (hash-checked on the content-addressed path) or served by an unverified
@@ -1045,8 +1074,9 @@ struct Chrome {
 
 impl Chrome {
     /// Paint the given [`ChromeState`] into the widgets: URL bar text, control
-    /// availability (Back/Forward greyed as history allows), the Stop vs Reload
-    /// active state (Stop only while loading), and the status/failure line.
+    /// availability (Back/Forward greyed as history allows), the one reload/stop
+    /// control's MODE and the spinner beside it (both derived from the load), and
+    /// the status/failure line.
     ///
     /// Every string / fraction / class name painted here is decided by the shared
     /// derivation in `werust-core` (`status_line`, `trust_indicator*`,
@@ -1075,10 +1105,25 @@ impl Chrome {
         }
         self.back.set_sensitive(state.can_go_back);
         self.forward.set_sensitive(state.can_go_forward);
-        // Stop is meaningful only while a load is in flight; Reload only once it
-        // has settled.
-        self.stop.set_sensitive(state.is_loading());
-        self.reload.set_sensitive(!state.is_loading());
+        // The ONE reload/stop control: Reload on a settled page, Stop while a load
+        // is in flight. WHICH mode it is in is the shared derivation's call, not a
+        // condition restated here; this painter only looks the mode's themed ICON
+        // NAME up (the freedesktop icon set is this toolkit's, exactly as the
+        // colour for a core CSS class is `desktop-paint`'s) and shows the core's
+        // own accessible description.
+        let control = reload_stop_control(state);
+        self.reload_stop.set_icon_name(reload_stop_icon(control));
+        self.reload_stop
+            .set_tooltip_text(Some(control.description()));
+        // The SPINNER beside it, on the shared rule: it turns while there is a
+        // load to report and stands still otherwise. Its slot is allocated
+        // permanently and only its OPACITY follows the rule, so starting a load
+        // never shifts the URL bar sideways (the geometry lesson of task
+        // `loading-progress-in-the-url-bar-not-a-banner`, applied to width). No
+        // timer either: the animation is GTK's, driven by this existing refresh.
+        let spinning = load_spinner_visible(state);
+        self.spinner.set_spinning(spinning);
+        self.spinner.set_opacity(if spinning { 1.0 } else { 0.0 });
         self.status.set_text(&status_line(state));
         // The LOAD-PROGRESS indicator lives IN the URL bar: the entry's own
         // progress fraction advances with the real pipeline phase and falls to
@@ -1086,8 +1131,8 @@ impl Chrome {
         // replaces, this changes NO widget geometry, so a navigation never resizes
         // the page view and the content cannot jump under the pointer (task
         // `loading-progress-in-the-url-bar-not-a-banner`). Cancelling is the
-        // toolbar Stop button, which is already sensitive exactly while a load is
-        // in flight — the banner's Cancel was a second affordance for the same
+        // toolbar's one reload/stop control, which is in its STOP mode on exactly
+        // that fact — the banner's Cancel was a second affordance for the same
         // `BrowserShell::stop`, so nothing is lost. Driven by this existing
         // refresh, so no new timer / poll / tight loop (the Android ANR guard is
         // not regressed).
@@ -1215,7 +1260,8 @@ fn install_app_css() {
 
 /// Open the shell window over the webview backend and navigate it to `url`.
 ///
-/// Builds the URL bar + back/forward/reload/stop toolbar over the embedded live
+/// Builds the URL bar + back/forward + the one reload/stop control and the
+/// loading spinner over the embedded live
 /// view, wires each control to drive the [`BrowserShell`] (never the webview
 /// directly), and starts a periodic pump that folds the seam's load-lifecycle
 /// events into the chrome.
@@ -1328,11 +1374,26 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     view.set_vexpand(true);
     view.set_hexpand(true);
 
-    // The toolbar: back / forward / reload / stop + the URL bar.
+    // The toolbar: back / forward / the ONE reload-stop control / the loading
+    // spinner + the URL bar. Back and forward stay: desktop keeps them, matching
+    // every desktop browser (spec `chrome-conventional-controls`, story 14).
     let back = Button::from_icon_name("go-previous-symbolic");
     let forward = Button::from_icon_name("go-next-symbolic");
-    let reload = Button::from_icon_name("view-refresh-symbolic");
-    let stop = Button::from_icon_name("process-stop-symbolic");
+    // ONE control where there were two. Its first paint is the shared
+    // derivation's own mode for the SAME default state `Chrome::refresh` will
+    // paint, so the button cannot start out showing a mode the chrome disagrees
+    // with (the discipline the trust badge's first paint already follows).
+    let initial_control = reload_stop_control(&ChromeState::default());
+    let reload_stop = Button::from_icon_name(reload_stop_icon(initial_control));
+    reload_stop.set_tooltip_text(Some(initial_control.description()));
+    // The SPINNER sits immediately AFTER the collapsed control and BEFORE the URL
+    // bar: the two loading surfaces the toolbar owns stay together at the left,
+    // and neither goes near the trust badge at the right, which must never read
+    // as a claim about the load. Its slot is permanent (only its opacity follows
+    // the derivation), so a navigation never shoves the URL bar sideways.
+    let spinner = Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.set_opacity(0.0);
     let url_entry = Entry::builder()
         .hexpand(true)
         .placeholder_text("Enter a URL and press Enter")
@@ -1388,8 +1449,9 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // in-flight load is visible in the chrome without ANY widget taking height
     // from the page view (task `loading-progress-in-the-url-bar-not-a-banner`).
     // Nothing to construct here: the surface is `url_entry` above, styled by the
-    // `entry > progress` rule in `APP_CSS`, and CANCEL is the toolbar Stop button
-    // (sensitive exactly while a load is in flight).
+    // `entry > progress` rule in `APP_CSS`, and CANCEL is the toolbar's one
+    // reload/stop control, which is in its STOP mode exactly while a load is in
+    // flight. The SPINNER built above is the second view of that same load.
 
     // The small "invalid URL" badge sits in the toolbar next to the URL bar,
     // shown ONLY when the last entry was invalid (field finding D). It starts
@@ -1401,8 +1463,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let toolbar = GtkBox::new(Orientation::Horizontal, 4);
     toolbar.append(&back);
     toolbar.append(&forward);
-    toolbar.append(&reload);
-    toolbar.append(&stop);
+    toolbar.append(&reload_stop);
+    toolbar.append(&spinner);
     toolbar.append(&url_entry);
     toolbar.append(&invalid_badge);
     toolbar.append(&trust_button);
@@ -1414,8 +1476,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
         url_entry: url_entry.clone(),
         back: back.clone(),
         forward: forward.clone(),
-        reload: reload.clone(),
-        stop: stop.clone(),
+        reload_stop: reload_stop.clone(),
+        spinner: spinner.clone(),
         status: status.clone(),
         trust: trust.clone(),
         trust_detail: trust_detail.clone(),
@@ -1486,20 +1548,20 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
             refresh();
         }
     });
-    reload.connect_clicked({
+    // The ONE reload/stop control: what it DOES is the mode's own
+    // `ChromeAction` (the same closed vocabulary Ctrl+R and Escape resolve into),
+    // performed by the SAME `perform_chrome_action` the keyboard and the mouse
+    // side buttons go through. So this handler decides nothing: cancelling an
+    // in-flight load from the toolbar and cancelling it with Escape are one path,
+    // and they cannot drift apart.
+    reload_stop.connect_clicked({
         let shell = shell.clone();
         let refresh = refresh.clone();
+        let url_entry = url_entry.clone();
+        let inspector_view = inspector_view.clone();
         move |_| {
-            let _ = shell.borrow_mut().reload();
-            refresh();
-        }
-    });
-    stop.connect_clicked({
-        let shell = shell.clone();
-        let refresh = refresh.clone();
-        move |_| {
-            shell.borrow_mut().stop();
-            refresh();
+            let action = reload_stop_control(shell.borrow().chrome()).action();
+            perform_chrome_action(action, &shell, &url_entry, &inspector_view, &refresh);
         }
     });
     // The TRUST-ON-FIRST-USE bless: record the current mutable name's CID as the
@@ -1627,8 +1689,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
 #[cfg(test)]
 mod tests {
     use super::{
-        app_id, banner, parse_args, resolve_output, shortcut_action, shortcut_pointer_button,
-        usage, Command, ResolveOutput, ResolvedName, APP_CSS, DEFAULT_URL,
+        app_id, banner, parse_args, reload_stop_icon, resolve_output, shortcut_action,
+        shortcut_pointer_button, usage, Command, ResolveOutput, ResolvedName, APP_CSS, DEFAULT_URL,
     };
     use gtk4::prelude::*;
     use gtk4::{gdk, gio, Label};
@@ -1639,7 +1701,7 @@ mod tests {
     use werust_core::debug::{ConsoleEntry, ConsoleLevel, DebugCapture, NetworkEntry};
     use werust_core::menu::{BrowserMenu, MenuItemKind, MENU_ITEM_DEBUG, MENU_ITEM_VERSION};
     use werust_core::shortcuts::{ChromeAction, Focus, PointerButton};
-    use werust_core::CssClassFamily;
+    use werust_core::{ChromeState, CssClassFamily, ReloadStopControl};
 
     #[test]
     fn f12_opens_the_web_inspector_and_the_gtk_debugger_chord_does_not() {
@@ -1927,6 +1989,108 @@ mod tests {
         // The guard has teeth: a class the core did NOT export is not styled
         // either, so the assertion above is not vacuously true.
         assert!(!styled("trust-not-a-posture"));
+    }
+
+    #[test]
+    fn the_reload_stop_icon_is_a_lookup_on_the_cores_mode_not_a_second_decision() {
+        // The ONE thing this edge adds to the collapse: which freedesktop icon
+        // this toolkit draws for the mode the CORE decided. A resource lookup, so
+        // it is total over the mode, distinct per mode, and names no condition of
+        // its own — the icon-theme counterpart of `desktop-paint`'s colour lookup
+        // on a core class name. Display-free.
+        let mut icons = std::collections::BTreeSet::new();
+        for control in ReloadStopControl::ALL {
+            let icon = reload_stop_icon(control);
+            assert!(icon.ends_with("-symbolic"), "{icon} is a themed icon name");
+            assert!(icons.insert(icon), "each mode draws its own icon");
+        }
+        assert_eq!(
+            reload_stop_icon(ReloadStopControl::Stop),
+            "process-stop-symbolic",
+            "the STOP mode keeps the very cross the separate Stop button wore"
+        );
+        assert_eq!(
+            reload_stop_icon(ReloadStopControl::Reload),
+            "view-refresh-symbolic"
+        );
+    }
+
+    /// End-to-end, on the REAL widgets: the ONE reload/stop control follows the
+    /// core's mode and the spinner follows the core's rule, across a whole load.
+    /// Ignored by default because it initializes GTK, which needs a display the
+    /// `verify` gate may not have; run explicitly on a desktop session with
+    /// `cargo test -p werust -- --ignored`. The DERIVATION itself is pinned
+    /// display-free in `werust-core`, and the wiring shape by
+    /// `crates/werust-core/tests/collapsed_reload_stop_control_shape.rs`; what
+    /// this adds is that the widgets really change.
+    #[test]
+    #[ignore = "needs a display: constructs the real chrome widgets (GTK init)"]
+    fn real_collapsed_control_and_spinner_follow_the_derivation_on_a_display() {
+        use super::Chrome;
+        use gtk4::{Button, Entry, Spinner};
+        use renderer::LoadState;
+        use werust_core::{reload_stop_control, LoadStep};
+
+        gtk4::init().expect("gtk init on a desktop session");
+        let reload_stop = Button::new();
+        let spinner = Spinner::new();
+        let chrome = Chrome {
+            url_entry: Entry::new(),
+            back: Button::new(),
+            forward: Button::new(),
+            reload_stop: reload_stop.clone(),
+            spinner: spinner.clone(),
+            status: Label::new(None),
+            trust: Label::new(None),
+            trust_detail: Label::new(None),
+            trust_pin_detail: Label::new(None),
+            trust_pin_button: Button::new(),
+            error_banner: Label::new(None),
+            invalid_badge: Label::new(None),
+        };
+
+        // Settled: ONE control, showing Reload, and a still spinner.
+        let settled = ChromeState {
+            load_state: LoadState::Finished,
+            ..ChromeState::default()
+        };
+        chrome.refresh(&settled);
+        assert_eq!(
+            reload_stop.icon_name().as_deref(),
+            Some(reload_stop_icon(ReloadStopControl::Reload))
+        );
+        assert_eq!(
+            reload_stop.tooltip_text().as_deref(),
+            Some(ReloadStopControl::Reload.description())
+        );
+        assert!(!spinner.is_spinning());
+
+        // In flight: the SAME widget becomes Stop (the cancel affordance is
+        // unmoved), and the spinner turns beside it.
+        let loading = ChromeState {
+            load_state: LoadState::Started,
+            load_step: LoadStep::FetchingContent,
+            ..ChromeState::default()
+        };
+        chrome.refresh(&loading);
+        assert_eq!(reload_stop_control(&loading), ReloadStopControl::Stop);
+        assert_eq!(
+            reload_stop.icon_name().as_deref(),
+            Some(reload_stop_icon(ReloadStopControl::Stop))
+        );
+        assert_eq!(
+            reload_stop.tooltip_text().as_deref(),
+            Some(ReloadStopControl::Stop.description())
+        );
+        assert!(spinner.is_spinning() && spinner.opacity() > 0.5);
+
+        // Back to settled: the spinner stops, and the control is Reload again.
+        chrome.refresh(&settled);
+        assert!(!spinner.is_spinning() && spinner.opacity() < 0.5);
+        assert_eq!(
+            reload_stop.icon_name().as_deref(),
+            Some(reload_stop_icon(ReloadStopControl::Reload))
+        );
     }
 
     #[test]

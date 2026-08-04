@@ -1365,3 +1365,38 @@ macos = { state = "implemented" }
 windows = { state = "implemented" }
 ios = { state = "implemented" }
 android = { state = "implemented" }
+
+[[capability]]
+name = "collapsed-reload-stop-and-loading-spinner"
+description = "The chrome shows ONE control that reloads a settled page and STOPS a load in flight (the single button every browser has, replacing werust's separate Reload and Stop), plus a LOADING SPINNER beside the URL bar's existing progress fraction, so a load that has reported no phase yet reads as working rather than idle. Both are derived from the one loading fact in the toolkit-free core; no edge decides either."
+# The rules are `werust_core::reload_stop_control` (Stop while
+# `ChromeState::is_loading`, Reload otherwise — the very fact the two separate
+# buttons took their sensitivity from, so the cancel affordance is unmoved) and
+# `werust_core::load_spinner_visible` (exactly `load_progress_visible`, so the
+# spinner and the URL-bar bar can never contradict each other and the pre-content
+# name-resolution window spins too). The URL bar's progress fraction/hint are
+# UNCHANGED (spec story 9). Both facts are exported through BOTH carriers — the
+# plain-Rust `desktop-paint` snapshot (`ChromePaint::reload_stop_control` /
+# `reload_stop_label` / `reload_stop_description` / `spinner_visible`) that the
+# AppKit and Win32 painters read, and `werust_core::chrome_json`
+# (`reloadStopControl` / `reloadStopControlLabel` /
+# `reloadStopControlDescription` / `loadSpinnerVisible`) that the Kotlin and Swift
+# edges decode — so every sibling edge reads a value instead of minting a
+# conditional. Task `reload-stop-collapse-and-loading-spinner-core-and-gtk`, spec
+# `chrome-conventional-controls`; decisions at
+# docs/spikes/reload-stop-collapse-and-loading-spinner-core-and-gtk/DECISIONS.md.
+# Desktop (Linux/GTK) is the edge that proves it end to end: ONE toolbar button
+# whose themed icon + tooltip follow the core's mode and whose click performs the
+# mode's own `ChromeAction` through the SAME `perform_chrome_action` the keyboard
+# uses (so toolbar-cancel and Escape-cancel are one path), with a `GtkSpinner` in
+# a permanently-allocated slot beside it. Shape-guarded by
+# crates/werust-core/tests/collapsed_reload_stop_control_shape.rs; the widgets
+# themselves are asserted in an `#[ignore]`d GTK test that was RUN under Xvfb
+# (docs/spikes/reload-stop-collapse-and-loading-spinner-core-and-gtk/README.md).
+# The other four cells are the sibling edge tasks: each is a PAINTER change over
+# a carrier that already holds the values, not a new decision.
+desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-macos-window" }
+windows = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-windows-chrome" }
+ios = { state = "stubbed", task = "ios-chrome-collapse-reload-stop-and-drop-history-buttons" }
+android = { state = "stubbed", task = "android-chrome-collapse-reload-stop-and-drop-history-buttons" }

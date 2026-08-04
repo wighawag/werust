@@ -4,6 +4,7 @@ slug: shortcuts-and-mouse-history-buttons-on-the-macos-edge
 spec: chrome-conventional-controls
 blockedBy: [shortcut-resolution-in-core-and-the-gtk-edge]
 covers: [1, 2, 3, 4, 5, 6, 7, 15]
+needsAnswers: true
 ---
 
 ## What to build

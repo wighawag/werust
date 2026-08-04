@@ -20,33 +20,27 @@ Every other check passes, including all the other new shortcut ones (Cmd+R re-fe
 
 This is the DISCRIMINATING half of the focus input: the same key, the same window, a different reported focus must do something else. It is currently not discriminating, so the one guarantee that proves this edge reports focus correctly is unproven.
 
-## The diagnosis (already done; confirm it before fixing)
+## CORRECTED diagnosis (the first one was WRONG; this supersedes it)
 
-In `crates/werust-macos/examples/window_smoke.rs` (~:374-390) the check does `set_url_text(typed)`, then `blur_url_bar()`, then presses Escape, and expects the typed text to SURVIVE (page-focused Escape is Stop, not RevertUrlBar).
+A build agent STOPPED on the original task and disproved its central premise. That analysis is ACCEPTED and is now the task. Its evidence:
 
-`WerustWindow::shortcut_focus` (`crates/werust-macos/src/window.rs:987`) reports `Focus::UrlBar` when EITHER `url_field.currentEditor()` is `Some` OR the field is the window's `firstResponder`.
+`press_key -> sendEvent -> claim_key -> perform_chrome_action` is fully SYNCHRONOUS, and the smoke asserts `window.url_text() == typed` immediately after `press_key(Escape)` with no pump between. On the PAGE branch, `ChromeAction::Stop` (`crates/werust-macos/src/window.rs:1052-1055`) calls `shell.stop()` and then `refresh_chrome()`; `refresh_chrome` (`window.rs:926-932`) always calls `Chrome::apply`, which at `window.rs:385-388` overwrites the URL field with `paint.url_text` whenever it differs, and `ChromePaint::url_text` is verbatim `ChromeState::url_text` (`crates/desktop-paint/src/lib.rs:303`), i.e. the `believed` URL.
 
-`blur_url_bar` (`crates/werust-macos/src/window.rs:1492`) is only:
+So **Stop itself rewrites the bar from `typed` to `believed` before the check reads it.** Two consequences:
 
-```rust
-pub fn blur_url_bar(&self) {
-    let _ = self.window.makeFirstResponder(None);
-}
-```
+1. The assertion is unreachable in BOTH focus states, because `ChromeAction::RevertUrlBar` (`window.rs:1056-1070`) also leaves the bar showing `believed`. The two branches produce IDENTICAL observable text, so the check never discriminated focus at all, even when it was written.
+2. There is therefore NO evidence that `blur_url_bar` is broken. The single observed CI failure is fully explained by the Stop repaint alone.
 
-Two problems. It DISCARDS the `BOOL` result, so a refused resignation is silent. And `makeFirstResponder(nil)` does not reliably tear down the FIELD EDITOR, which is the condition `shortcut_focus` checks first: `set_url_text` immediately before it touches `field.currentEditor()`, so an editor is installed, and if it survives the blur then `shortcut_focus` returns `UrlBar`, Escape resolves to `RevertUrlBar`, the bar reverts, and the check fails exactly as observed.
+The original theory (a surviving field editor makes `shortcut_focus` report `UrlBar`) is unproven and probably wrong. `shortcut_focus` appears CORRECT for a real user: a real click into the page moves the first responder and ends the field editor. Do not change production focus reporting.
 
-Note this is almost certainly a SMOKE-HARNESS defect, not a product defect: when a real user clicks into the page, AppKit moves the first responder and ends the editor properly. Confirm that before changing any production behaviour.
+## Acceptance criteria (RE-SCOPED — criterion 3 is now explicitly relaxed)
 
-## Acceptance criteria
-
-- [ ] `blur_url_bar` really takes the keyboard away from the URL bar: end the field-editor session explicitly (`NSWindow::endEditingFor(None)` is the API that tears it down) as well as moving the first responder, and do NOT silently discard the result of `makeFirstResponder`.
-- [ ] After `blur_url_bar()`, `shortcut_focus()` reports `Focus::Page`. Assert this directly in the smoke, so the next failure names the CAUSE (focus misreported) rather than only the symptom (the bar reverted).
-- [ ] The failing check passes: page-focused Escape leaves a half-typed URL exactly where it was.
-- [ ] The URL-bar-focused half still passes: Escape with the bar focused still reverts the edit and restores the current URL.
-- [ ] `macos-renderer` is GREEN on `main` afterwards.
-- [ ] If, and only if, the investigation shows `shortcut_focus` itself is wrong for a REAL user (not just for this harness), fix that instead and say so plainly in the done record. Do not change production focus reporting merely to make a harness call succeed.
-- [ ] Do NOT weaken or delete the check. It is the only evidence this project ever gets that the macOS edge reports focus correctly, and there is no Mac here.
+- [ ] `blur_url_bar` is hardened as hygiene: end the field-editor session explicitly (`NSWindow::endEditingFor(None)`) as well as moving the first responder, and HONOUR the `BOOL` from `makeFirstResponder` instead of discarding it.
+- [ ] PRIMARY CHECK: assert `shortcut_focus()` reports `Focus::Page` directly after `blur_url_bar()`. This is the only assertion that actually tests focus REPORTING for this case, and it is unaffected by the repaint. Expose whatever minimal accessor the smoke needs.
+- [ ] **AUTHORISED, and the point of this re-scope:** REPLACE the symptom assertion (`url_text() == typed`) with the EFFECT assertion the Windows smoke already uses (`crates/werust-windows/examples/window_smoke.rs:697-713`). With the PAGE focused, Escape must CANCEL an in-flight load (observed at the shell / the pinned fixture). With the BAR focused, Escape must revert the edit and must NOT cancel the load. This is strictly STRONGER and genuinely discriminating, so it does not weaken the safety net. The earlier "do not weaken the assertion" constraint is hereby relaxed FOR THIS ONE ASSERTION, and only in the direction of replacing it with the stronger effect-based pair.
+- [ ] Do NOT change production repaint behaviour to make a bar edit survive a chrome repaint. That is a cross-edge, user-visible product decision (the GTK edge behaves identically, `crates/werust/src/main.rs:296-300` and `1089-1090`), nothing in this spec asks for it, and it is out of scope here.
+- [ ] `macos-renderer` is GREEN on `main` afterwards. This is the only real evidence; the Ubuntu gate does not compile AppKit.
+- [ ] Record, as a durable note, that the original check was never discriminating, so the focus half of the macOS shortcut layer was unguarded from the moment it landed until this task.
 
 ## Blocked by
 

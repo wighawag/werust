@@ -23,14 +23,16 @@
 //!
 //! # The Swift ↔ core protocol
 //!
-//! One [`CoreSession`] per `UIViewController`. On a user action (typed URL, Back,
-//! Forward, Reload, Stop) Swift drives the session, then reads back:
+//! One [`CoreSession`] per `UIViewController`. On a user action (a typed URL, the
+//! ONE reload/stop control, an edge-swipe history move) Swift drives the session,
+//! then reads back:
 //!
 //! * [`take_pending_load`](CoreSession::take_pending_load) — the URL (if any) to
 //!   apply to the platform `WKWebView` via `WKWebView.load`.
 //! * [`chrome_json`](CoreSession::chrome_json) — the [`ChromeState`] as JSON to
-//!   paint the URL bar, the Back/Forward/Reload/Stop enablement, and the status
-//!   line. Swift holds NO browsing logic; every one of those is the core's truth.
+//!   paint the URL bar, the reload/stop control's mode, the loading spinner and
+//!   the status line. Swift holds NO browsing logic; every one of those is the
+//!   core's truth.
 //!
 //! And Swift reports the platform `WKWebView`'s real load signals back in
 //! ([`on_page_committed`](CoreSession::on_page_committed) /
@@ -43,7 +45,7 @@ mod backend;
 pub use backend::{IosBackend, IosHandle};
 
 use renderer::Renderer;
-use werust_core::{BrowserShell, ChromeState};
+use werust_core::{BrowserShell, ChromeState, ReloadStopControl};
 
 /// The wire form of a resolved `ipfs://` request handed back to the Swift edge:
 /// the MIME type and the verified bytes, or the fail-closed reason.
@@ -165,6 +167,53 @@ impl CoreSession {
     /// Stop the in-flight load, through the seam.
     pub fn stop(&mut self) {
         self.shell.stop();
+    }
+
+    /// Activate werust's ONE reload/stop control: perform whatever the CORE says
+    /// that control does right now (task
+    /// `ios-chrome-collapse-reload-stop-and-drop-history-buttons`, spec
+    /// `chrome-conventional-controls`, story 10).
+    ///
+    /// The Swift toolbar carries a SINGLE control where it carried a Reload
+    /// button and a Stop button, and which of the two modes it is in is
+    /// [`werust_core::reload_stop_control`]'s call, painted from the chrome JSON.
+    /// This is the matching ACTION half: the edge's tap handler calls this one
+    /// entry point, so the mode is decided exactly once, in the core, for both
+    /// what the control SHOWS and what it DOES. Without it the edge would need a
+    /// two-armed Swift `switch` mapping the carried mode back onto
+    /// [`reload`](CoreSession::reload) / [`stop`](CoreSession::stop) — a
+    /// hand-written twin of a core rule, which is precisely what
+    /// `docs/adr/0011` and the mobile presentation guard exist to prevent (and
+    /// this very edge already shipped one such twin: its invalid-entry badge
+    /// text was a Swift literal set at build time and never refreshed).
+    ///
+    /// The byte-for-byte counterpart of the Android edge's
+    /// `CoreSession::activate_reload_stop_control`, deliberately: the two mobile
+    /// edges face the identical question on their two different FFIs, and the
+    /// fan-in task `register-the-new-chrome-fields-in-the-mobile-presentation-guard`
+    /// is easier to close when they answered it the same way. On the desktop
+    /// edges the equivalent is routing the control's click through
+    /// [`ReloadStopControl::action`] into the one `perform_chrome_action`; a
+    /// `ChromeAction` cannot cross a C-ABI as anything but a string, so the
+    /// resolution stays on the Rust side of the boundary here.
+    ///
+    /// Matching on the MODE (rather than on the `ChromeAction` it names) is
+    /// deliberate: `ReloadStopControl` is a closed two-variant enum, so a third
+    /// mode would fail to compile here instead of falling into a silent
+    /// catch-all arm that quietly did nothing across the C-ABI. That the two
+    /// stay in agreement — each mode's arm performs what its `action()` names —
+    /// is asserted in
+    /// `tests/collapsed_control_and_dropped_history_buttons_shape.rs`.
+    pub fn activate_reload_stop_control(&mut self) {
+        match werust_core::reload_stop_control(self.chrome()) {
+            ReloadStopControl::Reload => {
+                // Same as the old Reload button: `false` means there was nothing
+                // to reload, which the edge treats exactly as it always has (it
+                // repaints and shows the unchanged chrome).
+                self.reload();
+            }
+            ReloadStopControl::Stop => self.stop(),
+        }
     }
 
     /// BLESS the current page's mutable name at the CID it resolves to right now
@@ -804,6 +853,22 @@ mod ffi {
     pub unsafe extern "C" fn werust_ios_stop(session: *mut CoreSession) {
         if let Some(s) = session_mut(session) {
             s.stop();
+        }
+    }
+
+    /// Activate werust's ONE reload/stop control: the Swift toolbar's single
+    /// control, which the CORE decides is a Reload or a Stop right now
+    /// (task `ios-chrome-collapse-reload-stop-and-drop-history-buttons`).
+    ///
+    /// The mode's LOOK crosses on the chrome JSON; this is the ACTION half, so
+    /// the Swift tap handler performs the mode without a `switch` of its own.
+    ///
+    /// # Safety
+    /// `session` is a live handle from `werust_ios_session_new`.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_activate_reload_stop_control(session: *mut CoreSession) {
+        if let Some(s) = session_mut(session) {
+            s.activate_reload_stop_control();
         }
     }
 

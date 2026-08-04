@@ -54,11 +54,27 @@ void werust_ios_string_free(char *s);
  * (an unusable URL leaves the chrome untouched for the user to fix). */
 bool werust_ios_navigate(WerustCoreSession *session, const char *url);
 
-/* Back / Forward / Reload / Stop, THROUGH the core's session history + seam. */
+/* Back / Forward / Reload / Stop, THROUGH the core's session history + seam.
+ * Back/Forward have NO on-screen button on this edge any more (the WebKit
+ * edge-swipe is the iOS history affordance, task
+ * ios-chrome-collapse-reload-stop-and-drop-history-buttons); they stay on the
+ * C-ABI because it is a mechanical mirror of the session's methods and the core
+ * capability is unchanged. */
 void werust_ios_go_back(WerustCoreSession *session);
 void werust_ios_go_forward(WerustCoreSession *session);
 bool werust_ios_reload(WerustCoreSession *session);
 void werust_ios_stop(WerustCoreSession *session);
+
+/* Activate werust's ONE reload/stop control (the single toolbar control that
+ * replaced the separate Reload and Stop buttons): perform whatever the CORE says
+ * that control does right now (werust_core::reload_stop_control -> Reload on a
+ * settled page, Stop while a load is in flight). The mode's LOOK crosses on the
+ * chrome JSON (reloadStopControlLabel / reloadStopControlDescription); this is
+ * the ACTION half, so the Swift tap handler performs the mode without a `switch`
+ * of its own — the hand-written twin of a core rule this repo has deleted once
+ * already (docs/adr/0011). Cancelling an in-flight load is this call in its Stop
+ * mode. */
+void werust_ios_activate_reload_stop_control(WerustCoreSession *session);
 
 /* BLESS the current page's MUTABLE name at the CID it resolves to right now: the
  * trust surface's "trust this content" action (trust-on-first-use, task

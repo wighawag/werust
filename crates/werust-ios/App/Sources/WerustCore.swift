@@ -47,6 +47,23 @@ final class WerustCore {
     /// Stop the in-flight load.
     func stop() { werust_ios_stop(handle) }
 
+    /// Activate werust's ONE reload/stop control: the single toolbar control that
+    /// replaced the separate Reload and Stop buttons (task
+    /// `ios-chrome-collapse-reload-stop-and-drop-history-buttons`, spec
+    /// `chrome-conventional-controls` story 10).
+    ///
+    /// The core decides which of the two modes the control is in, for BOTH what
+    /// it shows (the carried `reloadStopControlLabel` /
+    /// `reloadStopControlDescription`) and what it does (this call). So the
+    /// shell's tap handler contains no `switch` mapping the carried mode back
+    /// onto [reload] / [stop] — that would be a hand-written twin of
+    /// `werust_core::reload_stop_control`, the exact species of copy this edge
+    /// already shipped once in its invalid-entry badge and which
+    /// `docs/adr/0011` removed.
+    ///
+    /// Cancelling an in-flight load is THIS call, in the control's Stop mode.
+    func activateReloadStopControl() { werust_ios_activate_reload_stop_control(handle) }
+
     /// BLESS the current page's MUTABLE name at the CID it resolves to right now:
     /// the trust surface's "trust this content" action (trust-on-first-use, task
     /// `ipns-tofu-pin-and-warn-on-change`). A later resolution to a DIFFERENT CID
@@ -222,7 +239,11 @@ final class WerustCore {
     ///
     /// A move that really happened also clears the per-entry chrome the entry being
     /// LEFT owns (its error banner, its rejected-URL badge), so a swipe lands on
-    /// the same chrome the `◀` button leaves.
+    /// the same chrome a [goBack] through the seam leaves. Since the toolbar's
+    /// history buttons were dropped (task
+    /// `ios-chrome-collapse-reload-stop-and-drop-history-buttons`) the swipe is the
+    /// ONLY history affordance an iOS user has, so that parity is the whole story
+    /// rather than a second view of it.
     ///
     /// A history MOVE, not a new entry: the core lands its cursor on the entry
     /// swiped to, which is what keeps the URL bar, the trust posture and the
@@ -396,11 +417,13 @@ final class WerustCore {
     /// * the FACTS (`url`, `loading`, `loadStep`, `trustPosture`, `error`,
     ///   `failureKind`, `retryable`, `invalidEntry`, …): what the chrome IS;
     /// * the DERIVATION (`statusLine`, `trustIndicator`, `trustIndicatorDetail`,
-    ///   `errorBannerText`, `invalidEntryBadgeText`, `loadProgressFraction`, …):
-    ///   what the chrome SHOWS, each the return value of the core rule of the same
-    ///   name (`status_line`, `trust_indicator`, `trust_indicator_detail`,
-    ///   `error_banner_text`, `invalid_entry_badge_text`, `load_progress_fraction`,
-    ///   …).
+    ///   `errorBannerText`, `invalidEntryBadgeText`, `loadProgressFraction`,
+    ///   `reloadStopControlLabel`, `reloadStopControlDescription`,
+    ///   `loadSpinnerVisible`, …): what the chrome SHOWS, each the return value of
+    ///   the core rule of the same name (`status_line`, `trust_indicator`,
+    ///   `trust_indicator_detail`, `error_banner_text`, `invalid_entry_badge_text`,
+    ///   `load_progress_fraction`, `reload_stop_control(…).label()` /
+    ///   `.description()`, `load_spinner_visible`, …).
     ///
     /// This struct used to RE-DERIVE the second half in Swift (`statusLine()`,
     /// `trustIndicator()`, `errorBanner()`, `invalidEntryBadge()`,
@@ -478,6 +501,25 @@ final class WerustCore {
         /// The phase NAME behind the current progress, for the progress line's
         /// accessibility label: the core's `load_progress_hint`.
         let loadProgressHint: String
+        /// The GLYPH werust's ONE reload/stop control wears right now: the core's
+        /// `reload_stop_control(state).label()`. A field rather than a Swift
+        /// `switch` on the mode, so the control's look is the core's decision
+        /// (task `ios-chrome-collapse-reload-stop-and-drop-history-buttons`).
+        let reloadStopControlLabel: String
+        /// The control's ACCESSIBLE NAME ("Reload this page" / "Stop loading this
+        /// page"): the core's `reload_stop_control(state).description()`. iOS has
+        /// no hover, so it goes in the platform's accessible-name slot
+        /// (`accessibilityLabel`), the same string Android puts in its
+        /// `contentDescription`.
+        let reloadStopControlDescription: String
+        /// Whether the LOADING SPINNER shows: the core's `load_spinner_visible`.
+        ///
+        /// Deliberately its own field rather than the raw `loading` fact: the
+        /// spinner follows `load_progress_visible` (so the pre-content
+        /// name-resolution window spins) while the CONTROL follows the narrower
+        /// `is_loading`, and an edge that read `loading` for both would have
+        /// re-decided a rule the core already settled.
+        let loadSpinnerVisible: Bool
         /// Whether the trust surface should offer the BLESS action: the core's
         /// `trust_pin_action_visible`. An AFFORDANCE inside the surface the user
         /// opened by tapping the badge, never a first-visit prompt.
@@ -511,6 +553,8 @@ final class WerustCore {
             errorBannerVisible: false, errorBannerText: "",
             invalidEntryBadgeVisible: false, invalidEntryBadgeText: "",
             loadProgressVisible: false, loadProgressFraction: 0, loadProgressHint: "",
+            reloadStopControlLabel: "", reloadStopControlDescription: "",
+            loadSpinnerVisible: false,
             trustPinActionVisible: false, trustPinActionLabel: "", trustPinDetail: "")
 
         static func fromJSON(_ json: String) -> Chrome {
@@ -547,6 +591,17 @@ final class WerustCore {
                 loadProgressVisible: o["loadProgressVisible"] as? Bool ?? false,
                 loadProgressFraction: o["loadProgressFraction"] as? Double ?? 0,
                 loadProgressHint: o["loadProgressHint"] as? String ?? "",
+                // The collapsed reload/stop control + the spinner. The mode's
+                // stable WIRE NAME (`reloadStopControl`) is deliberately NOT
+                // decoded: a painter that must not branch on the mode has nothing
+                // to do with it, and the only tempting consumer is the `switch`
+                // this collapse exists to prevent. The Android binding decodes the
+                // same three and skips the same one, so the fan-in task
+                // `register-the-new-chrome-fields-in-the-mobile-presentation-guard`
+                // gets one shape to register rather than an argument.
+                reloadStopControlLabel: o["reloadStopControlLabel"] as? String ?? "",
+                reloadStopControlDescription: o["reloadStopControlDescription"] as? String ?? "",
+                loadSpinnerVisible: o["loadSpinnerVisible"] as? Bool ?? false,
                 trustPinActionVisible: o["trustPinActionVisible"] as? Bool ?? false,
                 trustPinActionLabel: o["trustPinActionLabel"] as? String ?? "",
                 trustPinDetail: o["trustPinDetail"] as? String ?? "")

@@ -146,6 +146,16 @@ description = "Session history: go_back / go_forward and their availability."
 # duplicating the platform's Back, and Android offers no forward gesture to
 # duplicate). `go_forward` remains reachable through the seam for the core and
 # for the other edges; only the Android BUTTON is gone.
+# iOS: the CAPABILITY is likewise unchanged and stays `implemented` — `IosBackend`
+# still implements go_back/go_forward/can_go_*, and the core's `can_go_back` /
+# `can_go_forward` are untouched — but since task
+# `ios-chrome-collapse-reload-stop-and-drop-history-buttons` the AFFORDANCE is the
+# WebKit EDGE-SWIPE gesture rather than on-screen ◀/▶ buttons. Unlike Android,
+# iOS loses NO direction by the trade: the swipe navigates both ways, and a
+# gesture-driven move reports into the core through the same load-lifecycle path a
+# button-driven one took (task `enable-the-ios-back-forward-swipe-gesture`, which
+# this one was blocked on precisely so the buttons were never removed while the
+# gesture was off).
 desktop = { state = "implemented" }
 macos = { state = "implemented" }
 windows = { state = "implemented" }
@@ -1435,7 +1445,26 @@ description = "The chrome shows ONE control that reloads a settled page and STOP
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-macos-window" }
 windows = { state = "stubbed", task = "reload-stop-collapse-and-spinner-on-the-windows-chrome" }
-ios = { state = "stubbed", task = "ios-chrome-collapse-reload-stop-and-drop-history-buttons" }
+# iOS (task `ios-chrome-collapse-reload-stop-and-drop-history-buttons`): the
+# toolbar carries ONE `reloadStopButton` whose glyph is the carried
+# `reloadStopControlLabel`, whose accessible name (iOS has no hover) is
+# `reloadStopControlDescription`, and whose tap activates ONE core entry point
+# (`CoreSession::activate_reload_stop_control`, C-ABI
+# `werust_ios_activate_reload_stop_control`) that performs the mode's own action —
+# so no Swift `switch` decides the mode, in either its look or its behaviour.
+# Beside it a `UIActivityIndicatorView` spinner in a permanently allocated slot
+# follows `loadSpinnerVisible` through its ALPHA (`hidesWhenStopped = false`, so
+# the stack view never re-lays-out mid-load). The painter no longer reads the raw
+# `loading` fact at all, and the ◀/▶ buttons went with the collapse (the WebKit
+# edge-swipe is the history affordance; row `back-forward`). Shape-guarded by
+# crates/werust-ios/rust/tests/collapsed_control_and_dropped_history_buttons_shape.rs,
+# whose assertions were re-checked by mutation. The widgets themselves are
+# runtime-only and there is NO Mac on this project, so the closest thing to
+# runtime evidence is the `mobile-ios` leg compiling the Swift and
+# check-app-bundle.sh finding the new C-ABI symbol in the shipped binary; the
+# device steps nobody here can run are recorded at
+# docs/spikes/ios-chrome-collapse-reload-stop-and-drop-history-buttons/README.md.
+ios = { state = "implemented" }
 # Android (task `android-chrome-collapse-reload-stop-and-drop-history-buttons`):
 # the toolbar carries ONE `reloadStopButton` whose glyph is the carried
 # `reloadStopControlLabel`, whose accessible name (Android has no hover) is

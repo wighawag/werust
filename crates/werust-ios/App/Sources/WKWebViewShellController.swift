@@ -1,7 +1,17 @@
 // WKWebViewShellController — the iOS OS edge: a real `UIViewController` with a
-// URL bar and Back/Forward/Reload/Stop controls over a live, interactive
-// `WKWebView` (task mobile-ios-shell-and-static-lib, spec story 18). The twin of
-// the Android `BrowserActivity`.
+// URL bar, ONE reload/stop control and a loading spinner over a live,
+// interactive `WKWebView` (task mobile-ios-shell-and-static-lib, spec story 18;
+// the collapse and the dropped history buttons are task
+// ios-chrome-collapse-reload-stop-and-drop-history-buttons). The twin of the
+// Android `BrowserActivity`.
+//
+// There are no ◀/▶ buttons: the WebKit EDGE-SWIPE gesture is the iOS history
+// affordance (enabled in `layoutChrome`, task
+// enable-the-ios-back-forward-swipe-gesture), and on a phone toolbar the URL bar
+// is worth more than two controls duplicating a platform gesture (spec
+// `chrome-conventional-controls`, story 11). The history CAPABILITY is untouched:
+// `can_go_back` / `can_go_forward` and the seam's history methods are exactly as
+// they were, and the swipe rides on them.
 //
 // This is the forced OS edge and NOTHING more: it owns the platform `WKWebView`
 // and the UIKit widgets, but every browsing DECISION is the Rust `WerustCore`'s.
@@ -10,8 +20,9 @@
 // from the core's `WerustCore.Chrome` (`refreshChrome`). The `WKWebView`'s real
 // load-lifecycle callbacks are reported straight back into the core, which folds
 // them into the chrome exactly as the desktop GTK pump folds WebKitGTK's signals.
-// The URL bar text, the Back/Forward enablement, and the load status are all read
-// from the core — the edge keeps no history or load state of its own.
+// The URL bar text, the reload/stop control's mode, the spinner and the load
+// status are all read from the core — the edge keeps no history or load state of
+// its own.
 //
 // Simulator only: no signing, no Apple Developer account.
 
@@ -28,10 +39,32 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
 
     // Chrome widgets (the UIKit side; painted from the core's Chrome).
     private let urlField = UITextField()
-    private let backButton = UIButton(type: .system)
-    private let forwardButton = UIButton(type: .system)
-    private let reloadButton = UIButton(type: .system)
-    private let stopButton = UIButton(type: .system)
+    /// werust's ONE reload/stop control: the single button every browser has,
+    /// which reloads a settled page and STOPS a load in flight. It replaced the
+    /// separate Reload and Stop buttons, which were one fact (`is_loading`)
+    /// wearing two widgets, each enabled on the negation of the other's
+    /// condition.
+    ///
+    /// This edge DECIDES NOTHING about it: the glyph is the carried
+    /// `reloadStopControlLabel`, the accessible name the carried
+    /// `reloadStopControlDescription`, and a tap performs whatever the core says
+    /// the control does (`WerustCore.activateReloadStopControl`). Cancelling an
+    /// in-flight load is this control in its Stop mode.
+    private let reloadStopButton = UIButton(type: .system)
+    /// The LOADING SPINNER: the second presentation of the load the URL-bar
+    /// progress line already reports, for the case that line cannot cover — a
+    /// load that has reported no phase yet paints a bare sliver that reads as a
+    /// decoration, and the long pre-content name-resolution window (`ronan.eth`)
+    /// is where a user most needs to see motion.
+    ///
+    /// Its visibility is the core's `loadSpinnerVisible` and nothing else. It has
+    /// its OWN permanently-allocated slot beside the control rather than sharing
+    /// one with it: the control's job while loading is to be the STOP button, so
+    /// a control that turned into a spinner would be unavailable exactly when its
+    /// cancel action matters. `hidesWhenStopped` is off and only the ALPHA moves,
+    /// the same rule the progress line follows, so no load state ever re-lays-out
+    /// the toolbar row under the user's finger.
+    private let loadingSpinner = UIActivityIndicatorView(style: .medium)
     /// The GENERAL browser menu affordance: the ⋮ button every browser has, at the
     /// end of the toolbar, presenting a `UIMenu` of the SHARED core's menu items
     /// (task `general-browser-menu-with-version-and-debug-entry`).
@@ -72,10 +105,11 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     /// showing/hiding it resized the content area on every navigation, so the page
     /// jumped twice per load. This line owns a fixed 3pt strip that is never given
     /// back, so no load state changes the layout (task
-    /// `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
-    /// button, which is enabled exactly while a load is in flight; the phase NAME
-    /// stays in the footer status line, which already names it. Driven by the
-    /// existing chrome-refresh pump (no new timer / poll / tight loop).
+    /// `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar's ONE
+    /// reload/stop control in its Stop mode, which the core puts it in exactly
+    /// while a load is in flight; the phase NAME stays in the footer status line,
+    /// which already names it. Driven by the existing chrome-refresh pump (no new
+    /// timer / poll / tight loop).
     private let loadingProgress = UIProgressView(progressViewStyle: .bar)
     private var webView: WKWebView!
     /// KVO token for observing `webView.url` so a SAME-DOCUMENT URL change (an SPA
@@ -105,8 +139,16 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         afterCoreAction()
     }
 
-    // --- layout: URL field + back/forward toolbar + content webview -----------
+    // --- layout: URL field + reload/stop + spinner toolbar + content webview --
     private func layoutChrome() {
+        // ONE chrome snapshot for every FIRST paint in this method. Each of them
+        // is the core's OWN derivation for the starting chrome, never a Swift
+        // literal that happens to match it today: that is how this very edge
+        // ended up with an invalid-entry badge string set at build time and never
+        // refreshed from the rule (task
+        // `mobile-chrome-presentation-from-one-derivation`).
+        let initialChrome = core.chrome()
+
         urlField.borderStyle = .roundedRect
         urlField.placeholder = "Enter a URL and press Go"
         urlField.autocapitalizationType = .none
@@ -116,29 +158,54 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         urlField.returnKeyType = .go
         urlField.delegate = self
 
-        backButton.setTitle("◀︎", for: .normal)
-        forwardButton.setTitle("▶︎", for: .normal)
-        reloadButton.setTitle("⟳", for: .normal)
-        stopButton.setTitle("✕", for: .normal)
+        // The ONE reload/stop control. Its FIRST paint is the core's too — both
+        // the glyph and the accessible name — so it cannot start out wearing a
+        // mode the very next `refreshChrome()` disagrees with, and no `⟳` is
+        // spelled anywhere in this edge.
+        reloadStopButton.setTitle(initialChrome.reloadStopControlLabel, for: .normal)
+        reloadStopButton.accessibilityLabel = initialChrome.reloadStopControlDescription
         // The general browser menu: a ⋮ button presenting the core's menu on tap.
         // `showsMenuAsPrimaryAction` makes a single tap open the menu (no long
         // press), which is what a browser's ⋮ button does.
         menuButton.setTitle("⋮", for: .normal)
         menuButton.menu = browserMenu()
         menuButton.showsMenuAsPrimaryAction = true
-        backButton.addTarget(self, action: #selector(onBack), for: .touchUpInside)
-        forwardButton.addTarget(self, action: #selector(onForward), for: .touchUpInside)
-        reloadButton.addTarget(self, action: #selector(onReload), for: .touchUpInside)
-        stopButton.addTarget(self, action: #selector(onStop), for: .touchUpInside)
+        // ONE handler for the ONE control: it performs whatever mode the CORE says
+        // the control is in. There is deliberately no `onReload` / `onStop` pair
+        // and no `switch` here — see `onReloadStop`.
+        reloadStopButton.addTarget(self, action: #selector(onReloadStop), for: .touchUpInside)
 
-        // The nav buttons stay at their intrinsic (compact) width: they hug their
-        // content tightly and resist being stretched. The URL field, by contrast,
-        // hugs weakly and is the first to stretch, so it takes the MAJORITY of the
-        // row while the four buttons keep only the width their glyphs need.
-        for button in [backButton, forwardButton, reloadButton, stopButton, menuButton] {
+        // The spinner: its own permanent slot beside the control, never sharing
+        // the control's (a control that becomes a spinner is unavailable exactly
+        // when its cancel action matters). `hidesWhenStopped = false` keeps the
+        // slot allocated whatever the load is doing, so only the ALPHA moves in
+        // `refreshChrome()` and the row never re-lays-out mid-load; it starts
+        // fully transparent, like the progress line, because a settled chrome
+        // shows no loading surface at all.
+        loadingSpinner.hidesWhenStopped = false
+        loadingSpinner.alpha = 0
+        // The load is ALREADY announced twice on this edge (the progress line
+        // carries the core's phase hint as its accessibility label, and the footer
+        // status line names the phase in words), so the spinner is the DECORATIVE
+        // half of a fact VoiceOver already speaks: a third node repeating it on
+        // every load is noise for exactly the users who can least skim past it.
+        // The control beside it keeps a real accessible name (the core's
+        // description), which is the node a user actually acts on.
+        loadingSpinner.isAccessibilityElement = false
+        loadingSpinner.accessibilityElementsHidden = true
+
+        // The toolbar controls stay at their intrinsic (compact) width: they hug
+        // their content tightly and resist being stretched. The URL field, by
+        // contrast, hugs weakly and is the first to stretch, so it takes ALL the
+        // spare width — including the width freed by the two dropped history
+        // buttons and the second reload/stop button, which is the point of story
+        // 11 and needs no arithmetic anywhere.
+        for button in [reloadStopButton, menuButton] {
             button.setContentHuggingPriority(.required, for: .horizontal)
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
         }
+        loadingSpinner.setContentHuggingPriority(.required, for: .horizontal)
+        loadingSpinner.setContentCompressionResistancePriority(.required, for: .horizontal)
         urlField.setContentHuggingPriority(.defaultLow, for: .horizontal)
         urlField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -154,11 +221,16 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         invalidBadge.setContentCompressionResistancePriority(.required, for: .horizontal)
         invalidBadge.isHidden = true
 
-        // The ⋮ menu sits at the END of the toolbar, where every other browser
+        // The two loading surfaces the toolbar owns (the control that offers to
+        // stop a load, and the spinner that reports one) stay together at the
+        // START, immediately before the URL field that takes the freed width;
+        // neither goes near the trust badge, which is a settled-state indicator
+        // and lives in the footer
+        // (docs/spikes/reload-stop-collapse-and-loading-spinner-core-and-gtk/DECISIONS.md).
+        // The ⋮ menu stays at the END of the toolbar, where every other browser
         // puts it.
         let toolbar = UIStackView(arrangedSubviews: [
-            backButton, forwardButton, reloadButton, stopButton, urlField, invalidBadge,
-            menuButton,
+            reloadStopButton, loadingSpinner, urlField, invalidBadge, menuButton,
         ])
         toolbar.axis = .horizontal
         toolbar.spacing = 8
@@ -263,16 +335,19 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // `chrome-conventional-controls` story 13): the swipe-from-the-edge every
         // other iOS browser has, and the first thing an iOS user reaches for.
         // `WKWebView` defaults this to FALSE, so leaving it unset (as werust did)
-        // means the gesture does nothing at all and history is reachable only
-        // through the on-screen ◀/▶ buttons — which the sibling task
-        // `ios-chrome-collapse-reload-stop-and-drop-history-buttons` REMOVES on
-        // the strength of this line existing. Nobody here has a Mac to notice a
-        // regression by using the app
+        // means the gesture does nothing at all. It is now the ONLY history
+        // affordance this edge has: the sibling task
+        // `ios-chrome-collapse-reload-stop-and-drop-history-buttons` removed the
+        // on-screen ◀/▶ buttons on the strength of this line existing, so if it
+        // goes, iOS has NO way to move through history at all. Nobody here has a
+        // Mac to notice a regression by using the app
         // (work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md),
-        // so the flag is pinned by
-        // `crates/werust-ios/rust/tests/back_forward_gesture_wiring_shape.rs` in
-        // the pure-Rust gate. WebKit performs the navigation itself; the edge only
-        // REPORTS it into the core (see `decidePolicyFor` below).
+        // so the flag is pinned in the pure-Rust gate by
+        // `crates/werust-ios/rust/tests/back_forward_gesture_wiring_shape.rs`, and
+        // re-asserted from the button-removal side by
+        // `crates/werust-ios/rust/tests/collapsed_control_and_dropped_history_buttons_shape.rs`.
+        // WebKit performs the navigation itself; the edge only REPORTS it into
+        // the core (see `decidePolicyFor` below).
         webView.allowsBackForwardNavigationGestures = true
         webView.translatesAutoresizingMaskIntoConstraints = false
         // WEB INSPECTOR (task enable-web-inspector-devtools-all-platforms): make
@@ -314,8 +389,9 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // hard-coded "⚠ unverified origin" here would be one more hand-written twin
         // of `trust_indicator`, which is precisely what task
         // `mobile-chrome-presentation-from-one-derivation` removed from this edge.
-        // Every later repaint comes from `refreshChrome()`.
-        let initialChrome = core.chrome()
+        // Every later repaint comes from `refreshChrome()`. `initialChrome` is the
+        // ONE snapshot read at the top of this method, so every first paint here
+        // describes the same chrome.
         statusLabel.text = initialChrome.statusLine
         trustLabel.text = initialChrome.trustIndicator
         trustLabel.font = .systemFont(ofSize: 13)
@@ -450,10 +526,28 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
                 urlField.attributedText = NSAttributedString(string: text)
             }
         }
-        backButton.isEnabled = chrome.canGoBack
-        forwardButton.isEnabled = chrome.canGoForward
-        stopButton.isEnabled = chrome.loading
-        reloadButton.isEnabled = !chrome.loading
+        // The ONE reload/stop control: it wears the mode the CORE is in, and
+        // nothing here decides which that is. These two lines replaced the four
+        // that painted the pre-collapse toolbar (`backButton.isEnabled =
+        // chrome.canGoBack`, its forward twin, and the `stopButton` /
+        // `reloadButton` enablement pair that read the raw `loading` fact). The
+        // history CAPABILITY those first two read is untouched in the core — the
+        // edge-swipe rides on it; only the buttons are gone.
+        reloadStopButton.setTitle(chrome.reloadStopControlLabel, for: .normal)
+        reloadStopButton.accessibilityLabel = chrome.reloadStopControlDescription
+        // The SPINNER: a second presentation of the load the progress line below
+        // already reports, on the core's own wider rule (it spins through the
+        // pre-content name-resolution window, where there is no backend load for
+        // the control to stop yet). Only the ALPHA moves — the slot is permanent,
+        // exactly like the progress line's 3pt strip — so starting or finishing a
+        // load never shifts the URL bar under the user's finger.
+        let spinnerVisible = chrome.loadSpinnerVisible
+        loadingSpinner.alpha = spinnerVisible ? 1 : 0
+        if spinnerVisible {
+            loadingSpinner.startAnimating()
+        } else {
+            loadingSpinner.stopAnimating()
+        }
         statusLabel.text = chrome.statusLine
         // The trust indicator tracks the core's posture (the real load path),
         // matching desktop; the seam-default no-op is gone. The badge's
@@ -480,10 +574,11 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
         // window, where the backend has not started yet), and it fades out once the
         // load settles. Only opacity and fraction change — the 3pt strip is
         // permanent — so a navigation never resizes the page (task
-        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar Stop
-        // button, enabled exactly while a load is in flight; the phase NAME is in
-        // the footer status line (and this line's accessibility label). Driven by
-        // this existing refresh, so no new timer / poll / tight loop.
+        // `loading-progress-in-the-url-bar-not-a-banner`). CANCEL is the toolbar's
+        // ONE control in its Stop mode, which the core selects exactly while a
+        // load is in flight; the phase NAME is in the footer status line (and this
+        // line's accessibility label). Driven by this existing refresh, so no new
+        // timer / poll / tight loop.
         //
         // The core hands over its progress FRACTION on the 0.0-1.0 scale
         // `UIProgressView` already uses, so only the numeric type is narrowed here.
@@ -600,10 +695,24 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     }
 
     // --- user intents -> Rust core (THROUGH the seams) ------------------------
-    @objc private func onBack() { core.goBack(); afterCoreAction() }
-    @objc private func onForward() { core.goForward(); afterCoreAction() }
-    @objc private func onReload() { core.reload(); afterCoreAction() }
-    @objc private func onStop() { core.stop(); afterCoreAction() }
+
+    /// The ONE reload/stop control was tapped: perform whatever the CORE says that
+    /// control does right now.
+    ///
+    /// There is deliberately no `switch` on the carried mode here. The chrome JSON
+    /// carries what the control SHOWS; `activateReloadStopControl` performs what it
+    /// DOES, resolving the mode inside the same C-ABI call that acts on it — so the
+    /// two halves are decided once, in `werust_core::reload_stop_control`, and a
+    /// mode this edge painted a frame ago can never be acted on after it changed.
+    /// A Swift `switch` mapping the mode back onto `core.reload()` / `core.stop()`
+    /// would be a hand-written twin of that rule sitting one call away from the
+    /// field that already answers the question, which is exactly the species of
+    /// copy `docs/adr/0011` deleted from this file.
+    ///
+    /// CANCEL is this handler, with the control in its Stop mode: the separate
+    /// Stop button was the documented cancel affordance, and it is offered on
+    /// precisely the states it always was.
+    @objc private func onReloadStop() { core.activateReloadStopControl(); afterCoreAction() }
 
     // URL field submit: pass the RAW typed text straight to the core, which is
     // the SINGLE front door that routes it (bare `.eth` -> ENS; a scheme-less

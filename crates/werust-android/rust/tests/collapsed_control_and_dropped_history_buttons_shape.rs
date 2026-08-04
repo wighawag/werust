@@ -500,11 +500,33 @@ fn the_mobile_presentation_guard_field_lists_are_not_registered_here() {
     // `register-the-new-chrome-fields-in-the-mobile-presentation-guard`, which is
     // blocked on both edges; this assertion is what keeps a well-meaning
     // registration from creeping in early.
+    //
+    // It reads the LITERAL half of the scan, and that is the whole difference
+    // between a real guard and a vacuous one: a field name can only ever appear
+    // in that guard AS a string literal (a `FACT_FIELDS` / `DERIVED_FIELDS`
+    // entry, or an FFI signature string), so asserting its absence from the
+    // literal-STRIPPED code view would be an assertion that can never fail. The
+    // positive control below pins that this check really does see a registered
+    // field; it straddles the file (a `DERIVED_FIELDS` entry near the top, the
+    // binding signature it demands near the bottom) because the scanned file is
+    // RUST and `scan` is written for Kotlin, so a construct it does not model
+    // (a byte-char literal such as `b'\"'`) could in principle shift the split
+    // partway through.
     let guard = source("crates/werust-core/tests/mobile_chrome_presentation_shape.rs");
-    let (code, _) = scan(&guard);
+    let (_, literals) = scan(&guard);
+    for control in ["loadProgressVisible", "fun loadProgressVisible()"] {
+        assert!(
+            literals.iter().any(|literal| literal == control),
+            "POSITIVE CONTROL: `{control}` IS registered in the mobile presentation guard \
+             (a `DERIVED_FIELDS` entry, and the binding signature it demands), so this check \
+             must SEE it — otherwise the assertion below could never fail and the \
+             MIGRATE/CONTRACT sequencing would be unguarded. The two controls straddle the \
+             whole file, so a scan that lost its place partway through is caught too."
+        );
+    }
     for field in CONSUMED_DERIVED_FIELDS {
         assert!(
-            !code.contains(field),
+            !literals.iter().any(|literal| literal.contains(field)),
             "`{field}` must NOT be registered in the mobile presentation guard yet: the guard \
              requires BOTH mobile edges to consume a field, and the iOS edge \
              (`ios-chrome-collapse-reload-stop-and-drop-history-buttons`) has not landed. The \

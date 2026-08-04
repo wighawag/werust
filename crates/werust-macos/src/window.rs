@@ -1487,10 +1487,32 @@ impl BrowserWindow {
         }
     }
 
-    /// Take the keyboard away from the URL bar (AppKit makes the window itself
-    /// first responder), so the smoke can drive the PAGE half of Escape.
-    pub fn blur_url_bar(&self) {
-        let _ = self.window.makeFirstResponder(None);
+    /// Take the keyboard away from the URL bar, so the smoke can drive the PAGE
+    /// half of Escape, and REPORT whether AppKit accepted it.
+    ///
+    /// Two facts, not one, because on AppKit "the bar is not being typed in" is
+    /// two facts. `makeFirstResponder(None)` moves the first responder to the
+    /// window, but the window LENDS a shared field editor to whichever control is
+    /// being edited, and [`WindowController::shortcut_focus`] asks the CONTROL
+    /// for that editor (`currentEditor`) rather than the window for its
+    /// responder — so an editing session that outlived the responder move would
+    /// still report the URL bar. `endEditingFor(None)` is AppKit's own "take the
+    /// editor back", which is the half a real user's click into the page gets for
+    /// free.
+    ///
+    /// The `BOOL` is RETURNED rather than dropped: a first responder may REFUSE
+    /// to resign, and a silently refused blur would leave the smoke asserting the
+    /// page half of Escape against a window that is still in the bar half. Nobody
+    /// on this project can press the key and look
+    /// (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`),
+    /// so the smoke checks it instead.
+    #[must_use]
+    pub fn blur_url_bar(&self) -> bool {
+        // SAFETY: `endEditingFor:` takes the object being edited, or nil for
+        // "whatever this window is currently editing", which is what is wanted
+        // here — there is exactly one editable control in this chrome.
+        unsafe { self.window.endEditingFor(None) };
+        self.window.makeFirstResponder(None)
     }
 
     /// Type into the URL bar without navigating, so the smoke can prove Escape

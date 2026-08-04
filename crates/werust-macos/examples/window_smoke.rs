@@ -131,6 +131,17 @@ mod macos {
         false
     }
 
+    /// Press Escape on the real window. Spelled once because the two focus
+    /// contexts must be driven by the IDENTICAL key press, or the pair below
+    /// would compare two different things.
+    fn press_escape(window: &BrowserWindow) {
+        window.press_key(
+            input::KEY_CODE_ESCAPE,
+            "\u{1b}",
+            NSEventModifierFlags::empty(),
+        );
+    }
+
     /// One assertion, reported rather than panicked, so the run prints every
     /// result instead of stopping at the first failure.
     fn check(failures: &mut Vec<String>, ok: bool, what: &str) {
@@ -314,7 +325,11 @@ mod macos {
         // Story 1 / 4: Cmd+L, the chord this whole edge exists for, and the ONLY
         // place the shared resolution's Cmd branch is reached by a real key press
         // anywhere in this project.
-        window.blur_url_bar();
+        check(
+            &mut failures,
+            window.blur_url_bar(),
+            "the URL bar can be blurred before the first chord is pressed",
+        );
         pump(&window);
         check(
             &mut failures,
@@ -332,7 +347,11 @@ mod macos {
         // The NEGATIVE CONTROL for the Cmd branch: a Mac user's Ctrl+L is NOT a
         // browser shortcut. Without this, "Cmd+L works" would pass just as well
         // on an edge that claimed the key under any modifier at all.
-        window.blur_url_bar();
+        check(
+            &mut failures,
+            window.blur_url_bar(),
+            "the URL bar gives the keyboard back after Cmd+L took it",
+        );
         pump(&window);
         window.press_key(0, "l", NSEventModifierFlags::Control);
         pump(&window);
@@ -354,11 +373,7 @@ mod macos {
             window.reported_focus() == Focus::UrlBar,
             "the window reports URL-BAR focus while the bar is being edited",
         );
-        window.press_key(
-            input::KEY_CODE_ESCAPE,
-            "\u{1b}",
-            NSEventModifierFlags::empty(),
-        );
+        press_escape(&window);
         pump(&window);
         check(
             &mut failures,
@@ -371,26 +386,100 @@ mod macos {
             "…and reverting the bar navigates nowhere",
         );
 
-        // Story 5, and the DISCRIMINATING half of the focus input: the SAME key,
-        // the same window, a different reported focus must do something else. With
-        // the page focused Escape is Stop, so a half-typed URL is left exactly
-        // where it was -- if this edge reported focus wrongly (or, worse, decided
-        // Escape itself), the bar would revert here too and this check would fail.
+        // STORIES 5 + 6, THE DISCRIMINATING PAIR: the SAME key, the same window,
+        // a different reported focus must do something ELSE.
+        //
+        // Watched at the EFFECT on the LOAD (the shape
+        // `crates/werust-windows/examples/window_smoke.rs` already uses), never at
+        // the URL bar's text. The bar cannot tell the two branches apart:
+        // `ChromeAction::Stop` calls `refresh_chrome`, and a chrome repaint
+        // rewrites the bar from the BELIEVED url — exactly where
+        // `ChromeAction::RevertUrlBar` leaves it. The check that used to stand
+        // here read the bar, so it proved nothing in EITHER focus and this edge's
+        // focus REPORTING was unguarded from the day it landed
+        // (`work/notes/observations/the-macos-page-focused-escape-check-was-never-discriminating-2026-08-04.md`).
+        //
+        // Neither half pumps between the navigation and the key press, so the load
+        // is genuinely in flight at the seam when Escape arrives and nothing about
+        // the timing is lucky.
+        let in_flight = format!("ipfs://{honest_cid}/");
+
+        // The BAR half: Escape reverts the edit and LEAVES THE LOAD ALONE.
+        let started = shell.borrow_mut().navigate(&in_flight).is_ok();
+        check(
+            &mut failures,
+            started && shell.borrow().chrome().is_loading(),
+            "a load is in flight when Escape is pressed with the URL bar focused",
+        );
+        let believed_in_flight = shell.borrow().chrome().url_text.clone();
+        window.focus_url_bar();
         window.set_url_text(typed);
-        window.blur_url_bar();
-        pump(&window);
-        window.press_key(
-            input::KEY_CODE_ESCAPE,
-            "\u{1b}",
-            NSEventModifierFlags::empty(),
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::UrlBar,
+            "…and the window reports URL-BAR focus for it",
+        );
+        press_escape(&window);
+        check(
+            &mut failures,
+            window.url_text() == believed_in_flight,
+            "Escape in the URL bar reverts the edit",
         );
         check(
             &mut failures,
-            window.url_text() == typed,
-            "Escape with the PAGE focused stops the load instead of reverting the bar",
+            shell.borrow().chrome().is_loading(),
+            "…and does NOT cancel the in-flight load",
         );
-        // The next repaint puts the bar back to what the chrome believes.
-        pump(&window);
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            settled,
+            "the load the URL bar's Escape left alone goes on to settle",
+        );
+
+        // The PAGE half: the same key CANCELS the load. This is the whole safety
+        // net for the focus half of the shortcut layer — if this edge reported
+        // focus wrongly (or decided Escape itself), the load would survive here
+        // exactly as it just did above.
+        let started = shell.borrow_mut().navigate(&in_flight).is_ok();
+        check(
+            &mut failures,
+            started && shell.borrow().chrome().is_loading(),
+            "a load is in flight when Escape is pressed with the page focused",
+        );
+        check(
+            &mut failures,
+            window.blur_url_bar(),
+            "blurring the URL bar ends its field-editor session",
+        );
+        check(
+            &mut failures,
+            window.reported_focus() == Focus::Page,
+            "…so the window reports PAGE focus for the identical key press",
+        );
+        press_escape(&window);
+        check(
+            &mut failures,
+            !shell.borrow().chrome().is_loading(),
+            "Escape with the PAGE focused CANCELS the in-flight load",
+        );
+
+        // The cancel leaves the shell settled on nothing in flight, so the checks
+        // below start from a loaded page again, exactly as they did before.
+        if shell.borrow_mut().navigate(&in_flight).is_err() {
+            eprintln!("the shell refused the fixture URL");
+            return 1;
+        }
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            settled,
+            "the page is loaded again after the cancelled load",
+        );
 
         // Story 2: Cmd+R reloads. Watched at the FIXTURE, because a settled load
         // state cannot tell a reload from "it was already loaded".
@@ -425,6 +514,19 @@ mod macos {
             &mut failures,
             !window.press_side_button(2),
             "an ordinary (middle) button stays the page's",
+        );
+        // Unlike before, there IS history behind those buttons by now (the two
+        // in-flight loads the Escape pair needed left entries), so the rear button
+        // really starts a navigation. Let it settle before the debug view's
+        // store-clearing check reads the capture store, rather than racing a page
+        // that is still running its own `console.log`.
+        let settled = wait_until(&window, 20, || {
+            shell.borrow().chrome().load_state == LoadState::Finished
+        });
+        check(
+            &mut failures,
+            settled,
+            "the history the side buttons moved through settles",
         );
 
         // The web inspector is DELIBERATELY unhandled on this edge: macOS reaches

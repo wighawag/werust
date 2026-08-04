@@ -45,7 +45,9 @@ Anything not in the table above is forwarded to AppKit untouched, so ordinary ty
 
 6. AppKit's own `NSEventModifierFlags` values equal the plain-bit constants the Linux-side table is written against.
 7. **Cmd+L, pressed as a real `NSEvent` through the real window's `sendEvent:`, focuses the URL bar** — and Ctrl+L, pressed the same way, does not (the negative control).
-8. Escape in the URL bar restores the URL the chrome believes and navigates nowhere; Escape with the page focused leaves a half-typed URL alone instead (the discriminating check for focus being a real input rather than a constant).
+8. Escape in the URL bar restores the URL the chrome believes and navigates nowhere; with an in-flight load, the SAME key press CANCELS it when the page is focused and LEAVES IT RUNNING when the bar is focused (the discriminating check for focus being a real input rather than a constant), with the reported focus asserted directly before each press.
+
+   **CORRECTED 2026-08-04.** This item originally claimed the discrimination was proved by the URL bar's TEXT ("Escape with the page focused leaves a half-typed URL alone"). It was not, and could not be: Stop repaints the chrome, which rewrites the bar with the believed url — exactly where Revert leaves it — so both branches produce identical text and the check was unreachable in either focus. The focus half of this edge was therefore unguarded from the day it landed until `macos-smoke-blur-url-bar-does-not-end-the-field-editor` replaced it with the effect-based pair above (`work/notes/observations/the-macos-page-focused-escape-check-was-never-discriminating-2026-08-04.md`).
 9. Cmd+R really re-fetches the page, watched at the fixture's own retrieval counter rather than at a settled load state.
 10. The side buttons are claimed by the chrome and an ordinary (middle) button is not.
 11. F12 opens nothing and disturbs nothing on this edge.

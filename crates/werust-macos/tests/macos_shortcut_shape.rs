@@ -39,7 +39,9 @@
 //!    without a Mac (`the_cmd_branch_is_exercised_where_a_runner_can_see_it`,
 //!    `the_macos_leg_presses_the_chords_on_a_real_window`).
 //! 4. Escape behaves per focus, on focus REPORTED by this edge
-//!    (`focus_is_reported_by_this_edge_and_branched_on_only_by_the_core`).
+//!    (`focus_is_reported_by_this_edge_and_branched_on_only_by_the_core`,
+//!    `blurring_the_url_bar_ends_the_field_editor_and_honours_the_result`,
+//!    `the_two_escapes_are_told_apart_by_the_load_not_by_the_url_bars_text`).
 //! 5. Mouse buttons 4 and 5 navigate history
 //!    (`the_side_buttons_ride_the_same_resolution_and_the_same_performer`).
 //! 6. History goes through the existing seam and capability flags, unchanged
@@ -362,6 +364,90 @@ fn focus_is_reported_by_this_edge_and_branched_on_only_by_the_core() {
         core.contains("Focus::Page => ChromeAction::Stop")
             && core.contains("Focus::UrlBar => ChromeAction::RevertUrlBar"),
         "the focus-dependent Escape must still be resolved in the core"
+    );
+}
+
+#[test]
+fn blurring_the_url_bar_ends_the_field_editor_and_honours_the_result() {
+    // Criterion 4's PRECONDITION: the smoke can only press the PAGE half of
+    // Escape if it can really put the window in the page-focused state, and on
+    // AppKit that is two facts, not one. `makeFirstResponder(None)` moves the
+    // responder to the window, but the window LENDS a shared field editor to
+    // whichever control is being typed in, and `shortcut_focus` asks the CONTROL
+    // for that editor (`currentEditor`) rather than the window for its responder
+    // -- so an editor session that outlived the responder move would still report
+    // `Focus::UrlBar`. `endEditingFor(None)` is AppKit's own "take the editor
+    // back", so both facts are established.
+    //
+    // And the `BOOL` is RETURNED rather than dropped: a responder may refuse to
+    // resign, and a silently refused blur would leave the smoke asserting the
+    // page half against a window that is still in the bar half -- the failure
+    // mode this whole task exists to close, since nobody here can press the key
+    // and look.
+    let window = window();
+    assert!(
+        window.contains("pub fn blur_url_bar(&self) -> bool {"),
+        "blurring the URL bar must REPORT whether AppKit accepted it"
+    );
+    let blur = between(&window, "pub fn blur_url_bar(&self) -> bool {", "\n    }");
+    assert!(
+        blur.contains("endEditingFor(None)"),
+        "the blur must END the field-editor session, not only move the first \
+         responder: {blur:?}"
+    );
+    assert!(
+        blur.contains("makeFirstResponder(None)") && !blur.contains("let _ ="),
+        "the responder move must happen AND its BOOL must be honoured: {blur:?}"
+    );
+}
+
+#[test]
+fn the_two_escapes_are_told_apart_by_the_load_not_by_the_url_bars_text() {
+    // Criterion 4's TEETH, re-cut after the original check turned out to prove
+    // nothing at all (task `macos-smoke-blur-url-bar-does-not-end-the-field-editor`;
+    // `work/notes/observations/the-macos-page-focused-escape-check-was-never-discriminating-2026-08-04.md`).
+    //
+    // `ChromeAction::Stop` calls `refresh_chrome`, and a chrome refresh repaints
+    // the URL bar from the BELIEVED url -- which is exactly where
+    // `ChromeAction::RevertUrlBar` leaves it. So the two focus branches are
+    // INDISTINGUISHABLE in the bar's text, and a check that reads the bar cannot
+    // tell them apart no matter which one ran. The only observation that
+    // separates them is the EFFECT on the load, which is what the Windows smoke
+    // already asserts (`crates/werust-windows/examples/window_smoke.rs`).
+    let smoke = source("crates/werust-macos/examples/window_smoke.rs");
+    let pair = between(
+        &smoke,
+        "// STORIES 5 + 6, THE DISCRIMINATING PAIR",
+        "// Story 2: Cmd+R reloads.",
+    );
+    // Both directions, watched at the shell: one focus CANCELS an in-flight load,
+    // the other leaves it running.
+    assert!(
+        pair.contains("!shell.borrow().chrome().is_loading()"),
+        "the PAGE half must assert that Escape CANCELLED the in-flight load: {pair:?}"
+    );
+    assert!(
+        pair.matches("chrome().is_loading()").count() >= 3,
+        "each half must establish that a load really was in flight and then say \
+         what Escape did to it: {pair:?}"
+    );
+    // The PAGE half is reachable only through a real blur, and the focus REPORT
+    // is asserted directly after it: the one assertion that tests focus
+    // REPORTING for this case, and the one a repaint cannot touch.
+    assert!(
+        pair.contains("window.blur_url_bar()")
+            && pair.contains("window.reported_focus() == Focus::Page"),
+        "the page half must blur the bar and assert the REPORTED focus: {pair:?}"
+    );
+    assert!(
+        pair.contains("window.reported_focus() == Focus::UrlBar"),
+        "…and the bar half must assert the other reported focus: {pair:?}"
+    );
+    // The retired symptom check must never come back: it passed no information.
+    assert!(
+        !code_only(&smoke).contains("url_text() == typed"),
+        "the URL bar's text cannot discriminate the two Escapes; asserting on it \
+         re-mints a check that proves nothing"
     );
 }
 

@@ -79,3 +79,51 @@ dorfl claim shortcuts-and-mouse-history-buttons-on-the-macos-edge --arbiter orig
 git fetch origin && git switch -c work/shortcuts-and-mouse-history-buttons-on-the-macos-edge origin/main
 git mv work/tasks/ready/shortcuts-and-mouse-history-buttons-on-the-macos-edge.md work/tasks/done/shortcuts-and-mouse-history-buttons-on-the-macos-edge.md
 ```
+
+## Requeue 2026-08-04
+
+Gate 2 BLOCKED the previous attempt with ONE finding, and it needed a DESIGN DECISION that has now been made. Your committed work on this branch is kept and is being CONTINUED: build on it, do not restart.
+
+THE FINDING: Cmd+Left / Cmd+Right are claimed unconditionally in sendEvent:, so they are taken away from the URL bar's field editor and from page text fields, where Cmd+Arrow is macOS's standard move-to-beginning/end-of-line binding. A user editing an address who presses Cmd+Left gets a history navigation and loses the edit. No Mac browser does that.
+
+WHY IT COULD NOT BE FIXED IN THE EDGE: the meaning of a chord is decided ONCE in werust_core::shortcuts, and this task is forbidden to fork that. So the fix belongs in the core.
+
+THE DECISION (made by the conductor; implement exactly this):
+
+Make the history chords FOCUS-SENSITIVE, but ONLY on platforms where the history chord collides with text editing. Do NOT gate the history rows on Focus::Page unconditionally: that would REGRESS the GTK and Windows edges, where Alt+Arrow is the history chord, is NOT a text-editing binding, and correctly navigates even while the URL bar has focus (which is what real Linux/Windows browsers do).
+
+Concretely, in crates/werust-core/src/shortcuts.rs:
+
+1. Add a method on PrimaryModifier expressing this ONE platform fact, beside the existing history() method and documented the same way. Something like:
+
+   const fn history_chord_is_a_text_editing_binding(self) -> bool {
+       match self {
+           PrimaryModifier::Control => false, // Alt+Arrow is not a text binding on Linux/Windows
+           PrimaryModifier::Meta => true,     // Cmd+Arrow is move-to-line-start/end on macOS
+       }
+   }
+
+2. Make the ArrowLeft / ArrowRight history rows resolve only when the chord does not collide, OR the page has focus:
+
+   let history_wins = history
+       && (matches!(focus, Focus::Page) || !primary.history_chord_is_a_text_editing_binding());
+
+   ... Key::ArrowLeft if history_wins => Some(ChromeAction::GoBack),
+   ... Key::ArrowRight if history_wins => Some(ChromeAction::GoForward),
+
+   When it does not win, resolve to None so the edge leaves the key to the field editor / the page. This is the behaviour every Mac browser has: Cmd+Left navigates back on the page, and moves the caret to the start of the line while you are editing text.
+
+3. Extend the table test to pin BOTH platforms in BOTH focus states, as four explicit cases:
+   - MAC_PLATFORM + Cmd+Left + Focus::Page      -> Some(GoBack)
+   - MAC_PLATFORM + Cmd+Left + Focus::UrlBar    -> None          (the new guarantee; the regression that was caught)
+   - CTRL_PLATFORM + Alt+Left + Focus::Page     -> Some(GoBack)
+   - CTRL_PLATFORM + Alt+Left + Focus::UrlBar   -> Some(GoBack)  (UNCHANGED; this is the GTK/Windows behaviour you must not regress)
+   Same four for the Right/GoForward direction.
+
+4. This is a change to a SHARED seam that the GTK and Windows edges already consume. Re-run their tests and confirm neither changes behaviour. crates/werust-core/tests/shortcut_edge_wiring_shape.rs and the Windows crate's coverage test must both still pass; if either encodes an assumption that history is focus-independent, correct the ASSUMPTION, do not weaken the new rule.
+
+5. RECORD this in DECISIONS.md as its own numbered decision, and CORRECT the existing text. Decision 1 currently lists Cmd+Arrow among the swallowed chords and calls it the conventional browser trade. That is true for Escape and Cmd+L; it is FALSE for Cmd+Arrow, and that inaccuracy is part of what Gate 2 blocked. Fix that wording. Also fix README manual step 3, which tests Cmd+Left only with the page focused: it must now also state the URL-bar-focused expectation (the caret moves, no navigation).
+
+OPTIONAL, only if it falls out cleanly and is covered by tests: macOS browsers ALSO bind Cmd+[ and Cmd+] to back/forward, and those do not collide with text editing. If you add them, add them in the core table for the Meta platform only, with tests. If it is not clean, leave it out and note it; it is not required by this task.
+
+HARD CONSTRAINTS, unchanged: do NOT edit or weaken crates/werust-core/tests/mobile_chrome_presentation_shape.rs. Do not re-select the toolchain (rust-toolchain.toml is pinned). The edge translates and performs; it never decides what a chord means. Keep the resolution CAPABILITY-AGNOSTIC (no capability parameter in the core). User-facing chrome strings come from the ONE core derivation. Conventional-commit subjects.

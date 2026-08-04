@@ -42,6 +42,36 @@ Work out, and RECORD, which of these the repo wants, then implement it:
 
 **Consider backfilling `v0.3.0`'s notes** as part of this, since "one CI-vehicle PR" is a poor public record of the release that added macOS and Windows. Editing a published release body changes no artifact and re-triggers nothing, so it is safe; the tag annotation itself should NOT be rewritten (force-pushing a tag would re-fire the release workflow into GoReleaser's non-idempotency).
 
+
+## SECOND DEFECT (added 2026-08-04 by the drive-tasks conductor): the exclude filters are not scope-aware
+
+Found while assessing release-readiness after the ten chrome tasks landed. Even when GoReleaser DOES win the race and write the body (it did on `v0.3.2`), the body is dominated by noise, because `.goreleaser.yaml`'s changelog filters are inconsistent with its own groups:
+
+- The GROUP regexps ARE scope-aware: `'^.*?feat(\(.+\))??!?:.+$'` matches `feat(some-scope):`.
+- The EXCLUDE filters are NOT: they are bare `"^chore:"`, `"^ci:"`, `"^test:"`, `"^docs:"`, which do NOT match `chore(scope):`, `ci(scope):`, `docs(scope):`.
+
+This repo writes almost every housekeeping commit WITH a scope, so the excludes essentially never fire. Measured over the 76 commits in `v0.3.2..main`:
+
+| exclude pattern | commits it actually matches |
+|---|---|
+| `^chore:` | 0 (all 7 are `chore(scope):`) |
+| `^ci:`    | 0 |
+| `^test:`  | 0 |
+| `^docs:`  | 1 of 22 |
+
+The visible consequence on `v0.3.2`'s published body is a `### Others` section whose entries are `ci(android-apk): ...` and `task: ...` — exactly the commits the filters were written to remove.
+
+A THIRD source of noise is specific to the runner: `dorfl`'s surface-retry duplication (see `work/notes/observations/dorfl-bounce-surface-duplicates-the-stuck-question-and-spams-main-2026-08-04.md`) pushes batches of `surface task:<slug> (stuck): ...` commits to `main`. There are ~30 of them in `v0.3.2..main`. They are pure runner bookkeeping and have no place in a user-facing changelog.
+
+Cutting a tag today would therefore publish roughly 58 noise lines against 17 `feat` lines.
+
+## Additional acceptance criteria (from the second defect)
+
+- [ ] The changelog exclude filters are SCOPE-AWARE, so `chore(x):`, `ci(x):`, `docs(x):` and `test(x):` are excluded exactly as their unscoped forms are. Mirror the groups' own style (e.g. `'^chore(\(.+\))??!?:'`) rather than inventing a second convention, and keep the unscoped forms working.
+- [ ] The runner's bookkeeping commits are excluded: `surface task:...` (and any equivalent `dorfl` lifecycle subject that reaches `main`) must not appear in a released changelog.
+- [ ] VERIFY the filters against real history rather than by eye: demonstrate, for the `v0.3.2..main` range, that the excluded categories drop out and every `feat(...)` / `fix(...)` survives. A tiny check or a recorded command output is fine; do not claim it untested.
+- [ ] Note the DUPLICATE-SUBJECT effect and decide whether to act: a `dorfl requeue` continuation commits again under the SAME task title, so `v0.3.2..main` contains e.g. three identical `feat(shortcuts-and-mouse-history-buttons-on-the-macos-edge): ...` subjects. If they can be de-duplicated in the changelog cleanly, do it; if not, record it as a known cosmetic limit rather than silently shipping it.
+
 ## Acceptance criteria
 
 - [ ] A tagged release's body is the conventional-commit changelog GoReleaser is configured to produce (grouped Features / Bug fixes), not GitHub's auto-notes.

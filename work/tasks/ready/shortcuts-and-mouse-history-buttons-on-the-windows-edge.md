@@ -42,6 +42,27 @@ Focus matters here because Escape is focus-dependent, so the edge must report wh
 >
 > RECORD non-obvious in-scope decisions durably and link them from the done record, in particular any Win32 message whose mapping is not one-to-one with the abstract vocabulary.
 
+## FORWARD-POINTER (planted by the drive-tasks conductor, after the hinge landed)
+
+> The shared resolution landed in `crates/werust-core/src/shortcuts.rs`
+> (`resolve_chord(chord, focus, primary)` / `resolve_pointer_button`). INHERIT that
+> vocabulary; do NOT fork it or re-decide what a chord means in this edge.
+>
+> - The Cmd-versus-Ctrl split is already expressed ONCE as `PrimaryModifier{Control, Meta}`.
+>   This edge selects its primary modifier; it does not add a second branch.
+> - The resolution is CAPABILITY-AGNOSTIC by settled design. An action this edge cannot
+>   perform is simply left unhandled. Do NOT add a capability parameter to the core.
+> - KNOWN, ACCEPTED LIMIT, out of scope here: letter chords are translated via the active
+>   keyboard layout, so Ctrl/Cmd+L and +R resolve only under a Latin layout. Recorded in
+>   `work/notes/observations/review-nits-shortcut-resolution-in-core-and-the-gtk-edge-2026-08-04.md`.
+>   Do not "fix" it unilaterally in this edge, which would re-fork the vocabulary.
+> - `ChromeAction` and the browser menu's `MenuItemKind::Action` are two vocabularies for
+>   chrome actions. Do not bridge or merge them here; that coherence question is open in the
+>   same nits note.
+>
+> Read `docs/spikes/shortcut-resolution-in-core-and-the-gtk-edge/DECISIONS.md` before starting.
+
+
 ---
 
 ### Claiming this task

@@ -3,7 +3,6 @@ title: "The change-warning still reads a snapshot, so a name blessed in another 
 slug: pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns
 blockedBy: [pin-store-read-modify-write-and-test-isolation]
 covers: []
-needsAnswers: true
 ---
 
 ## What to build
@@ -39,4 +38,6 @@ That is the same direction of failure the parent task existed over — the user 
 
 ## Prompt
 
+> HANDOFF (2026-08-16, conductor): the previous run's RED GATE WAS ENVIRONMENTAL, not your code. The fresh-worktree gate built in `/tmp`, which on this machine is a 16G tmpfs with 2.9G free, and died with `No space left on device (os error 28)` plus a linker `Bus error` (signal 7, the same cause surfacing through `ld`). A debug build of this workspace needs roughly 21G, so it could never fit there. The retry runs with the build scratch pointed at disk. Your previous work is KEPT on `work/task-pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns` and this claim continues from its tip: build ON it, and do NOT go hunting for a phantom compile or linker bug, because there is none.
+>
 > Goal: close the READ side of the pin-store defect. `pin-store-read-modify-write-and-test-isolation` made blessing read-modify-write, so a concurrent bless no longer ERASES a pin — but `self.pins` is still a snapshot taken at shell construction and refreshed only inside `bless_current_name`, so a long-lived window never sees a pin another window blessed, and its change-check (`lib.rs` ~2891) stays SILENT for that name. Same missed-warning direction, narrower. Do NOT re-read in the paint path (correctly rejected: a file read per chrome refresh); re-read at NAVIGATION to a mutable name, which is when the answer is used and is already I/O-bearing, and prove it with two independently-constructed shells sharing a directory. Also: `TrustedNamePins::load()` now has ZERO callers because the shell went through `PinStoreLocation::Settings`, so delete it or have `Settings` delegate — do not leave two ways to load one store. And close the mobile half of the test-isolation hole (`werust-android`/`werust-ios` tests build shells through the production `CoreSession::new()` and still read the real `pins.json`), adding the same real-store-untouched assertion. Before you do: the parent introduced this repo's FIRST `cfg!(test)` branch in production code, and its per-crate nature is precisely why the mobile hole exists — if an explicit opt-in is cleanly cheap, prefer it and retire the branch; if not, keep it and say why, but do not add a SECOND one. Do NOT record the cross-process non-atomicity as a standing limit any more: `trust-store-serialises-read-modify-write-so-no-bless-is-lost` (spec `trust-store-hardening`) fixes it with an advisory lock held across the read and the save, and that chain expects to land AFTER you.

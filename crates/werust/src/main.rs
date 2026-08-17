@@ -1286,6 +1286,20 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     // history move) with the target hash-verified by the fresh retrieval that
     // navigation triggers (task `ipfs-redirects-3xx-navigation-support`).
     let redirects = backend.install_ipfs();
+    // Serve the internal `werust://settings` page, and wire the CHROME-MARKED user
+    // intent a settings MUTATION requires (`docs/adr/0013`, task
+    // `settings-mutation-requires-marked-user-intent-in-core-and-on-gtk`). Before
+    // it, one `<img src="werust://settings?backend=custom&url=http://attacker/">`
+    // on any page silently repointed the user's IPFS retrieval backend — an EGRESS
+    // choice that sees every content-addressed site they visit.
+    //
+    // The carrier comes back here and is handed to the shell below, so BOTH halves
+    // of the marking share one handle: this edge's hook marks a link/form
+    // navigation started inside werust's own settings page, and
+    // `BrowserShell::navigate` marks what the chrome itself starts (the URL bar's
+    // Enter). The redirect sink goes IN because the core gate is main-frame AND
+    // marked, and that sink is the codebase's one main-frame predicate.
+    let settings_intent = backend.install_settings_page(&redirects);
     // Make a `target="_blank"` link / `window.open(url)` navigate IN THE CURRENT
     // view instead of being silently dropped. werust has no tab/window model yet,
     // so WebKitGTK's new-window (`create`) request is routed into the existing
@@ -1344,6 +1358,8 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let shell = Rc::new(RefCell::new(
         BrowserShell::new(Box::new(backend))
             .with_redirect_sink(redirects)
+            // The other clone of the settings intent carrier (see above).
+            .with_navigation_intent(settings_intent)
             .with_debug_capture(debug_capture.clone())
             // The USER's pin store (`pins.json`): a shell reads and writes a
             // durable one only when its edge ASKS, so no test anywhere can reach

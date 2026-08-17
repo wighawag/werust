@@ -1344,7 +1344,11 @@ fn open_window(app: &Application, url: &str) -> Result<(), renderer::RendererErr
     let shell = Rc::new(RefCell::new(
         BrowserShell::new(Box::new(backend))
             .with_redirect_sink(redirects)
-            .with_debug_capture(debug_capture.clone()),
+            .with_debug_capture(debug_capture.clone())
+            // The USER's pin store (`pins.json`): a shell reads and writes a
+            // durable one only when its edge ASKS, so no test anywhere can reach
+            // the developer's blessed names. This is the production window.
+            .with_settings_pins(),
     ));
 
     // The DEBUG-VIEW state the menu's Debug entry (which opens the view) and the

@@ -137,6 +137,40 @@ impl CoreSession {
         }
     }
 
+    /// Read and write the USER's trusted-name pin store (`pins.json`, beside
+    /// `retrieval.json`), through the shared
+    /// [`BrowserShell::with_settings_pins`](werust_core::BrowserShell::with_settings_pins).
+    ///
+    /// Called by the PRODUCTION entry point only (`werust_ios_session_new`),
+    /// never by [`new`](CoreSession::new): a shell reads and writes a durable
+    /// store only when it is asked to, so this crate's tests — which build real
+    /// sessions through `CoreSession::new` — cannot reach the DEVELOPER's own
+    /// blessed names. That hole existed because the previous default keyed off a
+    /// `cfg!` test branch, which is per-CRATE and so could never see across this
+    /// boundary (task
+    /// `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`;
+    /// the observation it closes is
+    /// `work/notes/observations/mobile-core-session-tests-read-the-real-pin-store-2026-07-31.md`).
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs` reds the gate if
+    /// the production entry point stops asking.
+    #[must_use]
+    pub fn with_settings_pins(self) -> Self {
+        let Self { shell, backend } = self;
+        Self {
+            shell: shell.with_settings_pins(),
+            backend,
+        }
+    }
+
+    /// Whether this session reads and writes a DURABLE pin store, or none at all.
+    /// See [`BrowserShell::has_durable_pin_store`](werust_core::BrowserShell::has_durable_pin_store):
+    /// it is what lets this crate's tests ASSERT they never touch the real
+    /// `pins.json` instead of arguing it.
+    #[must_use]
+    pub fn has_durable_pin_store(&self) -> bool {
+        self.shell.has_durable_pin_store()
+    }
+
     /// Navigate to `url` (the URL bar's Enter action), through the seam. The core
     /// front door routes the RAW entry (Swift passes the typed text verbatim):
     /// a bare `.eth` -> ENS; a scheme-less valid host -> `https://` prepend; an
@@ -769,9 +803,16 @@ mod ffi {
 
     /// Create a fresh browsing session; the returned pointer is threaded back
     /// through every call and freed with [`werust_ios_session_free`].
+    ///
+    /// This is the PRODUCTION entry point, and therefore the one place that asks
+    /// for the user's durable trusted-name pin store
+    /// ([`CoreSession::with_settings_pins`]): a shell reads and writes `pins.json`
+    /// only when asked, so this crate's `cargo test` sessions — which never come
+    /// through here — cannot read the developer's own blessed names. Guarded by
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs`.
     #[no_mangle]
     pub extern "C" fn werust_ios_session_new() -> *mut CoreSession {
-        Box::into_raw(Box::new(CoreSession::new()))
+        Box::into_raw(Box::new(CoreSession::new().with_settings_pins()))
     }
 
     /// Free a session created by [`werust_ios_session_new`].
@@ -1309,6 +1350,60 @@ mod tests {
     use super::*;
     use renderer::LoadState;
 
+    /// The opaque `*mut CoreSession` handle the C-ABI tests thread through the
+    /// exports, freed by `werust_ios_session_free` exactly like a production one.
+    ///
+    /// Deliberately NOT built by `werust_ios_session_new`: that is the PRODUCTION
+    /// entry point, and the one place that opts into the USER's real `pins.json`
+    /// ([`CoreSession::with_settings_pins`]). Calling it here would put whatever
+    /// the DEVELOPER has blessed inside this suite, which is the hermeticity hole
+    /// task `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`
+    /// closed — a failure that reproduces on one machine and nowhere else. What
+    /// the export itself does is one `Box::into_raw` plus that opt-in, and the
+    /// opt-in is guarded by
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs`.
+    fn ffi_test_session() -> *mut CoreSession {
+        Box::into_raw(Box::new(CoreSession::new()))
+    }
+
+    /// The REAL `pins.json`'s bytes, or `None` when the developer has none (or
+    /// there is no settings directory at all): the before/after snapshot the
+    /// hermeticity test asserts this suite never writes the developer's own pin
+    /// store with.
+    fn real_pin_store_snapshot() -> Option<Vec<u8>> {
+        werust_core::pins::pins_file_path().and_then(|path| std::fs::read(path).ok())
+    }
+
+    #[test]
+    fn a_test_session_reads_no_pin_store_and_never_touches_the_real_pins_json() {
+        // Hermeticity (the READ-side twin of the work contract's shared-write
+        // rule): this crate's tests build REAL sessions through the production
+        // `CoreSession::new`, so before the pin store became opt-in they read
+        // whatever the DEVELOPER had blessed in their own build — a fixture using
+        // the same name could flip a TOFU axis and red an unrelated assertion on
+        // ONE machine and nowhere else. Only `werust_ios_session_new` asks for the
+        // user's store now, so a session built here has none.
+        let real_before = real_pin_store_snapshot();
+
+        let mut s = CoreSession::new();
+        assert!(
+            !s.has_durable_pin_store(),
+            "a session built in this suite reads no `pins.json`"
+        );
+        // Drive it like any other test does, then try the one action that WRITES:
+        // it holds for the session and reports itself unpersisted, rather than
+        // reaching the developer's store.
+        assert!(s.navigate("https://example.com/"));
+        settle(&mut s);
+        assert!(!s.bless_current_name());
+
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the REAL pin store is untouched by this suite"
+        );
+    }
+
     /// Drive the in-flight load to done the way the Swift edge would from the
     /// platform `WKWebView`'s `didCommit` + `didFinish` signals.
     fn settle(session: &mut CoreSession) {
@@ -1701,7 +1796,7 @@ mod tests {
         use werust_core::debug::NetworkEntry;
 
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
             (*s).debug_capture()
                 .push_network(NetworkEntry::new("GET", "ipfs://bafy/x"));
 
@@ -1960,7 +2055,7 @@ mod tests {
         use super::ffi::*;
         use std::ffi::{CStr, CString};
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
             let channel = CString::new(werust_core::debug::CAPTURE_BRIDGE).unwrap();
             let body = CString::new(r#"{"kind":"console","level":"warn","message":"hi"}"#).unwrap();
             werust_ios_capture_script_message(s, channel.as_ptr(), body.as_ptr());
@@ -2079,7 +2174,7 @@ mod tests {
         use std::ffi::{CStr, CString};
 
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
             assert!(!s.is_null());
 
             let url = CString::new("https://example.com/").unwrap();
@@ -2127,7 +2222,7 @@ mod tests {
         use std::ffi::{CStr, CString};
 
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
             let a = CString::new("https://a.example/").unwrap();
             let b = CString::new("https://b.example/").unwrap();
             for url in [&a, &b] {
@@ -2168,7 +2263,7 @@ mod tests {
         use std::ffi::{CStr, CString};
 
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
 
             // A non-ipfs URL is not an intercepted scheme: NULL handle.
             let https = CString::new("https://example.com/").unwrap();
@@ -2222,7 +2317,7 @@ mod tests {
         use std::ffi::{CStr, CString};
 
         unsafe {
-            let s = werust_ios_session_new();
+            let s = ffi_test_session();
 
             // A non-werust URL is not an intercepted scheme: NULL handle.
             let https = CString::new("https://example.com/").unwrap();

@@ -12,6 +12,8 @@ Task: `work/tasks/*/pin-store-read-modify-write-and-test-isolation.md`. The corr
 
 **Rejected.** Keeping `Option<PathBuf>` plus a flag; making the real-directory read an explicit opt-in that PRODUCTION calls (the task offered this alternative, and it was rejected because forgetting the call at one of the five edges would silently disable TOFU persistence there, which is the same security-relevant direction of failure residue 1 is about, just moved).
 
+> **Revisited (2026-08-17).** The rejected opt-in is what `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns` ended up building, because the objection above rests on the failure being SILENT and a source-shape guard makes it loud. The type itself survives unchanged; only its DEFAULT moved. See `docs/spikes/pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns/DECISIONS.md`, decision 3.
+
 **Touches.** Nothing outside `werust-core`: the field and the type are private, `with_pins_dir` keeps its signature, and production behaviour is byte-for-byte unchanged (`Settings` does exactly what `None` did).
 
 ## 2. A test shell defaults to NO store via `cfg!(test)`, and this covers `werust-core`'s tests only
@@ -23,3 +25,5 @@ Task: `work/tasks/*/pin-store-read-modify-write-and-test-isolation.md`. The corr
 **Rejected.** Pointing `WERUST_SETTINGS_DIR` at a scratch directory from the tests (process-global env mutation is a data race with the parallel test threads, and the whole point of the directory-taking seam is that no test needs it); a `#[cfg(test)]`-only constructor (every existing test would have had to change, and a new test would default back to the unsafe path).
 
 **Touches.** `cfg!(test)` is per-CRATE, so this closes the hole for `werust-core`'s unit tests (the ones the task names) and NOT for `werust-android` / `werust-ios`, whose tests build shells through the PRODUCTION `CoreSession::new()`. Neither of those suites blesses anything, so nothing writes the developer's store; they do READ it. Captured, unfixed and in scope for nobody yet, in `work/notes/observations/mobile-core-session-tests-read-the-real-pin-store-2026-07-31.md`.
+
+> **SUPERSEDED (2026-08-17) by `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`.** The `cfg!(test)` branch is gone: the default is now `Ephemeral` unconditionally and production asks for the store explicitly (`BrowserShell::with_settings_pins`), which is what finally closed the mobile half of the hole this entry's last paragraph describes. The reasoning above is kept as the record of why the branch was chosen at the time, not as a description of the code. See `docs/spikes/pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns/DECISIONS.md`, decision 3.

@@ -1,3 +1,5 @@
 # `werust-android` / `werust-ios` unit tests still read the developer's real `pins.json` (2026-07-31)
 
 Spotted while closing residue 2 of `pin-store-read-modify-write-and-test-isolation`. `BrowserShell`'s new empty-store default keys off `cfg!(test)`, which is per-CRATE, so it covers `werust-core`'s own tests but not the mobile crates: their tests (`crates/werust-android/rust/src/lib.rs`, `crates/werust-ios/rust/src/lib.rs`) build shells through the PRODUCTION `CoreSession::new()`, which still resolves the real settings directory. Neither suite blesses anything, so nothing WRITES the real store; they only read it, so this is the same one-machine-only hermeticity hole, just narrower.
+
+**Closed 2026-08-17** by `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`: the `cfg!(test)` default was retired for an explicit production opt-in (`BrowserShell::with_settings_pins`, called by the JNI / C-ABI session constructors only), so a session built by either mobile suite reads no store at all. Each crate now asserts it (`a_test_session_reads_no_pin_store_and_never_touches_the_real_pins_json`).

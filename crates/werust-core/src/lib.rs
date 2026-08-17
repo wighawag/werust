@@ -1814,8 +1814,9 @@ pub struct BrowserShell {
     /// `docs/adr/0006`'s mutability axis).
     ///
     /// A READ-THROUGH CACHE of the store, so the paint path never touches the
-    /// filesystem: read once at launch, and REPLACED by the re-read store every
-    /// time the user blesses something
+    /// filesystem: read at launch, RE-READ at every navigation
+    /// ([`refresh_pin_store_cache`](BrowserShell::refresh_pin_store_cache)), and
+    /// REPLACED by the re-read store every time the user blesses something
     /// ([`bless_current_name`](BrowserShell::bless_current_name)). It is a cache
     /// and not the truth, because another window may be writing the same file
     /// (see [`pin_store`](BrowserShell::pin_store)); the file is the truth.
@@ -1827,8 +1828,11 @@ pub struct BrowserShell {
     /// (a fresh install, or an unreadable file) is exactly the pre-TOFU browser.
     pins: crate::pins::TrustedNamePins,
     /// WHERE the pin store is read from and written back to: the settings
-    /// directory in production, a scratch directory in a test that opts in, and
-    /// NOWHERE inside this crate's own test binary. See [`PinStoreLocation`].
+    /// directory when a production edge asked for it
+    /// ([`with_settings_pins`](BrowserShell::with_settings_pins)), a scratch
+    /// directory when a test asked for one
+    /// ([`with_pins_dir`](BrowserShell::with_pins_dir)), and NOWHERE unless
+    /// somebody asked. See [`PinStoreLocation`].
     pin_store: PinStoreLocation,
 }
 
@@ -1843,12 +1847,30 @@ pub struct BrowserShell {
 /// rewrite [`bless_current_name`](BrowserShell::bless_current_name) was fixed of,
 /// by forgetting to re-read. Task `pin-store-read-modify-write-and-test-isolation`
 /// (`docs/spikes/pin-store-read-modify-write-and-test-isolation/DECISIONS.md`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Nobody's store unless somebody ASKED for one
+///
+/// The DEFAULT is [`Ephemeral`](PinStoreLocation::Ephemeral): a shell reads and
+/// writes a durable store only when its constructor was told to, so the user's
+/// real `pins.json` is reachable from exactly the five production entry points
+/// that call [`with_settings_pins`](BrowserShell::with_settings_pins) and from
+/// nowhere else. That is what makes every test in every crate hermetic without a
+/// `cfg!` test branch in production code (which is per-CRATE, so it could never
+/// have covered the mobile crates' tests: they build shells through the
+/// production `CoreSession::new()`). The cost of an opt-in is that an edge which
+/// forgets it silently loses TOFU persistence, so the opt-in is not left to
+/// memory: `crates/werust-core/tests/pin_store_edge_wiring_shape.rs` reds the
+/// gate if any production entry point stops asking. Task
+/// `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`
+/// (`docs/spikes/pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns/DECISIONS.md`,
+/// decision 3), which supersedes the previous task's `cfg!(test)` default.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 enum PinStoreLocation {
     /// The [`retrieval`](crate::retrieval) settings directory: `pins.json` beside
     /// `retrieval.json`, under the same
     /// [`WERUST_SETTINGS_DIR`](crate::retrieval::SETTINGS_DIR_ENV) lever (one
-    /// mechanism, `pins`' settled decision 2). The production default.
+    /// mechanism, `pins`' settled decision 2). What every PRODUCTION edge asks
+    /// for, explicitly, via [`with_settings_pins`](BrowserShell::with_settings_pins).
     Settings,
     /// A SPECIFIC directory ([`with_pins_dir`](BrowserShell::with_pins_dir)): the
     /// shell-level twin of
@@ -1861,23 +1883,16 @@ enum PinStoreLocation {
     /// for THIS session (the chrome updates) and simply reports itself
     /// unpersisted, exactly as it does when there is no settings directory.
     ///
-    /// This is the DEFAULT inside `werust_core`'s own test binary (see
-    /// [`PinStoreLocation::default`]): a core test that has not asked for a store
-    /// must not read the DEVELOPER's blessed names, or a machine where
-    /// `ronan.eth` happens to be blessed would flip a TOFU axis inside a fixture
-    /// and red an unrelated chrome assertion, reproducing nowhere else. It is the
-    /// read-side twin of the work contract's shared-write rule.
+    /// This is the DEFAULT (see the type's "Nobody's store unless somebody ASKED
+    /// for one"): a test that has not asked for a store must not read the
+    /// DEVELOPER's blessed names, or a machine where `ronan.eth` happens to be
+    /// blessed would flip a TOFU axis inside a fixture and red an unrelated chrome
+    /// assertion, reproducing nowhere else. It is the read-side twin of the work
+    /// contract's shared-write rule, and being the DEFAULT is what extends it to
+    /// the crates whose tests reach a shell through their own production
+    /// constructor (`werust-android`, `werust-ios`) rather than building one here.
+    #[default]
     Ephemeral,
-}
-
-impl Default for PinStoreLocation {
-    fn default() -> Self {
-        if cfg!(test) {
-            Self::Ephemeral
-        } else {
-            Self::Settings
-        }
-    }
 }
 
 impl PinStoreLocation {
@@ -1891,11 +1906,19 @@ impl PinStoreLocation {
     /// there is no file whose contents could have superseded them.
     fn load(&self) -> Option<crate::pins::TrustedNamePins> {
         match self {
-            Self::Settings => crate::retrieval::settings_dir()
-                .map(|dir| crate::pins::TrustedNamePins::load_from(&dir)),
+            // Delegated, NOT re-derived: `TrustedNamePins::load` is the one site
+            // that knows the user's store is `pins.json` in the settings
+            // directory, and it already reports the no-directory case as `None`.
+            Self::Settings => crate::pins::TrustedNamePins::load(),
             Self::Dir(dir) => Some(crate::pins::TrustedNamePins::load_from(dir)),
             Self::Ephemeral => None,
         }
+    }
+
+    /// Whether there is a durable store here at all: everything but
+    /// [`Ephemeral`](PinStoreLocation::Ephemeral), which reads and writes nothing.
+    fn is_durable(&self) -> bool {
+        !matches!(self, Self::Ephemeral)
     }
 
     /// Persist `pins` here, reporting whether it reached disk. Always `false` for
@@ -1982,9 +2005,10 @@ impl BrowserShell {
         provider: Box<dyn EthereumProvider>,
         ipns_source: Box<dyn IpnsRecordSource>,
     ) -> Self {
-        // WHERE the pins live: the settings directory in production, and NOTHING
-        // inside this crate's own test binary, so no core test can read the
-        // developer's blessed names (see `PinStoreLocation::Ephemeral`).
+        // WHERE the pins live: NOWHERE until somebody asks. A production edge asks
+        // with `with_settings_pins`, a test with `with_pins_dir`; a shell nobody
+        // told reads and writes no store at all, so no test in any crate can reach
+        // the developer's blessed names (see `PinStoreLocation::Ephemeral`).
         let pin_store = PinStoreLocation::default();
         let mut shell = Self {
             renderer,
@@ -1999,9 +2023,9 @@ impl BrowserShell {
             back_skip: Vec::new(),
             back_skip_issued: None,
             debug: crate::debug::DebugCapture::new(),
-            // The blessed CIDs, read once per launch (and re-read on every bless).
-            // A missing/unreadable store is simply empty, which is the pre-TOFU
-            // browser (fail-safe).
+            // The blessed CIDs, read once per launch (and re-read on every
+            // navigation and every bless). A missing/unreadable store is simply
+            // empty, which is the pre-TOFU browser (fail-safe).
             pins: pin_store.load().unwrap_or_default(),
             pin_store,
         };
@@ -2026,6 +2050,47 @@ impl BrowserShell {
         self.pins = self.pin_store.load().unwrap_or_default();
         self.refresh_chrome();
         self
+    }
+
+    /// Read and write the USER's trust-on-first-use pin store: `pins.json` in the
+    /// [`retrieval`](crate::retrieval) settings directory, beside `retrieval.json`
+    /// and under the same [`WERUST_SETTINGS_DIR`](crate::retrieval::SETTINGS_DIR_ENV)
+    /// lever (one mechanism, `pins`' settled decision 2).
+    ///
+    /// **Every production entry point must call this, and only production entry
+    /// points may.** A shell that does not ask reads and writes NO store: blessing
+    /// still holds for the session and reports itself unpersisted, exactly as it
+    /// does when there is no settings directory. That default is what keeps every
+    /// test in every crate off the developer's own blessed names — including the
+    /// mobile crates', which build a shell through their production
+    /// `CoreSession::new()` and so could never be covered by a `cfg!` test branch
+    /// inside THIS crate (see [`PinStoreLocation`]). The opt-in's one hazard, an
+    /// edge that forgets it and silently loses TOFU persistence, is guarded by
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs`, which reds the
+    /// gate if a production entry point stops asking.
+    ///
+    /// Mutually exclusive with [`with_pins_dir`](BrowserShell::with_pins_dir)
+    /// (the last call wins): a shell has ONE store.
+    #[must_use]
+    pub fn with_settings_pins(mut self) -> Self {
+        self.pin_store = PinStoreLocation::Settings;
+        self.pins = self.pin_store.load().unwrap_or_default();
+        self.refresh_chrome();
+        self
+    }
+
+    /// Whether this shell has a DURABLE trusted-name pin store to read and write
+    /// (a settings directory or an explicit one), rather than none at all.
+    ///
+    /// The observable form of "nobody's store unless somebody asked": it is what
+    /// lets a test in a crate that builds shells through its own production
+    /// constructor ASSERT its hermeticity — that its sessions read no `pins.json`
+    /// — instead of arguing it. `false` also means a bless can only hold for this
+    /// session ([`bless_current_name`](BrowserShell::bless_current_name) returns
+    /// `false`), never reach disk.
+    #[must_use]
+    pub fn has_durable_pin_store(&self) -> bool {
+        self.pin_store.is_durable()
     }
 
     /// Share the `_redirects` 3xx [`RedirectSink`](crate::ipfs::RedirectSink) the
@@ -2208,6 +2273,12 @@ impl BrowserShell {
                 return Ok(());
             }
         };
+        // A navigation is about to land on an entry whose TOFU answer may be a
+        // name-resolved site this shell already knows (a bare `ipfs://<rootcid>`
+        // of one is matched by root-CID prefix), so re-read the pin store here
+        // rather than in the paint path (`refresh_pin_store_cache`). AFTER the
+        // refusal above: an entry the front door rejects is not a navigation.
+        self.refresh_pin_store_cache();
         // A USER-initiated navigation starts a FRESH redirect chain, so the hop
         // budget bounds one site's `_redirects` chain rather than a whole session.
         // And `target` is the TOP-LEVEL document about to load, which is what tells
@@ -2282,6 +2353,11 @@ impl BrowserShell {
         // The ENS front door proceeds, so any prior invalid-entry state is cleared
         // (a valid route never leaves the badge showing).
         self.chrome.invalid_entry = None;
+        // THE navigation to a mutable name: re-read the pin store before resolving,
+        // so a name another window blessed since this one launched is warned about
+        // here too (`refresh_pin_store_cache`). Reached by a typed `.eth` entry and
+        // by a reload of an ENS page, which both resolve the name afresh.
+        self.refresh_pin_store_cache();
         // Resolve the name to the content it points at, through the ONE shared
         // resolution path. The pipeline STEP it reaches is reported back through
         // the progress callback (`ResolvingName`, then `FetchingRecord` for a
@@ -2634,6 +2710,11 @@ impl BrowserShell {
     /// The in-flight Back skip is deliberately NOT touched here: `go_back` ARMS it
     /// immediately before calling this, while the other two callers end it first.
     fn enter_history_entry(&mut self) {
+        // A history move is a navigation onto another entry, which may be a
+        // name-resolved one whose pin another window has changed meanwhile: re-read
+        // the store here too, so Back/Forward gets the same answer a fresh load
+        // would (`refresh_pin_store_cache`).
+        self.refresh_pin_store_cache();
         // A user-initiated history move starts a FRESH redirect chain.
         self.redirects.reset();
         self.note_top_level_navigation();
@@ -2699,6 +2780,11 @@ impl BrowserShell {
             let (name, path) = (name.to_string(), path.to_string());
             return self.navigate_ens_name(&name, &path);
         }
+        // A plain reload can still land on a known ENS site's CID (the axis is
+        // matched by root-CID prefix), so it re-reads the store like every other
+        // navigation (`refresh_pin_store_cache`). The ENS branch above re-read it
+        // through the front door already.
+        self.refresh_pin_store_cache();
         self.renderer.reload()?;
         self.redirects.reset();
         self.end_back_skip();
@@ -3048,6 +3134,41 @@ impl BrowserShell {
     #[must_use]
     pub fn view_handle(&self) -> renderer::ViewHandle {
         self.renderer.view_handle()
+    }
+
+    /// Re-read the trusted-name pin store into the shell's cache, because a
+    /// NAVIGATION is about to make its answer matter.
+    ///
+    /// Pins are per-USER, not per-window, and the file is the truth (the cache is
+    /// not): another window blessing `ronan.eth` writes the same `pins.json`, so a
+    /// long-lived window that only ever read the store at its own launch would
+    /// stay SILENT about a name the user believes they blessed — the same
+    /// missed-warning direction `pin-store-read-modify-write-and-test-isolation`
+    /// closed on the write side, one window narrower.
+    ///
+    /// # Why NAVIGATION and not the paint path
+    ///
+    /// The obvious alternative, checking the store where the answer is USED
+    /// ([`refresh_chrome`](BrowserShell::refresh_chrome)), is a file read on every
+    /// chrome refresh — several per load, and the whole reason
+    /// [`ChromeState`](ChromeState) carries a plain
+    /// [`MutableNameTrust`](crate::pins::MutableNameTrust) value is that no
+    /// presentation rule may touch the filesystem. A navigation is the opposite:
+    /// it happens once per user action, it is already I/O-bearing (a name
+    /// resolution and a page load), and it is exactly the moment the answer stops
+    /// being the previous entry's. So the rule is: EVERY top-level navigation this
+    /// shell drives re-reads the store, and NOTHING in the paint path does — which
+    /// is why the call sites are the front door, the plain URL branch, reload and
+    /// the history move, rather than one convenient choke point.
+    ///
+    /// With no durable store (an [`Ephemeral`](PinStoreLocation::Ephemeral) shell,
+    /// or no settings directory on this system) the in-memory pins ARE the truth,
+    /// so this session's own blesses are kept rather than dropped — the same rule
+    /// [`bless_current_name`](BrowserShell::bless_current_name) applies.
+    fn refresh_pin_store_cache(&mut self) {
+        if let Some(pins) = self.pin_store.load() {
+            self.pins = pins;
+        }
     }
 
     /// Re-read the seam's authoritative state (load state, history availability,
@@ -4631,6 +4752,132 @@ mod tests {
         // The merge is visible to the writer itself, so its NEXT bless cannot
         // re-drop what it just merged in.
         assert_eq!(window_b.pins_for_test().len(), 2);
+    }
+
+    #[test]
+    fn a_name_blessed_in_another_window_is_warned_about_here_on_the_next_navigation() {
+        // Acceptance: the READ side of the same two-window defect. The pin now
+        // SURVIVES a concurrent bless (the test above), but a window that only read
+        // the store at its own launch would never SEE it: pins are per-USER, not
+        // per-window, so a user who blessed `ronan.eth` in one window reasonably
+        // expects the change warning in the other. Both shells are constructed
+        // BEFORE either blesses, so each starts from the same empty snapshot —
+        // exactly the long-lived-window situation.
+        let scratch = PinScratchDir::new("other-window-bless");
+        let (ch_old, _) = ipfs_contenthash_fixture(b"the version the other window trusts");
+        let (ch_new, _) = ipfs_contenthash_fixture(b"a DIFFERENT version, published later");
+
+        let (mut window_a, handle_a) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        let (mut window_b, handle_b) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_old)),
+            ],
+            &scratch.path,
+        );
+        assert!(
+            window_a.pins_for_test().is_empty(),
+            "the long-lived window launched with nothing blessed"
+        );
+
+        // Window B blesses the name at the CID it resolves to today.
+        load_eth_name(&mut window_b, &handle_b, "ronan.eth");
+        assert!(window_b.bless_current_name());
+        let blessed_cid = window_b
+            .chrome()
+            .mutable_name
+            .as_ref()
+            .expect("a name-resolved page carries the TOFU axis")
+            .cid
+            .clone();
+
+        // Window A now navigates to that same name, which resolves ELSEWHERE.
+        load_eth_name(&mut window_a, &handle_a, "ronan.eth");
+
+        let chrome = window_a.chrome();
+        assert!(
+            chrome.mutable_name_changed(),
+            "the other window's bless must be visible to this navigation"
+        );
+        let axis = chrome.mutable_name.as_ref().expect("the TOFU axis");
+        assert_eq!(
+            axis.blessed.as_ref().map(|p| p.cid.clone()),
+            Some(blessed_cid.clone()),
+            "the pin read back is the one the OTHER window wrote"
+        );
+        assert_ne!(axis.cid, blessed_cid);
+        // And it is the full, loud warning, not a quieter half of one.
+        assert_eq!(trust_indicator_css_class(chrome), "trust-name-changed");
+        assert!(error_banner_visible(chrome));
+        let banner = error_banner_text(chrome);
+        assert!(banner.contains(&blessed_cid), "the blessed CID: {banner}");
+        assert!(banner.contains(&axis.cid), "the current CID: {banner}");
+    }
+
+    #[test]
+    fn the_pin_store_is_re_read_at_navigation_and_never_in_the_paint_path() {
+        // The prescribed TRIGGER, asserted from the outside rather than argued: a
+        // chrome refresh must NOT touch the filesystem (it happens several times
+        // per load, and every presentation rule is a pure function of
+        // `ChromeState`), so a bless landing in the store while this window sits
+        // still is picked up by its next NAVIGATION and by nothing before it.
+        let scratch = PinScratchDir::new("navigation-not-paint");
+        let (ch_old, _) = ipfs_contenthash_fixture(b"the version the other window trusts");
+        let (ch_new, _) = ipfs_contenthash_fixture(b"the version this window is looking at");
+
+        // This window loads the name and settles on it, unblessed and unwarned.
+        let (mut window, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+                // A second navigation (the reload below) re-resolves the name.
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut window, &handle, "ronan.eth");
+        assert!(!window.chrome().mutable_name_changed());
+
+        // Another window blesses that name at a DIFFERENT CID meanwhile.
+        let (mut other, other_handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_old)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut other, &other_handle, "ronan.eth");
+        assert!(other.bless_current_name());
+
+        // Painting does not notice: repeated chrome refreshes read the CACHE.
+        for _ in 0..5 {
+            window.pump();
+            assert!(
+                !window.chrome().mutable_name_changed(),
+                "a chrome refresh must not re-read the store"
+            );
+        }
+        assert!(
+            window.pins_for_test().is_empty(),
+            "the cache is still the snapshot this window launched with"
+        );
+
+        // A NAVIGATION does: reloading re-resolves the name through the front door,
+        // which is where the store is re-read.
+        window.reload().expect("an ENS page reloads");
+        handle.serve_via_verified_content_path();
+        settle(&mut window, &handle);
+        assert!(
+            window.chrome().mutable_name_changed(),
+            "the navigation re-read the store and found the other window's pin"
+        );
     }
 
     #[test]

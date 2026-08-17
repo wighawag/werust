@@ -129,6 +129,40 @@ impl CoreSession {
         }
     }
 
+    /// Read and write the USER's trusted-name pin store (`pins.json`, beside
+    /// `retrieval.json`), through the shared
+    /// [`BrowserShell::with_settings_pins`](werust_core::BrowserShell::with_settings_pins).
+    ///
+    /// Called by the PRODUCTION entry point only (`nativeNew`), never by
+    /// [`new`](CoreSession::new): a shell reads and writes a durable store only
+    /// when it is asked to, so this crate's tests — which build real sessions
+    /// through `CoreSession::new` — cannot reach the DEVELOPER's own blessed
+    /// names. That hole existed because the previous default keyed off a `cfg!`
+    /// test branch, which is per-CRATE and so could never see across this
+    /// boundary (task
+    /// `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`;
+    /// the observation it closes is
+    /// `work/notes/observations/mobile-core-session-tests-read-the-real-pin-store-2026-07-31.md`).
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs` reds the gate if
+    /// the production entry point stops asking.
+    #[must_use]
+    pub fn with_settings_pins(self) -> Self {
+        let Self { shell, backend } = self;
+        Self {
+            shell: shell.with_settings_pins(),
+            backend,
+        }
+    }
+
+    /// Whether this session reads and writes a DURABLE pin store, or none at all.
+    /// See [`BrowserShell::has_durable_pin_store`](werust_core::BrowserShell::has_durable_pin_store):
+    /// it is what lets this crate's tests ASSERT they never touch the real
+    /// `pins.json` instead of arguing it.
+    #[must_use]
+    pub fn has_durable_pin_store(&self) -> bool {
+        self.shell.has_durable_pin_store()
+    }
+
     /// Navigate to `url` (the URL bar's Enter action), through the seam. The core
     /// front door routes the RAW entry (Kotlin passes the typed text verbatim):
     /// a bare `.eth` -> ENS; a scheme-less valid host -> `https://` prepend; an
@@ -547,7 +581,18 @@ impl SyncSession {
     /// Build a fresh synchronized session over a new [`CoreSession`].
     #[must_use]
     pub fn new() -> Self {
-        let session = CoreSession::new();
+        Self::over(CoreSession::new())
+    }
+
+    /// Synchronize an ALREADY-BUILT [`CoreSession`], so the caller decides how
+    /// that session was constructed.
+    ///
+    /// The production entry point (`nativeNew`) is the one place that asks for the
+    /// user's durable pin store
+    /// ([`CoreSession::with_settings_pins`]), and it hands the result here; a test
+    /// building a `SyncSession` gets the ordinary session, which reads no store.
+    #[must_use]
+    pub fn over(session: CoreSession) -> Self {
         // Clone the shared capture handle OUT once, at construction, so every
         // later capture push reaches the store WITHOUT taking the session lock
         // (see `debug_capture`). Both clones are the same store.
@@ -561,6 +606,13 @@ impl SyncSession {
             debug,
             backend,
         }
+    }
+
+    /// Whether the guarded session reads and writes a DURABLE pin store, or none
+    /// at all. See [`CoreSession::has_durable_pin_store`].
+    #[must_use]
+    pub fn has_durable_pin_store(&self) -> bool {
+        self.with(|s| s.has_durable_pin_store())
     }
 
     /// Run `f` against the guarded [`CoreSession`] while holding the lock, so no
@@ -990,7 +1042,7 @@ fn install_provider(backend: &mut AndroidBackend) {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "android")]
 mod jni_exports {
-    use super::SyncSession;
+    use super::{CoreSession, SyncSession};
     use jni::objects::{JClass, JString};
     use jni::sys::{jboolean, jint, jlong, jstring, JNI_FALSE, JNI_TRUE};
     use jni::JNIEnv;
@@ -1019,12 +1071,24 @@ mod jni_exports {
         env.get_string(s).map(|js| js.into()).unwrap_or_default()
     }
 
+    /// Build the ONE session this app runs on.
+    ///
+    /// This is the PRODUCTION entry point, and therefore the one place that asks
+    /// for the user's durable trusted-name pin store
+    /// ([`CoreSession::with_settings_pins`]): a shell reads and writes `pins.json`
+    /// only when asked, so this crate's `cargo test` sessions — which never come
+    /// through here — cannot read the developer's own blessed names. Guarded by
+    /// `crates/werust-core/tests/pin_store_edge_wiring_shape.rs`, which is also
+    /// the only check that reaches this function at all: this module is
+    /// `cfg(target_os = "android")`, so the Linux gate never compiles it.
     #[no_mangle]
     pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeNew(
         _env: JNIEnv,
         _class: JClass,
     ) -> jlong {
-        Box::into_raw(Box::new(SyncSession::new())) as jlong
+        Box::into_raw(Box::new(SyncSession::over(
+            CoreSession::new().with_settings_pins(),
+        ))) as jlong
     }
 
     /// # Safety
@@ -1512,6 +1576,48 @@ mod jni_exports {
 mod tests {
     use super::*;
     use renderer::LoadState;
+
+    /// The REAL `pins.json`'s bytes, or `None` when the developer has none (or
+    /// there is no settings directory at all): the before/after snapshot the
+    /// hermeticity test asserts this suite never writes the developer's own pin
+    /// store with.
+    fn real_pin_store_snapshot() -> Option<Vec<u8>> {
+        werust_core::pins::pins_file_path().and_then(|path| std::fs::read(path).ok())
+    }
+
+    #[test]
+    fn a_test_session_reads_no_pin_store_and_never_touches_the_real_pins_json() {
+        // Hermeticity (the READ-side twin of the work contract's shared-write
+        // rule): this crate's tests build REAL sessions through the production
+        // `CoreSession::new`, so before the pin store became opt-in they read
+        // whatever the DEVELOPER had blessed in their own build — a fixture using
+        // the same name could flip a TOFU axis and red an unrelated assertion on
+        // ONE machine and nowhere else. Only `nativeNew` asks for the user's store
+        // now, so a session built here — bare or synchronized — has none.
+        let real_before = real_pin_store_snapshot();
+
+        let mut s = CoreSession::new();
+        assert!(
+            !s.has_durable_pin_store(),
+            "a session built in this suite reads no `pins.json`"
+        );
+        assert!(
+            !SyncSession::new().has_durable_pin_store(),
+            "nor does the synchronized session the JNI edge wraps it in"
+        );
+        // Drive it like any other test does, then try the one action that WRITES:
+        // it holds for the session and reports itself unpersisted, rather than
+        // reaching the developer's store.
+        assert!(s.navigate("https://example.com/"));
+        settle(&mut s);
+        assert!(!s.bless_current_name());
+
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the REAL pin store is untouched by this suite"
+        );
+    }
 
     /// Drive the in-flight load to done the way the Kotlin edge would from the
     /// platform `WebView`'s commit + finished signals.

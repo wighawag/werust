@@ -208,7 +208,8 @@ pub fn pin_key(name: &str) -> String {
 /// Deliberately minimal, exactly like [`RetrievalSettings`](crate::retrieval::RetrievalSettings)
 /// (settled decision 2 is "reuse that mechanism verbatim", not "build a
 /// database"): a sorted list of pins, [`load`](TrustedNamePins::load) /
-/// [`save`](TrustedNamePins::save), plus the directory-taking cores tests drive.
+/// [`save`](TrustedNamePins::save) — the ONE pair that knows the store lives in
+/// the settings directory — plus the directory-taking cores tests drive.
 /// A missing or corrupt file loads as EMPTY rather than failing, because an
 /// unreadable pin store must degrade to the pre-TOFU behaviour, never to a
 /// broken browser (see the module's fail-safe note).
@@ -220,15 +221,25 @@ pub struct TrustedNamePins {
 }
 
 impl TrustedNamePins {
-    /// Load the pins from the settings directory, or an EMPTY store if there is
-    /// no directory, no file (nothing blessed yet), or the file is
-    /// unreadable/corrupt.
+    /// Load the pins from the settings directory, or `None` when this system has
+    /// no settings directory at all.
+    ///
+    /// `None` is deliberately NOT the same as an empty store: no file (nothing
+    /// blessed yet) and an unreadable/corrupt file both load as EMPTY, because an
+    /// unreadable pin store must degrade to the pre-TOFU behaviour (the module's
+    /// fail-safe note). "There is nowhere to read from" is a different fact, and
+    /// a caller holding pins in memory needs it to know that nothing on disk could
+    /// have superseded them. It is the read-side mirror of
+    /// [`save`](TrustedNamePins::save)'s `false`, which reports the same absence.
+    ///
+    /// This is the ONLY way to read the USER's store: the shell reaches it through
+    /// its own `PinStoreLocation::Settings`, which delegates here rather than
+    /// re-deriving `settings_dir().map(load_from)` itself, so there is exactly one
+    /// site that knows where the user's `pins.json` is (task
+    /// `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`).
     #[must_use]
-    pub fn load() -> Self {
-        match crate::retrieval::settings_dir() {
-            Some(dir) => Self::load_from(&dir),
-            None => Self::default(),
-        }
+    pub fn load() -> Option<Self> {
+        crate::retrieval::settings_dir().map(|dir| Self::load_from(&dir))
     }
 
     /// Load the pins from a SPECIFIC directory (the directory-taking core

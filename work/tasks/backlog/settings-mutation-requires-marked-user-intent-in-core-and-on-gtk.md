@@ -4,7 +4,6 @@ slug: settings-mutation-requires-marked-user-intent-in-core-and-on-gtk
 spec: settings-mutations-require-user-intent
 blockedBy: []
 covers: [1, 2, 3, 4, 5, 7]
-needsAnswers: true
 ---
 
 ## What to build

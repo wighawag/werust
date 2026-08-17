@@ -3,7 +3,6 @@ title: "The change-warning still reads a snapshot, so a name blessed in another 
 slug: pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns
 blockedBy: [pin-store-read-modify-write-and-test-isolation]
 covers: []
-needsAnswers: true
 ---
 
 ## What to build

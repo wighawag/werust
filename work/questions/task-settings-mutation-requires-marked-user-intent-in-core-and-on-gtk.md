@@ -39,3 +39,13 @@
 <!-- q4 fields: id=q4 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q5
+
+**'task:settings-mutation-requires-marked-user-intent-in-core-and-on-gtk' was bounced — how should we proceed?**
+
+> transient infra: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011Ce9A8XMYe2rwK7avFSbMa"          }
+
+<!-- q5 fields: id=q5 kind=stuck -->
+
+**Your answer** (write below this line):

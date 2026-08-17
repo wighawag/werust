@@ -41,3 +41,18 @@ The task was recovered with `requeue` (keep + continue) and a precise handoff, r
 ## Not fixed here
 
 This is a dorfl runner behaviour, not a werust one, so nothing in this repo can fix it. Recorded rather than acted on. If it recurs, the two things to look at are the "is this push ours" comparison in the surface retry loop, and whether a completed item should reap its own `work/questions/` sidecar.
+
+## Update 2026-08-16: recurrence, five duplicates, plus a backlog-driven wrinkle
+
+Recurred on dorfl 0.11.1 while driving `task:pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns` from `work/tasks/backlog/` (`do --isolated --allow-backlog`). The gate failed for an ENVIRONMENTAL reason (the fresh-worktree gate built in `/tmp`, a 16G tmpfs, and hit `No space left on device`), so the bounce path ran.
+
+What was observed, which sharpens the original signal:
+
+1. The surface pushed FIVE times (`d0d169d`, `8167bc0`, `7fd6ff0`, `3c507cd`, `1c900cb` on `main`), one per retry, each landing a commit.
+2. Every push was reported as REJECTED to the operator: `push reported up-to-date / no change of our making — origin/main is not our commit — treating as rejected`, followed by `main advanced under us — surface refetch and retry (n/5)`. So the retry loop was driven by a false negative: the pushes were landing while being reported as not landing. The post-detection ("is origin/main OUR commit?") appears to be what misfires, and it misfires deterministically once the first push succeeds, because from then on `main` genuinely is a commit the runner made but does not recognise as such.
+3. The final message claimed `surface ... did not land on origin/main (item missing on main, or contention exhausted after retries)` when the surface HAD landed: `needsAnswers: true` was set on the body and a 156-line `work/questions/task-<slug>.md` sidecar existed.
+4. A possible extra trigger for the "item missing on main" wording: the item was driven from `tasks/backlog/`, not the pool `tasks/ready/`. If the surface path looks the item up in the pool only, a `--allow-backlog` drive would always take the not-found branch, which would explain the mismatch between the message and the landed state.
+
+Also seen in the same session, and probably worth its own look: `dorfl status` reported 487 in-flight locks (4 for this repo) while `git ls-remote origin 'refs/dorfl/lock/*'` returned NOTHING. The locks exist only in the local mirror under `~/.dorfl/repos/.../werust.git`. The arbiter is the authoritative record, so `status` is reporting stale mirror refs as live holds, which makes an operator believe work is in flight when none is.
+
+Source: driving the werust board with the `drive-tasks` conductor, 2026-08-16.

@@ -30,3 +30,34 @@
 <!-- q1 fields: id=q1 kind=stuck -->
 
 **Your answer** (write below this line):
+
+## Q2
+
+**'task:pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns' was bounced — how should we proceed?**
+
+> acceptance gate failed (exit 101) on the rebased tip — the failing step was: `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test`; its last output was:
+>
+>           12 rust-lld                           0x0000564e6557b1e9
+>           collect2: fatal error: ld terminated with signal 7 [Bus error]
+>           compilation terminated.
+> error: could not compile `toml` (lib) due to 1 previous error
+> error: could not compile `werust-windows` (test "windows_window_shape") due to 1 previous error
+> error: failed to write to `/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rmetaV6IWFg/full.rmeta`: No space left on device (os error 28)
+> error: linking with `cc` failed: exit status: 1
+>   |
+>   = note:  "cc" "-m64" "/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rustc5Gbmma/symbols.o" "<29 object files omitted>" "-Wl,--as-needed" "-Wl,-Bstatic" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libtest-*,libgetopts-*,librustc_std_workspace_std-*}.rlib" "/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/{libdesktop_paint-52f18f2e17a324c3,libwerust_core-e41e20c615969baa,libens_normalize-a50060d74dda51b6,librust_ipns-5e60560e674790f1,libchrono-77c9504852e9d68a,libiana_time_zone-5b051489716b60ee,libnum_traits-f32483dd8c394954,liblibp2p_identity-2c4116e11c91f4bc,libbs58-beae3888be9cdf90,libhkdf-64fcb577bc12776c,libthiserror-a730a3a7536505bd,libprost-57296028b0ca462d,libk256-77e546363d5da42b,libonce_cell-d59d8380589a29a0,libasn1_der-d2fa3c750b6bbeeb,librand-ccb9d2587af26927,librand_chacha-47a112197c742777,libppv_lite86-8fc72f7ca2b76d65,libzerocopy-28021e75f21fa0ee,libed25519_dalek-66774e4d571d0184,libcurve25519_dalek-3a94632adb433e8a,libed25519-1dfe8bbf0f8ed661,libp256-6320b421928d3086,libecdsa-3b2630e59f6f4782,librfc6979-073eda3e3adf827e,libhmac-b4cf80f0877aa189,libsignature-345f0c610b56574a,libprimeorder-bb854f1b96e64732,libelliptic_curve-1756234deb546fda,libsec1-7ff4e61f71ab9fcb,libpkcs8-f737ecfb1ecc0f8d,libspki-55808d2356b0d15d,libder-73dd16e1a8bdbcb1,libpem_rfc7468-f61b60337e3ce445,libbase64ct-7593207e7f321d59,libcrypto_bigint-9750842e23c3f73f,libbase16ct-5d7a482000cb2d56,libgroup-031db549050b798b,libff-5b9270b753e01154,librand_core-74aded7e77f1bd41,libsha3-6b5ca54be5babec6,libkeccak-2d7803e8715f24e3,libserde_json-775b3a88be04dc0d,libmemchr-671ae5545933e67d,libzmij-56fbe50ec9877183,libfetcher-8cdc7d21d422b846,librs_car_sync-e3fa114f760b80f6,libserde_ipld_dagcbor-0b9378d5828e6613,libscopeguard-b121c5854cf70a16,libcbor4ii-70c6e90d58cfa347,libsha2-3ccf6489b9582892,libcpufeatures-d88c72c9f236f6fd,libdigest-a5ab951c1d5bdd1c,libconst_oid-f793321cf98b0db7,libblock_buffer-dc827cf0ea79efbb,libcrypto_common-4754bcea906318e6,libgeneric_array-654b8e6eb4d4d0f9,libtypenum-1bed52e3b96195d7,libblake2b_simd-760f6105d055365c,libconstant_time_eq-b2145416912cbc68,libarrayvec-4bf83d1fc98cc6c2,libarrayref-75ce230a3301eccb,libipld_dagpb-a8ed4c695fbe1834,libthiserror-14cd29739f84023a,libquick_protobuf-ae9bb82197ecb561,libbyteorder-c18a55978d2e2c90,libipld_core-352ca9fd30199d21,libcid-7c5e4f73ad2a6181,libserde_bytes-4a5d778317de1af7,libmultihash-909138f6dcd5a0ee,libunsigned_varint-0012064526f21c21,libmultibase-337a0ff08ef2543e,libbase45-b7c68267773d56c7,libbase_x-92f43a333c013ad4,libbase256emoji-3977790b5d0a0f57,libconst_str-2a0b4d926350ccd0,libdata_encoding_macro-997208c463f36286,libdata_encoding-a74ceba85f4790db,libureq-58044828070d3102,libwebpki_roots-8131d8a31ac6bafa,librustls-0ae8c87a79476b3e,libsubtle-f849b1bf141e845c,libwebpki-3d4d1cef6b77bbb3,libring-406a2afcf66c0bb3,libgetrandom-6b48abd9189e52ab,liblibc-e8b87544418d1318,libuntrusted-2a25e2c7527dba22,librustls_pki_types-5629d40982662720,libzeroize-ce8c920b6f111d64,libpercent_encoding-07d8617a9071b7a8,libflate2-b8407ff7075240ff,libminiz_oxide-2ac0d40844a61015,libsimd_adler32-522a9e6ce2f5787f,libcrc32fast-a69f4e85c36b3bd8,libcfg_if-949fb3e0809e796a,libutf8_zero-7b318e169aad1290,libureq_proto-613cc23655d21292,libhttparse-34ee956e8661f5c6,libbase64-1c6c759fa9cad540,libhttp-21930eca219117b6,libitoa-78c1e97095357e94,libbytes-dbe2b431f44b1504,libserde-151732994e9966c0,libserde_core-e426f6308dbf7702,liblog-16bb05250a82bd96,librenderer-ade4eb38650e715d}.rlib" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib/{libstd-*,libpanic_unwind-*,libobject-*,libmemchr-*,libaddr2line-*,libgimli-*,libcfg_if-*,librustc_demangle-*,libstd_detect-*,libhashbrown-*,librustc_std_workspace_alloc-*,libminiz_oxide-*,libadler2-*,libunwind-*,liblibc-*,librustc_std_workspace_core-*,liballoc-*,libcore-*,libcompiler_builtins-*}.rlib" "-Wl,-Bdynamic" "-lgcc_s" "-lutil" "-lrt" "-lpthread" "-lm" "-ldl" "-lc" "-L" "/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rustc5Gbmma/raw-dylibs" "-B<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/bin/gcc-ld" "-fuse-ld=lld" "-Wl,--eh-frame-hdr" "-Wl,-z,noexecstack" "-L" "/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/build/ring-391a6c157a6eade1/out" "-L" "<sysroot>/lib/rustlib/x86_64-unknown-linux-gnu/lib" "-o" "/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/werust_macos-b6821775412f8dbc" "-Wl,--gc-sections" "-pie" "-Wl,-z,relro,-z,now" "-nodefaultlibs"
+>   = note: some arguments are omitted. use `--verbose` to show all linker arguments
+>   = note: collect2: fatal error: ld terminated with signal 7 [Bus error]
+>           compilation terminated.
+> error: could not compile `regex-syntax` (lib) due to 1 previous error
+> error: could not compile `werust-macos` (lib test) due to 1 previous error
+> error: failed to write to `/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rmeta8xvZtE/full.rmeta`: No space left on device (os error 28)
+> error: could not compile `serde_yaml` (lib) due to 1 previous error
+> error: failed to write to `/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rmetazZ0hV5/full.rmeta`: No space left on device (os error 28)
+> error: could not compile `rustix` (lib) due to 1 previous error
+> error: failed to write to `/tmp/dorfl-fresh-gate-2J39HU/tip/target/debug/deps/rmetar5ZIki/full.rmeta`: No space left on device (os error 28)
+> error: could not compile `harfrust` (lib) due to 1 previous error
+
+<!-- q2 fields: id=q2 kind=stuck -->
+
+**Your answer** (write below this line):

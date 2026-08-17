@@ -33,6 +33,7 @@ pub mod contenthash;
 pub mod debug;
 pub mod ens;
 pub mod ethereum;
+pub mod intent;
 pub mod ipfs;
 pub mod ipns;
 pub mod menu;
@@ -1761,6 +1762,25 @@ pub struct BrowserShell {
     /// built without one keeps an unused empty sink, so nothing changes for a
     /// caller that does not wire `ipfs://` at all.
     redirects: crate::ipfs::RedirectSink,
+    /// The mark that says werust's own CHROME started the navigation now in
+    /// flight ([`crate::intent::NavigationIntent`]), so a `werust://settings`
+    /// MUTATION can require the user to have asked for it (`docs/adr/0013`).
+    ///
+    /// [`navigate`](BrowserShell::navigate) is a CHROME-ONLY entry point — an
+    /// in-page link click, a `window.open` and a `location=` never pass through
+    /// it, which is the same property the redirect sink's per-chain reset already
+    /// relies on — and every edge's URL bar commits its raw typed text to it. So
+    /// marking there gives every edge the URL-bar half of the gate for free; the
+    /// other half (a link/form GET inside a surface werust itself drew, which is
+    /// page-initiated and so cannot come from here) is the per-edge hook.
+    ///
+    /// The edge that serves the `werust://` scheme holds the OTHER clone
+    /// ([`with_navigation_intent`](BrowserShell::with_navigation_intent)); a shell
+    /// built without one keeps a private carrier that is marked and never read, so
+    /// nothing changes for a caller that serves no internal page at all — and the
+    /// direction of that default is fail-CLOSED (the mutation is refused, the page
+    /// still renders read-only).
+    intent: crate::intent::NavigationIntent,
     /// The history entries the IN-FLIGHT Back move must SKIP over: the
     /// `frame_key`s of the urls the redirect chain being left redirected AWAY
     /// from ([`crate::ipfs::RedirectSink::redirect_sources`]), snapshotted by
@@ -2020,6 +2040,7 @@ impl BrowserShell {
             ens_pages: HashMap::new(),
             resolving_step: None,
             redirects: crate::ipfs::RedirectSink::new(),
+            intent: crate::intent::NavigationIntent::new(),
             back_skip: Vec::new(),
             back_skip_issued: None,
             debug: crate::debug::DebugCapture::new(),
@@ -2105,6 +2126,28 @@ impl BrowserShell {
     #[must_use]
     pub fn with_redirect_sink(mut self, redirects: crate::ipfs::RedirectSink) -> Self {
         self.redirects = redirects;
+        self
+    }
+
+    /// Share the [`NavigationIntent`](crate::intent::NavigationIntent) carrier the
+    /// platform's `werust://` scheme handler consults, so a settings MUTATION is
+    /// applied only for a navigation this chrome started (`docs/adr/0013`).
+    ///
+    /// The scheme handler is installed on the backend BEFORE the shell owns it
+    /// (the GTK edge's `install_settings_page`), so the carrier is created at the
+    /// edge, cloned into the handler, and handed here — both clones are the same
+    /// carrier. This mirrors
+    /// [`with_redirect_sink`](BrowserShell::with_redirect_sink) exactly, and for
+    /// the same reason: the handler may run off the UI thread (`docs/adr/0008`),
+    /// so the carrier is a shared handle rather than a channel.
+    ///
+    /// Without this call the shell still marks its own private carrier, which
+    /// nothing reads: every mutation reaching that edge's handler is then REFUSED
+    /// (the page renders read-only with its real current values). That is the
+    /// deliberate fail-closed direction for an edge whose wiring has not landed.
+    #[must_use]
+    pub fn with_navigation_intent(mut self, intent: crate::intent::NavigationIntent) -> Self {
+        self.intent = intent;
         self
     }
 
@@ -2288,6 +2331,16 @@ impl BrowserShell {
         // request cannot be intercepted before the sink knows about it.
         self.redirects.reset();
         self.redirects.note_navigation(&target);
+        // THE chrome-marked intent (`docs/adr/0013`): this front door is reached
+        // only from chrome code paths (the URL bar's Enter on every edge, a menu
+        // entry), never from web content — the same property the chain reset above
+        // relies on. So a navigation STARTED HERE is one the user asked for, and
+        // the `werust://` scheme handler may apply a settings mutation for its
+        // main-frame request. Marked AFTER `note_navigation`, so the sink the mark
+        // captures already names this target as the top-level document, and marked
+        // for EVERY target (not just `werust://` ones) so a later navigation always
+        // supersedes an earlier mark rather than leaving it lying in wait.
+        self.intent.mark(&target, &self.redirects);
         // Any pending Back skip belongs to a Back the user has now overtaken.
         self.end_back_skip();
         self.renderer.navigate(&target)?;
@@ -6002,6 +6055,71 @@ mod tests {
             shell.chrome().load_state,
             LoadState::Finished,
             "a same-document URL change is not a load"
+        );
+    }
+
+    // ---- The chrome's NAVIGATION INTENT mark (`docs/adr/0013`) ---------------
+    // (task `settings-mutation-requires-marked-user-intent-in-core-and-on-gtk`)
+
+    #[test]
+    fn the_chrome_front_door_marks_user_intent_and_a_page_started_navigation_does_not() {
+        // The mark is what authorises a `werust://settings` MUTATION, so WHO can
+        // leave one is the whole security property. `navigate` is the chrome-only
+        // front door (every edge's URL bar commits its raw typed text here); an
+        // in-page navigation reaches the shell only as an OBSERVED load event, and
+        // observing is not intending.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let intent = crate::intent::NavigationIntent::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend))
+            .with_redirect_sink(redirects.clone())
+            .with_navigation_intent(intent.clone());
+
+        // The user types a settings change into the URL bar and commits it.
+        let typed = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+        shell.navigate(typed).unwrap();
+        settle(&mut shell, &handle);
+        assert!(
+            intent.take_mark_for(typed),
+            "the chrome's own front door marks the navigation it starts"
+        );
+
+        // A page then navigates the top-level frame itself (a link click, a
+        // `location=`, a submitted form on a hostile page). The shell learns about
+        // it from a load EVENT, which must not mark anything.
+        let page_started = "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+        handle.navigate_in_page(page_started);
+        shell.pump();
+        assert!(
+            !intent.is_marked(),
+            "a navigation the shell only OBSERVED is not one the chrome started"
+        );
+        assert!(!intent.take_mark_for(page_started));
+    }
+
+    #[test]
+    fn a_later_chrome_navigation_supersedes_an_unspent_mark() {
+        // A mark must not lie in wait: the user opens the settings page with a
+        // change queued, changes their mind and browses on, and the earlier
+        // authorisation is gone rather than waiting for a request that names it.
+        let redirects = crate::ipfs::RedirectSink::new();
+        let intent = crate::intent::NavigationIntent::new();
+        let backend = FakeBackend::default();
+        let handle = backend.handle();
+        let mut shell = BrowserShell::new(Box::new(backend))
+            .with_redirect_sink(redirects.clone())
+            .with_navigation_intent(intent.clone());
+
+        let typed = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+        shell.navigate(typed).unwrap();
+        settle(&mut shell, &handle);
+        shell.navigate("ipfs://bafyroot/index.html").unwrap();
+        settle(&mut shell, &handle);
+
+        assert!(
+            !intent.take_mark_for(typed),
+            "the settings mark did not survive the next navigation"
         );
     }
 

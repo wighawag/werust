@@ -511,15 +511,81 @@ impl WebViewRenderer {
             });
         });
 
+        redirects
+    }
+
+    /// Serve the internal `werust://settings` page, and supply the CHROME-MARKED
+    /// user intent a settings MUTATION requires (`docs/adr/0013`, task
+    /// `settings-mutation-requires-marked-user-intent-in-core-and-on-gtk`).
+    ///
+    /// It RETURNS the [`NavigationIntent`](werust_core::intent::NavigationIntent)
+    /// carrier the handler consults: the caller hands it to the shell
+    /// (`BrowserShell::with_navigation_intent`) so the URL bar's own commits mark
+    /// it too. Both are clones of ONE carrier, exactly as `install_ipfs` returns
+    /// the redirect sink it shares with its handler, and for the same reason: the
+    /// reader may be off the UI thread (`docs/adr/0008`), so the hand-off is a
+    /// shared handle rather than a channel.
+    ///
+    /// `frames` is the redirect sink `install_ipfs` returned, which is the
+    /// codebase's ONE main-frame predicate: the core gate is main-frame AND
+    /// marked, so the mark carries the sink that will answer the first half rather
+    /// than this edge minting a second notion of it.
+    ///
+    /// # The two halves of the marking, and why the second one lives HERE
+    ///
+    /// The shell's `navigate` covers everything werust's chrome starts itself (the
+    /// URL bar's Enter, a menu entry). It cannot cover the settings page's OWN
+    /// controls: that page is a plain GET form plus `werust://settings?backend=…`
+    /// links, so submitting it is a PAGE-initiated navigation that never passes
+    /// through the shell. That navigation is still the user acting inside a
+    /// surface werust itself drew, so this hook marks it, from the two facts
+    /// WebKitGTK's navigation-policy callback gives that a page cannot forge:
+    ///
+    /// * the navigation was ACTIVATED in the page (`LinkClicked` / `FormSubmitted`
+    ///   — never `Other`, which is what a script's `location = …` reports), and
+    /// * the document it starts FROM is a `werust://` page, i.e. one werust itself
+    ///   rendered. Web content cannot be at a `werust://` URL, and werust's own
+    ///   settings HTML carries no script, so nothing a hostile page controls
+    ///   satisfies this.
+    ///
+    /// The edge SUPPLIES a signal and decides nothing: whether the marked
+    /// navigation may actually mutate is still the shared core's call (it also
+    /// requires the request to be that navigation's main frame, and spends the
+    /// mark once).
+    ///
+    /// The `create` hook (`install_new_window_in_place`) deliberately marks
+    /// NOTHING: a `_blank`/`window.open` target is chosen by the page, and that
+    /// hook loads it straight into the view (`docs/adr/0010`), bypassing the shell.
+    pub fn install_settings_page(
+        &mut self,
+        frames: &werust_core::ipfs::RedirectSink,
+    ) -> werust_core::intent::NavigationIntent {
+        use werust_core::intent::NavigationIntent;
+        use werust_core::retrieval::WERUST_URL_PREFIX;
+
+        let intent = NavigationIntent::new();
+        let Some(context) = self.view.web_context() else {
+            return intent;
+        };
+
         // The internal `werust://settings` page (task
         // `retrieval-backend-user-setting`): registered on the SAME web context so
         // typing `werust://settings` renders the retrieval-backend selector, and a
         // `werust://settings?backend=…` selection is applied + persisted by the
-        // shared core `apply_settings_request`. It is a normal (unverified) internal
-        // page, so it does NOT mark the load content-verified.
+        // shared core. It is a normal (unverified) internal page, so it does NOT
+        // mark the load content-verified.
+        //
+        // The handler fires for the main document AND every sub-resource, which is
+        // exactly why the intent carrier is consulted: a `<img
+        // src="werust://settings?backend=…">` on any page reaches this closure too,
+        // and must render the page while changing nothing.
+        let intent_for_handler = intent.clone();
         context.register_uri_scheme(werust_core::retrieval::WERUST_SCHEME, move |request| {
             let uri = request.uri().map(|u| u.to_string()).unwrap_or_default();
-            match werust_core::retrieval::apply_settings_request(&renderer::SchemeRequest { uri }) {
+            match werust_core::retrieval::apply_settings_request_with_intent(
+                &renderer::SchemeRequest { uri },
+                &intent_for_handler,
+            ) {
                 Ok(response) => {
                     let bytes = glib::Bytes::from(&response.body);
                     let stream = gtk4::gio::MemoryInputStream::from_bytes(&bytes);
@@ -537,7 +603,57 @@ impl WebViewRenderer {
             }
         });
 
-        redirects
+        // The second half of the marking: a link click / form submission INSIDE
+        // werust's own internal page (see the method docs). Read-only observation
+        // of the policy decision — it always returns `false`, so WebKitGTK applies
+        // its normal policy and this hook can neither allow nor block a navigation.
+        let intent_for_policy = intent.clone();
+        let frames_for_policy = frames.clone();
+        let view_for_policy = self.view.clone();
+        self.view.connect_decide_policy(move |_, decision, kind| {
+            if kind != webkit6::PolicyDecisionType::NavigationAction {
+                return false;
+            }
+            let Some(decision) = decision.downcast_ref::<webkit6::NavigationPolicyDecision>()
+            else {
+                return false;
+            };
+            // `NavigationAction`'s getters take `&mut`, so take an owned action to
+            // read it (the same shape the `create` hook uses).
+            let Some(mut action) = decision.navigation_action() else {
+                return false;
+            };
+            // ACTIVATED in the page, and not a REDIRECT of one. A script's
+            // `location = …` reports `Other`, so it is excluded; a redirect is
+            // excluded because werust's own internal handler never issues one, and
+            // because a redirect re-fires this callback with the ORIGINAL
+            // navigation type after the view's active URI has already begun moving
+            // — the one window in which the origin check below could read the
+            // destination instead of the source.
+            let activated_in_the_page = !action.is_redirect()
+                && matches!(
+                    action.navigation_type(),
+                    webkit6::NavigationType::LinkClicked | webkit6::NavigationType::FormSubmitted
+                );
+            let target = action.request().and_then(|req| req.uri());
+            // The document the navigation starts FROM: a `werust://` URL means
+            // werust drew this surface, which is the fact web content cannot forge.
+            let from_werust_page = view_for_policy
+                .uri()
+                .is_some_and(|uri| uri.starts_with(WERUST_URL_PREFIX));
+            if let Some(target) = target {
+                if activated_in_the_page
+                    && from_werust_page
+                    && target.starts_with(WERUST_URL_PREFIX)
+                {
+                    intent_for_policy.mark(&target, &frames_for_policy);
+                }
+            }
+            // Never handled here: this hook observes, WebKitGTK decides.
+            false
+        });
+
+        intent
     }
 
     /// Wire WebKitGTK's new-window (`create`) hook so a `target="_blank"` link /

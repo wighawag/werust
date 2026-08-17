@@ -67,6 +67,15 @@ use renderer::{RendererError, SchemeRequest, SchemeResponse};
 /// so the backend that registers the handler and this module agree on the name.
 pub const WERUST_SCHEME: &str = "werust";
 
+/// The `werust://` URL prefix: the scheme plus its separator.
+///
+/// Beside [`WERUST_SCHEME`] because "is this URL one of werust's OWN internal
+/// pages?" is asked in a second place now — each edge's user-intent hook, which
+/// marks a link/form navigation that starts INSIDE a surface werust drew
+/// (`docs/adr/0013`) — and four more edges will ask it. One constant so no edge
+/// spells the prefix itself. A test pins it to [`WERUST_SCHEME`].
+pub const WERUST_URL_PREFIX: &str = "werust://";
+
 /// The settings page host: `werust://settings`.
 pub const SETTINGS_HOST: &str = "settings";
 
@@ -663,35 +672,72 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Handle a `werust://settings[?backend=…&url=…]` request: apply any selection
-/// (persist it), then render the page.
+/// The reason a settings change was refused because werust's own chrome did not
+/// start it — shown on the page after the same `Not changed: ` prefix a rejected
+/// SELECTION carries, so a refusal always reads as a refusal.
 ///
-/// This is the pure heart of the settings page the scheme handler delegates to,
-/// split out so the whole select -> persist -> re-render loop is testable without
-/// a webview. A bare `werust://settings` (no query) just renders the current
-/// settings. A `?backend=…` query is parsed + validated through
-/// [`RetrievalBackendChoice::parse`]: on success the new choice is persisted
-/// (best-effort — an in-memory interim if there is no settings dir) and confirmed;
-/// on a validation failure (unknown kind, missing/invalid custom URL, a
-/// coming-soon backend) the OLD settings are kept and the typed reason is shown.
-/// A non-`settings` `werust://` host is a fail-closed
-/// [`RendererError::InvalidUrl`].
+/// A constant because it is asserted (a refused attempt must be distinguishable
+/// in the rendered page from a successful one) and because every edge's tests
+/// look for the same words. It deliberately contains no character
+/// [`escape_html`] rewrites, so it appears in the rendered page VERBATIM and an
+/// assertion can look for it as written.
+pub const NOT_STARTED_BY_WERUST: &str = "werust did not start this change, so nothing was applied \
+     (a page cannot change your settings).";
+
+/// Handle a `werust://settings[?backend=…&url=…]` request with NO intent carrier:
+/// the page still renders, and any attempted CHANGE is refused.
+///
+/// This is the entry point an edge that has not yet wired the chrome's
+/// [`NavigationIntent`](crate::intent::NavigationIntent) calls, and its refusal is
+/// the deliberate fail-CLOSED direction of `docs/adr/0013`: a handler that cannot
+/// tell a user's own change from a page's cannot be allowed to apply either.
+/// Reads are untouched (they were never gated), so such an edge still shows the
+/// settings page with its real current values.
+///
+/// An edge that HAS wired the carrier calls
+/// [`apply_settings_request_with_intent`] instead; the four edge tasks named in
+/// the `settings-mutation-user-intent` row of `docs/platform-capability-matrix.toml`
+/// are what move each remaining edge over.
+pub fn apply_settings_request(request: &SchemeRequest) -> Result<SchemeResponse, RendererError> {
+    apply_settings_request_with_intent(request, &crate::intent::NavigationIntent::new())
+}
+
+/// Handle a `werust://settings[?backend=…&url=…]` request: apply the selection if
+/// (and only if) the chrome marked this navigation as intended, then render the
+/// page.
+///
+/// A bare `werust://settings` (no query) just renders the current settings —
+/// READS are never gated. A `?backend=…` query is a MUTATION, so it must first
+/// pass [`NavigationIntent::take_mark_for`](crate::intent::NavigationIntent::take_mark_for)
+/// (a MAIN-FRAME request whose navigation werust's own chrome started); a request
+/// that fails the gate still renders the page with its REAL current values and
+/// the [`NOT_STARTED_BY_WERUST`] reason, and changes nothing. Only then is the
+/// selection parsed + validated through [`RetrievalBackendChoice::parse`]: on
+/// success the new choice is persisted (best-effort — an in-memory interim if
+/// there is no settings dir) and confirmed; on a validation failure (unknown kind,
+/// missing/invalid custom URL, a coming-soon backend) the OLD settings are kept
+/// and the typed reason is shown. A non-`settings` `werust://` host is a
+/// fail-closed [`RendererError::InvalidUrl`].
 ///
 /// It reads + writes the persisted settings through [`RetrievalSettings::load`] /
 /// [`save`](RetrievalSettings::save), so it honours the [`SETTINGS_DIR_ENV`]
 /// isolation lever (a test never touches the real file).
-pub fn apply_settings_request(request: &SchemeRequest) -> Result<SchemeResponse, RendererError> {
+pub fn apply_settings_request_with_intent(
+    request: &SchemeRequest,
+    intent: &crate::intent::NavigationIntent,
+) -> Result<SchemeResponse, RendererError> {
     match settings_dir() {
-        Some(dir) => apply_settings_request_in(&dir, request),
+        Some(dir) => apply_settings_request_in(&dir, request, intent),
         // No settings directory: apply for this session (in-memory) but persist
         // nothing. `save_to` on a non-existent path would fail anyway; route
         // through a throwaway path so the confirmation says "could not persist".
-        None => apply_settings_request_in(std::path::Path::new(""), request),
+        None => apply_settings_request_in(std::path::Path::new(""), request, intent),
     }
 }
 
 /// Handle a `werust://settings[?…]` request against a SPECIFIC settings directory
-/// (the directory-taking core [`apply_settings_request`] delegates to).
+/// (the directory-taking core [`apply_settings_request_with_intent`] delegates
+/// to).
 ///
 /// The explicit-directory seam (see [`RetrievalSettings::load_from`]): production
 /// resolves the directory from [`settings_dir`], and tests pass their own scratch
@@ -700,10 +746,11 @@ pub fn apply_settings_request(request: &SchemeRequest) -> Result<SchemeResponse,
 pub fn apply_settings_request_in(
     dir: &std::path::Path,
     request: &SchemeRequest,
+    intent: &crate::intent::NavigationIntent,
 ) -> Result<SchemeResponse, RendererError> {
     let uri = &request.uri;
     let rest = uri
-        .strip_prefix("werust://")
+        .strip_prefix(WERUST_URL_PREFIX)
         .ok_or_else(|| RendererError::InvalidUrl(uri.clone()))?;
     // The host is up to the first `/`, `?`, or `#`.
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
@@ -714,7 +761,15 @@ pub fn apply_settings_request_in(
     let mut settings = RetrievalSettings::load_from(dir);
     let (backend, url) = parse_settings_query(uri);
     let status = match backend {
+        // A READ: nothing to authorise, nothing to spend. Rendering the page has
+        // never required anything and still does not.
         None => None,
+        // A MUTATION. The gate is checked BEFORE the selection is even parsed, so
+        // a refused attempt cannot reach the persistence at all, and the mark is
+        // spent only by an attempt that was really the user's.
+        Some(_) if !intent.take_mark_for(uri) => {
+            Some(format!("Not changed: {NOT_STARTED_BY_WERUST}"))
+        }
         Some(kind) => match RetrievalBackendChoice::parse(&kind, url.as_deref()) {
             Ok(choice) => {
                 settings.backend = choice;
@@ -971,6 +1026,7 @@ mod tests {
             &SchemeRequest {
                 uri: "werust://settings".to_string(),
             },
+            &crate::intent::NavigationIntent::new(),
         )
         .expect("the settings page renders");
         assert_eq!(response.mime_type, "text/html");
@@ -987,12 +1043,15 @@ mod tests {
         // to the scratch dir, no env mutation.
         let scratch = ScratchDir::new("apply-custom");
 
+        let uri = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
         let response = apply_settings_request_in(
             &scratch.path,
             &SchemeRequest {
-                uri: "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080"
-                    .to_string(),
+                uri: uri.to_string(),
             },
+            // The user's own change, marked by the chrome that started it (the
+            // mutation gate; the refusal side is asserted further down).
+            &intended(uri),
         )
         .expect("the selection applies");
         let html = String::from_utf8(response.body).unwrap();
@@ -1027,20 +1086,24 @@ mod tests {
         let scratch = ScratchDir::new("apply-bad");
 
         // First set a known-good custom choice.
+        let good = "werust://settings?backend=custom&url=http%3A%2F%2Flocalhost%3A5001";
         apply_settings_request_in(
             &scratch.path,
             &SchemeRequest {
-                uri: "werust://settings?backend=custom&url=http%3A%2F%2Flocalhost%3A5001"
-                    .to_string(),
+                uri: good.to_string(),
             },
+            &intended(good),
         )
         .unwrap();
         // Then try a bad one: it is refused, and the old choice stays persisted.
+        let bad = "werust://settings?backend=custom&url=ftp%3A%2F%2Fnope";
         let response = apply_settings_request_in(
             &scratch.path,
             &SchemeRequest {
-                uri: "werust://settings?backend=custom&url=ftp%3A%2F%2Fnope".to_string(),
+                uri: bad.to_string(),
             },
+            // Marked, so this test is about VALIDATION and not about the gate.
+            &intended(bad),
         )
         .expect("the page still renders on a bad selection");
         let html = String::from_utf8(response.body).unwrap();
@@ -1062,11 +1125,12 @@ mod tests {
         // Selecting a coming-soon backend from the page is refused, not applied.
         let scratch = ScratchDir::new("apply-coming-soon");
 
+        let uri = format!("werust://settings?backend={KIND_EMBEDDED}");
         let response = apply_settings_request_in(
             &scratch.path,
-            &SchemeRequest {
-                uri: format!("werust://settings?backend={KIND_EMBEDDED}"),
-            },
+            &SchemeRequest { uri: uri.clone() },
+            // Marked, so the refusal under test is the coming-soon one.
+            &intended(&uri),
         )
         .expect("the page renders");
         let html = String::from_utf8(response.body).unwrap();
@@ -1096,6 +1160,356 @@ mod tests {
             }),
             Err(RendererError::InvalidUrl(_))
         ));
+    }
+
+    // ---- The MUTATION GATE: main frame AND chrome-marked user intent. -----
+
+    /// The settings file's exact bytes, or `None` when there is no file yet: the
+    /// negative control every refusal test asserts on. A gate that merely renders
+    /// a "not changed" page while still writing the file would pass a status-text
+    /// assertion and fail this one.
+    fn settings_bytes(dir: &std::path::Path) -> Option<Vec<u8>> {
+        std::fs::read(dir.join(SETTINGS_FILE)).ok()
+    }
+
+    /// A carrier holding the mark werust's own chrome would leave for `url`,
+    /// with the frame sink reporting `url` as the top-level document — i.e. the
+    /// state after the user commits `url` in the URL bar.
+    fn intended(url: &str) -> crate::intent::NavigationIntent {
+        let frames = crate::ipfs::RedirectSink::new();
+        frames.note_navigation(url);
+        let intent = crate::intent::NavigationIntent::new();
+        intent.mark(url, &frames);
+        intent
+    }
+
+    /// A carrier holding NO mark, with the frame sink on `top_level`: what every
+    /// page-initiated request sees.
+    fn unintended(top_level: &str) -> crate::intent::NavigationIntent {
+        let frames = crate::ipfs::RedirectSink::new();
+        frames.note_navigation(top_level);
+        crate::intent::NavigationIntent::new()
+    }
+
+    /// The REAL (user's own) settings file's bytes, or `None` when there is no
+    /// settings directory or no file: the hermeticity control, the twin of the pin
+    /// store's `real_pin_store_snapshot`.
+    fn real_settings_snapshot() -> Option<Vec<u8>> {
+        settings_dir().and_then(|dir| std::fs::read(dir.join(SETTINGS_FILE)).ok())
+    }
+
+    /// Persist a known-good starting choice so a refusal has something to be
+    /// unchanged FROM (and so the negative control compares real bytes).
+    fn seed_custom_backend(dir: &std::path::Path, url: &str) {
+        let settings = RetrievalSettings {
+            backend: RetrievalBackendChoice::Custom {
+                url: url.to_string(),
+            },
+        };
+        assert!(
+            settings.save_to(dir),
+            "the scratch settings file is written"
+        );
+    }
+
+    #[test]
+    fn a_sub_resource_request_for_a_mutating_settings_url_changes_nothing() {
+        // THE attack this gate exists for: `<img src="werust://settings?backend=
+        // custom&url=http://attacker.example/">` on any page. The request carries
+        // no marked navigation and is not the main frame, so the persisted
+        // settings must be unchanged BYTE FOR BYTE.
+        let scratch = ScratchDir::new("sub-resource-attack");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+        let before = settings_bytes(&scratch.path).expect("the seed file exists");
+
+        let response = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F"
+                    .to_string(),
+            },
+            // The user is reading some other page; the attack request is one of
+            // its sub-resources.
+            &unintended("ipfs://bafyattacker/index.html"),
+        )
+        .expect("the page still renders");
+
+        assert_eq!(
+            settings_bytes(&scratch.path).as_deref(),
+            Some(before.as_slice()),
+            "a page-initiated sub-resource request must not write the settings file"
+        );
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(!html.contains("Saved:"), "nothing was saved: {html}");
+        assert!(
+            !html.contains("attacker.example"),
+            "the refused endpoint is not shown as the active one: {html}"
+        );
+    }
+
+    #[test]
+    fn a_main_frame_request_with_no_marked_intent_changes_nothing() {
+        // Main-frame alone is NOT enough: a page can navigate the top-level frame
+        // (`location = 'werust://settings?...'`), so the top-level document being
+        // the mutating URL says nothing about who asked for it.
+        let scratch = ScratchDir::new("main-frame-unmarked");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+        let before = settings_bytes(&scratch.path).expect("the seed file exists");
+
+        let uri = "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+        let response = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: uri.to_string(),
+            },
+            // The page navigated the top level here itself: the frame sink has
+            // adopted it, but nothing marked it.
+            &unintended(uri),
+        )
+        .expect("the page still renders");
+
+        assert_eq!(
+            settings_bytes(&scratch.path).as_deref(),
+            Some(before.as_slice()),
+            "an unmarked top-level navigation must not write the settings file"
+        );
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(!html.contains("Saved:"), "nothing was saved: {html}");
+    }
+
+    #[test]
+    fn a_marked_navigation_whose_request_is_a_sub_resource_changes_nothing() {
+        // Marked-intent alone is NOT enough either: the mark says the chrome
+        // started a navigation, and a sub-resource request carries no navigation
+        // at all. Here the chrome marked a settings navigation that the view is
+        // not on (it was abandoned / not started), and a sub-resource of the page
+        // the user IS on asks for the marked URL.
+        let scratch = ScratchDir::new("marked-but-sub-resource");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+        let before = settings_bytes(&scratch.path).expect("the seed file exists");
+
+        let uri = "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+        let frames = crate::ipfs::RedirectSink::new();
+        frames.note_navigation("ipfs://bafyattacker/index.html");
+        let intent = crate::intent::NavigationIntent::new();
+        intent.mark(uri, &frames);
+
+        apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: uri.to_string(),
+            },
+            &intent,
+        )
+        .expect("the page still renders");
+
+        assert_eq!(
+            settings_bytes(&scratch.path).as_deref(),
+            Some(before.as_slice()),
+            "a marked URL requested as a SUB-RESOURCE must not write the settings file"
+        );
+    }
+
+    #[test]
+    fn marked_intent_is_not_satisfied_by_a_query_stripped_frame_key_match() {
+        // Hazard 1: the main-frame notion compares a QUERY-STRIPPED frame key, so
+        // while the user is legitimately ON `werust://settings`, a sub-resource
+        // request for `werust://settings?backend=…` reduces to the SAME key and
+        // PASSES the main-frame half. The mark is what must be tighter: it is the
+        // exact URL the chrome navigated to, query included.
+        let scratch = ScratchDir::new("query-stripped-key");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+        let before = settings_bytes(&scratch.path).expect("the seed file exists");
+
+        // The user opened the settings page itself, so THAT is what is marked.
+        let intent = intended("werust://settings");
+        let attack = "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+        // The frame sink really does think the attack URL is the main frame.
+        let frames = crate::ipfs::RedirectSink::new();
+        frames.note_navigation("werust://settings");
+        assert!(
+            frames.is_main_frame(attack),
+            "the frame key strips the query, which is exactly the hazard"
+        );
+
+        apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: attack.to_string(),
+            },
+            &intent,
+        )
+        .expect("the page still renders");
+
+        assert_eq!(
+            settings_bytes(&scratch.path).as_deref(),
+            Some(before.as_slice()),
+            "a mark for the settings page must not authorise a DIFFERENT query on it"
+        );
+    }
+
+    #[test]
+    fn a_main_frame_request_with_marked_intent_applies_and_persists() {
+        // The user's own change is unaffected: the chrome marked exactly this
+        // navigation and the request is its main frame, so it applies and
+        // persists exactly as it did before the gate existed.
+        let scratch = ScratchDir::new("marked-applies");
+        let uri = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+
+        let response = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: uri.to_string(),
+            },
+            &intended(uri),
+        )
+        .expect("the selection applies");
+
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("Saved:"), "the change is confirmed: {html}");
+        assert_eq!(
+            RetrievalSettings::load_from(&scratch.path).backend,
+            RetrievalBackendChoice::Custom {
+                url: "http://127.0.0.1:8080".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_marked_navigation_authorises_exactly_one_request() {
+        // The mark is CONSUMED by the request it was left for, so the page's own
+        // sub-resources (and any later replay of the same URL) find nothing to
+        // spend: the main document's request is first, and it is the only one.
+        let scratch = ScratchDir::new("single-use");
+        let uri = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+        let intent = intended(uri);
+
+        apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: uri.to_string(),
+            },
+            &intent,
+        )
+        .expect("the first request applies");
+        let after_first = settings_bytes(&scratch.path).expect("the file was written");
+
+        // A second, identical request (a replay, or a sub-resource of the page
+        // that just rendered) finds the mark spent.
+        let replay = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: "werust://settings?backend=default-gateway".to_string(),
+            },
+            &intent,
+        )
+        .expect("the page still renders");
+        assert_eq!(
+            settings_bytes(&scratch.path).as_deref(),
+            Some(after_first.as_slice()),
+            "a spent mark authorises nothing"
+        );
+        assert!(!String::from_utf8(replay.body).unwrap().contains("Saved:"));
+    }
+
+    #[test]
+    fn a_refused_attempt_still_renders_the_page_with_the_real_current_values() {
+        // The refusal is of the CHANGE, not of the surface: a blocked attack must
+        // not look like a broken browser, and the page must show what is REALLY
+        // configured (not the attempted value) so the user can see the truth.
+        let scratch = ScratchDir::new("refused-renders");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+
+        let response = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F"
+                    .to_string(),
+            },
+            &unintended("ipfs://bafyattacker/index.html"),
+        )
+        .expect("the page still renders");
+
+        assert_eq!(response.mime_type, "text/html");
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("IPFS retrieval backend"), "{html}");
+        // The REAL current value, not the attempted one.
+        assert!(html.contains("http://localhost:5001"), "{html}");
+        assert!(!html.contains("attacker.example"), "{html}");
+        // Distinguishable from a success: no confirmation, and a stated refusal.
+        assert!(!html.contains("Saved:"), "{html}");
+        assert!(html.contains("Not changed:"), "{html}");
+        assert!(html.contains(NOT_STARTED_BY_WERUST), "{html}");
+    }
+
+    #[test]
+    fn reading_the_settings_page_is_never_gated() {
+        // Reads are unauthenticated: rendering the page requires no mark at all,
+        // and no status line is invented for a plain read.
+        let scratch = ScratchDir::new("read-ungated");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+
+        let response = apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: "werust://settings".to_string(),
+            },
+            &crate::intent::NavigationIntent::new(),
+        )
+        .expect("the page renders with no intent whatsoever");
+        let html = String::from_utf8(response.body).unwrap();
+        assert!(html.contains("IPFS retrieval backend"), "{html}");
+        assert!(html.contains("http://localhost:5001"), "{html}");
+        assert!(
+            !html.contains("Not changed:"),
+            "a read is not a refusal: {html}"
+        );
+        assert!(!html.contains("Saved:"), "{html}");
+    }
+
+    #[test]
+    fn the_gate_never_touches_the_users_own_settings_file() {
+        // Hermeticity, asserted rather than argued: every gate test drives the
+        // DIRECTORY-TAKING core against a scratch dir, so the developer's real
+        // `retrieval.json` is never read as a fixture and — the direction that
+        // would really hurt — never REPOINTED by a test that runs an attack.
+        let before = real_settings_snapshot();
+
+        let scratch = ScratchDir::new("hermetic");
+        seed_custom_backend(&scratch.path, "http://localhost:5001");
+        // A refused attempt...
+        apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F"
+                    .to_string(),
+            },
+            &unintended("ipfs://bafyattacker/index.html"),
+        )
+        .unwrap();
+        // ...and an applied one.
+        let intended_uri = "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+        apply_settings_request_in(
+            &scratch.path,
+            &SchemeRequest {
+                uri: intended_uri.to_string(),
+            },
+            &intended(intended_uri),
+        )
+        .unwrap();
+
+        assert_eq!(
+            real_settings_snapshot(),
+            before,
+            "the user's own settings file must be untouched by these tests"
+        );
+    }
+
+    #[test]
+    fn the_werust_url_prefix_is_the_scheme_and_nothing_else() {
+        // Two constants, one truth: the edges' intent hooks match on the PREFIX
+        // while the scheme registration uses the SCHEME, so they must not drift.
+        assert_eq!(WERUST_URL_PREFIX, format!("{WERUST_SCHEME}://"));
     }
 
     #[test]

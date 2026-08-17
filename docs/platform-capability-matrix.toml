@@ -1526,3 +1526,43 @@ ios = { state = "implemented" }
 # runtime-only (no Android SDK in the gate), so the device steps are recorded at
 # docs/spikes/android-chrome-collapse-reload-stop-and-drop-history-buttons/README.md.
 android = { state = "implemented" }
+
+[[capability]]
+name = "settings-mutation-user-intent"
+description = "A `werust://settings?backend=…` MUTATION is applied only for a MAIN-FRAME request whose navigation werust's own chrome MARKED as intended, so no page can repoint the user's IPFS retrieval backend (an EGRESS choice) with an `<img>` tag; a refused attempt still renders the page read-only with its real current values, and READS are never gated."
+# The RULE is the shared toolkit-free core: `werust_core::intent::NavigationIntent`
+# (the mark, and the main-frame-AND-marked gate) plus
+# `werust_core::retrieval::apply_settings_request_with_intent` (the refusal that
+# still renders). Spec `settings-mutations-require-user-intent`, ADR-0013.
+# Each edge owes the core a SIGNAL and decides nothing: it hands ONE carrier to
+# both its `werust://` scheme handler and its `BrowserShell`, and marks exactly
+# two things — what the chrome itself starts (which every edge gets from
+# `BrowserShell::navigate`, the front door the URL bar commits to) and a link/form
+# navigation started INSIDE werust's own settings page (page-initiated, so it
+# cannot come from the shell). The `_blank`/`window.open` in-place hook must NOT
+# mark: that target is a page's choice (`docs/adr/0010`).
+# An edge whose carrier is not yet wired fails CLOSED through the ungated
+# `retrieval::apply_settings_request`: its settings page still RENDERS with real
+# values, and BOTH change paths (its URL bar and its own form) are refused until
+# its task lands. That is deliberate — a handler that cannot tell a user's change
+# from a page's must not apply either.
+# Desktop (task `settings-mutation-requires-marked-user-intent-in-core-and-on-gtk`):
+# `WebViewRenderer::install_settings_page` registers the `werust` scheme against
+# the gated core entry point and marks from WebKitGTK's `decide-policy`
+# navigation callback, requiring BOTH that the navigation was activated in the
+# page (`LinkClicked`/`FormSubmitted`, never a script's `location =`, which
+# reports `Other`) and that the document it starts FROM is a `werust://` page —
+# a surface werust itself drew, which web content can never be at. The window
+# hands the same carrier to the shell (`with_navigation_intent`). The rule is
+# unit-tested headlessly (`werust_core::intent`, and `retrieval`'s gate tests
+# against a scratch settings directory); the GTK wiring is pinned by
+# crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs. HONEST
+# LIMIT: no CI leg drives a real WebKitGTK settings-page submission, so the
+# desktop evidence is the shared core's tests plus the shape guard over the
+# wiring, not an observed form submit; the manual steps are recorded at
+# docs/spikes/settings-mutation-requires-marked-user-intent-in-core-and-on-gtk/README.md.
+desktop = { state = "implemented" }
+macos = { state = "stubbed", task = "macos-marks-user-intent-for-settings-mutations" }
+windows = { state = "stubbed", task = "windows-marks-user-intent-for-settings-mutations" }
+ios = { state = "stubbed", task = "ios-marks-user-intent-for-settings-mutations" }
+android = { state = "stubbed", task = "android-marks-user-intent-for-settings-mutations" }

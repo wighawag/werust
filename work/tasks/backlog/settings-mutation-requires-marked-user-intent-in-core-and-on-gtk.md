@@ -78,3 +78,7 @@ Three hazards found while tasking, each of which would produce a wrong-but-compi
 > Out of scope: new settings, a new settings surface, gating READS, any other page-reachable internal surface, and the retrieval default itself (`retrieval-default-egress-before-final-release`, an unpromoted backlog task that edits the same settings page and module: if it lands first, rebase rather than reverting its wording).
 >
 > Two more files you share: `crates/werust-core/src/lib.rs` is this repo's worst collision point (8000+ lines) and `trust-store-fails-closed-instead-of-reading-as-nothing-trusted` is deliberately blocked on YOU so the two writers are serialised. You own the navigation/intent region; that task owns the pin-store and bless region. RECORD the intent mechanism as an ADR: it is a security boundary, hard to reverse, and surprising without context.
+
+## Requeue 2026-08-17
+
+Attempt 1 died on upstream model capacity (overloaded_error) before any build work. Nothing to do with the repo or the task.

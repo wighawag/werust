@@ -2005,13 +2005,22 @@ impl PinStoreLocation {
         !matches!(self, Self::Ephemeral)
     }
 
-    /// Persist `pins` here, reporting whether it reached disk. Always `false` for
-    /// [`Ephemeral`](PinStoreLocation::Ephemeral), which has nowhere to write.
-    fn save(&self, pins: &crate::pins::TrustedNamePins) -> bool {
+    /// Persist `pins` here, reporting WHAT happened
+    /// ([`PinSaveOutcome`](crate::pins::PinSaveOutcome)): recorded, not persisted,
+    /// or REFUSED because the store on disk cannot be read.
+    ///
+    /// [`Ephemeral`](PinStoreLocation::Ephemeral) has nowhere to write, which is
+    /// [`CouldNotPersist`](crate::pins::PinSaveOutcome::CouldNotPersist) and not
+    /// [`NothingToRecord`](crate::pins::PinSaveOutcome::NothingToRecord): there
+    /// WAS something to record, it simply has nowhere durable to go, exactly as
+    /// when this system has no settings directory.
+    fn save(&self, pins: &crate::pins::TrustedNamePins) -> crate::pins::PinSaveOutcome {
         match self {
             Self::Settings => pins.save(),
             Self::Dir(dir) => pins.save_to(dir),
-            Self::Ephemeral => false,
+            Self::Ephemeral => crate::pins::PinSaveOutcome::CouldNotPersist(
+                "this session has no durable trusted-name pin store".to_string(),
+            ),
         }
     }
 }
@@ -2177,8 +2186,9 @@ impl BrowserShell {
     /// lets a test in a crate that builds shells through its own production
     /// constructor ASSERT its hermeticity — that its sessions read no `pins.json`
     /// — instead of arguing it. `false` also means a bless can only hold for this
-    /// session ([`bless_current_name`](BrowserShell::bless_current_name) returns
-    /// `false`), never reach disk.
+    /// session ([`bless_current_name`](BrowserShell::bless_current_name) reports
+    /// [`CouldNotPersist`](crate::pins::PinSaveOutcome::CouldNotPersist)), never
+    /// reach disk.
     #[must_use]
     pub fn has_durable_pin_store(&self) -> bool {
         self.pin_store.is_durable()
@@ -2691,31 +2701,53 @@ impl BrowserShell {
     /// werust was showing, so a later change can say WHICH trust level was being
     /// blessed.
     ///
-    /// Returns whether the pin was DURABLY recorded. It is `false` in three
-    /// distinct-but-uninteresting-to-the-caller cases: there was nothing to bless
-    /// (no mutable name, or the name is already blessed at exactly this CID, both
-    /// of which the edge avoids by only offering the action when
-    /// [`trust_pin_action_visible`] is true), or there is no settings directory /
-    /// the write failed, in which case the bless still holds for THIS session
-    /// (the chrome updates), it simply cannot survive a relaunch. It is never an
-    /// error: a pin store that cannot be written must not break browsing.
+    /// Returns WHAT happened ([`PinSaveOutcome`](crate::pins::PinSaveOutcome)),
+    /// which is four different sentences and deliberately not a bare boolean:
     ///
-    /// A FOURTH case is a REFUSAL rather than a failure, and it is the only one
-    /// where the bless does not hold for this session either: the store on disk
-    /// cannot be READ (`docs/adr/0014`). Nothing is recorded, in memory or on
-    /// disk, because a store werust cannot read may not be overwritten — one
-    /// transient failure would replace every record in it with this single fresh
-    /// one. The chrome then STATES that trust cannot be determined instead of
-    /// showing an unpersisted bless, and the affordance withdraws
-    /// ([`ChromeState::can_bless_name`]).
-    pub fn bless_current_name(&mut self) -> bool {
+    /// - [`Recorded`](crate::pins::PinSaveOutcome::Recorded): on disk, and it
+    ///   survives a relaunch.
+    /// - [`NothingToRecord`](crate::pins::PinSaveOutcome::NothingToRecord): there
+    ///   was nothing to bless (no mutable name, or the name is already blessed at
+    ///   exactly this CID), both of which the edge avoids by only offering the
+    ///   action when [`trust_pin_action_visible`] is true. Nothing was lost.
+    /// - [`CouldNotPersist`](crate::pins::PinSaveOutcome::CouldNotPersist): no
+    ///   settings directory, no durable store on this shell, or the write failed.
+    ///   The bless holds for THIS session (the chrome updates), it simply cannot
+    ///   survive a relaunch. Never an error: a pin store that cannot be written
+    ///   must not break browsing.
+    /// - [`Refused`](crate::pins::PinSaveOutcome::Refused): the store on disk
+    ///   cannot be READ (`docs/adr/0014`), the one case where the bless does not
+    ///   hold for this session either. Nothing is recorded, in memory or on disk,
+    ///   because a store werust cannot read may not be overwritten: one transient
+    ///   failure would replace every record in it with this single fresh one. The
+    ///   chrome then STATES that trust cannot be determined instead of showing an
+    ///   unpersisted bless, and the affordance withdraws
+    ///   ([`ChromeState::can_bless_name`]).
+    ///
+    /// werust shows none of this to the user yet (there is no trust-management
+    /// surface, and building one is out of scope for spec `trust-store-hardening`).
+    /// The outcome is carried so the surface that eventually says "your trusted
+    /// names could not be saved" is not blocked on a plumbing change; a caller
+    /// that only needs the old "will it survive a relaunch" answer asks
+    /// [`is_recorded`](crate::pins::PinSaveOutcome::is_recorded).
+    pub fn bless_current_name(&mut self) -> crate::pins::PinSaveOutcome {
         // ONE gate, the very rule the edge's button visibility is painted from,
         // so "the button is shown" and "the action does something" cannot drift.
+        //
+        // It is closed for two DIFFERENT reasons, and the outcome says which: there
+        // is genuinely nothing to record (no mutable name, or one already blessed
+        // at exactly this CID), or the affordance was WITHDRAWN because the store
+        // cannot be read, which is a refusal the caller may want to say out loud.
+        // Reporting the second as "nothing to record" would be the same flattening
+        // `docs/adr/0014` exists to prevent, one layer up.
         if !trust_pin_action_visible(&self.chrome) {
-            return false;
+            return match &self.trust_undeterminable {
+                Some(why) => crate::pins::PinSaveOutcome::Refused(why.clone()),
+                None => crate::pins::PinSaveOutcome::NothingToRecord,
+            };
         }
         let Some(current) = self.chrome.mutable_name.clone() else {
-            return false;
+            return crate::pins::PinSaveOutcome::NothingToRecord;
         };
         // READ -> MODIFY -> WRITE, per action, against the store on DISK: exactly
         // the shape the sibling settings store already uses
@@ -2741,10 +2773,10 @@ impl BrowserShell {
         let mut pins = match self.pin_store.load() {
             crate::pins::PinStoreRead::Pins(pins) => pins,
             crate::pins::PinStoreRead::NoStore => self.pins.clone(),
-            read @ crate::pins::PinStoreRead::Undeterminable(_) => {
-                self.apply_pin_store_read(read);
+            crate::pins::PinStoreRead::Undeterminable(why) => {
+                self.apply_pin_store_read(crate::pins::PinStoreRead::Undeterminable(why.clone()));
                 self.refresh_chrome();
-                return false;
+                return crate::pins::PinSaveOutcome::Refused(why);
             }
         };
         pins.bless(
@@ -2753,7 +2785,7 @@ impl BrowserShell {
             self.chrome.trust_posture,
             crate::pins::now_unix_secs(),
         );
-        let persisted = self.pin_store.save(&pins);
+        let outcome = self.pin_store.save(&pins);
         // The re-read store (plus this bless) becomes the shell's cache, so a
         // concurrent writer's pins are visible here from now on too.
         self.pins = pins;
@@ -2761,7 +2793,7 @@ impl BrowserShell {
         // Re-derive the chrome's TOFU axis from the store, so the surface reflects
         // the bless immediately (the action label and the warning both change).
         self.refresh_chrome();
-        persisted
+        outcome
     }
 
     /// Go one step back in session history, through the seam.
@@ -4618,7 +4650,11 @@ mod tests {
             .expect("a name-resolved page carries the TOFU axis")
             .cid
             .clone();
-        assert!(first.bless_current_name(), "the bless is recorded durably");
+        assert_eq!(
+            first.bless_current_name(),
+            crate::pins::PinSaveOutcome::Recorded,
+            "the bless is recorded durably"
+        );
 
         // It is on disk, in the scratch dir ONLY, and the surface now says so.
         assert!(scratch.path.join(crate::pins::PINS_FILE).is_file());
@@ -4694,7 +4730,7 @@ mod tests {
         // 4. Re-blessing clears the warning (the SSH-host-key "I looked, and I
         //    accept"), and the NEW CID is what a later change is measured against.
         let current_cid = axis.cid.clone();
-        assert!(second.bless_current_name());
+        assert!(second.bless_current_name().is_recorded());
         assert!(!second.chrome().mutable_name_changed());
         assert!(!error_banner_visible(second.chrome()));
         assert_eq!(
@@ -4739,7 +4775,7 @@ mod tests {
             Some(old_cid.clone()),
             "the axis carries the CID the RECORD currently points at"
         );
-        assert!(shell.bless_current_name());
+        assert!(shell.bless_current_name().is_recorded());
 
         // A later launch: the key holder has published a different target.
         let backend = FakeBackend::default();
@@ -4784,7 +4820,7 @@ mod tests {
             &scratch.path,
         );
         load_eth_name(&mut first, &handle, "ronan.eth");
-        assert!(first.bless_current_name());
+        assert!(first.bless_current_name().is_recorded());
 
         // The name now resolves elsewhere, and the bytes are NOT served through the
         // verified content path this time.
@@ -4820,7 +4856,11 @@ mod tests {
         assert!(!shell.chrome().can_bless_name());
         assert!(!trust_pin_action_visible(shell.chrome()));
         assert_eq!(trust_pin_detail(shell.chrome()), "");
-        assert!(!shell.bless_current_name(), "nothing to bless");
+        assert_eq!(
+            shell.bless_current_name(),
+            crate::pins::PinSaveOutcome::NothingToRecord,
+            "nothing to bless, which is the one uninteresting non-success"
+        );
 
         shell.navigate("https://example.com/").unwrap();
         settle(&mut shell, &handle);
@@ -4844,7 +4884,7 @@ mod tests {
             &scratch.path,
         );
         load_eth_name(&mut first, &handle, "ronan.eth");
-        assert!(first.bless_current_name());
+        assert!(first.bless_current_name().is_recorded());
 
         let (mut second, handle2) = shell_with_provider_and_pins(
             vec![
@@ -4906,7 +4946,7 @@ mod tests {
         );
 
         load_eth_name(&mut window_a, &handle_a, "a.eth");
-        assert!(window_a.bless_current_name());
+        assert!(window_a.bless_current_name().is_recorded());
         let cid_a = window_a
             .chrome()
             .mutable_name
@@ -4916,7 +4956,7 @@ mod tests {
             .clone();
 
         load_eth_name(&mut window_b, &handle_b, "b.eth");
-        assert!(window_b.bless_current_name());
+        assert!(window_b.bless_current_name().is_recorded());
         let cid_b = window_b
             .chrome()
             .mutable_name
@@ -4974,7 +5014,7 @@ mod tests {
 
         // Window B blesses the name at the CID it resolves to today.
         load_eth_name(&mut window_b, &handle_b, "ronan.eth");
-        assert!(window_b.bless_current_name());
+        assert!(window_b.bless_current_name().is_recorded());
         let blessed_cid = window_b
             .chrome()
             .mutable_name
@@ -5040,7 +5080,7 @@ mod tests {
             &scratch.path,
         );
         load_eth_name(&mut other, &other_handle, "ronan.eth");
-        assert!(other.bless_current_name());
+        assert!(other.bless_current_name().is_recorded());
 
         // Painting does not notice: repeated chrome refreshes read the CACHE.
         for _ in 0..5 {
@@ -5107,9 +5147,14 @@ mod tests {
         // is reported unpersisted, rather than being written into the developer's
         // real store.
         assert!(trust_pin_action_visible(shell.chrome()));
+        let outcome = shell.bless_current_name();
         assert!(
-            !shell.bless_current_name(),
-            "a test shell has no durable store to record into"
+            matches!(outcome, crate::pins::PinSaveOutcome::CouldNotPersist(_)),
+            "a test shell has no durable store to record into: {outcome:?}"
+        );
+        assert!(
+            outcome.problem().is_some(),
+            "and it can SAY so, rather than being a bare false"
         );
         assert_eq!(
             real_pin_store_snapshot(),
@@ -5177,8 +5222,22 @@ mod tests {
         );
 
         // A bless attempted anyway (the edge is the only caller, and it paints its
-        // button from the rule above) records nothing and destroys nothing.
-        assert!(!shell.bless_current_name());
+        // button from the rule above) records nothing and destroys nothing, and it
+        // says which of the three non-successes this is: a REFUSAL, carrying why,
+        // not the "could not write it" a full disk would report.
+        let outcome = shell.bless_current_name();
+        assert!(
+            matches!(
+                outcome,
+                crate::pins::PinSaveOutcome::Refused(
+                    crate::pins::UndeterminableTrust::UnreadableEntry(_)
+                )
+            ),
+            "{outcome:?}"
+        );
+        assert!(outcome
+            .problem()
+            .is_some_and(|why| why.contains(crate::pins::PINS_FILE)));
         assert_eq!(
             std::fs::read(&store).unwrap(),
             corrupt,
@@ -5209,7 +5268,13 @@ mod tests {
         // third state; and the change warning it had already derived STANDS, because
         // an unreadable store may never make werust say LESS than it already did.
         std::fs::write(&store, corrupt).unwrap();
-        assert!(!shell.bless_current_name(), "the write refuses");
+        assert!(
+            matches!(
+                shell.bless_current_name(),
+                crate::pins::PinSaveOutcome::Refused(_)
+            ),
+            "the write refuses"
+        );
         assert_eq!(std::fs::read(&store).unwrap(), corrupt, "byte for byte");
         let chrome = shell.chrome();
         assert!(chrome.trust_is_undeterminable());

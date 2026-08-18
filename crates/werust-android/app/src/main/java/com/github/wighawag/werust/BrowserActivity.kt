@@ -966,6 +966,13 @@ class BrowserActivity : ComponentActivity() {
      * an unsupported scheme is still refused — a router, not a trust bypass) and
      * create NO real second window.
      *
+     * A ROUTER IS NOT AN AUTHORISATION: this hook must never report USER INTENT
+     * (`docs/adr/0013`, [CoreWebViewClient.shouldOverrideUrlLoading]). The target
+     * is a URL the PAGE chose, so marking here would hand any page a settings
+     * write with one `window.open('werust://settings?backend=…')`. The transport
+     * WebView below therefore has a client of its own that only recovers the URL,
+     * and neither it nor this method reports a navigation to the core.
+     *
      * Manual verification steps:
      * docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.
      */
@@ -1216,6 +1223,80 @@ class BrowserActivity : ComponentActivity() {
             451 -> "Unavailable For Legal Reasons"
             else -> "Status $status"
         }
+
+        /**
+         * The ANDROID MARKING POINT for werust's CHROME-MARKED NAVIGATION INTENT
+         * (`docs/adr/0013`, spec `settings-mutations-require-user-intent`, task
+         * `android-marks-user-intent-for-settings-mutations`): the hook that lets
+         * a submission from werust's OWN `werust://settings` page apply a change,
+         * while a navigation web content starts cannot.
+         *
+         * WHY THIS HOOK AND NOT THE URL BAR: a settings MUTATION is applied only
+         * for a MAIN-FRAME request whose navigation werust's chrome MARKED, and
+         * the URL bar's half is already free on every edge (its Enter commits
+         * through `BrowserShell::navigate`, which marks). The half that is NOT
+         * free is the settings page's own GET form: submitting it is a
+         * PAGE-initiated navigation, so it never passes through the shell. It is
+         * still the user acting inside a surface werust itself drew, and THIS
+         * callback is where Android reports it.
+         *
+         * WHAT THIS LAYER DOES: report FACTS, decide nothing. It hands over the
+         * target, the document the navigation starts FROM ([WebView.getUrl]) and
+         * the three per-request facts Android exposes — `isForMainFrame`,
+         * `hasGesture()` and `isRedirect` ([isRedirectOrUnknown]) — and the RUST
+         * side decides whether they add up to a mark
+         * (`IntentMarker::note_page_navigation`), exactly as this edge reads the
+         * core's chrome derivation instead of re-deriving it (`docs/adr/0011`).
+         * Whether a marked navigation may then MUTATE is the shared core's call
+         * inside the `werust://` handler, never this edge's.
+         *
+         * READ-ONLY observation: it always returns `false`, so the platform
+         * `WebView` performs the navigation exactly as it did before this hook
+         * existed. It can neither start nor block one.
+         *
+         * The `_blank`/`window.open` route ([CoreWebChromeClient.onCreateWindow])
+         * deliberately reports NOTHING: that target is a URL the PAGE chose, and
+         * that hook loads it into this same WebView by design (`docs/adr/0010`).
+         * It is a router, and marking there would hand any page a settings write
+         * with one `window.open('werust://settings?backend=…')`.
+         *
+         * THREADING: the UI thread, and the native call marks OFF the session
+         * lock (through the intent carrier's own shared handle), so a navigation
+         * can never queue behind an in-flight `ipfs://` retrieval — the ANR guard
+         * every UI-thread native call on this edge respects.
+         */
+        override fun shouldOverrideUrlLoading(
+            view: WebView,
+            request: WebResourceRequest,
+        ): Boolean {
+            core.notePageNavigation(
+                request.url.toString(),
+                view.url ?: "",
+                request.isForMainFrame,
+                request.hasGesture(),
+                isRedirectOrUnknown(request),
+            )
+            // Never handled here: this hook observes, the WebView navigates.
+            return false
+        }
+
+        /**
+         * Whether this navigation is a REDIRECT of another one — or whether the
+         * platform cannot say, which reads the SAME way.
+         *
+         * `WebResourceRequest.isRedirect` arrived in API 24 and this app's floor
+         * is API 21, so on older devices the fact is simply unavailable. An
+         * unknown fact in an authorisation input must take the FAIL-CLOSED
+         * reading, so it is reported as a redirect and the mark is withheld: on
+         * API 21–23 the settings page's own form submission is refused (the page
+         * still renders with real values, and a change typed into the URL bar
+         * still applies, because that path marks through the shell). Reporting
+         * the convenient answer instead would let a redirect INTO
+         * `werust://settings?…` be marked while the view's URL is still on
+         * werust's own page — the one window the redirect exclusion closes.
+         */
+        private fun isRedirectOrUnknown(request: WebResourceRequest): Boolean =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) request.isRedirect else true
 
         override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
             // Install the EIP-1193 provider shim as the FIRST script the document

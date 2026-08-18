@@ -163,6 +163,35 @@ class WerustCore : AutoCloseable {
     fun onUrlChanged(url: String) = nativeOnUrlChanged(handle, url)
 
     /**
+     * Report a navigation the PAGE is starting, from
+     * [android.webkit.WebViewClient.shouldOverrideUrlLoading], so werust's own
+     * `werust://settings` page can have its form submission MARKED as the user's
+     * intent while a navigation web content starts cannot (`docs/adr/0013`, spec
+     * `settings-mutations-require-user-intent`).
+     *
+     * Every parameter is a FACT this edge was handed, never a judgement it made:
+     * [target] is `request.url`, [document] is the URL of the page the navigation
+     * starts FROM (`WebView.getUrl`), and [mainFrame] / [userGesture] / [redirect]
+     * are `request.isForMainFrame` / `request.hasGesture()` / `request.isRedirect`
+     * (reported `true` when the platform is too old to say, the fail-closed
+     * reading). Whether they add up to a mark is the RUST side's rule, and whether
+     * a marked navigation may then MUTATE the settings is the shared core's gate
+     * inside the `werust://` handler — this class decides neither. Returns whether
+     * the navigation was marked, which the on-device probe asserts on.
+     *
+     * Runs on the UI thread and marks OFF the native session lock (like
+     * [onPageCommitted]), so a navigation never waits on an in-flight `ipfs://`
+     * retrieval.
+     */
+    fun notePageNavigation(
+        target: String,
+        document: String,
+        mainFrame: Boolean,
+        userGesture: Boolean,
+        redirect: Boolean,
+    ): Boolean = nativeNotePageNavigation(handle, target, document, mainFrame, userGesture, redirect)
+
+    /**
      * Map a core URL to the URL the platform `WebView` should load:
      * `ipfs://<cid>[/path]` -> the internal `https://<cid>.ipfs.werust.invalid`
      * origin, anything else unchanged. SESSION-FREE (a pure native function),
@@ -581,6 +610,14 @@ class WerustCore : AutoCloseable {
     private external fun nativeOnPageFinished(handle: Long, url: String)
     private external fun nativeOnPageFailed(handle: Long, url: String, reason: String)
     private external fun nativeOnUrlChanged(handle: Long, url: String)
+    private external fun nativeNotePageNavigation(
+        handle: Long,
+        target: String,
+        document: String,
+        mainFrame: Boolean,
+        userGesture: Boolean,
+        redirect: Boolean,
+    ): Boolean
     private external fun nativeToWebViewUrl(url: String): String
     private external fun nativeChromeJson(handle: Long): String
     private external fun nativeDebugJson(handle: Long): String

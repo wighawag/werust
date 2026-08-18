@@ -29,6 +29,12 @@
 //!   paint the URL bar, the Back/Forward/Reload/Stop enablement, and the status
 //!   line. Kotlin holds NO browsing logic; every one of those is the core's truth.
 //!
+//! Kotlin also reports the navigations the PAGE starts
+//! ([`note_page_navigation`](SyncSession::note_page_navigation)), which is how
+//! werust's own settings page's form submission is marked as the user's intent
+//! and every other page-started navigation is not ([`IntentMarker`],
+//! `docs/adr/0013`).
+//!
 //! And Kotlin reports the platform `WebView`'s real load signals back in
 //! ([`on_page_committed`](CoreSession::on_page_committed) /
 //! [`on_page_finished`](CoreSession::on_page_finished) /
@@ -72,6 +78,125 @@ pub enum SchemeResolution {
     Err { reason: String },
 }
 
+/// The Android edge's half of the CHROME-MARKED NAVIGATION INTENT a
+/// `werust://settings` MUTATION requires (`docs/adr/0013`, spec
+/// `settings-mutations-require-user-intent`, task
+/// `android-marks-user-intent-for-settings-mutations`): the shared
+/// [`NavigationIntent`](werust_core::intent::NavigationIntent) carrier this
+/// session's `werust://` scheme handler consults, together with the ONE
+/// main-frame predicate ([`RedirectSink`](werust_core::ipfs::RedirectSink)) a
+/// mark captures.
+///
+/// # Why the Android edge needs one at all
+///
+/// `BrowserShell::navigate` — the chrome-only front door Kotlin's URL bar commits
+/// its typed text to — already marks what werust's own chrome starts, and this
+/// session hands the shell the SAME carrier the handler reads. What it cannot
+/// cover is werust's own settings page submitting its own GET form: that is a
+/// PAGE-initiated navigation, so it never passes through the shell. It is still
+/// the user acting inside a surface werust drew, so this edge marks it from its
+/// own navigation hook — Kotlin's `WebViewClient.shouldOverrideUrlLoading`, the
+/// Android member of the per-edge navigation-policy family ADR-0013 names.
+///
+/// # The edge supplies a SIGNAL; the core decides
+///
+/// Kotlin reports the per-request FACTS its callback is handed and nothing else
+/// (see [`note_page_navigation`](IntentMarker::note_page_navigation)); whether a
+/// marked navigation may actually MUTATE stays the shared core's call, inside
+/// [`retrieval::apply_settings_request_with_intent`](werust_core::retrieval::apply_settings_request_with_intent)
+/// — the one place that answers both halves of the gate and spends the mark.
+/// Nothing on this side ever reads a mark (a shape guard reds the gate if this
+/// edge starts to).
+///
+/// # A clone handle, held BESIDE the session lock
+///
+/// It is `Clone` (both halves are `Arc`-shared, `Send + Sync` handles) for the
+/// same reason [`AndroidHandle`] and the debug capture store are: the marking
+/// call arrives on the Android UI thread, and it must never queue behind the
+/// session lock a WebView worker thread can hold for seconds inside an `ipfs://`
+/// retrieval (the ANR guard — see [`SyncSession`]'s lock-free paths).
+#[derive(Debug, Clone)]
+pub struct IntentMarker {
+    /// The carrier the `werust://` scheme handler consults, and the shell marks
+    /// its own navigations into. Every clone is the SAME carrier.
+    intent: werust_core::intent::NavigationIntent,
+    /// The main-frame predicate a mark captures, so the core can answer BOTH
+    /// halves of the gate (marked AND main frame) from the one carrier. It is
+    /// the sink `install_ipfs` returned and the shell reports its top-level
+    /// navigations into — not a second notion of "which request is the page".
+    frames: werust_core::ipfs::RedirectSink,
+}
+
+impl IntentMarker {
+    /// Report a navigation the PAGE is starting, with the facts Android's
+    /// `WebResourceRequest` + `WebView` expose for it, and mark it as the user's
+    /// intent when — and only when — all of them hold. Returns whether it marked.
+    ///
+    /// The facts, each an INPUT to the decision and never the decision itself:
+    ///
+    /// * `target` — the URL the navigation is going to (`request.url`).
+    /// * `document` — the URL of the document it starts FROM (`WebView.url`).
+    /// * `main_frame` — `request.isForMainFrame`: a sub-frame navigation is not
+    ///   the user changing werust's settings.
+    /// * `user_gesture` — `request.hasGesture()`: the navigation was ACTIVATED in
+    ///   the page (a link tap, a form submit), rather than run by a script
+    ///   (`location = …`, which carries no gesture).
+    /// * `redirect` — `request.isRedirect`, or `true` from an edge whose platform
+    ///   cannot tell (Android exposes it only from API 24): a redirect re-reports
+    ///   the ORIGINAL navigation's gesture while the view's URL is already
+    ///   moving, which is the one window in which the `document` check below
+    ///   could read the destination instead of the source. Unknown therefore
+    ///   reads as a redirect, which withholds the mark — the fail-closed
+    ///   direction.
+    ///
+    /// The load-bearing fact is `document`: web content can never BE at a
+    /// `werust://` URL (only werust serves that scheme, and it serves one
+    /// script-free page), so "this navigation started inside a surface werust
+    /// itself drew" is not forgeable by a page. The gesture and the frame are the
+    /// cheap corroborating facts; the GTK edge's `decide-policy` hook requires the
+    /// same shape from WebKit's own navigation vocabulary
+    /// (`docs/spikes/settings-mutation-requires-marked-user-intent-in-core-and-on-gtk/DECISIONS.md`,
+    /// decision 4).
+    ///
+    /// Marking is HARMLESS for a navigation that has nothing to do with settings:
+    /// the core matches a mark against the exact URL (query included), so a mark
+    /// for one `werust://` URL authorises no other.
+    ///
+    /// NOT called from Kotlin's `onCreateWindow`: a `_blank` / `window.open`
+    /// target is a URL the PAGE chose, and that hook routes it into this same
+    /// WebView by design (`docs/adr/0010`). It is a router, and it must never
+    /// become a trust bypass.
+    pub fn note_page_navigation(
+        &self,
+        target: &str,
+        document: &str,
+        main_frame: bool,
+        user_gesture: bool,
+        redirect: bool,
+    ) -> bool {
+        use werust_core::retrieval::WERUST_URL_PREFIX;
+
+        let activated_in_the_page = user_gesture && !redirect;
+        let inside_a_surface_werust_drew =
+            document.starts_with(WERUST_URL_PREFIX) && target.starts_with(WERUST_URL_PREFIX);
+        if main_frame && activated_in_the_page && inside_a_surface_werust_drew {
+            self.intent.mark(target, &self.frames);
+            return true;
+        }
+        false
+    }
+
+    /// The carrier itself, for the tests that drive the shared core's gate
+    /// (`retrieval::apply_settings_request_in`) with the very mark this edge
+    /// left. Production code on this side only ever MARKS through
+    /// [`note_page_navigation`](IntentMarker::note_page_navigation) and through
+    /// the shell's own front door; reading a mark is the core's business.
+    #[must_use]
+    pub fn intent(&self) -> &werust_core::intent::NavigationIntent {
+        &self.intent
+    }
+}
+
 /// A single browsing session for one Android `Activity`: a
 /// [`BrowserShell`](werust_core::BrowserShell) over an [`AndroidBackend`], plus the
 /// WebView-signal callbacks Kotlin reports into.
@@ -85,6 +210,11 @@ pub struct CoreSession {
     /// platform-`WebView` protocol (pending-load + load signals) that the
     /// cross-backend seam does not carry.
     backend: AndroidHandle,
+    /// The chrome-marked navigation-intent handle this session's `werust://`
+    /// scheme handler consults and its shell marks into ([`IntentMarker`],
+    /// `docs/adr/0013`), kept so the Kotlin edge's navigation hook can mark the
+    /// settings page's own form submission.
+    intent: IntentMarker,
 }
 
 impl Default for CoreSession {
@@ -115,6 +245,15 @@ impl CoreSession {
         // platform webview performs (bar + history move, target hash-verified by the
         // fresh retrieval it triggers). Task `ipfs-redirects-3xx-navigation-support`.
         let redirects = install_ipfs(&mut backend);
+        // The internal `werust://settings` page, and the CHROME-MARKED USER
+        // INTENT its mutations require (`docs/adr/0013`): the handler is
+        // registered against the GATED core entry point and consults the carrier
+        // this returns, which is then handed to the shell below so the URL bar's
+        // own commits mark it too. Both are clones of ONE carrier, exactly as
+        // `install_ipfs` shares its redirect sink with its handler, and for the
+        // same reason — the reader is the WebView WORKER thread
+        // (`shouldInterceptRequest`), not the thread that marks.
+        let intent = install_settings_page(&mut backend, &redirects);
         // Wire the FIRST trust hook exactly as the desktop backend's
         // `install_provider` does: register the EIP-1193 provider bridge handler
         // and inject the page-side provider shim at document start, both routed
@@ -124,9 +263,20 @@ impl CoreSession {
         // [`handle_provider_message`](CoreSession::handle_provider_message).
         install_provider(&mut backend);
         Self {
-            shell: BrowserShell::new(Box::new(backend)).with_redirect_sink(redirects),
+            shell: BrowserShell::new(Box::new(backend))
+                .with_redirect_sink(redirects)
+                .with_navigation_intent(intent.intent().clone()),
             backend: handle,
+            intent,
         }
+    }
+
+    /// The chrome-marked navigation-intent handle ([`IntentMarker`]): the Kotlin
+    /// edge's navigation hook marks through it, and this crate's tests drive the
+    /// shared core's gate with it.
+    #[must_use]
+    pub fn intent_marker(&self) -> &IntentMarker {
+        &self.intent
     }
 
     /// Read and write the USER's trusted-name pin store (`pins.json`, beside
@@ -147,10 +297,15 @@ impl CoreSession {
     /// the production entry point stops asking.
     #[must_use]
     pub fn with_settings_pins(self) -> Self {
-        let Self { shell, backend } = self;
+        let Self {
+            shell,
+            backend,
+            intent,
+        } = self;
         Self {
             shell: shell.with_settings_pins(),
             backend,
+            intent,
         }
     }
 
@@ -577,6 +732,12 @@ pub struct SyncSession {
     /// "lock-free paths" section). Both clones are the same shared inner the
     /// shell's backend drives.
     backend: AndroidHandle,
+    /// A CLONE of the session's [`IntentMarker`], held BESIDE the mutex for the
+    /// same reason: Kotlin's navigation hook runs on the UI thread and must mark
+    /// in microseconds, never behind a worker thread's in-flight retrieval (see
+    /// [`note_page_navigation`](SyncSession::note_page_navigation)). Both clones
+    /// are the same carrier the `werust://` scheme handler reads.
+    intent: IntentMarker,
 }
 
 impl Default for SyncSession {
@@ -609,10 +770,13 @@ impl SyncSession {
         // page-signal callbacks record through the shared inner WITHOUT taking
         // the session lock (see the struct doc's "lock-free paths" section).
         let backend = session.backend_handle();
+        // And the intent marker, for the UI-thread navigation hook (below).
+        let intent = session.intent_marker().clone();
         Self {
             inner: Mutex::new(session),
             debug,
             backend,
+            intent,
         }
     }
 
@@ -752,6 +916,37 @@ impl SyncSession {
     /// records through the clone-handle boundary with the pump deferred.
     pub fn on_page_failed(&self, url: &str, reason: &str) {
         self.backend.on_page_failed(url, reason);
+    }
+
+    /// Report a navigation the PAGE is starting, OFF the session lock, and mark
+    /// it as the user's intent when every fact holds. See
+    /// [`IntentMarker::note_page_navigation`] for the rule and
+    /// [`IntentMarker`] for why the Android edge marks at all.
+    ///
+    /// Called from Kotlin's `WebViewClient.shouldOverrideUrlLoading`, which runs
+    /// on the Android UI thread, so it takes the lock-free clone-handle path for
+    /// the same reason the page-signal callbacks do: waiting on the session lock
+    /// here would put a navigation behind an in-flight `ipfs://` retrieval (the
+    /// ANR guard). It needs no session at all — both halves of the marker are
+    /// `Send + Sync` shared handles.
+    pub fn note_page_navigation(
+        &self,
+        target: &str,
+        document: &str,
+        main_frame: bool,
+        user_gesture: bool,
+        redirect: bool,
+    ) -> bool {
+        self.intent
+            .note_page_navigation(target, document, main_frame, user_gesture, redirect)
+    }
+
+    /// The session's chrome-marked navigation-intent handle ([`IntentMarker`]),
+    /// reachable WITHOUT the session lock — the same clone the marking path
+    /// above uses, and the carrier this crate's tests drive the core's gate with.
+    #[must_use]
+    pub fn intent_marker(&self) -> &IntentMarker {
+        &self.intent
     }
 
     /// Report a same-document URL change, OFF the session lock. See
@@ -967,7 +1162,7 @@ fn epoch_millis() -> u64 {
 fn install_ipfs(backend: &mut AndroidBackend) -> werust_core::ipfs::RedirectSink {
     use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
     use werust_core::ipfs::{resolve_ipfs_request, RedirectSink, IPFS_SCHEME};
-    use werust_core::retrieval::{active_gateway_endpoint, apply_settings_request, WERUST_SCHEME};
+    use werust_core::retrieval::active_gateway_endpoint;
 
     // Point the retriever at the USER'S CHOSEN retrieval backend (persisted via
     // `werust://settings`): a custom gateway/local-node URL if picked, else the
@@ -984,14 +1179,46 @@ fn install_ipfs(backend: &mut AndroidBackend) -> werust_core::ipfs::RedirectSink
         IPFS_SCHEME,
         Box::new(move |request| resolve_ipfs_request(&retriever, &request, &redirects_for_handler)),
     );
-    // The internal `werust://settings` page, resolved through the SAME scheme
-    // seam so Kotlin's `shouldInterceptRequest` for `werust` serves it and a
-    // `?backend=…` selection is applied + persisted by the shared core.
+    redirects
+}
+
+/// Install the internal `werust://settings` page on `backend` and return the
+/// CHROME-MARKED USER INTENT carrier its MUTATIONS require, the twin of the
+/// desktop backend's `install_settings_page` (`docs/adr/0013`, task
+/// `android-marks-user-intent-for-settings-mutations`).
+///
+/// The page is served through the SAME scheme seam `ipfs://` is, so Kotlin's
+/// `shouldInterceptRequest` for `werust` serves it. That hook fires for the main
+/// document AND every sub-resource, which is exactly why the handler consults the
+/// intent carrier rather than applying a `?backend=…` selection off the query
+/// string: an `<img src="werust://settings?backend=…">` on any page reaches this
+/// closure too, and must render the page while changing NOTHING.
+///
+/// `frames` is the redirect sink [`install_ipfs`] returned — this codebase's ONE
+/// main-frame predicate — so the mark carries the sink that answers the gate's
+/// first half instead of this edge minting a second notion of it.
+///
+/// The returned [`IntentMarker`] is the caller's clone of that one carrier: it
+/// goes to the shell (`BrowserShell::with_navigation_intent`, so a URL-bar
+/// commit marks) and to the Kotlin navigation hook (so the settings page's own
+/// form submission marks). Nothing else marks — in particular not the
+/// `_blank`/`window.open` in-place route (`docs/adr/0010`).
+fn install_settings_page(
+    backend: &mut AndroidBackend,
+    frames: &werust_core::ipfs::RedirectSink,
+) -> IntentMarker {
+    use werust_core::retrieval::{apply_settings_request_with_intent, WERUST_SCHEME};
+
+    let marker = IntentMarker {
+        intent: werust_core::intent::NavigationIntent::new(),
+        frames: frames.clone(),
+    };
+    let intent_for_handler = marker.intent().clone();
     backend.register_scheme_handler(
         WERUST_SCHEME,
-        Box::new(|request| apply_settings_request(&request)),
+        Box::new(move |request| apply_settings_request_with_intent(&request, &intent_for_handler)),
     );
-    redirects
+    marker
 }
 
 /// Install the native EIP-1193 provider bridge on `backend`, the twin of the
@@ -1443,6 +1670,47 @@ mod jni_exports {
     ) {
         let url = read(&mut env, &url);
         unsafe { session(handle) }.on_url_changed(&url);
+    }
+
+    /// Report a navigation the PAGE is starting, from Kotlin's
+    /// `WebViewClient.shouldOverrideUrlLoading`, so a submission from werust's
+    /// OWN settings page can be marked as the user's intent (`docs/adr/0013`).
+    ///
+    /// Kotlin passes the FACTS its callback is handed — the target, the document
+    /// the navigation starts from, whether it is the main frame, whether it
+    /// carried a user gesture, and whether it is a redirect (reported `true` when
+    /// the platform cannot say, below API 24) — and decides nothing: whether they
+    /// add up to a mark is [`IntentMarker::note_page_navigation`]'s call, and
+    /// whether a marked navigation may MUTATE is the shared core's. Returns
+    /// whether the navigation was marked, which the on-device probe asserts on.
+    ///
+    /// Runs on the UI thread and marks OFF the session lock (the ANR guard).
+    #[no_mangle]
+    #[allow(clippy::too_many_arguments)]
+    pub extern "system" fn Java_com_github_wighawag_werust_WerustCore_nativeNotePageNavigation(
+        mut env: JNIEnv,
+        _class: JClass,
+        handle: jlong,
+        target: JString,
+        document: JString,
+        main_frame: jboolean,
+        user_gesture: jboolean,
+        redirect: jboolean,
+    ) -> jboolean {
+        let target = read(&mut env, &target);
+        let document = read(&mut env, &document);
+        let marked = unsafe { session(handle) }.note_page_navigation(
+            &target,
+            &document,
+            main_frame == JNI_TRUE,
+            user_gesture == JNI_TRUE,
+            redirect == JNI_TRUE,
+        );
+        if marked {
+            JNI_TRUE
+        } else {
+            JNI_FALSE
+        }
     }
 
     #[no_mangle]
@@ -2570,5 +2838,353 @@ mod tests {
         );
         s.clear_debug_capture();
         assert!(s.debug_json().contains("\"network\":[]"));
+    }
+
+    // ---- The settings-mutation USER-INTENT signal (`docs/adr/0013`) ---------
+    // (task `android-marks-user-intent-for-settings-mutations`, spec
+    // `settings-mutations-require-user-intent`)
+    //
+    // The RULE is the shared core's and is unit-tested there (`werust_core::intent`
+    // + `werust_core::retrieval`'s gate tests). What is tested HERE is the Android
+    // edge's half: that the signal Kotlin reports produces a mark for exactly the
+    // navigations werust's own chrome starts, that the carrier the shell marks is
+    // the SAME one this edge's `werust://` handler reads, and that the core's gate
+    // then applies or refuses the change accordingly.
+    //
+    // Every test drives the DIRECTORY-TAKING core
+    // (`retrieval::apply_settings_request_in`) against a scratch directory, which
+    // is what the production handler does against the user's real one — so the
+    // developer's own `retrieval.json` is never read as a fixture and, the
+    // direction that would really hurt, never REPOINTED by a test running the
+    // attack.
+
+    use werust_core::retrieval::{
+        apply_settings_request_in, RetrievalBackendChoice, RetrievalSettings, NOT_STARTED_BY_WERUST,
+    };
+
+    /// A scratch settings directory, removed on drop: the isolation lever the
+    /// core's own gate tests use, with no process-global env mutation.
+    struct ScratchSettingsDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchSettingsDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "werust-android-settings-test-{tag}-{pid}-{n}",
+                pid = std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            // A known-good starting choice, so a refusal has something to be
+            // unchanged FROM and the negative control compares real bytes.
+            let seeded = RetrievalSettings {
+                backend: RetrievalBackendChoice::Custom {
+                    url: "http://localhost:5001".to_string(),
+                },
+            };
+            assert!(
+                seeded.save_to(&path),
+                "the scratch settings file is written"
+            );
+            Self { path }
+        }
+
+        /// The settings file's exact bytes: the negative control every refusal
+        /// asserts on (a gate that renders "not changed" while still WRITING the
+        /// file would pass a status-text assertion and fail this one).
+        fn bytes(&self) -> Vec<u8> {
+            std::fs::read(self.path.join("retrieval.json")).expect("the seeded settings file")
+        }
+    }
+
+    impl Drop for ScratchSettingsDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Serve `uri` the way Kotlin's `shouldInterceptRequest` does — through the
+    /// shared core's gate, against `dir` — and hand back the rendered page.
+    fn serve_settings(dir: &ScratchSettingsDir, uri: &str, marker: &IntentMarker) -> String {
+        let response = apply_settings_request_in(
+            &dir.path,
+            &renderer::SchemeRequest {
+                uri: uri.to_string(),
+            },
+            marker.intent(),
+        )
+        .expect("a refused mutation still RENDERS the settings page");
+        String::from_utf8(response.body).expect("the settings page is utf-8")
+    }
+
+    /// Every file in the user's REAL settings directory: the hermeticity snapshot
+    /// (`retrieval.json` is the one that matters, and taking the whole directory
+    /// needs no private constant).
+    fn real_settings_snapshot() -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let Some(dir) = werust_core::retrieval::settings_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path()).ok().map(|bytes| (e.path(), bytes)))
+            .collect();
+        files.sort();
+        files
+    }
+
+    const A_MUTATING_URL: &str =
+        "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+    const THE_ATTACK_URL: &str =
+        "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+
+    #[test]
+    fn a_form_submission_inside_werusts_own_settings_page_applies_the_change() {
+        // The user's own change, on the path only this edge can supply: the
+        // settings page is a plain GET form, so submitting it is a PAGE-initiated
+        // navigation that never passes through the shell. Kotlin reports it from
+        // `shouldOverrideUrlLoading` with the facts Android hands that callback,
+        // and the change applies and PERSISTS exactly as it did before the gate.
+        let scratch = ScratchSettingsDir::new("own-form");
+        let mut session = CoreSession::new();
+        // The user opened the settings page from the URL bar and it settled.
+        assert!(session.navigate("werust://settings"));
+        settle(&mut session);
+
+        assert!(
+            session.intent_marker().note_page_navigation(
+                A_MUTATING_URL,
+                "werust://settings",
+                true,
+                true,
+                false,
+            ),
+            "a form submit inside werust's own page is the user acting"
+        );
+
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(page.contains("Saved:"), "{page}");
+        assert!(
+            String::from_utf8(scratch.bytes())
+                .unwrap()
+                .contains("127.0.0.1:8080"),
+            "the change is PERSISTED, not just rendered"
+        );
+    }
+
+    #[test]
+    fn a_url_bar_commit_marks_through_the_carrier_this_edge_hands_its_handler() {
+        // The other half, and the one that proves the WIRING rather than the rule:
+        // `BrowserShell::navigate` marks, and the mark is readable by the carrier
+        // this session's `werust://` scheme handler was built with — i.e. the
+        // shell's carrier and the handler's carrier are ONE. A session that built
+        // two would refuse the user's own typed change with every test green.
+        let scratch = ScratchSettingsDir::new("url-bar");
+        let mut session = CoreSession::new();
+        assert!(session.navigate(A_MUTATING_URL), "the URL bar commits");
+
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(page.contains("Saved:"), "{page}");
+
+        // And the mark is SINGLE-USE: the rendered page's own re-request of the
+        // same URL finds nothing left to spend.
+        let again = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(again.contains(NOT_STARTED_BY_WERUST), "{again}");
+    }
+
+    #[test]
+    fn a_page_started_navigation_to_a_mutating_settings_url_changes_nothing() {
+        // THE attack, in the shape Android exposes it: a hostile page navigates
+        // the top-level frame to a mutating settings URL from a tap it controls.
+        // Every request-level fact it can produce is present (main frame, a real
+        // user gesture, no redirect) — and the one fact it cannot forge, the
+        // document the navigation starts FROM, is not a surface werust drew.
+        let scratch = ScratchSettingsDir::new("page-started");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        assert!(session.navigate("https://attacker.example/"));
+        settle(&mut session);
+
+        assert!(
+            !session.intent_marker().note_page_navigation(
+                THE_ATTACK_URL,
+                "https://attacker.example/",
+                true,
+                true,
+                false,
+            ),
+            "a navigation started in WEB CONTENT is never the user asking werust"
+        );
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(
+            scratch.bytes(),
+            before,
+            "the persisted settings are unchanged byte for byte"
+        );
+        assert!(!page.contains("Saved:"), "{page}");
+        assert!(
+            page.contains(NOT_STARTED_BY_WERUST),
+            "the refusal is stated on the page: {page}"
+        );
+        assert!(
+            !page.contains("attacker.example"),
+            "the refused endpoint is never shown as the active one: {page}"
+        );
+        assert!(
+            page.contains("localhost:5001"),
+            "and the page still renders the REAL current values: {page}"
+        );
+    }
+
+    #[test]
+    fn a_sub_resource_request_for_a_mutating_settings_url_changes_nothing() {
+        // The `<img src="werust://settings?backend=…">` case, which on Android
+        // reaches `shouldInterceptRequest` exactly like the main document does
+        // (that hook sees EVERY request) and reaches no navigation hook at all —
+        // so the carrier has nothing to spend, whatever page the user is on.
+        let scratch = ScratchSettingsDir::new("sub-resource");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        // The worst case for a naive main-frame check: the user is legitimately
+        // ON the settings page, whose frame key the attack URL shares.
+        assert!(session.navigate("werust://settings"));
+        settle(&mut session);
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(scratch.bytes(), before, "nothing was written");
+        assert!(page.contains(NOT_STARTED_BY_WERUST), "{page}");
+    }
+
+    #[test]
+    fn the_blank_and_window_open_route_cannot_mutate_because_it_marks_nothing() {
+        // `window.open('werust://settings?backend=…')` is routed into this same
+        // WebView by Kotlin's `onCreateWindow` (`docs/adr/0010`): a ROUTER, and it
+        // must never become a trust bypass. It hands the target straight to
+        // `WebView.loadUrl`, so it passes through NEITHER marking path — not the
+        // shell's front door, and not the navigation hook. The load therefore
+        // reaches the handler with nothing marked.
+        let scratch = ScratchSettingsDir::new("window-open");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        assert!(session.navigate("https://attacker.example/"));
+        settle(&mut session);
+
+        // What that hook does, in full: map the URL and load it. No signal.
+        let target = crate::to_webview_url(THE_ATTACK_URL);
+        assert_eq!(target, THE_ATTACK_URL, "a werust:// URL is not remapped");
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(scratch.bytes(), before, "nothing was written");
+        assert!(page.contains(NOT_STARTED_BY_WERUST), "{page}");
+    }
+
+    #[test]
+    fn every_fact_the_mark_requires_is_load_bearing() {
+        // The signal's truth table, one flipped fact at a time: each is necessary,
+        // so a later change that drops one shows up here rather than as a silent
+        // reopening of the hole. The facts are Android's own
+        // (`WebResourceRequest.isForMainFrame` / `hasGesture()` / `isRedirect`,
+        // plus `WebView.url`), used as INPUTS — never as the decision.
+        let session = CoreSession::new();
+        let marker = session.intent_marker();
+        let from = "werust://settings";
+
+        assert!(
+            !marker.note_page_navigation(A_MUTATING_URL, from, false, true, false),
+            "a SUB-FRAME navigation is not the user changing werust's settings"
+        );
+        assert!(
+            !marker.note_page_navigation(A_MUTATING_URL, from, true, false, false),
+            "no user gesture: a script's `location = …` is the page acting"
+        );
+        assert!(
+            !marker.note_page_navigation(A_MUTATING_URL, from, true, true, true),
+            "a REDIRECT re-reports the original navigation while the view's URL is \
+             already moving (and an edge that cannot tell reports one)"
+        );
+        assert!(
+            !marker.note_page_navigation(
+                A_MUTATING_URL,
+                "https://attacker.example/",
+                true,
+                true,
+                false
+            ),
+            "web content can never BE at a werust:// URL, which is the fact a page \
+             cannot forge"
+        );
+        assert!(
+            !marker.note_page_navigation("https://elsewhere.example/", from, true, true, false),
+            "a navigation LEAVING werust's own page for the web is not a settings change"
+        );
+        assert!(
+            marker.note_page_navigation(A_MUTATING_URL, from, true, true, false),
+            "all of them together: the settings page's own form submit"
+        );
+    }
+
+    #[test]
+    fn the_marking_path_never_waits_on_the_session_lock_so_the_ui_thread_cannot_anr() {
+        // Kotlin's `shouldOverrideUrlLoading` runs on the UI THREAD, while
+        // `resolve_ipfs` can hold the session lock for SECONDS on a worker thread
+        // during a CAR retrieval. Marking must therefore take the lock-free
+        // clone-handle path the page-signal callbacks take (the ANR guard, task
+        // `mobile-page-signal-callbacks-off-session-lock`). Same shape as the
+        // capture test above: hold the lock, then mark from another thread.
+        let session: Box<SyncSession> = Box::default();
+        // The user is on the settings page (the URL bar took them there), which is
+        // what makes the form submit that follows a MAIN-FRAME navigation.
+        session.navigate("werust://settings");
+        let raw: *mut SyncSession = Box::into_raw(session);
+        let held = unsafe { &*raw }
+            .inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let ptr = SessionPtr(raw);
+        let marked = std::thread::spawn(move || {
+            let ptr = ptr;
+            let s: &SyncSession = unsafe { &*ptr.0 };
+            s.note_page_navigation(A_MUTATING_URL, "werust://settings", true, true, false)
+        })
+        .join()
+        .expect("the marking thread must not block on the session lock");
+
+        assert!(marked, "the navigation was marked without the session");
+        drop(held);
+        let session = unsafe { Box::from_raw(raw) };
+        // And it is the SAME carrier the session's handler consults.
+        let scratch = ScratchSettingsDir::new("off-lock");
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(page.contains("Saved:"), "{page}");
+    }
+
+    #[test]
+    fn the_intent_signal_never_touches_the_users_own_settings_file() {
+        // Hermeticity, asserted rather than argued: the tests above drive the
+        // directory-taking core against a scratch dir, so the developer's real
+        // `retrieval.json` is neither read as a fixture nor repointed by the test
+        // that runs the attack.
+        let before = real_settings_snapshot();
+
+        let scratch = ScratchSettingsDir::new("hermetic");
+        let mut session = CoreSession::new();
+        assert!(session.navigate(A_MUTATING_URL));
+        // An applied change...
+        serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        // ...and a refused one.
+        serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+
+        assert_eq!(
+            real_settings_snapshot(),
+            before,
+            "the REAL settings directory is untouched by this suite"
+        );
     }
 }

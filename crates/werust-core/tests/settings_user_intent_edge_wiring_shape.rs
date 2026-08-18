@@ -117,6 +117,12 @@ fn only_the_core_decides_whether_a_marked_navigation_may_mutate() {
     for edge in [
         "crates/webview-renderer/src/backend.rs",
         "crates/werust/src/main.rs",
+        // Android (task `android-marks-user-intent-for-settings-mutations`): the
+        // Rust edge and the Kotlin shell over it. The Kotlin file is listed for
+        // the same reason its own block below exists — that layer is a signal
+        // source, and a `take_mark_for` there would be it deciding.
+        "crates/werust-android/rust/src/lib.rs",
+        "crates/werust-android/app/src/main/java/com/github/wighawag/werust/BrowserActivity.kt",
         // A sibling edge task APPENDS its own edge files here as it lands.
     ] {
         assert!(
@@ -236,4 +242,297 @@ fn gtk_never_marks_the_blank_and_window_open_path() {
         "the new-window in-place hook must not mark user intent:\n{hook}"
     );
     assert!(!hook.contains(THE_DECISION), "nor read one:\n{hook}");
+}
+
+// ---------------------------------------------------------------------------
+// EDGE: Android / the System WebView (task
+// `android-marks-user-intent-for-settings-mutations`).
+//
+// Android is TWO files: the Rust edge (`werust-android-core`, which owns the
+// scheme handler, the carrier and the marking RULE, and is gate-compiled — its
+// unit tests run in this same `cargo test`) and the Kotlin shell (which reports
+// the per-request facts and is reachable from this gate only by parsing, since
+// the Gradle/Kotlin build is not in `verify` at all). Both are asserted here.
+// ---------------------------------------------------------------------------
+
+fn android_rust_edge() -> String {
+    source("crates/werust-android/rust/src/lib.rs")
+}
+
+fn android_kotlin_shell() -> String {
+    source("crates/werust-android/app/src/main/java/com/github/wighawag/werust/BrowserActivity.kt")
+}
+
+/// The BODY of a Kotlin declaration: the text between the braces of the block
+/// that opens after `signature`, bounded at its MATCHING closing brace.
+///
+/// Brace-matched rather than bounded by the next member declaration, which is the
+/// lesson `crates/werust-android/rust/tests/system_back_wiring_shape.rs` records:
+/// a kind-ordered terminator search silently swallowed a whole later method and
+/// made that guard VACUOUS. Here it matters just as much, because the negative
+/// assertions below ("this hook does NOT mark") are exactly the kind that pass
+/// for free on a mis-bounded slice. `//` and `/* */` comments and `"`/`"""`
+/// literals are skipped so a brace inside one cannot unbalance the count.
+fn kotlin_block_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let bytes = source.as_bytes();
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("the Kotlin source must declare `{signature}`"));
+    let find_from = |from: usize, pat: &[u8]| -> Option<usize> {
+        if from >= bytes.len() {
+            return None;
+        }
+        bytes[from..]
+            .windows(pat.len())
+            .position(|w| w == pat)
+            .map(|i| from + i)
+    };
+    let open = find_from(start + signature.len(), b"{")
+        .unwrap_or_else(|| panic!("`{signature}` must open a block"));
+
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < bytes.len() {
+        let tail = &bytes[i..];
+        if tail.starts_with(b"//") {
+            i = find_from(i, b"\n").unwrap_or(bytes.len());
+            continue;
+        }
+        if tail.starts_with(b"/*") {
+            i = find_from(i + 2, b"*/").map_or(bytes.len(), |e| e + 2);
+            continue;
+        }
+        if tail.starts_with(b"\"\"\"") {
+            i = find_from(i + 3, b"\"\"\"").map_or(bytes.len(), |e| e + 3);
+            continue;
+        }
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Both are ASCII brace positions, so these are char boundaries.
+                    return &source[open + 1..i];
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    panic!("`{signature}` opens a block that is never closed")
+}
+
+/// The ONE call the Kotlin shell may make about a navigation: reporting it.
+const THE_ANDROID_KOTLIN_SIGNAL: &str = "core.notePageNavigation(";
+
+#[test]
+fn android_serves_the_settings_page_through_the_gated_core_entry_point() {
+    // Android's `shouldInterceptRequest` fires for the main document AND every
+    // sub-resource (this edge sees more requests than any other), so the handler
+    // is where the gate has to be consulted. Routing through the UNGATED
+    // `apply_settings_request` instead — which is what this edge did before, and
+    // what it would fall back to on any refactor — leaves the hole open with every
+    // test still green, because that entry point still renders the page.
+    let edge = android_rust_edge();
+    let handler = after(
+        &edge,
+        "backend.register_scheme_handler(\n        WERUST_SCHEME",
+        300,
+    );
+    assert!(
+        handler.contains("apply_settings_request_with_intent"),
+        "the Android settings handler must consult the intent carrier:\n{handler}"
+    );
+}
+
+#[test]
+fn android_hands_the_one_carrier_to_both_the_handler_and_the_shell() {
+    // Two halves, ONE carrier: the shell marks what the chrome starts (the URL
+    // bar's Enter, through `BrowserShell::navigate`), the Kotlin navigation hook
+    // marks a form submit inside werust's own page, and the scheme handler reads
+    // both. A session that built the carrier for its handler and forgot to hand it
+    // to the shell would refuse the user's own URL-bar change — invisible to a
+    // headless gate, which is why it is asserted here as well as unit-tested in
+    // `werust-android-core`.
+    let edge = android_rust_edge();
+    let wiring = after(&edge, "let intent = install_settings_page(", 200);
+    assert!(
+        wiring.contains("&redirects"),
+        "the settings page is wired with the ONE main-frame predicate (the redirect \
+         sink `install_ipfs` returned), not a second notion of it:\n{wiring}"
+    );
+    assert!(
+        edge.contains(".with_navigation_intent("),
+        "the Android session must hand the carrier to the shell, or a URL-bar-committed \
+         settings change is refused"
+    );
+}
+
+#[test]
+fn android_marks_only_a_navigation_activated_inside_a_surface_werust_drew() {
+    // The mark is the whole authorisation, so WHAT it is derived from is the
+    // security property. The Android facts are its own vocabulary
+    // (`isForMainFrame` / `hasGesture()` / `isRedirect`), but the shape is the one
+    // every edge inherits: the navigation was ACTIVATED in the page, it is not a
+    // REDIRECT of one, and the document it starts FROM is a `werust://` page — a
+    // surface werust itself drew, which web content can never be at.
+    let rule = between(
+        &android_rust_edge(),
+        "    pub fn note_page_navigation(",
+        "\n    /// ",
+    );
+    assert!(
+        rule.contains("user_gesture") && rule.contains("!redirect"),
+        "the mark must require a navigation the user ACTIVATED in the page, and must \
+         exclude a REDIRECT of one:\n{rule}"
+    );
+    assert!(
+        rule.contains("main_frame"),
+        "and must require the MAIN frame:\n{rule}"
+    );
+    assert!(
+        rule.matches("WERUST_URL_PREFIX").count() >= 2,
+        "the mark must require BOTH the document it starts from and its target to be \
+         werust's own internal page:\n{rule}"
+    );
+    assert!(
+        rule.contains(THE_SIGNAL),
+        "and it must actually leave the mark:\n{rule}"
+    );
+}
+
+#[test]
+fn the_android_kotlin_shell_reports_the_facts_and_decides_nothing() {
+    // The discipline this edge is held to everywhere else (it READS
+    // `werust_core::chrome_json` rather than re-deriving the chrome,
+    // `docs/adr/0011`), applied to the authorisation: Kotlin hands over the facts
+    // its callback was given and the Rust side decides. A Kotlin-side `if` that
+    // decided when to mark would be the same hand-written twin — in the one place
+    // where a drifted copy is a security hole rather than a wrong glyph.
+    let shell = android_kotlin_shell();
+    let hook = kotlin_block_body(
+        &shell,
+        "override fun shouldOverrideUrlLoading(\n            view: WebView,\n            request: WebResourceRequest,\n        ): Boolean",
+    );
+    assert!(
+        hook.contains(THE_ANDROID_KOTLIN_SIGNAL),
+        "the navigation hook must report the navigation to the core:\n{hook}"
+    );
+    for fact in [
+        "request.url",
+        "view.url",
+        "request.isForMainFrame",
+        "request.hasGesture()",
+        "isRedirectOrUnknown(request)",
+    ] {
+        assert!(
+            hook.contains(fact),
+            "the hook must report `{fact}`, one of the facts the mark is derived \
+             from:\n{hook}"
+        );
+    }
+    assert!(
+        !hook.contains("if (") && !hook.contains("when ("),
+        "the hook must not decide WHETHER to report: the rule lives in the Rust edge \
+         (`IntentMarker::note_page_navigation`), where the gate can test it:\n{hook}"
+    );
+    assert!(
+        hook.contains("return false"),
+        "and it must stay READ-ONLY observation (the WebView performs the navigation \
+         exactly as it did before this hook existed):\n{hook}"
+    );
+}
+
+#[test]
+fn android_never_marks_the_blank_and_window_open_path() {
+    // The counter-example the spec names, on the edge whose version of it is a
+    // whole second WebView. `onCreateWindow` recovers the `_blank`/`window.open`
+    // target through a throwaway transport WebView and loads it into the main one
+    // (`docs/adr/0010`), deliberately bypassing the shell. That target is a URL the
+    // PAGE chose, so neither the hook nor its transport client may report a
+    // navigation: marking there would hand any page a settings write with one
+    // `window.open('werust://settings?backend=custom&url=http://attacker/')`.
+    let shell = android_kotlin_shell();
+    let hook = kotlin_block_body(
+        &shell,
+        "override fun onCreateWindow(\n            view: WebView,\n            isDialog: Boolean,\n            isUserGesture: Boolean,\n            resultMsg: Message,\n        ): Boolean",
+    );
+    assert!(
+        hook.contains("webView.loadUrl("),
+        "the slice must really be the in-place routing hook, or this test passes \
+         vacuously:\n{hook}"
+    );
+    assert!(
+        hook.contains("shouldOverrideUrlLoading"),
+        "including its transport WebView's own client, which is where a second \
+         marking site would hide:\n{hook}"
+    );
+    assert!(
+        !hook.contains(THE_ANDROID_KOTLIN_SIGNAL),
+        "the new-window in-place hook must not report a navigation as intent:\n{hook}"
+    );
+    assert!(!hook.contains(THE_DECISION), "nor read a mark:\n{hook}");
+}
+
+#[test]
+fn the_kotlin_block_extractor_stops_at_the_matching_brace() {
+    // The guard ON the guard: the two negative assertions above ("this hook does
+    // NOT mark") are worthless if the slice is empty or mis-bounded, so the
+    // extractor is pinned on a fixture shaped like the trap that once made a
+    // sibling Kotlin guard vacuous — a short `override fun` whose next member is
+    // another `override fun`, with the decoy call further down.
+    let fixture = "\
+class Fixture {
+    override fun onCreateWindow(): Boolean {
+        transport.webViewClient = object : WebViewClient() { }
+        return true
+    }
+
+    override fun shouldOverrideUrlLoading(): Boolean {
+        core.notePageNavigation(\"a\", \"b\", true, true, false)
+        return false
+    }
+}
+";
+    let routing = kotlin_block_body(fixture, "override fun onCreateWindow(): Boolean");
+    assert!(
+        routing.contains("transport.webViewClient"),
+        "the extracted body is the hook's own: {routing:?}"
+    );
+    assert!(
+        !routing.contains(THE_ANDROID_KOTLIN_SIGNAL),
+        "and it STOPS at the matching brace rather than running on into the marking \
+         hook below it (the vacuity this pins): {routing:?}"
+    );
+    let marking = kotlin_block_body(fixture, "override fun shouldOverrideUrlLoading(): Boolean");
+    assert!(marking.contains(THE_ANDROID_KOTLIN_SIGNAL));
+
+    // Braces inside comments and string literals must not unbalance the count.
+    let tricky = "\
+    private fun sample() {
+        // a brace in a comment: }
+        /* and a block one: } */
+        val s = \"a literal brace }\"
+        val t = \"\"\"a raw one }\"\"\"
+        val marker = 1
+    }
+
+    private fun after() {
+        val outside = 2
+    }
+";
+    let body = kotlin_block_body(tricky, "private fun sample()");
+    assert!(
+        body.contains("val marker = 1") && !body.contains("val outside = 2"),
+        "braces inside comments/strings must not end the body early or late; \
+         extracted: {body:?}"
+    );
 }

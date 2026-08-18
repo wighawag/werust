@@ -198,6 +198,53 @@
 //! picking whichever sorted first, which would decide for the user which content
 //! they had trusted.
 //!
+//! # Which NORMALIZATION wrote this store: the stamp, and the corpus
+//!
+//! A key derived from a LIBRARY is only as stable as that library: a version of
+//! `ens-normalize` that changes any mapping re-keys every affected record, the
+//! user's blessed names stop being found, and the next visit records fresh pins
+//! for names they already trusted. A dependency bump would be a trust reset, and
+//! nothing would say so. Two mechanisms make it loud instead (task
+//! `trust-store-pins-normalization-stability-with-a-corpus-and-a-stamp`,
+//! decisions at
+//! `docs/spikes/trust-store-pins-normalization-stability-with-a-corpus-and-a-stamp/DECISIONS.md`):
+//!
+//! 1. **A fixed corpus REDS the gate** (`crates/werust-core/tests/normalization_corpus.rs`):
+//!    a checked-in table of names and the keys [`pin_key`] must produce for them,
+//!    covering the classes that bite a TOFU store (an emoji with and without
+//!    U+FE0F, fullwidth and circled Latin, a mixed-script confusable, an
+//!    invisible-character pair, plain ASCII). Bumping the crate without updating
+//!    the table fails the build, which is the reviewable moment the bump needs.
+//!    That file also carries the maintainer's procedure for a red.
+//! 2. **The document RECORDS which normalization wrote it**
+//!    ([`NORMALIZATION_VERSION`], the `normalizationVersion` member,
+//!    [`TrustedNamePins::normalization_version`]), so a change is DETECTABLE from
+//!    the file rather than inferred from a version somebody remembers running.
+//!
+//! What the two claim is deliberately narrow: the corpus proves the mapping is
+//! what it was when the corpus was written, and the stamp proves which
+//! normalization last WROTE the file. Neither claims the library is correct, and
+//! neither is a migration.
+//!
+//! A store with NO stamp is not an error and not a mismatch: it was written
+//! before stamping existed, and it loads exactly as it always did. The stamp is
+//! an ordinary top-level document member, which is what makes an OLDER build
+//! preserve it: to that build it is simply a member it does not know, carried by
+//! the unknown-member rule above.
+//!
+//! **What a MISMATCH means, and what it does.** A stamp naming a version that is
+//! not this build's says exactly one thing: *the records in this file were keyed
+//! by a different normalization, so a key this build derives may not be the key
+//! that is stored.* It is RECORDED and READABLE
+//! ([`normalization_version_mismatch`](TrustedNamePins::normalization_version_mismatch))
+//! and NOTHING acts on it — it does not make the store undeterminable, does not
+//! block a write, does not re-key, and does not change what the chrome says. That
+//! is the honest minimum: acting on it silently is the trust reset this whole
+//! mechanism exists to prevent, and the read-time re-key already folds an old key
+//! onto today's derivation for every name this build CAN normalize. A surface
+//! that eventually reports it (or a migration that acts on it) inherits a fact it
+//! can read, rather than a version it has to guess.
+//!
 //! # Vocabulary note: "pin"
 //!
 //! `pin` is already used loosely in this crate for "held in place" (the shell
@@ -222,6 +269,29 @@ use crate::debug::{trust_posture_from_wire_name, trust_posture_wire_name};
 /// decision 2: `pins.json` lives NEXT TO `retrieval.json`, one mechanism, one
 /// `WERUST_SETTINGS_DIR` lever, not a second location).
 pub const PINS_FILE: &str = "pins.json";
+
+/// The NORMALIZATION this build keys pins with: the bound `ens-normalize` crate
+/// and the version of it Cargo.lock resolves — the value stamped into every
+/// document [`TrustedNamePins::save_to`] writes.
+///
+/// It names a LIBRARY and a version rather than an abstract "ENSIP-15 revision",
+/// because the library is what actually decides a key: two crates claiming the
+/// same spec revision can still disagree, and the question this stamp answers is
+/// "which code produced the keys in this file?".
+///
+/// It is kept honest by `crates/werust-core/tests/normalization_corpus.rs`, which
+/// reds if it stops naming the version the lockfile resolves — so bumping the
+/// dependency, the corpus and this constant is ONE deliberate change rather than
+/// three chances to forget one.
+pub const NORMALIZATION_VERSION: &str = "ens-normalize 0.1.1";
+
+/// The document member [`NORMALIZATION_VERSION`] is recorded under.
+///
+/// A plain top-level string member, deliberately: that is exactly the shape the
+/// unknown-member rule carries, so a build that does not know this member (every
+/// werust before it existed) preserves it through a read-modify-write instead of
+/// stripping it.
+const NORMALIZATION_VERSION_MEMBER: &str = "normalizationVersion";
 
 // ---------------------------------------------------------------------------
 // The pin value.
@@ -709,6 +779,15 @@ pub struct TrustedNamePins {
     /// fields are public and constructed by literal in three other crates' tests;
     /// see the decisions doc.
     unknown_entry_members: BTreeMap<String, Map<String, Value>>,
+    /// The [`NORMALIZATION_VERSION`] the document this store was READ from was
+    /// written by, or `None` when it carried no stamp (it predates stamping, or
+    /// this store was built in memory and has never been read from a file).
+    ///
+    /// Provenance of the FILE, not content of the store: a save always stamps
+    /// the document with THIS build's version, because this build is the one
+    /// writing it. Reading it back is how a mismatch becomes visible
+    /// ([`normalization_version_mismatch`](TrustedNamePins::normalization_version_mismatch)).
+    normalization_version: Option<String>,
 }
 
 impl TrustedNamePins {
@@ -932,6 +1011,39 @@ impl TrustedNamePins {
         })
     }
 
+    /// The normalization version the document this store was read from was
+    /// WRITTEN by ([`NORMALIZATION_VERSION`]), or `None` when it carried no
+    /// stamp.
+    ///
+    /// `None` is NOT an error and not a mismatch: a store written before
+    /// stamping existed simply says nothing about it, and it loads exactly as it
+    /// always did (the module's stamp note). A store built in memory has never
+    /// been read from a file and says nothing either.
+    #[must_use]
+    pub fn normalization_version(&self) -> Option<&str> {
+        self.normalization_version.as_deref()
+    }
+
+    /// The recorded normalization version when it is NOT this build's, i.e. the
+    /// records in this file were keyed by a DIFFERENT normalization than the one
+    /// [`pin_key`] applies today.
+    ///
+    /// `None` covers both "the same version wrote it" and "it carries no stamp",
+    /// which are the two cases with nothing to report.
+    ///
+    /// Reading this is deliberately all that happens to a mismatch. Nothing in
+    /// werust acts on it: it does not make the store [`UndeterminableTrust`], it
+    /// does not refuse a write, it does not re-key and it does not change what
+    /// the chrome says (the module's stamp note has the reasoning, and
+    /// `a_mismatched_stamp_is_recorded_and_readable_and_changes_nothing_else`
+    /// asserts it). It exists so the surface or migration that eventually DOES
+    /// act on it inherits a fact instead of a guess.
+    #[must_use]
+    pub fn normalization_version_mismatch(&self) -> Option<&str> {
+        self.normalization_version()
+            .filter(|recorded| *recorded != NORMALIZATION_VERSION)
+    }
+
     /// How many names are blessed.
     #[must_use]
     pub fn len(&self) -> usize {
@@ -954,6 +1066,11 @@ impl TrustedNamePins {
     /// ([`trust_posture_wire_name`]) the chrome JSON and the debug view's Network
     /// tab already speak (`docs/adr/0006`), so the store never mints a second
     /// spelling of a posture.
+    ///
+    /// The document also records WHICH normalization wrote it
+    /// (`"normalizationVersion":"<`[`NORMALIZATION_VERSION`]`>"`), always this
+    /// build's: a save is this build writing the file, so the stamp it leaves is
+    /// its own, whatever the document it replaces said (the module's stamp note).
     ///
     /// The unknown members are written FIRST and the fields werust owns second,
     /// so a preserved member can never shadow a field this build is authoritative
@@ -981,6 +1098,10 @@ impl TrustedNamePins {
             .collect();
         let mut document = self.unknown_document_members.clone();
         document.insert("pins".to_string(), Value::Array(pins));
+        document.insert(
+            NORMALIZATION_VERSION_MEMBER.to_string(),
+            json!(NORMALIZATION_VERSION),
+        );
         Value::Object(document).to_string()
     }
 
@@ -993,7 +1114,12 @@ impl TrustedNamePins {
     /// read honestly (no name, no CID, no timestamp, a posture spelling this build
     /// does not know) is [`UnreadableEntry`](UndeterminableTrust::UnreadableEntry),
     /// and two entries for one key are
-    /// [`DuplicateName`](UndeterminableTrust::DuplicateName). Dropping any of them
+    /// [`DuplicateName`](UndeterminableTrust::DuplicateName). A
+    /// `normalizationVersion` that is not a STRING is not this wire form either,
+    /// and is reported for the same reason the `pins` member's type is: this
+    /// build owns that member's spelling and would otherwise overwrite a value it
+    /// could not read. A MISSING stamp is not a failure at all — it predates
+    /// stamping (the module's stamp note). Dropping any of them
     /// would be silent: the next save persists the survivors, so a build that met
     /// a fifth [`TrustPosture`] would un-trust every name recorded under it.
     pub fn from_json(text: &str) -> Result<Self, UndeterminableTrust> {
@@ -1018,15 +1144,29 @@ impl TrustedNamePins {
                 duplicate[0].name.clone(),
             ));
         }
-        // Everything BESIDE `pins`: carried, not understood, and written back
-        // untouched (the module's unknown-member note). `value` is an object here,
-        // because a non-object has no `pins` member to have got this far.
+        // WHICH normalization wrote this document, if it says. Absent is the
+        // ordinary case for a store written before stamping existed, and is not a
+        // failure; present-but-not-a-string is a document that is not this wire
+        // form, reported rather than silently replaced on the next save.
+        let normalization_version = match value.get(NORMALIZATION_VERSION_MEMBER) {
+            None => None,
+            Some(Value::String(recorded)) => Some(recorded.clone()),
+            Some(other) => {
+                return Err(UndeterminableTrust::Unparseable(format!(
+                    "`{NORMALIZATION_VERSION_MEMBER}` is not a string: `{other}`"
+                )))
+            }
+        };
+        // Everything BESIDE the members this build OWNS: carried, not understood,
+        // and written back untouched (the module's unknown-member note). `value`
+        // is an object here, because a non-object has no `pins` member to have got
+        // this far.
         let unknown_document_members = value
             .as_object()
             .map(|document| {
                 document
                     .iter()
-                    .filter(|(member, _)| member.as_str() != "pins")
+                    .filter(|(member, _)| !KNOWN_DOCUMENT_MEMBERS.contains(&member.as_str()))
                     .map(|(member, carried)| (member.clone(), carried.clone()))
                     .collect()
             })
@@ -1035,6 +1175,7 @@ impl TrustedNamePins {
             pins,
             unknown_document_members,
             unknown_entry_members,
+            normalization_version,
         })
     }
 }
@@ -1117,6 +1258,15 @@ fn read_entry(
 /// [`TrustedNamePin`]. Everything else in an entry is a later build's, and is
 /// carried through untouched.
 const KNOWN_ENTRY_MEMBERS: [&str; 4] = ["name", "cid", "blessedAt", "posture"];
+
+/// The DOCUMENT members THIS build owns and re-serializes itself: the pins, and
+/// the stamp saying which normalization wrote them. Everything else at the top
+/// level is a later build's, and is carried through untouched.
+///
+/// Every werust before the stamp existed knew only `pins`, so `normalizationVersion`
+/// was — to it — an unknown member, which is exactly why an older build
+/// preserves a newer one's stamp instead of stripping it.
+const KNOWN_DOCUMENT_MEMBERS: [&str; 2] = ["pins", NORMALIZATION_VERSION_MEMBER];
 
 /// The name of the temp file a save writes before renaming it onto `pins.json`,
 /// in the SAME directory (see [`TrustedNamePins::save_to`]).
@@ -1266,6 +1416,24 @@ mod tests {
         let hash = cid::multihash::Multihash::<64>::wrap(root.hash().code(), &digest)
             .expect("a 32-byte sha2-256 multihash");
         fetcher::Cid::new_v1(root.codec(), hash)
+    }
+
+    /// `pins` as it READS BACK after this build saves it: the same value, plus
+    /// the normalization stamp the save writes ([`NORMALIZATION_VERSION`], the
+    /// module's stamp note).
+    ///
+    /// A save STAMPS the document with the version that wrote it, so a store
+    /// built in memory (no stamp) or loaded from a document written before
+    /// stamping existed is deliberately NOT equal to what comes back off disk:
+    /// the file now records something it did not record before. The tests that
+    /// assert a save round-trips say so through this helper rather than dropping
+    /// the stamp out of the comparison, which would stop them noticing if a save
+    /// ever failed to stamp.
+    fn as_read_back(pins: &TrustedNamePins) -> TrustedNamePins {
+        TrustedNamePins {
+            normalization_version: Some(NORMALIZATION_VERSION.to_string()),
+            ..pins.clone()
+        }
     }
 
     /// Every file name in a scratch directory, sorted: what a test asserts a save
@@ -1617,7 +1785,7 @@ mod tests {
         // IDEMPOTENT: a second launch re-keys nothing, and a re-save is byte for
         // byte the same document.
         let reloaded = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
-        assert_eq!(reloaded, pins);
+        assert_eq!(reloaded, as_read_back(&pins));
         assert_eq!(reloaded.to_json(), pins.to_json());
         assert_eq!(reloaded.save_to(&scratch.path), PinSaveOutcome::Recorded);
         assert_eq!(
@@ -2058,7 +2226,7 @@ mod tests {
         assert!(pins.save_to(&scratch.path).is_recorded());
         assert_eq!(
             TrustedNamePins::load_from(&scratch.path),
-            Ok(pins),
+            Ok(as_read_back(&pins)),
             "a readable store still round-trips"
         );
     }
@@ -2080,7 +2248,7 @@ mod tests {
             .expect("a name werust can key");
         }
         let round_tripped = TrustedNamePins::from_json(&pins.to_json()).expect("a readable store");
-        assert_eq!(round_tripped, pins);
+        assert_eq!(round_tripped, as_read_back(&pins));
         assert_eq!(round_tripped.len(), TrustPosture::ALL.len());
 
         // The document is STABLE: an unchanged store re-serializes byte-identically
@@ -2157,7 +2325,7 @@ mod tests {
         assert_eq!(outcome, PinSaveOutcome::Recorded);
         assert_eq!(
             TrustedNamePins::load_from(&scratch.path),
-            Ok(next),
+            Ok(as_read_back(&next)),
             "the renamed document IS the store"
         );
         assert_eq!(
@@ -2217,7 +2385,7 @@ mod tests {
         );
         assert_eq!(
             TrustedNamePins::load_from(&scratch.path),
-            Ok(previous),
+            Ok(as_read_back(&previous)),
             "and still readable, so the next write is not blocked either"
         );
         assert_eq!(
@@ -2238,6 +2406,13 @@ mod tests {
         // and the store's whole shape follows from it), so an OLDER build must
         // never silently strip what a NEWER one wrote, at BOTH levels the
         // document has: the document itself, and each entry.
+        //
+        // The document-level fixture member is deliberately one NO build will
+        // ever own. It used to be `normalizationVersion`, which the very next
+        // task in this chain made REAL: the moment it did, this test stopped
+        // asserting what it says, because its example of "a member this build
+        // does not know" was one this build knows. A fixture whose whole job is
+        // to be unknown must not be a name anybody would plausibly implement.
         let scratch = ScratchDir::new("unknown-members");
         std::fs::create_dir_all(&scratch.path).unwrap();
         let written_by_a_later_build = r#"{
@@ -2250,7 +2425,7 @@ mod tests {
                     "retainedContent": {"path": "blobs/abc", "bytes": 1234}
                 }
             ],
-            "normalizationVersion": "ensip15-2026",
+            "somethingNoWerustWillEverImplement": {"kind": "a later build's own", "count": 2},
             "writtenBy": "werust 9.9.9"
         }"#;
         std::fs::write(scratch.path.join(PINS_FILE), written_by_a_later_build).unwrap();
@@ -2267,11 +2442,18 @@ mod tests {
         let text = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
         let document: Value = serde_json::from_str(&text).expect("still one JSON document");
         assert_eq!(
-            document["normalizationVersion"],
-            json!("ensip15-2026"),
+            document["somethingNoWerustWillEverImplement"],
+            json!({"kind": "a later build's own", "count": 2}),
             "an unknown TOP-LEVEL member survives, unchanged: {text}"
         );
         assert_eq!(document["writtenBy"], json!("werust 9.9.9"));
+        // The other side of the same rule: a member werust DOES own is werust's
+        // to write, and this save is the one that wrote the file.
+        assert_eq!(
+            document[NORMALIZATION_VERSION_MEMBER],
+            json!(NORMALIZATION_VERSION),
+            "the stamp names the normalization that wrote THIS document: {text}"
+        );
 
         let entries = document["pins"].as_array().expect("the `pins` array");
         assert_eq!(entries.len(), 2);
@@ -2301,7 +2483,270 @@ mod tests {
 
         // The residue is READ back too, so it survives any number of round trips
         // rather than only the first.
-        assert_eq!(TrustedNamePins::load_from(&scratch.path), Ok(pins));
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(as_read_back(&pins))
+        );
+    }
+
+    #[test]
+    fn the_store_records_which_normalization_version_wrote_it() {
+        // Acceptance: the persisted document records the normalization that wrote
+        // it, so a mapping change is DETECTABLE from the file rather than inferred
+        // from whichever build somebody remembers running. The keys in a
+        // `pins.json` are a LIBRARY's output (`pin_key` -> `ens-normalize`), and
+        // nothing else in the file says which library produced them.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("stamp");
+        let mut pins = TrustedNamePins::default();
+        pins.bless("ronan.eth", "bafyone", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
+        assert_eq!(
+            pins.normalization_version(),
+            None,
+            "a store built in memory has been read from no document, so it reports no stamp"
+        );
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+
+        let text = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
+        let document: Value = serde_json::from_str(&text).expect("one JSON document");
+        assert_eq!(
+            document[NORMALIZATION_VERSION_MEMBER],
+            json!(NORMALIZATION_VERSION),
+            "the document names the normalization that wrote it: {text}"
+        );
+        assert_eq!(
+            NORMALIZATION_VERSION_MEMBER, "normalizationVersion",
+            "the member name is a WIRE contract: an older build carries it by name"
+        );
+
+        let reloaded = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        assert_eq!(
+            reloaded.normalization_version(),
+            Some(NORMALIZATION_VERSION)
+        );
+        assert_eq!(
+            reloaded.normalization_version_mismatch(),
+            None,
+            "the version that wrote it IS this build's: nothing to report"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_store_with_no_stamp_still_loads_because_it_predates_stamping() {
+        // Acceptance: the stamp must not invalidate what is already on disk. Every
+        // `pins.json` written before this change carries no `normalizationVersion`
+        // at all, and "written before stamping existed" is a fact, not a fault: it
+        // loads, its pins are read, and it is not a mismatch either (there is
+        // nothing to mismatch WITH). Treating it as corrupt would be this task
+        // destroying the very records it exists to protect.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("unstamped");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            r#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1800000000,"posture":"name-via-trusted-rpc"}]}"#,
+        )
+        .unwrap();
+
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("an unstamped store reads");
+        assert_eq!(pins.len(), 1, "and its records are all there");
+        assert_eq!(pins.normalization_version(), None, "it predates stamping");
+        assert_eq!(
+            pins.normalization_version_mismatch(),
+            None,
+            "no stamp is not a MISMATCH: there is nothing recorded to disagree with"
+        );
+        assert!(
+            pins.check("ronan.eth", "bafyold")
+                .expect("a name werust can key")
+                .is_unchanged(),
+            "and it answers exactly as it always did"
+        );
+
+        // The next ordinary write stamps it: nothing is migrated, the file simply
+        // records the build that last wrote it.
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path)
+                .expect("a readable store")
+                .normalization_version(),
+            Some(NORMALIZATION_VERSION)
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_stamp_is_recorded_and_readable_and_changes_nothing_else() {
+        // The stated decision, asserted so the CODE matches the statement (the
+        // module's stamp note): a stamp naming a normalization that is not this
+        // build's is RECORDED and READABLE, and nothing acts on it. It does not
+        // make the store undeterminable, does not refuse a write, does not re-key
+        // and does not change a single answer the store gives. Acting on it
+        // silently would be the trust reset the corpus + stamp exist to prevent;
+        // reporting it is a surface's job, and there is no trust-management
+        // surface yet.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("stamp-mismatch");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            r#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1800000000,"posture":"name-via-trusted-rpc"}],
+                "normalizationVersion":"ens-normalize 0.0.1"}"#,
+        )
+        .unwrap();
+
+        let mut pins = TrustedNamePins::load_from(&scratch.path)
+            .expect("a store another normalization wrote is READABLE, not corrupt");
+        assert_eq!(
+            pins.normalization_version(),
+            Some("ens-normalize 0.0.1"),
+            "what wrote it is readable from the file"
+        );
+        assert_eq!(
+            pins.normalization_version_mismatch(),
+            Some("ens-normalize 0.0.1"),
+            "and it is legible AS a mismatch, without anybody deriving it twice"
+        );
+        assert_eq!(pins.len(), 1, "every record is still read");
+        assert!(
+            pins.check("ronan.eth", "bafyold")
+                .expect("a name werust can key")
+                .is_unchanged(),
+            "and the store's answers are untouched by the mismatch"
+        );
+
+        // The write is not refused either, and the document it leaves names the
+        // build that wrote it — this one.
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        let reloaded = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        assert_eq!(
+            reloaded.normalization_version(),
+            Some(NORMALIZATION_VERSION)
+        );
+        assert_eq!(
+            reloaded.normalization_version_mismatch(),
+            None,
+            "the stamp follows the WRITER, so it stops disagreeing once this build has written"
+        );
+        assert_eq!(reloaded.len(), 2);
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_stamp_survives_a_rewrite_by_a_build_that_does_not_know_it() {
+        // Acceptance: an OLDER werust rewriting the store must not STRIP the stamp
+        // a newer one wrote — the same two-versions-as-two-processes rule the
+        // unknown-member preservation follows. That older build cannot be linked
+        // into this test, so what is asserted is the MECHANISM it applies, in the
+        // two halves the claim rests on:
+        //
+        // 1. What a build carries is decided by ONE thing, its known-member set.
+        //    This change added exactly ONE member to it, so every werust before it
+        //    knew only `pins` — to all of them the stamp is an unknown member.
+        // 2. An unknown top-level member survives a read-modify-write untouched.
+        //    Exercised here on a member shaped exactly like the stamp (a plain
+        //    top-level string this build does not know), through the very carrier
+        //    an older build would run
+        //    (`trust-store-writes-atomically-and-keeps-fields-it-does-not-know`).
+        assert_eq!(
+            KNOWN_DOCUMENT_MEMBERS,
+            ["pins", NORMALIZATION_VERSION_MEMBER],
+            "the stamp is the ONE document member this change added, so every earlier build \
+             treats it as unknown and therefore carries it"
+        );
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("stamp-carried");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        // A stamp-SHAPED member this build does not know: what `normalizationVersion`
+        // itself looks like to a build written before it existed.
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            r#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1,"posture":"mutable-name"}],
+                "someLaterBuildsVersionStamp":"a-normalizer 9.9.9"}"#,
+        )
+        .unwrap();
+
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+
+        let text = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
+        let document: Value = serde_json::from_str(&text).expect("one JSON document");
+        assert_eq!(
+            document["someLaterBuildsVersionStamp"],
+            json!("a-normalizer 9.9.9"),
+            "a version stamp this build does not know rides the carrier untouched: {text}"
+        );
+        // And the stamp really is a member of exactly that class: one plain
+        // top-level string, no nesting and no sidecar, so there is nothing about
+        // it an older reader could fail to carry.
+        assert!(
+            document[NORMALIZATION_VERSION_MEMBER].is_string(),
+            "the stamp is a plain top-level string member: {text}"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_stamp_that_is_not_a_string_is_reported_rather_than_silently_replaced() {
+        // A member werust OWNS, carrying a value werust cannot read, is a document
+        // that is not this wire form — the same answer a `pins` member that is not
+        // an array gets. It matters because this build would otherwise overwrite
+        // that value with its own stamp on the next save: reporting it keeps the
+        // store's rule (report, never silently shrink) whole, and the write
+        // refuses while it holds, so the bytes stay on disk for whoever looks.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("stamp-not-a-string");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let odd = br#"{"pins":[],"normalizationVersion":15}"#;
+        std::fs::write(scratch.path.join(PINS_FILE), odd).unwrap();
+
+        let why = TrustedNamePins::load_from(&scratch.path).expect_err("not this wire form");
+        assert!(
+            matches!(&why, UndeterminableTrust::Unparseable(detail)
+                if detail.contains(NORMALIZATION_VERSION_MEMBER)),
+            "it says WHICH member it could not read: {why:?}"
+        );
+        let mut pins = TrustedNamePins::default();
+        pins.bless("ronan.eth", "bafynew", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
+        assert!(matches!(
+            pins.save_to(&scratch.path),
+            PinSaveOutcome::Refused(_)
+        ));
+        assert_eq!(
+            std::fs::read(scratch.path.join(PINS_FILE)).unwrap(),
+            odd,
+            "and nothing is overwritten while it holds"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
     }
 
     #[test]

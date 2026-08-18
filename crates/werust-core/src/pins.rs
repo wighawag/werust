@@ -100,10 +100,10 @@
 //!    OOM kill or a full disk mid-write leaves the PREVIOUS document, not a
 //!    truncated one. Same directory is load-bearing (a rename is atomic only
 //!    within one filesystem), and the temp file is removed on the failure path.
-//!    Atomicity is not mutual exclusion: two windows can still LOSE an update,
-//!    which the advisory lock of
-//!    `trust-store-serialises-read-modify-write-so-no-bless-is-lost` owns. This
-//!    makes that loss clean instead of corrupt.
+//!    Atomicity is not mutual exclusion, and never claimed to be: what stops two
+//!    windows LOSING an update is the write lock described below, and this is
+//!    what makes the CRASH it does own leave a whole document rather than a
+//!    truncated one.
 //! 2. **A field this build does not know is CARRIED, never stripped.** Two werust
 //!    versions are two processes (the same fact the whole read-modify-write shape
 //!    follows from), so an OLDER build re-writing the document must not delete
@@ -119,6 +119,59 @@
 //!    trust-management surface and building one is out of scope, so the taxonomy
 //!    exists (and is propagated through the shell's bless path) so that surface is
 //!    not blocked on a plumbing change when it arrives.
+//!
+//! # One writer at a time: the store's WRITE LOCK
+//!
+//! A bless is a READ-MODIFY-WRITE — re-read the document, insert, write the
+//! whole thing back — and two windows are a supported configuration (a second
+//! launch opens a second window, and two VERSIONS are two processes). With no
+//! mutual exclusion, B reads before A writes and then B's whole document lands
+//! on top of A's: A's record is GONE, silently, and the user goes on believing a
+//! name is blessed that nothing will ever warn about. That is the one direction
+//! of failure a TOFU store must not have, and the atomic write above does not
+//! prevent it — it only makes the loss clean instead of corrupt (task
+//! `trust-store-serialises-read-modify-write-so-no-bless-is-lost`, decisions at
+//! `docs/spikes/trust-store-serialises-read-modify-write-so-no-bless-is-lost/DECISIONS.md`).
+//!
+//! So the READ and the SAVE of one check-and-record happen inside ONE critical
+//! section ([`TrustedNamePins::update_in`], the only way this module mutates a
+//! store on disk), and the four questions a lock has to answer are answered
+//! HERE rather than left to each caller to remember:
+//!
+//! 1. **What is locked, and with what.** An advisory lock on a SIBLING file
+//!    ([`PINS_LOCK_FILE`], `pins.lock`, beside `pins.json`), taken with the
+//!    standard library's own `File::try_lock` — `flock(2)` on Unix,
+//!    `LockFileEx` on Windows. That is the PLATFORM primitive, so this costs no
+//!    dependency at all. It is a sibling and deliberately NOT `pins.json`
+//!    itself, for two independent reasons: a save RENAMES a new file over the
+//!    store, so a lock held on the old inode would guard nothing the next writer
+//!    opens; and creating `pins.json` merely to have something to lock would
+//!    turn a fresh install into an EMPTY file, which this store reads as
+//!    undeterminable and then refuses to write over.
+//! 2. **It serialises PROCESSES, which is the case that loses pins.** The lock
+//!    lives on the open file DESCRIPTION, so two windows in two processes
+//!    contend — and so do two shells inside ONE process, because each opens the
+//!    lock file for itself. An in-process mutex would have proven nothing about
+//!    the real contenders while still passing a thread-based test, which is why
+//!    the test that guards this drives a SECOND PROCESS.
+//! 3. **A lock that cannot be taken is BOUNDED, and said out loud.** A writer
+//!    retries for [`WRITE_LOCK_WAIT`] and then gives up with
+//!    [`CouldNotPersist`](PinSaveOutcome::CouldNotPersist): never an indefinite
+//!    wait (a browser must not freeze because another window is wedged) and
+//!    never a silent skip. Nothing is written, and nothing is applied in memory
+//!    either, because the store was never READ — so the action can simply be
+//!    repeated, which is the honest answer to a moment of contention.
+//! 4. **A lock a DEAD process left behind releases itself.** The lock is the
+//!    operating system's, held on a descriptor, so a crash, an OOM kill or a
+//!    `SIGKILL` releases it exactly as an orderly exit does. The only residue is
+//!    an empty `pins.lock`, which holds nothing and blocks nobody. That is
+//!    precisely why this binds an OS lock instead of hand-rolling a
+//!    create-a-lock-FILE-exclusively protocol, whose stale entries can only be
+//!    broken by guessing at an age, and whose guess is another race.
+//!
+//! READERS take no lock. The write is atomic, so a reader observes one whole
+//! document or the previous one and never a torn one; making every navigation's
+//! read queue behind a writer would put a lock in the load path to buy nothing.
 //!
 //! # One content root, more than one CID spelling
 //!
@@ -269,6 +322,39 @@ use crate::debug::{trust_posture_from_wire_name, trust_posture_wire_name};
 /// decision 2: `pins.json` lives NEXT TO `retrieval.json`, one mechanism, one
 /// `WERUST_SETTINGS_DIR` lever, not a second location).
 pub const PINS_FILE: &str = "pins.json";
+
+/// The advisory-lock file every WRITER of the store takes before it reads and
+/// holds until it has saved, in the SAME directory as [`PINS_FILE`] (the
+/// module's one-writer note; [`TrustedNamePins::update_in`] is the critical
+/// section).
+///
+/// A file of its own rather than a lock on `pins.json`, because a save renames a
+/// NEW file over the store (a lock on the replaced inode would guard nothing)
+/// and because creating `pins.json` just to lock it would make a fresh install
+/// look like an unreadable store. It is empty, it is never deleted (deleting a
+/// lock file is a race, not tidiness), and it holds nothing while no process has
+/// it locked.
+pub const PINS_LOCK_FILE: &str = "pins.lock";
+
+/// How long a writer waits for [`PINS_LOCK_FILE`] before giving up and saying so
+/// through [`PinSaveOutcome::CouldNotPersist`].
+///
+/// The bound is the whole point: a browser must never hang because another
+/// window is wedged mid-save, and it must never skip the write silently either.
+/// Two seconds is far longer than the critical section it guards (one small read
+/// plus one small write, microseconds when nothing else is running, milliseconds
+/// on a slow disk), so an honest contender always gets in; and it is short
+/// enough that a user who did hit the pathological case gets an answer rather
+/// than a frozen window.
+pub const WRITE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a writer sleeps between two attempts at [`PINS_LOCK_FILE`].
+///
+/// The wait is a bounded POLL rather than a blocking lock because neither
+/// platform primitive offers a lock-with-timeout, and a blocking `flock` cannot
+/// be cancelled once it is entered — which is exactly the indefinite hang
+/// [`WRITE_LOCK_WAIT`] exists to forbid.
+const WRITE_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// The NORMALIZATION this build keys pins with: the bound `ens-normalize` crate
 /// and the version of it Cargo.lock resolves — the value stamped into every
@@ -599,11 +685,21 @@ pub enum PinSaveOutcome {
     NothingToRecord,
     /// There was something to record and it did not reach disk: no settings
     /// directory on this system, no durable store on this shell, a full disk, a
-    /// permission error, an interrupted write. Carries a legible reason.
+    /// permission error, an interrupted write, or another window holding the
+    /// store's [`WriteLock`] for longer than [`WRITE_LOCK_WAIT`]. Carries a
+    /// legible reason.
     ///
     /// NOT a policy decision: werust WOULD have written it. That distinction is
     /// the whole reason [`Refused`](PinSaveOutcome::Refused) is a separate
     /// variant.
+    ///
+    /// The bless still holds for THIS session in every case EXCEPT the contended
+    /// one, where the store was never read, so nothing was applied in memory
+    /// either and the action can simply be repeated. Contention is deliberately
+    /// not a variant of its own: to everyone who could read this it says the same
+    /// thing a full disk says ("werust would have written it and could not"), and
+    /// there is no surface, and no retry, that would branch on the difference —
+    /// see the task's decisions doc.
     CouldNotPersist(String),
     /// werust REFUSED to write, because the store on disk cannot be READ
     /// (`docs/adr/0014`): overwriting it is how ONE transient failure permanently
@@ -652,6 +748,152 @@ impl PinSaveOutcome {
                  there are not lost"
             )),
             Self::Unkeyable(why) => Some(format!("nothing was written, because {why}")),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The write lock: one check-and-record at a time.
+// ---------------------------------------------------------------------------
+
+/// The store's advisory WRITE LOCK, held for as long as this value lives: one
+/// check-and-record is one critical section (the module's one-writer note).
+///
+/// It is the operating system's lock on [`PINS_LOCK_FILE`], taken through the
+/// standard library (`flock(2)` on Unix, `LockFileEx` on Windows) and therefore
+/// held on the open file DESCRIPTION — which is what makes it serialise two
+/// PROCESSES (two windows, two versions) and, because each holder opens the file
+/// for itself, two shells inside one process as well.
+///
+/// Releasing it is not a step anybody can forget: the lock is released when the
+/// descriptor closes, so it goes away when this value is dropped, when the
+/// thread unwinds, and when the PROCESS DIES — crash, OOM kill or `SIGKILL`
+/// alike. A lock file left behind by a dead process therefore blocks nothing;
+/// only the empty file remains.
+struct WriteLock {
+    /// The directory whose store this lock guards, so a writer holding the lock
+    /// cannot be handed a DIFFERENT directory to write into.
+    dir: std::path::PathBuf,
+    /// The locked handle. Never read or written — the file's CONTENT is
+    /// meaningless; it exists only to carry the lock, and to be closed.
+    _file: std::fs::File,
+}
+
+impl WriteLock {
+    /// Take the lock for the store in `dir`, waiting at most [`WRITE_LOCK_WAIT`],
+    /// or say WHY not in the words [`PinSaveOutcome::CouldNotPersist`] carries.
+    ///
+    /// `dir` must already exist ([`prepare_and_lock`] is the pairing that makes
+    /// sure of it).
+    fn acquire(dir: &std::path::Path) -> Result<Self, String> {
+        let path = dir.join(PINS_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            // Never truncate: the file is a lock, not a document, and another
+            // process may be holding this very file right now.
+            .truncate(false)
+            .open(&path)
+            .map_err(|err| format!("{PINS_LOCK_FILE} could not be opened: {err}"))?;
+        let deadline = std::time::Instant::now() + WRITE_LOCK_WAIT;
+        loop {
+            match file.try_lock() {
+                Ok(()) => {
+                    return Ok(Self {
+                        dir: dir.to_path_buf(),
+                        _file: file,
+                    })
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "another werust window was recording a trusted name and did not \
+                             finish within {}s, so nothing was written and nothing was lost \
+                             (the bless can simply be repeated)",
+                            WRITE_LOCK_WAIT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(WRITE_LOCK_POLL);
+                }
+                Err(std::fs::TryLockError::Error(err)) => {
+                    return Err(format!("{PINS_LOCK_FILE} could not be locked: {err}"))
+                }
+            }
+        }
+    }
+}
+
+/// Make sure `dir` exists and TAKE the store's [`WriteLock`] there, or the
+/// [`PinSaveOutcome`] that says why neither happened.
+///
+/// The one place both mutating entry points ([`TrustedNamePins::save_to`] and
+/// [`TrustedNamePins::update_in`]) start, so no writer can reach the document
+/// without the lock: the private write core takes a `&WriteLock` it cannot
+/// fabricate, which turns "remember to lock" into something the compiler asks
+/// for.
+fn prepare_and_lock(dir: &std::path::Path) -> Result<WriteLock, PinSaveOutcome> {
+    if dir.as_os_str().is_empty() {
+        return Err(PinSaveOutcome::CouldNotPersist(
+            "there is no directory to record into".to_string(),
+        ));
+    }
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        return Err(PinSaveOutcome::CouldNotPersist(err.to_string()));
+    }
+    WriteLock::acquire(dir).map_err(PinSaveOutcome::CouldNotPersist)
+}
+
+/// What ONE read-modify-write critical section did
+/// ([`TrustedNamePins::update_in`] / [`update`](TrustedNamePins::update)): the
+/// store as it now stands IN MEMORY, and what happened to the WRITE.
+///
+/// Two answers rather than one because they are genuinely independent, and the
+/// caller (the shell, whose `pins` field is a read-through cache) needs both: a
+/// bless that could not be persisted still happened, while a bless that was
+/// REFUSED — or one whose critical section never opened — did not happen at all
+/// and must not be shown as if it had.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinStoreUpdate {
+    /// The store AS IT NOW STANDS for the caller to cache: the re-read document
+    /// plus the change, or `None` when nothing was applied anywhere.
+    ///
+    /// `None` is not "empty": it means the change never ran against a store the
+    /// writer could trust — the document could not be read
+    /// ([`Refused`](PinSaveOutcome::Refused)), the name had no key
+    /// ([`Unkeyable`](PinSaveOutcome::Unkeyable)), or the write lock could not be
+    /// taken within [`WRITE_LOCK_WAIT`]. A caller keeps whatever it already had.
+    pub pins: Option<TrustedNamePins>,
+    /// What happened to the write, in the same vocabulary a plain
+    /// [`save_to`](TrustedNamePins::save_to) speaks.
+    pub outcome: PinSaveOutcome,
+}
+
+impl PinStoreUpdate {
+    /// The update performed by a caller with NOWHERE DURABLE to write: the change
+    /// is applied to `cached` in memory and `why` is reported as
+    /// [`CouldNotPersist`](PinSaveOutcome::CouldNotPersist).
+    ///
+    /// This is [`PinStoreRead::NoStore`]'s rule seen from the write side: with no
+    /// file that could have superseded them, the caller's in-memory pins ARE the
+    /// truth, so the bless holds for this session and simply cannot survive a
+    /// relaunch. It takes no lock, because there is nothing to serialise: no file
+    /// is touched, and the only writer of that in-memory store is its owner.
+    pub(crate) fn in_memory_only(
+        cached: &TrustedNamePins,
+        change: impl FnOnce(&mut TrustedNamePins) -> Result<(), UnkeyableName>,
+        why: &str,
+    ) -> Self {
+        let mut pins = cached.clone();
+        match change(&mut pins) {
+            Ok(()) => Self {
+                pins: Some(pins),
+                outcome: PinSaveOutcome::CouldNotPersist(why.to_string()),
+            },
+            Err(unkeyable) => Self {
+                pins: None,
+                outcome: PinSaveOutcome::Unkeyable(unkeyable),
+            },
         }
     }
 }
@@ -757,8 +999,8 @@ pub fn pin_key(name: &str) -> Result<String, UnkeyableName> {
 /// Deliberately minimal, exactly like [`RetrievalSettings`](crate::retrieval::RetrievalSettings)
 /// (settled decision 2 is "reuse that mechanism verbatim", not "build a
 /// database"): a sorted list of pins, [`load`](TrustedNamePins::load) /
-/// [`save`](TrustedNamePins::save) — the ONE pair that knows the store lives in
-/// the settings directory — plus the directory-taking cores tests drive.
+/// [`update`](TrustedNamePins::update) — the ONE pair that knows the store lives
+/// in the settings directory — plus the directory-taking cores tests drive.
 /// A MISSING file loads as EMPTY (a fresh install), while an UNREADABLE one
 /// yields [`UndeterminableTrust`] rather than a silent empty store, and blocks
 /// the write while it holds (see the module's fail-safe note).
@@ -834,25 +1076,15 @@ impl TrustedNamePins {
         }
     }
 
-    /// Persist the pins to the settings directory, creating it if needed, and say
-    /// WHAT happened ([`PinSaveOutcome`]): recorded, could not be persisted (no
-    /// settings directory on this system, or the write failed), or REFUSED because
-    /// the store on disk cannot be read (see [`save_to`](TrustedNamePins::save_to)).
+    /// Persist the pins to a SPECIFIC directory, creating it if needed, and say
+    /// WHAT happened ([`PinSaveOutcome`]).
     ///
-    /// Only the first survives a relaunch; in every other case the bless still
-    /// took effect for THIS session, it just could not be recorded.
-    pub fn save(&self) -> PinSaveOutcome {
-        match crate::retrieval::settings_dir() {
-            Some(dir) => self.save_to(&dir),
-            None => {
-                PinSaveOutcome::CouldNotPersist("this system has no settings directory".to_string())
-            }
-        }
-    }
-
-    /// Persist the pins to a SPECIFIC directory (the directory-taking core
-    /// [`save`](TrustedNamePins::save) delegates to), creating it if needed, and
-    /// say WHAT happened ([`PinSaveOutcome`]).
+    /// There is deliberately no settings-directory `save` beside
+    /// [`load`](TrustedNamePins::load) any more: writing the USER's store means
+    /// [`update`](TrustedNamePins::update), which re-reads it under the same lock
+    /// it writes under. A bare "write this document to the user's store" is the
+    /// stale whole-file snapshot the whole shape exists to prevent, and leaving
+    /// one reachable is leaving two ways to write one store.
     ///
     /// # The write is ATOMIC: a temp file beside the store, renamed over it
     ///
@@ -882,8 +1114,110 @@ impl TrustedNamePins {
     /// Neither the refusal nor a failed write is an ERROR: the bless holds for
     /// THIS session and simply cannot survive a relaunch, because a store werust
     /// cannot read or write must not break browsing.
+    ///
+    /// # The write takes the store's WRITE LOCK
+    ///
+    /// It is one writer at a time (the module's one-writer note), bounded by
+    /// [`WRITE_LOCK_WAIT`]. A save of a store that was read OUTSIDE the lock is
+    /// still a read-modify-write with a hole in it, though, so this is the entry
+    /// point for writing a document a caller already HAS; a check-and-record
+    /// goes through [`update_in`](TrustedNamePins::update_in), which holds the
+    /// same lock across the read as well.
     pub fn save_to(&self, dir: &std::path::Path) -> PinSaveOutcome {
         self.save_to_through(dir, write_document)
+    }
+
+    /// Read-modify-write the USER's store as ONE critical section: the settings
+    /// directory's [`update_in`](TrustedNamePins::update_in), the write-side twin
+    /// of [`load`](TrustedNamePins::load).
+    ///
+    /// This and [`load`](TrustedNamePins::load) are the only sites that know
+    /// where the user's `pins.json` is; a caller asks for a check-and-record
+    /// rather than deriving the directory and sequencing the steps itself, which
+    /// is what keeps the lock un-forgettable.
+    ///
+    /// With no settings directory on this system there is nothing to lock and
+    /// nothing to read, so `cached` (the caller's in-memory store, which nothing
+    /// on disk could have superseded) is what the change is applied to — see
+    /// [`PinStoreUpdate::in_memory_only`].
+    pub fn update(
+        cached: &Self,
+        change: impl FnOnce(&mut Self) -> Result<(), UnkeyableName>,
+    ) -> PinStoreUpdate {
+        match crate::retrieval::settings_dir() {
+            Some(dir) => Self::update_in(&dir, change),
+            None => PinStoreUpdate::in_memory_only(
+                cached,
+                change,
+                "this system has no settings directory",
+            ),
+        }
+    }
+
+    /// Read-modify-write the store in a SPECIFIC directory as ONE critical
+    /// section: take the write lock, RE-READ the document, apply `change`, save,
+    /// release. The check-and-record every mutation of a durable store goes
+    /// through (the module's one-writer note).
+    ///
+    /// # Why the read is INSIDE the lock
+    ///
+    /// Re-reading before writing is what stops a stale whole-file snapshot from
+    /// erasing another window's records; holding the lock ACROSS that read is
+    /// what stops the subtler loss the re-read alone leaves behind. Without it, B
+    /// reads before A writes and B's document then lands on top of A's: A's
+    /// record is gone, silently, and nothing will ever warn about the name its
+    /// user believes is blessed. The lock makes "check what is recorded, then
+    /// record" indivisible, which is the only shape in which that cannot happen.
+    ///
+    /// # What it answers
+    ///
+    /// A [`PinStoreUpdate`]: the store as it now stands in memory (`None` when
+    /// nothing was applied) plus the [`PinSaveOutcome`]. Three ways the change
+    /// does not happen at all, each said out loud rather than swallowed:
+    /// [`Refused`](PinSaveOutcome::Refused) when the document cannot be read
+    /// (`docs/adr/0014`), [`Unkeyable`](PinSaveOutcome::Unkeyable) when `change`
+    /// declines the name, and [`CouldNotPersist`](PinSaveOutcome::CouldNotPersist)
+    /// when the lock could not be taken within [`WRITE_LOCK_WAIT`] — a moment of
+    /// contention, after which the action can simply be repeated.
+    ///
+    /// `change` runs while the lock is HELD, so it must be short: it exists to
+    /// modify the store it is handed, not to do I/O of its own.
+    pub fn update_in(
+        dir: &std::path::Path,
+        change: impl FnOnce(&mut Self) -> Result<(), UnkeyableName>,
+    ) -> PinStoreUpdate {
+        let lock = match prepare_and_lock(dir) {
+            Ok(lock) => lock,
+            Err(outcome) => {
+                return PinStoreUpdate {
+                    pins: None,
+                    outcome,
+                }
+            }
+        };
+        let mut pins = match Self::load_from(dir) {
+            Ok(pins) => pins,
+            // The write-side half of the fail-closed rule, reached before a
+            // single byte is touched: a store werust cannot READ may not be
+            // overwritten (`docs/adr/0014`).
+            Err(why) => {
+                return PinStoreUpdate {
+                    pins: None,
+                    outcome: PinSaveOutcome::Refused(why),
+                }
+            }
+        };
+        if let Err(unkeyable) = change(&mut pins) {
+            return PinStoreUpdate {
+                pins: None,
+                outcome: PinSaveOutcome::Unkeyable(unkeyable),
+            };
+        }
+        let outcome = pins.save_holding(&lock, write_document);
+        PinStoreUpdate {
+            pins: Some(pins),
+            outcome,
+        }
     }
 
     /// [`save_to`](TrustedNamePins::save_to)'s body, with the step that puts BYTES
@@ -902,14 +1236,31 @@ impl TrustedNamePins {
         dir: &std::path::Path,
         write_temp: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
     ) -> PinSaveOutcome {
-        if dir.as_os_str().is_empty() {
-            return PinSaveOutcome::CouldNotPersist(
-                "there is no directory to record into".to_string(),
-            );
+        match prepare_and_lock(dir) {
+            Ok(lock) => self.save_holding(&lock, write_temp),
+            Err(outcome) => outcome,
         }
-        if let Err(err) = std::fs::create_dir_all(dir) {
-            return PinSaveOutcome::CouldNotPersist(err.to_string());
-        }
+    }
+
+    /// The write itself, performed while the store's [`WriteLock`] is HELD: the
+    /// one place a document reaches `pins.json`.
+    ///
+    /// It takes the lock as an argument it cannot fabricate, so "hold the lock
+    /// while writing" is a thing the compiler asks for rather than a thing a
+    /// future writer must remember; the lock also carries the DIRECTORY, so the
+    /// bytes cannot land somewhere other than what was locked.
+    ///
+    /// The refuse-while-unreadable re-read lives here, at the innermost writer,
+    /// for the same reason: every path to disk passes through it, including
+    /// [`update_in`](TrustedNamePins::update_in), whose own read makes this one
+    /// redundant — a cheap re-read of a small file is a fair price for a rule no
+    /// caller can drop.
+    fn save_holding(
+        &self,
+        lock: &WriteLock,
+        write_temp: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
+    ) -> PinSaveOutcome {
+        let dir = lock.dir.as_path();
         if let Err(why) = Self::load_from(dir) {
             return PinSaveOutcome::Refused(why);
         }
@@ -1272,11 +1623,11 @@ const KNOWN_DOCUMENT_MEMBERS: [&str; 2] = ["pins", NORMALIZATION_VERSION_MEMBER]
 /// in the SAME directory (see [`TrustedNamePins::save_to`]).
 ///
 /// Unique per process and per call, so two windows saving at the same moment
-/// cannot write each other's temp file. It is deliberately NOT unique enough to
-/// serialize them: two concurrent read-modify-writes can still lose an update,
-/// which is an advisory LOCK's job (task
-/// `trust-store-serialises-read-modify-write-so-no-bless-is-lost`), not a file
-/// name's. Atomicity makes that loss clean instead of corrupt.
+/// cannot write each other's temp file. Uniqueness is deliberately NOT how
+/// writers are serialised — a file name cannot make a read and a write
+/// indivisible — that is [`WriteLock`]'s job, held across both. This name only
+/// has to be distinct, and it stays distinct even for a writer that reached the
+/// document some other way.
 fn temp_document_name() -> String {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1389,6 +1740,25 @@ mod tests {
         pins_file_path().and_then(|path| std::fs::read(path).ok())
     }
 
+    /// Every file name in the REAL settings directory, sorted: the other half of
+    /// the before/after snapshot, which catches a file this suite CREATED there
+    /// rather than one it rewrote.
+    ///
+    /// The write lock made that a live question: a writer creates a `pins.lock`
+    /// beside the store, so "the suite left no lock artefact in the developer's
+    /// settings directory" is a thing to assert rather than assume. It compares
+    /// the LISTING rather than asserting the absence of `pins.lock`, because a
+    /// developer who has actually run werust legitimately HAS one.
+    fn real_settings_entries() -> Option<Vec<String>> {
+        let dir = crate::retrieval::settings_dir()?;
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|entry| Some(entry.ok()?.file_name().to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        Some(names)
+    }
+
     /// A REAL dag-pb content root, DERIVED from `content` rather than pasted: the
     /// shape an ENS `ipfs-ns` contenthash carries when it holds a CIDv0, and the
     /// ONE root every spelling in the comparison tests names.
@@ -1439,6 +1809,16 @@ mod tests {
     /// Every file name in a scratch directory, sorted: what a test asserts a save
     /// left behind, so a temp file that survives (a successful save's, or an
     /// interrupted one's) is a FAILURE rather than something nobody looked for.
+    /// Every file a SETTLED store directory holds, sorted: the document, plus the
+    /// empty lock file every writer takes and nobody deletes (the module's
+    /// one-writer note). What `dir_entries` must equal once a save has been and
+    /// gone, so a surviving temp file is still a failure.
+    fn store_and_lock() -> Vec<String> {
+        let mut names = vec![PINS_FILE.to_string(), PINS_LOCK_FILE.to_string()];
+        names.sort();
+        names
+    }
+
     fn dir_entries(dir: &std::path::Path) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
             .expect("the scratch dir exists")
@@ -1488,6 +1868,7 @@ mod tests {
         // file sits BESIDE `retrieval.json` (one mechanism, settled decision 2),
         // which is what `pins_file_path` promises.
         let real_before = real_pin_store_snapshot();
+        let real_entries_before = real_settings_entries();
         let scratch = ScratchDir::new("isolation");
         let mut pins = TrustedNamePins::default();
         pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1)
@@ -1498,8 +1879,15 @@ mod tests {
             real_before,
             "the developer's own `pins.json` is never written by this suite"
         );
+        assert_eq!(
+            real_settings_entries(),
+            real_entries_before,
+            "and no lock artefact (or anything else) appears in the developer's \
+             settings directory: a save creates `pins.lock` beside the store it \
+             writes, and the store it writes is the scratch one"
+        );
 
-        assert_eq!(dir_entries(&scratch.path), vec![PINS_FILE.to_string()]);
+        assert_eq!(dir_entries(&scratch.path), store_and_lock());
 
         // Both files resolve under the SAME directory, whatever it is.
         if let (Some(pins_path), Some(settings_path)) =
@@ -1773,7 +2161,7 @@ mod tests {
         assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
         assert_eq!(
             dir_entries(&scratch.path),
-            vec![PINS_FILE.to_string()],
+            store_and_lock(),
             "the re-key goes through the ordinary atomic save: no temp file left"
         );
         let document = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
@@ -1829,8 +2217,10 @@ mod tests {
         );
         assert_eq!(
             dir_entries(&scratch.path),
-            vec![PINS_FILE.to_string()],
-            "and no temp file was left beside them"
+            store_and_lock(),
+            "and no temp file was left beside them (the empty lock file every \
+             writer takes is not a document: a refused write takes the lock \
+             before it can know it must refuse)"
         );
         assert_eq!(real_pin_store_snapshot(), real_before);
     }
@@ -2330,7 +2720,7 @@ mod tests {
         );
         assert_eq!(
             dir_entries(&scratch.path),
-            vec![PINS_FILE.to_string()],
+            store_and_lock(),
             "no temp file survives a successful save"
         );
         assert_eq!(
@@ -2390,7 +2780,7 @@ mod tests {
         );
         assert_eq!(
             dir_entries(&scratch.path),
-            vec![PINS_FILE.to_string()],
+            store_and_lock(),
             "the half-written temp file is cleaned up on the failure path"
         );
         assert_eq!(
@@ -2398,6 +2788,308 @@ mod tests {
             real_before,
             "the developer's own `pins.json` is never written by this suite"
         );
+    }
+
+    // ---- One writer at a time: the store's write lock -------------------------
+
+    /// A rendezvous the two critical sections of the lost-update tests use to
+    /// FORCE the interleaving that loses a pin: each writer announces that it has
+    /// READ, and then gives the other one that same moment to read the very same
+    /// snapshot before either of them writes.
+    ///
+    /// This is what makes those tests deterministic in BOTH directions, which
+    /// "spawn two threads and hope they collide" is not. Without the lock both
+    /// writers read, both announce, both waits return at once and the second
+    /// document lands on top of the first: a guaranteed RED. With the lock the
+    /// second writer is still waiting for the LOCK, so it cannot announce, the
+    /// first writer's wait simply runs out its window and proceeds: a guaranteed
+    /// GREEN, because the assertion never depends on which writer was quicker.
+    /// The window is a CEILING on a condition that provably cannot arrive while
+    /// the lock holds, not a sleep that hopes for a race.
+    #[derive(Default)]
+    struct ReadRendezvous {
+        read: std::sync::Mutex<usize>,
+        announced: std::sync::Condvar,
+    }
+
+    impl ReadRendezvous {
+        /// How long a writer inside the critical section waits for the others.
+        /// Comfortably under [`WRITE_LOCK_WAIT`], so the writer queued behind it
+        /// never hits the bound.
+        const WINDOW: std::time::Duration = std::time::Duration::from_millis(200);
+
+        /// Announce that this writer has READ the store, then wait until
+        /// `writers` of them have, or [`WINDOW`](Self::WINDOW) elapses.
+        fn read_and_wait_for(&self, writers: usize) {
+            let mut read = self.read.lock().expect("no writer panics holding this");
+            *read += 1;
+            self.announced.notify_all();
+            let _ = self
+                .announced
+                .wait_timeout_while(read, Self::WINDOW, |read| *read < writers);
+        }
+    }
+
+    /// Drive `names` through [`TrustedNamePins::update_in`] CONCURRENTLY against
+    /// one store, with every writer's READ forced to happen before any writer's
+    /// WRITE (see [`ReadRendezvous`]), and return what each of them reported.
+    fn bless_concurrently(dir: &std::path::Path, names: [(&str, &str); 2]) -> Vec<PinSaveOutcome> {
+        let rendezvous = ReadRendezvous::default();
+        let start = std::sync::Barrier::new(names.len());
+        let outcomes = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|threads| {
+            for (name, cid) in names {
+                let (rendezvous, start, outcomes) = (&rendezvous, &start, &outcomes);
+                threads.spawn(move || {
+                    start.wait();
+                    let update = TrustedNamePins::update_in(dir, |pins| {
+                        // INSIDE the critical section, after the read: a writer
+                        // can only get past this at the same time as the other
+                        // one if the read and the save are not one section.
+                        rendezvous.read_and_wait_for(2);
+                        pins.bless(name, cid, TrustPosture::MutableName, 1_800_000_000)
+                    });
+                    outcomes
+                        .lock()
+                        .expect("no writer panicked")
+                        .push(update.outcome);
+                });
+            }
+        });
+        outcomes.into_inner().expect("every writer finished")
+    }
+
+    #[test]
+    fn two_writers_recording_two_different_names_both_survive() {
+        // THE case this lock exists for, and the one that fails without it: B
+        // reads before A writes, B's whole document then lands on top of A's, and
+        // A's record is GONE -- silently, and failing OPEN, which is the one
+        // direction a TOFU store must not fail in. The atomic write makes that
+        // loss clean rather than corrupt; only holding the lock across the read
+        // AND the save prevents it.
+        //
+        // Two threads is not a weaker test than two processes for THIS property:
+        // the lock lives on the open file description, so two shells in one
+        // process contend exactly as two windows do (and
+        // `a_write_lock_another_process_holds_bounds_the_wait_and_then_says_so`
+        // is the half a process-local mutex could never pass).
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("lost-update");
+        std::fs::create_dir_all(&scratch.path).expect("the scratch dir");
+
+        let outcomes = bless_concurrently(
+            &scratch.path,
+            [("ronan.eth", "bafyronan"), ("stranger.eth", "bafystranger")],
+        );
+        assert_eq!(
+            outcomes,
+            vec![PinSaveOutcome::Recorded, PinSaveOutcome::Recorded],
+            "both writers were told their record was on disk"
+        );
+
+        let store = TrustedNamePins::load_from(&scratch.path).expect("the store reads back");
+        assert_eq!(
+            store.len(),
+            2,
+            "both records survived two concurrent blesses: {store:?}"
+        );
+        assert_eq!(
+            store.get("ronan.eth").map(|pin| pin.cid.clone()),
+            Some("bafyronan".to_string())
+        );
+        assert_eq!(
+            store.get("stranger.eth").map(|pin| pin.cid.clone()),
+            Some("bafystranger".to_string())
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn two_writers_recording_the_same_name_leave_exactly_one_record() {
+        // The other half of the concurrent case, and the one where losing a write
+        // is CORRECT: a name has at most one pin, so the later writer's CID is
+        // what the user last accepted (`bless` replaces). What must not happen is
+        // two records for one identity, or a document neither of them can read.
+        let scratch = ScratchDir::new("same-name");
+        std::fs::create_dir_all(&scratch.path).expect("the scratch dir");
+
+        let outcomes = bless_concurrently(
+            &scratch.path,
+            [("ronan.eth", "bafyone"), ("ronan.eth", "bafytwo")],
+        );
+        assert_eq!(
+            outcomes,
+            vec![PinSaveOutcome::Recorded, PinSaveOutcome::Recorded]
+        );
+
+        let store = TrustedNamePins::load_from(&scratch.path).expect("the store reads back");
+        assert_eq!(store.len(), 1, "one identity, one record: {store:?}");
+        let recorded = store.get("ronan.eth").expect("the one record").cid.clone();
+        assert!(
+            recorded == "bafyone" || recorded == "bafytwo",
+            "the last writer wins, and it is one of the two, never a merge: {recorded}"
+        );
+    }
+
+    /// The environment variable that turns this test binary into the CHILD half
+    /// of the two cross-process lock tests, carrying the store directory whose
+    /// write lock the child must take and hold.
+    ///
+    /// Set per-CHILD through `Command::env` and never on this process, so the
+    /// suite still mutates no process-global environment (the shared-write rule).
+    const HOLD_THE_LOCK: &str = "WERUST_TEST_HOLD_PIN_WRITE_LOCK_IN";
+
+    /// The child test's name, as libtest addresses it.
+    const HOLD_THE_LOCK_TEST: &str = "pins::tests::a_child_process_that_holds_the_write_lock";
+
+    /// The file the child creates once it HAS the lock: a fact the parent can
+    /// wait for, instead of sleeping and hoping the child got there.
+    const CHILD_HOLDS_IT: &str = "child-holds-the-write-lock";
+
+    #[test]
+    fn a_child_process_that_holds_the_write_lock() {
+        // Not a test of its own: the CHILD PROCESS the two cross-process tests
+        // spawn, by re-running this very binary with one variable set. An
+        // ordinary `cargo test` run reaches it with the variable UNSET and it
+        // does nothing at all, which is why it needs no `#[ignore]`.
+        //
+        // A separate PROCESS is the whole point. An in-process mutex would
+        // serialise the threads of one test and prove nothing about the
+        // contenders that actually lose pins (a second launch is a second window,
+        // and two versions are two processes), and a thread-based test would pass
+        // against one. This is the half that cannot.
+        let Ok(dir) = std::env::var(HOLD_THE_LOCK) else {
+            return;
+        };
+        let dir = std::path::PathBuf::from(dir);
+        let _lock = WriteLock::acquire(&dir).expect("the child takes the store's write lock");
+        std::fs::write(dir.join(CHILD_HOLDS_IT), b"held").expect("the child announces the lock");
+        // Held until the parent KILLS this process. The cap is a leak guard (a
+        // child whose parent died must not live forever), not a timeout: nothing
+        // in either test waits for it.
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
+
+    /// Re-run this test binary as a child PROCESS holding the store's write lock
+    /// in `dir`, returning once it demonstrably HAS it.
+    fn child_holding_the_write_lock(dir: &std::path::Path) -> std::process::Child {
+        let exe = std::env::current_exe().expect("the test binary's own path");
+        let mut child = std::process::Command::new(exe)
+            .args([HOLD_THE_LOCK_TEST, "--exact", "--nocapture"])
+            .env(HOLD_THE_LOCK, dir)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("re-run this test binary as a child process");
+        let marker = dir.join(CHILD_HOLDS_IT);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker.exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the child process never took the store's write lock");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        child
+    }
+
+    #[test]
+    fn a_write_lock_another_process_holds_bounds_the_wait_and_then_says_so() {
+        // The acquire-failure rule, driven ACROSS PROCESSES (which is what makes
+        // this test one a process-local mutex could not pass): a writer waits
+        // WRITE_LOCK_WAIT for the holder and then gives up with a sentence, never
+        // hanging (a browser must not freeze because another window is wedged)
+        // and never skipping the write in silence.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("contended");
+        std::fs::create_dir_all(&scratch.path).expect("the scratch dir");
+        let mut child = child_holding_the_write_lock(&scratch.path);
+
+        let started = std::time::Instant::now();
+        let update = TrustedNamePins::update_in(&scratch.path, |pins| {
+            panic!("the change must not run: the store was never read ({pins:?})")
+        });
+        let waited = started.elapsed();
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            matches!(update.outcome, PinSaveOutcome::CouldNotPersist(_)),
+            "contention is not a policy refusal and not a panic: {update:?}"
+        );
+        assert!(
+            update
+                .outcome
+                .problem()
+                .is_some_and(|why| why.contains("another werust window")),
+            "and it says so in words: {update:?}"
+        );
+        assert!(
+            update.pins.is_none(),
+            "nothing was applied in memory either, because nothing was read: {update:?}"
+        );
+        assert!(
+            waited >= WRITE_LOCK_WAIT,
+            "it WAITED for the holder rather than giving up at once: {waited:?}"
+        );
+        assert!(
+            waited < WRITE_LOCK_WAIT * 10,
+            "and it gave up: an unbounded wait is a frozen window: {waited:?}"
+        );
+        assert!(
+            !scratch.path.join(PINS_FILE).exists(),
+            "and it wrote nothing over the document the holder is working on"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_write_lock_a_dead_process_left_behind_never_bricks_the_store() {
+        // The question every lock has to answer: what happens to one a process
+        // died holding. This lock is the OPERATING SYSTEM's, held on a
+        // descriptor, so it is released when the process ends however it ends --
+        // here by SIGKILL, which runs no `Drop`, unwinds nothing and gives the
+        // holder no chance to tidy up: a crash, an OOM kill or a power-off, as
+        // far as the next writer can tell. That is exactly why this is not a
+        // hand-rolled create-a-lock-FILE-exclusively protocol, whose stale
+        // entries can only be broken by guessing at an age.
+        let scratch = ScratchDir::new("dead-holder");
+        std::fs::create_dir_all(&scratch.path).expect("the scratch dir");
+        let mut child = child_holding_the_write_lock(&scratch.path);
+        child.kill().expect("the holder is killed mid-hold");
+        child.wait().expect("and reaped, so its descriptor is gone");
+
+        let update = TrustedNamePins::update_in(&scratch.path, |pins| {
+            pins.bless("ronan.eth", "bafyone", TrustPosture::MutableName, 1)
+        });
+        assert_eq!(
+            update.outcome,
+            PinSaveOutcome::Recorded,
+            "the store is writable the moment the holder dies: {update:?}"
+        );
+        assert!(
+            scratch.path.join(PINS_LOCK_FILE).is_file(),
+            "the lock FILE is still there: it is the LOCK that died with the process"
+        );
+
+        // And the file it left behind blocks nothing later either -- nobody ever
+        // deletes it, because deleting a lock file is a race, not tidiness.
+        let again = TrustedNamePins::update_in(&scratch.path, |pins| {
+            pins.bless("stranger.eth", "bafytwo", TrustPosture::MutableName, 2)
+        });
+        assert_eq!(again.outcome, PinSaveOutcome::Recorded);
+        let store = TrustedNamePins::load_from(&scratch.path).expect("the store reads back");
+        assert_eq!(store.len(), 2, "and both records are there: {store:?}");
     }
 
     #[test]

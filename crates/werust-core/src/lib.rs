@@ -2009,21 +2009,34 @@ impl PinStoreLocation {
         !matches!(self, Self::Ephemeral)
     }
 
-    /// Persist `pins` here, reporting WHAT happened
-    /// ([`PinSaveOutcome`](crate::pins::PinSaveOutcome)): recorded, not persisted,
-    /// or REFUSED because the store on disk cannot be read.
+    /// Read-modify-write this location's store as ONE critical section: re-read
+    /// what is on disk, apply `change`, write it back, all while the store's
+    /// write lock is held (`crate::pins`' one-writer note).
     ///
-    /// [`Ephemeral`](PinStoreLocation::Ephemeral) has nowhere to write, which is
-    /// [`CouldNotPersist`](crate::pins::PinSaveOutcome::CouldNotPersist) and not
+    /// The ONLY mutation path, deliberately: a `save` that a caller could reach
+    /// separately from the re-read is the lost update this exists to remove, and
+    /// a FUTURE mutation (a "forget this pin" action, say) inherits the whole
+    /// rule by having nowhere else to go.
+    ///
+    /// [`Ephemeral`](PinStoreLocation::Ephemeral) has nowhere durable to write,
+    /// so the change is applied in memory and reported as
+    /// [`CouldNotPersist`](crate::pins::PinSaveOutcome::CouldNotPersist), not
     /// [`NothingToRecord`](crate::pins::PinSaveOutcome::NothingToRecord): there
-    /// WAS something to record, it simply has nowhere durable to go, exactly as
-    /// when this system has no settings directory.
-    fn save(&self, pins: &crate::pins::TrustedNamePins) -> crate::pins::PinSaveOutcome {
+    /// WAS something to record, it simply has nowhere to go, exactly as when this
+    /// system has no settings directory. Nothing is locked for that case, because
+    /// nothing outside this shell can see the store it writes.
+    fn update(
+        &self,
+        cached: &crate::pins::TrustedNamePins,
+        change: impl FnOnce(&mut crate::pins::TrustedNamePins) -> Result<(), crate::pins::UnkeyableName>,
+    ) -> crate::pins::PinStoreUpdate {
         match self {
-            Self::Settings => pins.save(),
-            Self::Dir(dir) => pins.save_to(dir),
-            Self::Ephemeral => crate::pins::PinSaveOutcome::CouldNotPersist(
-                "this session has no durable trusted-name pin store".to_string(),
+            Self::Settings => crate::pins::TrustedNamePins::update(cached, change),
+            Self::Dir(dir) => crate::pins::TrustedNamePins::update_in(dir, change),
+            Self::Ephemeral => crate::pins::PinStoreUpdate::in_memory_only(
+                cached,
+                change,
+                "this session has no durable trusted-name pin store",
             ),
         }
     }
@@ -2748,7 +2761,12 @@ impl BrowserShell {
     ///   settings directory, no durable store on this shell, or the write failed.
     ///   The bless holds for THIS session (the chrome updates), it simply cannot
     ///   survive a relaunch. Never an error: a pin store that cannot be written
-    ///   must not break browsing.
+    ///   must not break browsing. The one case where it does NOT hold for the
+    ///   session either is CONTENTION — another window held the store's write
+    ///   lock past its bound (`crate::pins::WRITE_LOCK_WAIT`), so this shell never
+    ///   read the store and has nothing to show: the chrome is unchanged and the
+    ///   action can simply be repeated. Never an indefinite wait, and never a
+    ///   silent skip.
     /// - [`Unkeyable`](crate::pins::PinSaveOutcome::Unkeyable): the name has no
     ///   store key at all ([`pin_key`](crate::pins::pin_key)), so nothing could be
     ///   recorded for it. Unreachable from the chrome (a name with no key carries
@@ -2789,57 +2807,64 @@ impl BrowserShell {
         let Some(current) = self.chrome.mutable_name.clone() else {
             return crate::pins::PinSaveOutcome::NothingToRecord;
         };
-        // READ -> MODIFY -> WRITE, per action, against the store on DISK: exactly
-        // the shape the sibling settings store already uses
-        // (`retrieval::apply_settings_request_in`). Saving `self.pins` instead
-        // would rewrite the whole file from the snapshot THIS shell took at its
-        // own launch, silently ERASING every pin another window blessed since --
-        // and two windows is not exotic (a second `werust` launch opens a second
-        // window in the same GTK application, and two VERSIONS are two processes).
-        // That is the one direction of failure a TOFU store cannot have: the user
-        // believes a name is blessed, the pin is gone, and the next resolution to
-        // a different CID warns about nothing.
+        // READ -> MODIFY -> WRITE, per action, against the store on DISK, and all
+        // of it inside ONE critical section (`crate::pins`' one-writer note).
+        // Saving `self.pins` instead would rewrite the whole file from the
+        // snapshot THIS shell took at its own launch, silently ERASING every pin
+        // another window blessed since -- and two windows is not exotic (a second
+        // `werust` launch opens a second window in the same GTK application, and
+        // two VERSIONS are two processes). Re-reading closes that; holding the
+        // store's write lock ACROSS the re-read and the save closes the subtler
+        // one it leaves behind, where the other window's write lands between them
+        // and this document goes on top of it. Either way it is the one direction
+        // of failure a TOFU store cannot have: the user believes a name is
+        // blessed, the pin is gone, and the next resolution to a different CID
+        // warns about nothing.
         //
         // With no durable store to re-read, the in-memory pins ARE the truth (no
         // file could have superseded them), so this session's earlier blesses are
         // carried rather than dropped.
         //
-        // And it REFUSES outright while the store cannot be READ (`docs/adr/0014`):
-        // saving into what merely looks like an empty store is the same erasure
-        // from the other side, one transient failure replacing every record with a
-        // single fresh one. `TrustedNamePins::save_to` refuses too (that is the
-        // structural guarantee, for every writer); this returns early so the
-        // refusal is visible in the chrome rather than only in the return value.
-        let mut pins = match self.pin_store.load() {
-            crate::pins::PinStoreRead::Pins(pins) => pins,
-            crate::pins::PinStoreRead::NoStore => self.pins.clone(),
-            crate::pins::PinStoreRead::Undeterminable(why) => {
-                self.apply_pin_store_read(crate::pins::PinStoreRead::Undeterminable(why.clone()));
-                self.refresh_chrome();
-                return crate::pins::PinSaveOutcome::Refused(why);
-            }
-        };
-        // The name on the axis IS the store key the resolution produced, so this
-        // cannot refuse — but the write path gets no silent "cannot happen"
-        // branch: in a TOFU store a swallowed refusal is a lost warning, so it is
-        // reported as the outcome it is (`docs/adr/0014`'s discipline, applied to
-        // the key rather than to the file).
-        if let Err(why) = pins.bless(
-            &current.name,
-            &current.cid,
-            self.chrome.trust_posture,
-            crate::pins::now_unix_secs(),
-        ) {
-            return crate::pins::PinSaveOutcome::Unkeyable(why);
+        // The name on the axis IS the store key the resolution produced, so the
+        // bless below cannot refuse -- but the write path gets no silent "cannot
+        // happen" branch: in a TOFU store a swallowed refusal is a lost warning,
+        // so it is reported as the outcome it is (`docs/adr/0014`'s discipline,
+        // applied to the key rather than to the file).
+        let posture = self.chrome.trust_posture;
+        let crate::pins::PinStoreUpdate { pins, outcome } =
+            self.pin_store.update(&self.pins, |pins| {
+                pins.bless(
+                    &current.name,
+                    &current.cid,
+                    posture,
+                    crate::pins::now_unix_secs(),
+                )
+            });
+        // A store werust cannot READ is refused outright (`docs/adr/0014`): saving
+        // into what merely looks like an empty store is the same erasure from the
+        // other side, one transient failure replacing every record with a single
+        // fresh one. The refusal is put on the CHROME here (not only in the return
+        // value), so the surface states that trust cannot be determined and
+        // withdraws an affordance the next write would refuse too.
+        if let crate::pins::PinSaveOutcome::Refused(why) = &outcome {
+            self.apply_pin_store_read(crate::pins::PinStoreRead::Undeterminable(why.clone()));
+            self.refresh_chrome();
+            return outcome;
         }
-        let outcome = self.pin_store.save(&pins);
         // The re-read store (plus this bless) becomes the shell's cache, so a
-        // concurrent writer's pins are visible here from now on too.
-        self.pins = pins;
-        self.trust_undeterminable = None;
-        // Re-derive the chrome's TOFU axis from the store, so the surface reflects
-        // the bless immediately (the action label and the warning both change).
-        self.refresh_chrome();
+        // concurrent writer's pins are visible here from now on too. `None` is the
+        // change that never happened at all -- an unkeyable name, or a write lock
+        // another window held past its bound -- and it leaves the cache, and the
+        // chrome, exactly as they were: a bless werust did not perform must not be
+        // shown as one it did.
+        if let Some(pins) = pins {
+            self.pins = pins;
+            self.trust_undeterminable = None;
+            // Re-derive the chrome's TOFU axis from the store, so the surface
+            // reflects the bless immediately (the action label and the warning
+            // both change).
+            self.refresh_chrome();
+        }
         outcome
     }
 
@@ -5235,6 +5260,83 @@ mod tests {
         // The merge is visible to the writer itself, so its NEXT bless cannot
         // re-drop what it just merged in.
         assert_eq!(window_b.pins_for_test().len(), 2);
+    }
+
+    #[test]
+    fn two_windows_blessing_two_names_at_the_same_moment_both_survive() {
+        // Acceptance, through the SHELL: the test above blesses one window after
+        // the other, which the read-modify-write already survived. This one
+        // blesses AT THE SAME MOMENT, which it did not: window B read before
+        // window A wrote, and B's whole document then landed on top of A's
+        // record. Silent, and failing OPEN. Holding the store's write lock across
+        // the read AND the save is what makes a check-and-record indivisible
+        // (`crate::pins`' one-writer note).
+        //
+        // Two INDEPENDENTLY-CONSTRUCTED shells, each built inside its own thread
+        // over its own backend and its own scripted resolver, sharing ONE scratch
+        // directory: the two-window situation with nothing shared but the file.
+        // The rendezvous is a barrier, never a sleep. The DETERMINISTIC proof
+        // that the lock is what saves this lives one layer down, where the test
+        // can force the losing interleaving from inside the critical section
+        // (`pins::tests::two_writers_recording_two_different_names_both_survive`);
+        // what this one adds is that the whole shell path really is inside it.
+        let scratch = PinScratchDir::new("two-windows-at-once");
+        std::fs::create_dir_all(&scratch.path).expect("the scratch dir");
+        let (ch_a, _) = ipfs_contenthash_fixture(b"the site behind a.eth");
+        let (ch_b, _) = ipfs_contenthash_fixture(b"the site behind b.eth");
+
+        let ready = std::sync::Barrier::new(2);
+        let blessed: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|windows| {
+            for (name, contenthash, address) in
+                [("a.eth", ch_a, [0x11u8; 20]), ("b.eth", ch_b, [0x22u8; 20])]
+            {
+                let (ready, blessed, dir) = (&ready, &blessed, scratch.path.as_path());
+                windows.spawn(move || {
+                    let (mut window, handle) = shell_with_provider_and_pins(
+                        vec![
+                            Ok(address_word(&address)),
+                            Ok(abi_bytes_return(&contenthash)),
+                        ],
+                        dir,
+                    );
+                    load_eth_name(&mut window, &handle, name);
+                    let cid = window
+                        .chrome()
+                        .mutable_name
+                        .as_ref()
+                        .expect("a name-resolved page carries the TOFU axis")
+                        .cid
+                        .clone();
+                    // Both windows are settled on their page BEFORE either
+                    // blesses, so the two blesses are what actually race.
+                    ready.wait();
+                    assert_eq!(
+                        window.bless_current_name(),
+                        crate::pins::PinSaveOutcome::Recorded,
+                        "{name} was recorded"
+                    );
+                    blessed
+                        .lock()
+                        .expect("no window panicked")
+                        .push((name.to_string(), cid));
+                });
+            }
+        });
+
+        let on_disk = crate::pins::TrustedNamePins::load_from(&scratch.path).expect("it reads");
+        assert_eq!(
+            on_disk.len(),
+            2,
+            "two windows blessing two names at once lose neither: {on_disk:?}"
+        );
+        for (name, cid) in blessed.into_inner().expect("both windows finished") {
+            assert_eq!(
+                on_disk.get(&name).map(|pin| pin.cid.clone()),
+                Some(cid),
+                "{name} is on disk at the CID its window blessed"
+            );
+        }
     }
 
     #[test]

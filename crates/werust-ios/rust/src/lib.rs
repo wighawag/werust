@@ -72,6 +72,154 @@ pub enum SchemeResolution {
     Err { reason: String },
 }
 
+// ---------------------------------------------------------------------------
+// WebKit's `WKNavigationType`, as the Swift edge reports it across the C-ABI.
+//
+// The Swift shell hands `WKNavigationAction.navigationType.rawValue` over
+// UNTRANSLATED (it is a FACT about the navigation, and translating it would put
+// a rule in the layer this project's Linux gate cannot execute), so the values
+// below are WebKit's own, declared in `WKNavigationDelegate.h` as a public
+// `NS_ENUM(NSInteger)` and therefore fixed by ObjC ABI compatibility. They are
+// named here so the marking rule reads as WebKit's vocabulary rather than as
+// magic numbers, and so the truth-table test can name every kind it refuses.
+//
+// An UNRECOGNISED value marks nothing (the rule matches the two activation kinds
+// and refuses everything else), which is the fail-closed direction if WebKit ever
+// adds a kind.
+// ---------------------------------------------------------------------------
+
+/// `WKNavigationTypeLinkActivated`: the user activated a link in the page.
+pub const WK_NAVIGATION_TYPE_LINK_ACTIVATED: i32 = 0;
+/// `WKNavigationTypeFormSubmitted`: the user submitted a form in the page, which
+/// is what the settings page's own GET form produces.
+pub const WK_NAVIGATION_TYPE_FORM_SUBMITTED: i32 = 1;
+/// `WKNavigationTypeBackForward`: a history move (the edge-swipe gesture, or a
+/// page's `history.back()`), never a fresh decision to change a setting.
+pub const WK_NAVIGATION_TYPE_BACK_FORWARD: i32 = 2;
+/// `WKNavigationTypeReload`: a reload, likewise not a fresh decision.
+pub const WK_NAVIGATION_TYPE_RELOAD: i32 = 3;
+/// `WKNavigationTypeFormResubmitted`: a form resubmission (a reload of a form
+/// result), likewise not a fresh decision.
+pub const WK_NAVIGATION_TYPE_FORM_RESUBMITTED: i32 = 4;
+/// `WKNavigationTypeOther`: everything else, in particular a SCRIPT's
+/// `location = …`, which is the page acting rather than the user.
+pub const WK_NAVIGATION_TYPE_OTHER: i32 = -1;
+
+/// The CHROME-MARKED USER INTENT carrier this edge hands both its `werust://`
+/// scheme handler and its [`BrowserShell`], plus the ONE main-frame predicate a
+/// mark needs (`docs/adr/0013`, spec `settings-mutations-require-user-intent`,
+/// task `ios-marks-user-intent-for-settings-mutations`).
+///
+/// # Why the iOS edge needs one at all
+///
+/// [`BrowserShell::navigate`](werust_core::BrowserShell::navigate), the
+/// chrome-only front door Swift's URL bar commits its typed text to
+/// (`textFieldShouldReturn`), already marks what werust's own chrome starts, and
+/// this session hands the shell the SAME carrier the handler reads. What it
+/// cannot cover is werust's own settings page submitting its own GET form: that
+/// is a PAGE-initiated navigation, so it never passes through the shell. It is
+/// still the user acting inside a surface werust drew, so this edge marks it from
+/// its own navigation-policy hook, Swift's
+/// `WKNavigationDelegate.decidePolicyFor`: the iOS member of the per-edge
+/// navigation-policy family ADR-0013 names.
+///
+/// # The edge supplies a SIGNAL; the core decides
+///
+/// Swift reports the per-navigation FACTS `WKNavigationAction` carries and
+/// nothing else (see [`note_page_navigation`](IntentMarker::note_page_navigation));
+/// whether a marked navigation may actually MUTATE stays the shared core's call,
+/// inside
+/// [`retrieval::apply_settings_request_with_intent`](werust_core::retrieval::apply_settings_request_with_intent),
+/// the one place that answers both halves of the gate and spends the mark.
+/// Nothing on this side ever reads a mark (a shape guard reds the gate if this
+/// edge starts to).
+#[derive(Debug, Clone)]
+pub struct IntentMarker {
+    /// The carrier the `werust://` scheme handler consults, and the shell marks
+    /// its own navigations into. Every clone is the SAME carrier.
+    intent: werust_core::intent::NavigationIntent,
+    /// The main-frame predicate a mark captures, so the core can answer BOTH
+    /// halves of the gate (marked AND main frame) from the one carrier. It is the
+    /// sink [`install_ipfs`] returned and the shell reports its top-level
+    /// navigations into, not a second notion of "which request is the page".
+    frames: werust_core::ipfs::RedirectSink,
+}
+
+impl IntentMarker {
+    /// Report a navigation the PAGE is starting, with the facts WebKit's
+    /// `WKNavigationAction` exposes for it, and mark it as the user's intent when
+    /// (and only when) all of them hold. Returns whether it marked.
+    ///
+    /// The facts, each an INPUT to the decision and never the decision itself:
+    ///
+    /// * `target`: the URL the navigation is going to
+    ///   (`navigationAction.request.url`).
+    /// * `document`: the URL of the document it starts FROM
+    ///   (`navigationAction.sourceFrame.request.url`). Read from the NAVIGATION's
+    ///   own source frame rather than from the live `WKWebView.url`, which is why
+    ///   this edge needs no redirect exclusion: the fact does not move with a
+    ///   redirect the way the GTK edge's view-URI read does
+    ///   (`docs/spikes/ios-marks-user-intent-for-settings-mutations/DECISIONS.md`,
+    ///   decision 2).
+    /// * `main_frame`, `navigationAction.targetFrame?.isMainFrame == true`: a
+    ///   sub-frame navigation is not the user changing werust's settings, and a
+    ///   `_blank` navigation (no target frame at all) is not either.
+    /// * `navigation_type`, `navigationAction.navigationType.rawValue`: one of
+    ///   the `WK_NAVIGATION_TYPE_*` constants above. Only
+    ///   [`WK_NAVIGATION_TYPE_LINK_ACTIVATED`] and
+    ///   [`WK_NAVIGATION_TYPE_FORM_SUBMITTED`] are the user ACTIVATING something
+    ///   in the page; a script's `location = …` reports
+    ///   [`WK_NAVIGATION_TYPE_OTHER`], and a reload or a history move is not a
+    ///   fresh decision to change a setting. This is WebKit's own vocabulary, the
+    ///   same one the GTK edge matches on (`LinkClicked` / `FormSubmitted`).
+    ///
+    /// The load-bearing fact is `document`: web content can never BE at a
+    /// `werust://` URL (only werust serves that scheme, and it serves one
+    /// script-free page), so "this navigation started inside a surface werust
+    /// itself drew" is not forgeable by a page. The navigation kind and the frame
+    /// are the cheap corroborating facts.
+    ///
+    /// Marking is HARMLESS for a navigation that has nothing to do with settings:
+    /// the core matches a mark against the exact URL (query included), so a mark
+    /// for one `werust://` URL authorises no other.
+    ///
+    /// NOT called from the `WKUIDelegate` new-window hook: a `_blank` /
+    /// `window.open` target is a URL the PAGE chose, and that hook loads it into
+    /// this same view by design (`docs/adr/0010`). It is a router, and it must
+    /// never become a trust bypass.
+    pub fn note_page_navigation(
+        &self,
+        target: &str,
+        document: &str,
+        main_frame: bool,
+        navigation_type: i32,
+    ) -> bool {
+        use werust_core::retrieval::WERUST_URL_PREFIX;
+
+        let activated_in_the_page = matches!(
+            navigation_type,
+            WK_NAVIGATION_TYPE_LINK_ACTIVATED | WK_NAVIGATION_TYPE_FORM_SUBMITTED
+        );
+        let inside_a_surface_werust_drew =
+            document.starts_with(WERUST_URL_PREFIX) && target.starts_with(WERUST_URL_PREFIX);
+        if main_frame && activated_in_the_page && inside_a_surface_werust_drew {
+            self.intent.mark(target, &self.frames);
+            return true;
+        }
+        false
+    }
+
+    /// The carrier itself, for the tests that drive the shared core's gate
+    /// (`retrieval::apply_settings_request_in`) with the very mark this edge left.
+    /// Production code on this side only ever MARKS through
+    /// [`note_page_navigation`](IntentMarker::note_page_navigation) and through the
+    /// shell's own front door; reading a mark is the core's business.
+    #[must_use]
+    pub fn intent(&self) -> &werust_core::intent::NavigationIntent {
+        &self.intent
+    }
+}
+
 /// A single browsing session for one iOS `UIViewController`: a
 /// [`BrowserShell`](werust_core::BrowserShell) over an [`IosBackend`], plus the
 /// WebView-signal callbacks Swift reports into.
@@ -85,6 +233,11 @@ pub struct CoreSession {
     /// platform-`WKWebView` protocol (pending-load + load signals) that the
     /// cross-backend seam does not carry.
     backend: IosHandle,
+    /// The chrome-marked navigation-intent handle this session's `werust://`
+    /// scheme handler consults and its shell marks into ([`IntentMarker`],
+    /// `docs/adr/0013`), kept so the Swift edge's navigation-policy hook can mark
+    /// the settings page's own form submission.
+    intent: IntentMarker,
 }
 
 impl Default for CoreSession {
@@ -115,6 +268,13 @@ impl CoreSession {
         // platform webview performs (bar + history move, target hash-verified by the
         // fresh retrieval it triggers). Task `ipfs-redirects-3xx-navigation-support`.
         let redirects = install_ipfs(&mut backend);
+        // The internal `werust://settings` page, and the CHROME-MARKED USER INTENT
+        // its mutations require (`docs/adr/0013`): the handler is registered
+        // against the GATED core entry point and consults the carrier this
+        // returns, which is then handed to the shell below so the URL bar's own
+        // commits mark it too. Both are clones of ONE carrier, exactly as
+        // `install_ipfs` shares its redirect sink with its handler.
+        let intent = install_settings_page(&mut backend, &redirects);
         // Wire the FIRST trust hook exactly as the desktop backend's
         // `install_provider` does: register the EIP-1193 provider bridge handler
         // and inject the page-side provider shim at document start, both routed
@@ -132,9 +292,38 @@ impl CoreSession {
         Self {
             shell: BrowserShell::new(Box::new(backend))
                 .with_redirect_sink(redirects)
+                .with_navigation_intent(intent.intent().clone())
                 .with_debug_capture(debug),
             backend: handle,
+            intent,
         }
+    }
+
+    /// The chrome-marked navigation-intent handle ([`IntentMarker`]): the Swift
+    /// edge's navigation-policy hook marks through it, and this crate's tests
+    /// drive the shared core's gate with it.
+    #[must_use]
+    pub fn intent_marker(&self) -> &IntentMarker {
+        &self.intent
+    }
+
+    /// Report a navigation the PAGE is starting, from Swift's
+    /// `WKNavigationDelegate.decidePolicyFor`, so a submission from werust's OWN
+    /// settings page can be marked as the user's intent (`docs/adr/0013`).
+    ///
+    /// Swift passes the FACTS `WKNavigationAction` hands it and decides nothing;
+    /// whether they add up to a mark is [`IntentMarker::note_page_navigation`]'s
+    /// call, and whether a marked navigation may MUTATE is the shared core's.
+    /// Returns whether the navigation was marked.
+    pub fn note_page_navigation(
+        &self,
+        target: &str,
+        document: &str,
+        main_frame: bool,
+        navigation_type: i32,
+    ) -> bool {
+        self.intent
+            .note_page_navigation(target, document, main_frame, navigation_type)
     }
 
     /// Read and write the USER's trusted-name pin store (`pins.json`, beside
@@ -155,10 +344,15 @@ impl CoreSession {
     /// the production entry point stops asking.
     #[must_use]
     pub fn with_settings_pins(self) -> Self {
-        let Self { shell, backend } = self;
+        let Self {
+            shell,
+            backend,
+            intent,
+        } = self;
         Self {
             shell: shell.with_settings_pins(),
             backend,
+            intent,
         }
     }
 
@@ -290,7 +484,8 @@ impl CoreSession {
         // dedicated `ipfs` `WKURLSchemeHandler` (and `werust://settings` through
         // the separate `apply_settings`, which does NOT mark), but scope the mark
         // to the `ipfs` scheme defensively so an internal chrome page can never be
-        // mis-marked content-verified.
+        // mis-marked content-verified. ("Mark" here is the TRUST posture, not the
+        // navigation-intent mark of `docs/adr/0013`, which no resolve path leaves.)
         let is_ipfs = uri
             .split_once("://")
             .is_some_and(|(scheme, _)| scheme == werust_core::ipfs::IPFS_SCHEME);
@@ -438,12 +633,16 @@ impl CoreSession {
     /// `WKURLSchemeHandler` is registered for it, so Swift's handler calls this:
     /// it routes `uri` through the `werust` scheme handler installed at
     /// [`new`](CoreSession::new) (the SAME
-    /// [`apply_settings_request`](werust_core::retrieval::apply_settings_request)
+    /// [`apply_settings_request_with_intent`](werust_core::retrieval::apply_settings_request_with_intent)
     /// path desktop and Android use), which renders the retrieval-backend settings
-    /// page and PERSISTS a `?backend=…` selection. It returns the page HTML +
-    /// MIME type, or the fail-closed reason (a non-`settings` host). Returns `None`
-    /// if `uri` is not the registered `werust` scheme (Swift then lets the
-    /// `WKWebView` handle it normally).
+    /// page and PERSISTS a `?backend=…` selection, but only for a MAIN-FRAME
+    /// request whose navigation werust's own chrome MARKED as intended
+    /// (`docs/adr/0013`). This handler fires for the main document AND every
+    /// sub-resource, so a refused mutation still renders the page read-only with
+    /// its real current values. It returns the page HTML + MIME type, or the
+    /// fail-closed reason (a non-`settings` host). Returns `None` if `uri` is not
+    /// the registered `werust` scheme (Swift then lets the `WKWebView` handle it
+    /// normally).
     ///
     /// This is the twin of [`resolve_ipfs`](CoreSession::resolve_ipfs): both go
     /// through the same generic [`IosHandle::resolve_scheme`] dispatch, but they
@@ -621,7 +820,7 @@ pub fn menu_json() -> String {
 fn install_ipfs(backend: &mut IosBackend) -> werust_core::ipfs::RedirectSink {
     use fetcher::{HttpFetcher, TrustlessGatewayCarRetriever};
     use werust_core::ipfs::{resolve_ipfs_request, RedirectSink, IPFS_SCHEME};
-    use werust_core::retrieval::{active_gateway_endpoint, apply_settings_request, WERUST_SCHEME};
+    use werust_core::retrieval::active_gateway_endpoint;
 
     // Point the retriever at the USER'S CHOSEN retrieval backend (persisted via
     // `werust://settings`): a custom gateway/local-node URL if picked, else the
@@ -638,14 +837,48 @@ fn install_ipfs(backend: &mut IosBackend) -> werust_core::ipfs::RedirectSink {
         IPFS_SCHEME,
         Box::new(move |request| resolve_ipfs_request(&retriever, &request, &redirects_for_handler)),
     );
-    // The internal `werust://settings` page, resolved through the SAME scheme
-    // seam so Swift's `WKURLSchemeHandler` for `werust` serves it and a
-    // `?backend=…` selection is applied + persisted by the shared core.
+    redirects
+}
+
+/// Install the internal `werust://settings` page on `backend` and return the
+/// CHROME-MARKED USER INTENT carrier its MUTATIONS require, the twin of the
+/// desktop backend's `install_settings_page` (`docs/adr/0013`, task
+/// `ios-marks-user-intent-for-settings-mutations`).
+///
+/// The page is served through the SAME scheme seam `ipfs://` is, so Swift's
+/// `WKURLSchemeHandler` for `werust` serves it (a `WKWebView` will not hand an
+/// UNREGISTERED custom scheme to any handler, which is why that per-scheme
+/// registration exists on the Swift side). That handler fires for the main
+/// document AND every sub-resource, which is exactly why this registration
+/// consults the intent carrier rather than applying a `?backend=…` selection off
+/// the query string: an `<img src="werust://settings?backend=…">` on any page
+/// reaches this closure too, and must render the page while changing NOTHING.
+///
+/// `frames` is the redirect sink [`install_ipfs`] returned, this codebase's ONE
+/// main-frame predicate, so the mark carries the sink that answers the gate's
+/// first half instead of this edge minting a second notion of it.
+///
+/// The returned [`IntentMarker`] is the caller's clone of that one carrier: it
+/// goes to the shell (`BrowserShell::with_navigation_intent`, so a URL-bar commit
+/// marks) and to the Swift navigation-policy hook (so the settings page's own
+/// form submission marks). Nothing else marks, in particular not the
+/// `WKUIDelegate` `_blank`/`window.open` in-place route (`docs/adr/0010`).
+fn install_settings_page(
+    backend: &mut IosBackend,
+    frames: &werust_core::ipfs::RedirectSink,
+) -> IntentMarker {
+    use werust_core::retrieval::{apply_settings_request_with_intent, WERUST_SCHEME};
+
+    let marker = IntentMarker {
+        intent: werust_core::intent::NavigationIntent::new(),
+        frames: frames.clone(),
+    };
+    let intent_for_handler = marker.intent().clone();
     backend.register_scheme_handler(
         WERUST_SCHEME,
-        Box::new(|request| apply_settings_request(&request)),
+        Box::new(move |request| apply_settings_request_with_intent(&request, &intent_for_handler)),
     );
-    redirects
+    marker
 }
 
 /// Install the native EIP-1193 provider bridge on `backend`, the twin of the
@@ -1180,6 +1413,36 @@ mod ffi {
         if let Some(s) = session_mut(session) {
             s.on_page_finished(&url);
         }
+    }
+
+    /// Report a navigation the PAGE is starting, from Swift's
+    /// `WKNavigationDelegate.decidePolicyFor`, so a submission from werust's OWN
+    /// settings page can be marked as the user's intent (`docs/adr/0013`).
+    ///
+    /// Swift passes the FACTS `WKNavigationAction` hands it (the target, the
+    /// document the navigation starts from (its SOURCE frame's own URL), whether
+    /// the TARGET frame is the main frame, and WebKit's navigation-type raw value)
+    /// and decides nothing: whether they add up to a mark is
+    /// [`IntentMarker::note_page_navigation`](super::IntentMarker::note_page_navigation)'s
+    /// call, and whether a marked navigation may MUTATE is the shared core's.
+    /// Returns whether the navigation was marked (a null session marks nothing).
+    ///
+    /// # Safety
+    /// `session` is a live handle; `target` / `document` are valid NUL-terminated
+    /// C strings.
+    #[no_mangle]
+    pub unsafe extern "C" fn werust_ios_note_page_navigation(
+        session: *mut CoreSession,
+        target: *const c_char,
+        document: *const c_char,
+        main_frame: bool,
+        navigation_type: i32,
+    ) -> bool {
+        let target = read(target);
+        let document = read(document);
+        session_mut(session)
+            .map(|s| s.note_page_navigation(&target, &document, main_frame, navigation_type))
+            .unwrap_or(false)
     }
 
     /// Report a same-document URL change (an SPA `pushState`/`replaceState`) into
@@ -2362,5 +2625,449 @@ mod tests {
             // Null handles are tolerated.
             assert!(werust_ios_apply_settings(std::ptr::null_mut(), werust.as_ptr()).is_null());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The CHROME-MARKED USER INTENT a `werust://settings` mutation requires
+    // (`docs/adr/0013`, task `ios-marks-user-intent-for-settings-mutations`).
+    //
+    // Every test below runs on the pure Linux gate: the rule, the wiring and the
+    // C-ABI export are all Rust, so the half of this edge that decides is
+    // exercised here rather than on a Simulator nobody in this project has
+    // (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`).
+    // What Swift must REPORT is pinned by
+    // `crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs`.
+    // -----------------------------------------------------------------------
+
+    /// A scratch settings directory, removed on drop: the isolation lever the
+    /// core's own gate tests use, with no process-global env mutation.
+    struct ScratchSettingsDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchSettingsDir {
+        fn new(tag: &str) -> Self {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            use werust_core::retrieval::{RetrievalBackendChoice, RetrievalSettings};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "werust-ios-settings-test-{tag}-{pid}-{n}",
+                pid = std::process::id(),
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            // A known-good starting choice, so a refusal has something to be
+            // unchanged FROM and the negative control compares real bytes.
+            let seeded = RetrievalSettings {
+                backend: RetrievalBackendChoice::Custom {
+                    url: "http://localhost:5001".to_string(),
+                },
+            };
+            assert!(
+                seeded.save_to(&path),
+                "the scratch settings file is written"
+            );
+            Self { path }
+        }
+
+        /// The settings file's exact bytes: the negative control every refusal
+        /// asserts on (a gate that renders "not changed" while still WRITING the
+        /// file would pass a status-text assertion and fail this one).
+        fn bytes(&self) -> Vec<u8> {
+            std::fs::read(self.path.join("retrieval.json")).expect("the seeded settings file")
+        }
+    }
+
+    impl Drop for ScratchSettingsDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Serve `uri` the way Swift's `WerustSchemeHandler` does (through the shared
+    /// core's gate, against `dir`) and hand back the rendered page.
+    fn serve_settings(dir: &ScratchSettingsDir, uri: &str, marker: &IntentMarker) -> String {
+        let response = werust_core::retrieval::apply_settings_request_in(
+            &dir.path,
+            &renderer::SchemeRequest {
+                uri: uri.to_string(),
+            },
+            marker.intent(),
+        )
+        .expect("a refused mutation still RENDERS the settings page");
+        String::from_utf8(response.body).expect("the settings page is utf-8")
+    }
+
+    /// Every file in the user's REAL settings directory: the hermeticity snapshot
+    /// (`retrieval.json` is the one that matters, and taking the whole directory
+    /// needs no private constant).
+    fn real_settings_snapshot() -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let Some(dir) = werust_core::retrieval::settings_dir() else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| std::fs::read(e.path()).ok().map(|bytes| (e.path(), bytes)))
+            .collect();
+        files.sort();
+        files
+    }
+
+    const A_MUTATING_URL: &str =
+        "werust://settings?backend=custom&url=http%3A%2F%2F127.0.0.1%3A8080";
+    const THE_ATTACK_URL: &str =
+        "werust://settings?backend=custom&url=http%3A%2F%2Fattacker.example%2F";
+
+    #[test]
+    fn a_form_submission_inside_werusts_own_settings_page_applies_the_change() {
+        // The user's own change, on the path only this edge can supply: the
+        // settings page is a plain GET form, so submitting it is a PAGE-initiated
+        // navigation that never passes through the shell. Swift reports it from
+        // `decidePolicyFor` with the facts `WKNavigationAction` carries, and the
+        // change applies and PERSISTS exactly as it did before the gate.
+        let scratch = ScratchSettingsDir::new("own-form");
+        let mut session = CoreSession::new();
+        // The user opened the settings page from the URL bar and it settled.
+        assert!(session.navigate("werust://settings"));
+        settle(&mut session);
+
+        assert!(
+            session.intent_marker().note_page_navigation(
+                A_MUTATING_URL,
+                "werust://settings",
+                true,
+                WK_NAVIGATION_TYPE_FORM_SUBMITTED,
+            ),
+            "a form submit inside werust's own page is the user acting"
+        );
+
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(page.contains("Saved:"), "{page}");
+        assert!(
+            String::from_utf8(scratch.bytes())
+                .unwrap()
+                .contains("127.0.0.1:8080"),
+            "the change is PERSISTED, not just rendered"
+        );
+    }
+
+    #[test]
+    fn a_url_bar_commit_marks_through_the_carrier_this_edge_hands_its_handler() {
+        // The other half, and the one that proves the WIRING rather than the rule:
+        // `BrowserShell::navigate` (what `textFieldShouldReturn` commits to) marks,
+        // and the mark is readable by the carrier this session's `werust://` scheme
+        // handler was built with, i.e. the shell's carrier and the handler's
+        // carrier are ONE. A session that built two would refuse the user's own
+        // typed change with every test still green.
+        let scratch = ScratchSettingsDir::new("url-bar");
+        let mut session = CoreSession::new();
+        assert!(session.navigate(A_MUTATING_URL), "the URL bar commits");
+
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(page.contains("Saved:"), "{page}");
+
+        // And the mark is SINGLE-USE: the rendered page's own re-request of the
+        // same URL finds nothing left to spend.
+        let again = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(
+            again.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn the_registered_werust_scheme_handler_consults_the_carrier_the_shell_marks_into() {
+        // The WIRING, driven through the REAL dispatch Swift's
+        // `WerustSchemeHandler` calls (`CoreSession::apply_settings`) rather than
+        // through the rule: the mark the URL bar left must be readable by the
+        // closure this session REGISTERED for the `werust` scheme. A handler still
+        // registered against the UNGATED `apply_settings_request`, or a session that
+        // built the carrier for its handler and forgot `with_navigation_intent`,
+        // both refuse the user's own typed change, with every rule test green,
+        // because the rule is not what broke.
+        //
+        // The probe URL names an UNKNOWN backend kind on purpose, so this test can
+        // drive the PRODUCTION settings directory without ever being able to write
+        // it: the mark is consumed and the selection then fails to parse, so the
+        // page says so and nothing is persisted either way. Wired, the refusal is
+        // the PARSE one; unwired, it is the intent one. Two different sentences,
+        // neither of which touches the user's file.
+        let real_before = real_settings_snapshot();
+        let mut session = CoreSession::new();
+        let probe = "werust://settings?backend=definitely-not-a-backend";
+        assert!(session.navigate(probe), "the URL bar commits");
+
+        let Some(SchemeResolution::Ok { body, .. }) = session.apply_settings(probe) else {
+            panic!("the werust scheme is intercepted and renders the page");
+        };
+        let page = String::from_utf8(body).expect("the settings page is utf-8");
+        assert!(
+            !page.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "the REGISTERED handler must see the mark the shell left, or the user's \
+             own typed change is refused:\n{page}"
+        );
+        assert!(
+            page.contains("unknown retrieval backend"),
+            "the mark was spent and the selection was then parsed (and refused on \
+             its own merits), which is what proves the gated entry point ran:\n{page}"
+        );
+
+        // And an UNMARKED request through the same registered handler is refused,
+        // which is the half a page reaches.
+        let Some(SchemeResolution::Ok { body, .. }) = session.apply_settings(probe) else {
+            panic!("a refused mutation still renders the page");
+        };
+        let unmarked = String::from_utf8(body).expect("the settings page is utf-8");
+        assert!(
+            unmarked.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "{unmarked}"
+        );
+        assert_eq!(
+            real_settings_snapshot(),
+            real_before,
+            "the probe must never touch the user's own settings file"
+        );
+    }
+
+    #[test]
+    fn a_page_started_navigation_to_a_mutating_settings_url_changes_nothing() {
+        // THE attack, in the shape iOS exposes it: a hostile page navigates the
+        // top-level frame to a mutating settings URL from a LINK the user tapped,
+        // so the navigation is main-frame and genuinely activated in the page, and
+        // the only fact left is the one a page cannot forge: the document it starts
+        // FROM is not a surface werust drew.
+        let scratch = ScratchSettingsDir::new("page-started");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        assert!(session.navigate("https://attacker.example/"));
+        settle(&mut session);
+
+        assert!(
+            !session.intent_marker().note_page_navigation(
+                THE_ATTACK_URL,
+                "https://attacker.example/",
+                true,
+                WK_NAVIGATION_TYPE_LINK_ACTIVATED,
+            ),
+            "a navigation started in WEB CONTENT is never the user asking werust"
+        );
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(
+            scratch.bytes(),
+            before,
+            "the persisted settings are unchanged byte for byte"
+        );
+        assert!(!page.contains("Saved:"), "{page}");
+        assert!(
+            page.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "the refusal is stated on the page: {page}"
+        );
+        assert!(
+            !page.contains("attacker.example"),
+            "the refused endpoint is never shown as the active one: {page}"
+        );
+        assert!(
+            page.contains("localhost:5001"),
+            "and the page still renders the REAL current values: {page}"
+        );
+    }
+
+    #[test]
+    fn a_sub_resource_request_for_a_mutating_settings_url_changes_nothing() {
+        // The `<img src="werust://settings?backend=…">` case. A `WKURLSchemeHandler`
+        // fires for the main document AND every sub-resource, and its task carries
+        // no navigation at all, so it reaches no navigation hook, the carrier has
+        // nothing to spend, and the worst case for a naive main-frame check (the
+        // user legitimately ON the settings page, whose frame key the attack URL
+        // shares once the query is stripped) still changes nothing.
+        let scratch = ScratchSettingsDir::new("sub-resource");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        assert!(session.navigate("werust://settings"));
+        settle(&mut session);
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(scratch.bytes(), before, "nothing was written");
+        assert!(
+            page.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn the_blank_and_window_open_route_cannot_mutate_because_it_marks_nothing() {
+        // `window.open('werust://settings?backend=…')` is routed into this same
+        // `WKWebView` by the `WKUIDelegate` hook (`docs/adr/0010`): a ROUTER, and it
+        // must never become a trust bypass. That hook hands the request straight to
+        // `WKWebView.load`, so it passes through NEITHER marking path: not the
+        // shell's front door, and not the navigation report. Whatever the page
+        // opens therefore reaches the handler with nothing marked, which is what
+        // this asserts; that the Swift hook really reports nothing is pinned by the
+        // source-shape guard.
+        let scratch = ScratchSettingsDir::new("window-open");
+        let before = scratch.bytes();
+        let mut session = CoreSession::new();
+        assert!(session.navigate("https://attacker.example/"));
+        settle(&mut session);
+
+        let page = serve_settings(&scratch, THE_ATTACK_URL, session.intent_marker());
+        assert_eq!(scratch.bytes(), before, "nothing was written");
+        assert!(
+            page.contains(werust_core::retrieval::NOT_STARTED_BY_WERUST),
+            "{page}"
+        );
+    }
+
+    #[test]
+    fn every_fact_the_mark_requires_is_load_bearing() {
+        // The signal's truth table, one flipped fact at a time: each is necessary,
+        // so a later change that drops one shows up here rather than as a silent
+        // reopening of the hole. The facts are WebKit's own (the navigation TYPE,
+        // the TARGET frame's main-frame flag, and the SOURCE frame's own document),
+        // used as INPUTS, never as the decision.
+        let session = CoreSession::new();
+        let marker = session.intent_marker();
+        let from = "werust://settings";
+
+        assert!(
+            !marker.note_page_navigation(
+                A_MUTATING_URL,
+                from,
+                false,
+                WK_NAVIGATION_TYPE_FORM_SUBMITTED
+            ),
+            "a SUB-FRAME navigation (or a `_blank` one, which has no target frame \
+             at all) is not the user changing werust's settings"
+        );
+        for scripted in [
+            WK_NAVIGATION_TYPE_OTHER,
+            WK_NAVIGATION_TYPE_BACK_FORWARD,
+            WK_NAVIGATION_TYPE_RELOAD,
+            WK_NAVIGATION_TYPE_FORM_RESUBMITTED,
+        ] {
+            assert!(
+                !marker.note_page_navigation(A_MUTATING_URL, from, true, scripted),
+                "navigation type {scripted} is not the user ACTIVATING a link or a \
+                 form in the page: a script's `location = …` reports `.other`, and \
+                 a reload / history move / form resubmission is not a fresh \
+                 decision to change a setting"
+            );
+        }
+        assert!(
+            !marker.note_page_navigation(
+                A_MUTATING_URL,
+                "https://attacker.example/",
+                true,
+                WK_NAVIGATION_TYPE_LINK_ACTIVATED
+            ),
+            "web content can never BE at a werust:// URL, which is the fact a page \
+             cannot forge"
+        );
+        assert!(
+            !marker.note_page_navigation(
+                "https://elsewhere.example/",
+                from,
+                true,
+                WK_NAVIGATION_TYPE_LINK_ACTIVATED
+            ),
+            "a navigation LEAVING werust's own page for the web is not a settings change"
+        );
+        assert!(
+            marker.note_page_navigation(
+                A_MUTATING_URL,
+                from,
+                true,
+                WK_NAVIGATION_TYPE_LINK_ACTIVATED
+            ),
+            "all of them together, for a link inside werust's own page"
+        );
+        assert!(
+            marker.note_page_navigation(
+                A_MUTATING_URL,
+                from,
+                true,
+                WK_NAVIGATION_TYPE_FORM_SUBMITTED
+            ),
+            "and for the settings page's own form submit"
+        );
+    }
+
+    #[test]
+    fn the_c_abi_reports_a_page_navigation_and_tolerates_a_null_session() {
+        // The export Swift's `decidePolicyFor` calls, driven exactly as the edge
+        // drives it: the facts cross as borrowed C strings plus two scalars, and the
+        // RETURN says whether the report added up to a mark (nothing on the Swift
+        // side reads a mark, that being the core's business).
+        use super::ffi::*;
+        use std::ffi::CString;
+
+        unsafe {
+            let s = ffi_test_session();
+            let target = CString::new(A_MUTATING_URL).unwrap();
+            let own_page = CString::new("werust://settings").unwrap();
+            let hostile = CString::new("https://attacker.example/").unwrap();
+
+            assert!(
+                werust_ios_note_page_navigation(
+                    s,
+                    target.as_ptr(),
+                    own_page.as_ptr(),
+                    true,
+                    WK_NAVIGATION_TYPE_FORM_SUBMITTED,
+                ),
+                "the settings page's own form submit marks"
+            );
+            assert!(
+                !werust_ios_note_page_navigation(
+                    s,
+                    target.as_ptr(),
+                    hostile.as_ptr(),
+                    true,
+                    WK_NAVIGATION_TYPE_FORM_SUBMITTED,
+                ),
+                "a navigation started in web content does not"
+            );
+
+            werust_ios_session_free(s);
+
+            assert!(
+                !werust_ios_note_page_navigation(
+                    std::ptr::null_mut(),
+                    target.as_ptr(),
+                    own_page.as_ptr(),
+                    true,
+                    WK_NAVIGATION_TYPE_FORM_SUBMITTED,
+                ),
+                "a null session marks nothing (and does not crash the edge)"
+            );
+        }
+    }
+
+    #[test]
+    fn the_intent_signal_never_touches_the_users_own_settings_file() {
+        // Hermeticity, the write-side twin of the pin-store test above: every
+        // assertion in this section drives the settings gate against a SCRATCH
+        // directory, so the developer's own `retrieval.json` is neither read as a
+        // fixture nor written as a side effect.
+        let real_before = real_settings_snapshot();
+
+        let scratch = ScratchSettingsDir::new("hermetic");
+        let mut session = CoreSession::new();
+        assert!(session.navigate(A_MUTATING_URL));
+        let page = serve_settings(&scratch, A_MUTATING_URL, session.intent_marker());
+        assert!(
+            page.contains("Saved:"),
+            "the change landed in the SCRATCH dir"
+        );
+
+        assert_eq!(
+            real_settings_snapshot(),
+            real_before,
+            "the user's own settings directory is untouched"
+        );
     }
 }

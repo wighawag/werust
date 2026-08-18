@@ -1564,7 +1564,35 @@ description = "A `werust://settings?backend=…` MUTATION is applied only for a 
 desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "macos-marks-user-intent-for-settings-mutations" }
 windows = { state = "stubbed", task = "windows-marks-user-intent-for-settings-mutations" }
-ios = { state = "stubbed", task = "ios-marks-user-intent-for-settings-mutations" }
+# iOS (task `ios-marks-user-intent-for-settings-mutations`):
+# `werust_ios_core::install_settings_page` registers the `werust` scheme against
+# the gated core entry point and returns the ONE carrier, which the session hands
+# to its shell (`with_navigation_intent`) and to Swift's
+# `WKNavigationDelegate.decidePolicyFor`. That hook REPORTS the facts
+# `WKNavigationAction` carries (`request.url`, `sourceFrame.request.url`,
+# `targetFrame?.isMainFrame`, `navigationType.rawValue`) and
+# `IntentMarker::note_page_navigation` decides, requiring a `.linkActivated` /
+# `.formSubmitted` navigation, the main frame, and a document that is werust's
+# own `werust://` page. The `WKUIDelegate` `createWebViewWith` hook (the
+# `_blank`/`window.open` router, `docs/adr/0010`) reports nothing. iOS needs NO
+# redirect exclusion because the document fact is read from the navigation's own
+# SOURCE FRAME rather than from the live view URL (docs/spikes/
+# ios-marks-user-intent-for-settings-mutations/DECISIONS.md, decision 2). The
+# Rust half is gate-compiled and unit-tested in `crates/werust-ios/rust/src/lib.rs`
+# (the form submit applies and persists, a page-started navigation and a
+# sub-resource change nothing byte-for-byte, each required fact is load-bearing,
+# and the registered handler really reads the carrier the shell marks into); the
+# Swift half is pinned by
+# crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs. HONEST
+# LIMIT: `.github/workflows/mobile-ios.yml` BUILDS the app and LAUNCHES it on a
+# Simulator but asserts NO behaviour, so it proves only that this wiring
+# compiles and links, and it cannot prove the refusal. There is NO on-device
+# evidence at all: nobody on this project has a Mac
+# (work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md),
+# so no Simulator run was done and none is claimed; the manual steps are written
+# down UNRUN at
+# docs/spikes/ios-marks-user-intent-for-settings-mutations/README.md.
+ios = { state = "implemented" }
 # Android (task `android-marks-user-intent-for-settings-mutations`):
 # `werust_android_core::install_settings_page` registers the `werust` scheme
 # against the gated core entry point and returns the ONE carrier, which the

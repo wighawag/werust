@@ -123,6 +123,14 @@ fn only_the_core_decides_whether_a_marked_navigation_may_mutate() {
         // source, and a `take_mark_for` there would be it deciding.
         "crates/werust-android/rust/src/lib.rs",
         "crates/werust-android/app/src/main/java/com/github/wighawag/werust/BrowserActivity.kt",
+        // iOS (task `ios-marks-user-intent-for-settings-mutations`): the Rust edge
+        // and the two Swift files over it (the shell that reports a navigation,
+        // and the C-ABI binding it reports through). Listed for the same reason
+        // the Kotlin file is: those layers are signal sources, and a
+        // `take_mark_for` there would be them deciding.
+        "crates/werust-ios/rust/src/lib.rs",
+        "crates/werust-ios/App/Sources/WKWebViewShellController.swift",
+        "crates/werust-ios/App/Sources/WerustCore.swift",
         // A sibling edge task APPENDS its own edge files here as it lands.
     ] {
         assert!(
@@ -535,4 +543,279 @@ class Fixture {
         "braces inside comments/strings must not end the body early or late; \
          extracted: {body:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// EDGE: iOS / WKWebView (task `ios-marks-user-intent-for-settings-mutations`).
+//
+// iOS is THREE files: the Rust edge (`werust-ios-core`, which owns the scheme
+// handler registration, the carrier and the marking RULE, and is gate-compiled:
+// its unit tests run in this same `cargo test`), the Swift shell (which reports
+// the per-navigation facts `WKNavigationAction` carries and routes a
+// `_blank`/`window.open` target in place), and the Swift C-ABI binding between
+// them. The two Swift files are reachable from this gate only by PARSING, since
+// no Xcode/SDK exists here, and nobody on this project has a Mac to notice a
+// regression by using the app
+// (`work/notes/findings/apple-signing-tiers-and-the-no-mac-evidence-gap-2026-08-01.md`),
+// which is why the Swift half is pinned rather than argued.
+// ---------------------------------------------------------------------------
+
+fn ios_rust_edge() -> String {
+    source("crates/werust-ios/rust/src/lib.rs")
+}
+
+fn ios_swift_shell() -> String {
+    source("crates/werust-ios/App/Sources/WKWebViewShellController.swift")
+}
+
+/// The BODY of a Swift declaration: the text between the braces of the block that
+/// opens after `signature`, bounded at its MATCHING closing brace.
+///
+/// Swift and Kotlin share exactly the lexical subset this scan needs (`//` and
+/// `/* */` comments, `"` and `"""` literals, `{}` blocks), so this DELEGATES to
+/// the extractor the Android block above already carries (which has its own
+/// regression guard, `the_kotlin_block_extractor_stops_at_the_matching_brace`)
+/// rather than landing a second copy of a tricky scanner in the same file. It is
+/// edge-prefixed because this file is APPENDED to: a sibling Swift edge (macOS)
+/// lands its own helpers here, and two `swift_block_body` definitions would not
+/// compile.
+fn ios_swift_block_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    assert!(
+        source.contains(signature),
+        "the Swift source must declare `{signature}`"
+    );
+    kotlin_block_body(source, signature)
+}
+
+/// The ONE call the Swift shell may make about a navigation: reporting it.
+const THE_IOS_SWIFT_SIGNAL: &str = "core.notePageNavigation(";
+
+#[test]
+fn ios_serves_the_settings_page_through_the_gated_core_entry_point() {
+    // A `WKWebView` hands a custom scheme ONLY to a registered
+    // `WKURLSchemeHandler`, and that handler is asked for the main document AND
+    // every sub-resource, so the registration is where the gate has to be
+    // consulted. Routing through the UNGATED `apply_settings_request` instead
+    // (which is what this edge did before) leaves the hole open with every test
+    // still green, because that entry point still renders the page.
+    let edge = ios_rust_edge();
+    let handler = after(
+        &edge,
+        "    backend.register_scheme_handler(\n        WERUST_SCHEME",
+        300,
+    );
+    assert!(
+        handler.contains("apply_settings_request_with_intent"),
+        "the iOS settings handler must consult the intent carrier:\n{handler}"
+    );
+}
+
+#[test]
+fn ios_hands_the_one_carrier_to_both_the_handler_and_the_shell() {
+    // Two halves, ONE carrier: the shell marks what the chrome starts (the URL
+    // bar's Enter, through `BrowserShell::navigate`), the Swift navigation-policy
+    // hook marks a form submit inside werust's own page, and the scheme handler
+    // reads both. A session that built the carrier for its handler and forgot to
+    // hand it to the shell would refuse the user's own URL-bar change, invisible
+    // to a headless gate and, on this edge, to every human as well.
+    let edge = ios_rust_edge();
+    let wiring = after(&edge, "let intent = install_settings_page(", 200);
+    assert!(
+        wiring.contains("&redirects"),
+        "the settings page is wired with the ONE main-frame predicate (the redirect \
+         sink `install_ipfs` returned), not a second notion of it:\n{wiring}"
+    );
+    assert!(
+        edge.contains(".with_navigation_intent("),
+        "the iOS session must hand the carrier to the shell, or a URL-bar-committed \
+         settings change is refused"
+    );
+}
+
+#[test]
+fn ios_marks_only_a_navigation_activated_inside_a_surface_werust_drew() {
+    // The mark is the whole authorisation, so WHAT it is derived from is the
+    // security property. The iOS facts are WebKit's own vocabulary (the
+    // `WKNavigationType`, the target frame, the source frame's document), but the
+    // shape is the one every edge inherits: the navigation was ACTIVATED in the
+    // page, it targets the MAIN frame, and the document it starts FROM is a
+    // `werust://` page: a surface werust itself drew, which web content can never
+    // be at.
+    let rule = between(
+        &ios_rust_edge(),
+        "    pub fn note_page_navigation(",
+        "\n    /// ",
+    );
+    assert!(
+        rule.contains("WK_NAVIGATION_TYPE_LINK_ACTIVATED")
+            && rule.contains("WK_NAVIGATION_TYPE_FORM_SUBMITTED"),
+        "the mark must require a navigation the user ACTIVATED in the page (a \
+         script's `location = …` reports `.other`):\n{rule}"
+    );
+    assert!(
+        rule.contains("main_frame"),
+        "and must require the MAIN frame:\n{rule}"
+    );
+    // Named per SIDE rather than counted: the `use` line also mentions the
+    // constant, so a count of two is satisfied by the import plus ONE check, and
+    // dropping the DOCUMENT side is exactly the mutation that reopens the hole.
+    for side in [
+        "document.starts_with(WERUST_URL_PREFIX)",
+        "target.starts_with(WERUST_URL_PREFIX)",
+    ] {
+        assert!(
+            rule.contains(side),
+            "the mark must require `{side}`: BOTH the document the navigation starts \
+             from and its target must be werust's own internal page:\n{rule}"
+        );
+    }
+    assert!(
+        rule.contains(THE_SIGNAL),
+        "and it must actually leave the mark:\n{rule}"
+    );
+}
+
+#[test]
+fn the_ios_swift_shell_reports_the_facts_and_decides_nothing() {
+    // The discipline this edge is held to everywhere else (it READS
+    // `werust_core::chrome_json` rather than re-deriving the chrome,
+    // `docs/adr/0011`), applied to the authorisation: Swift hands over the facts
+    // its callback was given and the Rust side decides. A Swift-side condition
+    // choosing when to report would be the same hand-written twin, in the one
+    // place where a drifted copy is a security hole rather than a wrong glyph.
+    let shell = ios_swift_shell();
+    let hook = ios_swift_block_body(
+        &shell,
+        "func webView(\n        _ wv: WKWebView,\n        decidePolicyFor navigationAction: WKNavigationAction,",
+    );
+    let report = hook.find(THE_IOS_SWIFT_SIGNAL).unwrap_or_else(|| {
+        panic!("the navigation hook must report the navigation to the core:\n{hook}")
+    });
+    for fact in [
+        "navigationAction.request.url",
+        "navigationAction.sourceFrame.request.url",
+        "navigationAction.targetFrame?.isMainFrame == true",
+        "navigationAction.navigationType.rawValue",
+    ] {
+        assert!(
+            hook.contains(fact),
+            "the hook must report `{fact}`, one of the facts the mark is derived \
+             from:\n{hook}"
+        );
+    }
+    // The report is UNCONDITIONAL: nothing may decide WHETHER to report, because
+    // the rule lives in the Rust edge (`IntentMarker::note_page_navigation`) where
+    // the gate can test it. This hook DOES branch afterwards (on `.backForward`,
+    // for the edge-swipe report), so the assertion is that no branch precedes the
+    // report rather than that the body is branch-free.
+    let before_the_report = &hook[..report];
+    for decider in ["if ", "guard ", "switch ", "?", "&&", "||"] {
+        assert!(
+            !before_the_report.contains(decider),
+            "nothing may decide whether to report the navigation (`{decider}` \
+             appears before it); the rule belongs to the Rust edge:\n{before_the_report}"
+        );
+    }
+    assert!(
+        hook.contains("decisionHandler(.allow)"),
+        "and the hook must stay READ-ONLY observation (WebKit performs the \
+         navigation exactly as it did before this report existed):\n{hook}"
+    );
+}
+
+#[test]
+fn ios_never_marks_the_blank_and_window_open_path() {
+    // The counter-example the spec names, in its iOS shape: `WKUIDelegate`'s
+    // `createWebViewWith` loads a `_blank`/`window.open` target straight into the
+    // existing view (`docs/adr/0010`), deliberately bypassing the shell. That
+    // target is a URL the PAGE chose, so this hook must report nothing: reporting
+    // there would hand any page a settings write with one
+    // `window.open('werust://settings?backend=custom&url=http://attacker/')`.
+    let shell = ios_swift_shell();
+    let hook = ios_swift_block_body(
+        &shell,
+        "func webView(\n        _ wv: WKWebView,\n        createWebViewWith configuration: WKWebViewConfiguration,",
+    );
+    assert!(
+        hook.contains("wv.load(navigationAction.request)"),
+        "the slice must really be the in-place load hook, or this test passes \
+         vacuously:\n{hook}"
+    );
+    assert!(
+        !hook.contains(THE_IOS_SWIFT_SIGNAL),
+        "the new-window in-place hook must not report a navigation as intent:\n{hook}"
+    );
+    assert!(!hook.contains(THE_DECISION), "nor read a mark:\n{hook}");
+}
+
+#[test]
+fn the_ios_swift_binding_marshals_the_report_and_adds_no_rule() {
+    // The layer between the two: `WerustCore.notePageNavigation` is a C-ABI
+    // marshalling shim, so it must carry the facts across unchanged. A condition
+    // HERE would be as invisible as one in the shell, and it is the more tempting
+    // site (it is the file that knows the FFI's shape).
+    let binding = source("crates/werust-ios/App/Sources/WerustCore.swift");
+    let shim = ios_swift_block_body(
+        &binding,
+        "func notePageNavigation(\n        target: String, document: String, mainFrame: Bool, navigationType: Int\n    ) -> Bool",
+    );
+    assert!(
+        shim.contains("werust_ios_note_page_navigation("),
+        "the binding must call the C-ABI export:\n{shim}"
+    );
+    for decider in ["if ", "guard ", "switch ", "&&", "||"] {
+        assert!(
+            !shim.contains(decider),
+            "the binding must add no rule of its own (`{decider}`):\n{shim}"
+        );
+    }
+}
+
+#[test]
+fn the_ios_swift_block_extractor_stops_at_the_matching_brace() {
+    // The guard ON the guard, in this edge's own idiom: the negative assertions
+    // above ("this hook does NOT report") are worthless on a mis-bounded slice, and
+    // Swift's multi-line signatures are exactly where a naive scan goes wrong: the
+    // signature this file matches on spans three lines and ends in a comma, so the
+    // brace it opens is the one after the RETURN clause, not the next `{` on the
+    // line.
+    let fixture = "\
+final class Fixture {
+    func webView(
+        _ wv: WKWebView,
+        createWebViewWith configuration: WKWebViewConfiguration,
+        for navigationAction: WKNavigationAction
+    ) -> WKWebView? {
+        wv.load(navigationAction.request)
+        return nil
+    }
+
+    func webView(
+        _ wv: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+    ) {
+        core.notePageNavigation(target: \"a\", document: \"b\", mainFrame: true, navigationType: 1)
+        decisionHandler(.allow)
+    }
+}
+";
+    let routing = ios_swift_block_body(
+        fixture,
+        "func webView(\n        _ wv: WKWebView,\n        createWebViewWith configuration: WKWebViewConfiguration,",
+    );
+    assert!(
+        routing.contains("wv.load(navigationAction.request)"),
+        "the extracted body is the hook's own: {routing:?}"
+    );
+    assert!(
+        !routing.contains(THE_IOS_SWIFT_SIGNAL),
+        "and it STOPS at the matching brace rather than running on into the reporting \
+         hook below it (the vacuity this pins): {routing:?}"
+    );
+    let policy = ios_swift_block_body(
+        fixture,
+        "func webView(\n        _ wv: WKWebView,\n        decidePolicyFor navigationAction: WKNavigationAction,",
+    );
+    assert!(policy.contains(THE_IOS_SWIFT_SIGNAL));
 }

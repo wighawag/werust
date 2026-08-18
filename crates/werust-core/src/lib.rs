@@ -2050,6 +2050,17 @@ struct EnsIdentity {
     /// so a root-CID-prefix match on a sub-path re-derives `ronan.eth/<in-site-path>`
     /// (the whole-site identity), not the exact stored entry's display.
     root_name: String,
+    /// The ENSIP-15-NORMALIZED root name the RESOLUTION produced
+    /// ([`ResolvedName::normalized_name`](crate::name_resolution::ResolvedName::normalized_name)):
+    /// this site's IDENTITY, and the key its trusted-name pin is recorded under.
+    ///
+    /// Kept BESIDE [`root_name`](EnsIdentity::root_name) rather than replacing it
+    /// because the two answer different questions: `root_name` is what the URL
+    /// bar shows (the name the user typed), this is what the store is keyed on.
+    /// It is carried from the resolution rather than derived here so the key and
+    /// the resolved identity cannot diverge (task
+    /// `trust-store-keys-on-the-resolved-normalized-name-and-migrates`).
+    normalized_root_name: String,
 }
 
 impl BrowserShell {
@@ -2521,8 +2532,7 @@ impl BrowserShell {
                 // LOUDER `NameViaTrustedRpc` still wins today (the two-axis display
                 // rule); it falls back to `MutableName` once Phase 2 clears the RPC
                 // warning — no rule change here.
-                let mutable = resolved.is_mutable();
-                self.load_resolved_content(name, path, resolved.uri(), mutable);
+                self.load_resolved_content(name, path, &resolved);
                 Ok(())
             }
             // Any typed resolution failure (unnormalizable name, no resolver, no/
@@ -2549,6 +2559,13 @@ impl BrowserShell {
     /// `ipfs://<cid><path>` produces, so reload / back / forward onto THIS entry
     /// re-derive the name+path (not the bare-CID root, nor the raw CID+path).
     ///
+    /// The whole [`ResolvedName`](crate::name_resolution::ResolvedName) is passed
+    /// rather than the two or three fields this needs, so the identity the trust
+    /// store is keyed on
+    /// ([`normalized_name`](crate::name_resolution::ResolvedName::normalized_name))
+    /// travels with the URI it was resolved to instead of being re-derived here
+    /// from the typed `name`.
+    ///
     /// Shared by the `ipfs-ns` (immutable name via trusted RPC) and the resolved
     /// `ipns-ns` (mutable name) branches: both feed a CID into the SAME verified
     /// path, differing only in whether the name is MUTABLE. The load is always
@@ -2560,7 +2577,14 @@ impl BrowserShell {
     /// warning). The flags must come AFTER `navigate` (which resets them on a
     /// fresh `begin`). If the backend cannot even start the load, that is a
     /// fail-closed front-door failure, never a silent success.
-    fn load_resolved_content(&mut self, name: &str, path: &str, uri: &str, mutable: bool) {
+    fn load_resolved_content(
+        &mut self,
+        name: &str,
+        path: &str,
+        resolved: &crate::name_resolution::ResolvedName,
+    ) {
+        let uri = resolved.uri();
+        let mutable = resolved.is_mutable();
         // The backend target is the resolved CID PLUS the typed sub-path
         // (`ipfs://<cid>/blog/`); the displayed identity is the name PLUS the path
         // (`ronan.eth/blog/`) — the identity the user typed, never the CID+path.
@@ -2623,6 +2647,12 @@ impl BrowserShell {
                     mutable,
                     root_cid,
                     root_name: name.to_string(),
+                    // The identity the trust store is keyed on, as the resolution
+                    // returned it: never re-normalized here, and never the typed
+                    // spelling (two spellings of one name normalize together, and
+                    // keying on the spelling is how one blessed identity became
+                    // two records).
+                    normalized_root_name: resolved.normalized_name().to_string(),
                 },
             );
         }
@@ -2719,6 +2749,12 @@ impl BrowserShell {
     ///   The bless holds for THIS session (the chrome updates), it simply cannot
     ///   survive a relaunch. Never an error: a pin store that cannot be written
     ///   must not break browsing.
+    /// - [`Unkeyable`](crate::pins::PinSaveOutcome::Unkeyable): the name has no
+    ///   store key at all ([`pin_key`](crate::pins::pin_key)), so nothing could be
+    ///   recorded for it. Unreachable from the chrome (a name with no key carries
+    ///   no TOFU axis, so no bless is ever offered for one, and an unnormalizable
+    ///   name fails resolution before there is a page to bless); it exists so the
+    ///   write path has no silent refusal.
     /// - [`Refused`](crate::pins::PinSaveOutcome::Refused): the store on disk
     ///   cannot be READ (`docs/adr/0014`), the one case where the bless does not
     ///   hold for this session either. Nothing is recorded, in memory or on disk,
@@ -2783,12 +2819,19 @@ impl BrowserShell {
                 return crate::pins::PinSaveOutcome::Refused(why);
             }
         };
-        pins.bless(
+        // The name on the axis IS the store key the resolution produced, so this
+        // cannot refuse — but the write path gets no silent "cannot happen"
+        // branch: in a TOFU store a swallowed refusal is a lost warning, so it is
+        // reported as the outcome it is (`docs/adr/0014`'s discipline, applied to
+        // the key rather than to the file).
+        if let Err(why) = pins.bless(
             &current.name,
             &current.cid,
             self.chrome.trust_posture,
             crate::pins::now_unix_secs(),
-        );
+        ) {
+            return crate::pins::PinSaveOutcome::Unkeyable(why);
+        }
         let outcome = self.pin_store.save(&pins);
         // The re-read store (plus this bless) becomes the shell's cache, so a
         // concurrent writer's pins are visible here from now on too.
@@ -3446,9 +3489,20 @@ impl BrowserShell {
         // deliberately wider than the `MutableName` POSTURE, which loses to the
         // louder `NameViaTrustedRpc` on every ENS load today). A page that is not
         // name-resolved at all has no axis value, so nothing changes for it.
+        //
+        // Keyed on the entry's NORMALIZED root name — the identity the resolution
+        // returned — never on the display name, so the two spellings of one
+        // identity share one record (task
+        // `trust-store-keys-on-the-resolved-normalized-name-and-migrates`). A name
+        // with no store key at all yields no axis, which is honest: werust has
+        // nothing recorded for it and could not record anything either.
         let mutable_name = ens_entry.as_ref().and_then(|(_, entry)| {
-            (!entry.root_cid.is_empty() && !entry.root_name.is_empty())
-                .then(|| self.pins.check(&entry.root_name, &entry.root_cid))
+            (!entry.root_cid.is_empty() && !entry.normalized_root_name.is_empty())
+                .then(|| {
+                    self.pins
+                        .check(&entry.normalized_root_name, &entry.root_cid)
+                })
+                .flatten()
         });
         self.chrome.mutable_name = mutable_name;
         // The store's THIRD state, carried to the chrome as its own axis: a store
@@ -4858,6 +4912,151 @@ mod tests {
             "trust-name-changed"
         );
         assert!(error_banner_text(later.chrome()).contains(&new_cid));
+    }
+
+    /// ONE `.eth` identity spelled two ways an ASCII fold does NOT collapse and
+    /// ENSIP-15 normalization DOES: fullwidth Latin, and the plain form both
+    /// spellings normalize to. The front door accepts either (the `.eth` suffix
+    /// is ASCII in both), and the ENS read is keyed on the same node.
+    const FULLWIDTH_ETH_NAME: &str = "ＲＯＮＡＮ.eth";
+    const PLAIN_ETH_NAME: &str = "ronan.eth";
+
+    #[test]
+    fn two_spellings_of_one_identity_are_one_trusted_record_through_the_whole_shell() {
+        // Acceptance, end to end and offline: a non-ASCII name typed in two
+        // spellings that NORMALIZE to the same identity resolves to ONE record.
+        // Blessing under one spelling makes the OTHER spelling report unchanged,
+        // with no second record created — because the shell keys the store on the
+        // name the RESOLUTION produced, not on the string the user typed. Under
+        // the old `trim().to_lowercase()` key these were two pins, so the second
+        // spelling looked unblessed and its change would have warned about
+        // nothing.
+        let scratch = PinScratchDir::new("two-spellings");
+        let (contenthash, _) = ipfs_contenthash_fixture(b"the version the user trusts");
+        assert_ne!(
+            FULLWIDTH_ETH_NAME.trim().to_lowercase(),
+            PLAIN_ETH_NAME,
+            "the two spellings really do split under the OLD ASCII fold"
+        );
+
+        // --- Launch 1: the user types the FULLWIDTH spelling and blesses it. ---
+        let (mut first, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&contenthash)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut first, &handle, FULLWIDTH_ETH_NAME);
+        assert_eq!(
+            first.chrome().mutable_name.as_ref().map(|n| n.name.clone()),
+            Some(PLAIN_ETH_NAME.to_string()),
+            "the TOFU axis is keyed on the resolved identity, not the typed spelling"
+        );
+        assert_eq!(
+            first.bless_current_name(),
+            crate::pins::PinSaveOutcome::Recorded
+        );
+
+        // --- Launch 2: the PLAIN spelling of the same identity. ---
+        let (mut second, handle2) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&contenthash)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut second, &handle2, PLAIN_ETH_NAME);
+        let chrome = second.chrome();
+        assert!(
+            chrome
+                .mutable_name
+                .as_ref()
+                .expect("a name-resolved page carries the TOFU axis")
+                .is_unchanged(),
+            "the OTHER spelling finds the record the first one blessed"
+        );
+        assert!(!chrome.mutable_name_changed());
+        assert!(
+            !trust_pin_action_visible(chrome),
+            "there is nothing left to record: no second pin is offered"
+        );
+        assert!(trust_pin_detail(chrome).contains("You trusted exactly this content on"));
+
+        // And there is exactly ONE record on disk, under the one key space.
+        let store = crate::pins::TrustedNamePins::load_from(&scratch.path).expect("readable");
+        assert_eq!(store.len(), 1, "one identity, one record: {store:?}");
+        assert!(store.get(FULLWIDTH_ETH_NAME).is_some());
+        assert!(store.get(PLAIN_ETH_NAME).is_some());
+    }
+
+    #[test]
+    fn a_store_written_under_the_old_key_still_warns_after_the_upgrade() {
+        // Acceptance (the MIGRATION, through the shell): a record written by an
+        // EARLIER build under the ASCII fold would MISS once the key became the
+        // normalized name, and the user — who blessed this name — would be shown
+        // an unblessed page and then given a SECOND record for it. Instead the old
+        // record is re-keyed as the store is read, so the very next resolution to
+        // a DIFFERENT CID still warns, and the store still holds one record.
+        let scratch = PinScratchDir::new("old-key-warns");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let (ch_new, new_uri) = ipfs_contenthash_fixture(b"a DIFFERENT version, published later");
+        let new_cid = new_uri.trim_start_matches("ipfs://").to_string();
+        // Exactly what an older werust wrote for this name: `trim().to_lowercase()`.
+        let old_key = FULLWIDTH_ETH_NAME.trim().to_lowercase();
+        std::fs::write(
+            scratch.path.join(crate::pins::PINS_FILE),
+            format!(
+                r#"{{"pins":[{{"name":"{old_key}","cid":"bafyblessedbyanolderbuild","blessedAt":1800000000,"posture":"name-via-trusted-rpc"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let (mut shell, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&ch_new)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut shell, &handle, PLAIN_ETH_NAME);
+
+        let chrome = shell.chrome();
+        assert!(
+            chrome.mutable_name_changed(),
+            "the pin an older build recorded still warns after the re-key"
+        );
+        assert_eq!(
+            chrome
+                .mutable_name
+                .as_ref()
+                .unwrap()
+                .blessed
+                .as_ref()
+                .map(|p| p.cid.clone()),
+            Some("bafyblessedbyanolderbuild".to_string()),
+            "and it is the SAME record, not a fresh one"
+        );
+        assert_eq!(trust_indicator_css_class(chrome), "trust-name-changed");
+
+        // Accepting the change RE-blesses that one record; no second entry is
+        // created for a name the user already trusted.
+        assert_eq!(
+            shell.bless_current_name(),
+            crate::pins::PinSaveOutcome::Recorded
+        );
+        let store = crate::pins::TrustedNamePins::load_from(&scratch.path).expect("readable");
+        assert_eq!(store.len(), 1, "still ONE record: {store:?}");
+        assert_eq!(
+            store.get(PLAIN_ETH_NAME).map(|pin| pin.cid.clone()),
+            Some(new_cid)
+        );
+        let document =
+            std::fs::read_to_string(scratch.path.join(crate::pins::PINS_FILE)).expect("the store");
+        assert!(
+            !document.contains(&old_key),
+            "and the old key space is gone from the persisted document: {document}"
+        );
     }
 
     #[test]

@@ -151,6 +151,53 @@
 //!    cannot parse is not condemned to a warning that no re-bless could ever
 //!    clear. Never a panic, whatever is in the file.
 //!
+//! # One IDENTITY, one key: the store keys on the RESOLVED name
+//!
+//! The key a pin is recorded under is the ENSIP-15-NORMALIZED name the
+//! RESOLUTION produced ([`pin_key`],
+//! [`ResolvedName::normalized_name`](crate::name_resolution::ResolvedName::normalized_name)),
+//! not a fold this module computes from whatever string a caller was holding.
+//! The namehash normalizes the name already and used to throw the result away,
+//! while the store keyed on `trim().to_lowercase()`: an ASCII case fold. For
+//! every name whose normalization is NOT plain case folding (an emoji with and
+//! without its U+FE0F variation selector, fullwidth or circled Latin, other
+//! confusables) that made ONE resolved identity into TWO keys, which is exactly
+//! the missed warning this store exists to raise (task
+//! `trust-store-keys-on-the-resolved-normalized-name-and-migrates`). Two rules
+//! hold the shape together:
+//!
+//! 1. **One derivation, one call site.** [`pin_key`] reaches the SAME
+//!    [`ens::normalize_name`](crate::ens::normalize_name) the namehash does, and
+//!    the shell keys the store on the value the resolution RETURNED rather than
+//!    re-deriving one from the typed spelling. A second derivation of an
+//!    identity is a second chance to drift, and a store whose key disagrees with
+//!    the resolved identity warns about nothing.
+//! 2. **The key is FALLIBLE, and never falls back.** A name normalization
+//!    refuses has no key, no pin and no warning, said out loud as an
+//!    [`UnkeyableName`] ([`pin_key`]'s own doc has the grounding). A fallback to
+//!    the old fold would be the second key space this change exists to delete.
+//!
+//! A NON-ENS name needs no special case: a bare IPNS key (`k51qzi…`, base36) is
+//! a lower-case ASCII dot-less label, so the same normalization returns it
+//! unchanged, and a test asserts that rather than prose.
+//!
+//! # Re-keying what is already recorded
+//!
+//! A record written under the OLD fold would MISS after that change, and the
+//! next bless would write a SECOND record for a name the user already trusts. So
+//! every entry is re-keyed AS IT IS READ (`read_entry`), which makes the
+//! migration part of the one thing every caller already does. It is in place and
+//! idempotent (re-keying an already-normalized key returns it, so a second
+//! launch re-keys nothing), it inherits the write rules whole because it reaches
+//! disk only through [`save_to`](TrustedNamePins::save_to) (refused while the
+//! store is unreadable, atomic when it lands), and it needs no separate startup
+//! rewrite: a store nobody ever writes again is still read correctly forever.
+//! Two old records that collapse onto ONE new key are the very bug being fixed,
+//! so they are REPORTED through the existing
+//! [`DuplicateName`](UndeterminableTrust::DuplicateName) rule — never merged by
+//! picking whichever sorted first, which would decide for the user which content
+//! they had trusted.
+//!
 //! # Vocabulary note: "pin"
 //!
 //! `pin` is already used loosely in this crate for "held in place" (the shell
@@ -190,8 +237,8 @@ pub const PINS_FILE: &str = "pins.json";
 /// itself".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrustedNamePin {
-    /// The mutable name, in the store's canonical (lower-cased, trimmed) key
-    /// form; see [`pin_key`].
+    /// The mutable name, in the store's canonical key form: the
+    /// ENSIP-15-normalized name the resolution produced; see [`pin_key`].
     pub name: String,
     /// The CID the name resolved to when it was blessed, VERBATIM in the form
     /// that resolution produced (a CIDv0 `Qm…` or a CIDv1 `bafybe…`): the store
@@ -293,9 +340,10 @@ fn canonical_root(cid: &str) -> Option<Cid> {
 /// module's CID-spelling note).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutableNameTrust {
-    /// The mutable name the user sees in the URL bar for this site (the ROOT
-    /// name, e.g. `ronan.eth`, never a sub-path display): the identity a pin is
-    /// keyed on, so `ronan.eth/blog/` and `ronan.eth` share one pin.
+    /// The mutable name this site is trusted UNDER: the ROOT name (e.g.
+    /// `ronan.eth`, never a sub-path display) in its canonical [`pin_key`] form,
+    /// so `ronan.eth/blog/` and `ronan.eth` share one pin — and so do two
+    /// spellings of one identity that normalize together.
     pub name: String,
     /// The ROOT CID this name resolves to on THIS load.
     pub cid: String,
@@ -493,6 +541,18 @@ pub enum PinSaveOutcome {
     /// [`UndeterminableTrust`] the read side reports, so a caller says WHY without
     /// re-reading the file.
     Refused(UndeterminableTrust),
+    /// The NAME has no store key at all ([`pin_key`]), so there is nothing that
+    /// could be recorded for it and nothing was written.
+    ///
+    /// A refusal, like [`Refused`](PinSaveOutcome::Refused), and deliberately not
+    /// [`CouldNotPersist`](PinSaveOutcome::CouldNotPersist) (werust would NOT
+    /// have written this) nor
+    /// [`NothingToRecord`](PinSaveOutcome::NothingToRecord) (there WAS something
+    /// the user asked to record). Unreachable through the browser — an
+    /// unnormalizable name fails resolution before a page exists to bless — so it
+    /// exists to make sure the write path has no silent "cannot happen" branch,
+    /// which in a TOFU store is a lost warning.
+    Unkeyable(UnkeyableName),
 }
 
 impl PinSaveOutcome {
@@ -521,6 +581,7 @@ impl PinSaveOutcome {
                 "nothing was written, because {why}, so the trusted names already recorded \
                  there are not lost"
             )),
+            Self::Unkeyable(why) => Some(format!("nothing was written, because {why}")),
         }
     }
 }
@@ -529,15 +590,94 @@ impl PinSaveOutcome {
 // The store.
 // ---------------------------------------------------------------------------
 
-/// The canonical store key for a mutable name: trimmed and lower-cased.
+/// A name that has NO store key, because ENSIP-15 normalization refuses it: the
+/// legible half of the fallible key (see [`pin_key`]).
 ///
-/// ENS names are case-insensitive (ENSIP-1 normalization lower-cases them before
-/// the namehash), so `Ronan.eth` and `ronan.eth` are ONE name and must not be two
-/// pins: a second pin under a different casing would silently make the warning
-/// miss, which is the one failure mode a TOFU store cannot have.
-#[must_use]
-pub fn pin_key(name: &str) -> String {
-    name.trim().to_lowercase()
+/// It exists so a refusal is a SENTENCE at the call site rather than a bare
+/// `None` a later caller reads as "the user has not blessed this" — the one
+/// reading that would turn "werust cannot key this name" into a missing warning.
+/// It is the store's statement of the same fact
+/// [`ResolutionError::UnnormalizableName`](crate::ens::ResolutionError::UnnormalizableName)
+/// reports on the resolution path, and it carries that normalizer's own reason
+/// rather than wording a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnkeyableName {
+    /// The name as it was handed to [`pin_key`] (trimmed).
+    pub name: String,
+    /// The normalizer's own reason.
+    pub detail: String,
+}
+
+impl std::fmt::Display for UnkeyableName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { name, detail } = self;
+        write!(
+            f,
+            "`{name}` is not a name werust can normalize, so it has no trusted-name key: {detail}"
+        )
+    }
+}
+
+/// The canonical store key for a mutable name: its ENSIP-15-NORMALIZED form —
+/// the SAME identity the resolution path produced
+/// ([`ResolvedName::normalized_name`](crate::name_resolution::ResolvedName::normalized_name)).
+///
+/// # Why normalization and not case folding
+///
+/// The key used to be `trim().to_lowercase()`, an ASCII case fold, while the
+/// resolution normalized the very same name through ENSIP-15 (inside the
+/// namehash) and discarded the result. Normalization is much more than case: it
+/// folds fullwidth and circled Latin onto plain letters and strips an emoji's
+/// invisible U+FE0F variation selector, so for any name whose normalization is
+/// not plain case folding ONE resolved identity produced TWO store keys — the
+/// user blesses a name, sees it again under its other spelling, and werust says
+/// nothing. That is the one failure mode a TOFU store cannot have, and this
+/// module's own doc used to claim a casing guard that covered ASCII only (task
+/// `trust-store-keys-on-the-resolved-normalized-name-and-migrates`).
+///
+/// The derivation lives HERE, in one place, reaching the ONE bound-normalizer
+/// call site ([`ens::normalize_name`](crate::ens::normalize_name)). One place is
+/// load-bearing twice over: the key and the resolved identity cannot drift, and
+/// the follow-on that records WHICH normalization version wrote a store has a
+/// single site to stamp.
+///
+/// # The key is FALLIBLE
+///
+/// A name ENSIP-15 refuses has NO key: no pin, and therefore no warning. It does
+/// NOT fall back to the old fold (that is the second key space this change
+/// removes) and it gets no separate marked key space. Nothing is lost by that:
+/// [`ens::resolve`](crate::ens::resolve) refuses an unnormalizable name with its
+/// own typed error long before a load, so such a name never reaches a page there
+/// is anything to bless. The refusal is returned as an [`UnkeyableName`] rather
+/// than a silent `None`, so no caller mistakes it for "unblessed".
+///
+/// The trim is the store's own tolerance for a stray space around a typed name
+/// (` ronan.eth ` is `ronan.eth`, as it always was); the normalizer itself takes
+/// the name exactly as spelled.
+pub fn pin_key(name: &str) -> Result<String, UnkeyableName> {
+    let name = name.trim();
+    let unkeyable = |detail: String| UnkeyableName {
+        name: name.to_string(),
+        detail,
+    };
+    // The normalizer accepts the EMPTY string (it is the ENS root, which has a
+    // well-defined node), but the root is not a name anybody browses to and an
+    // empty key would collide with every other empty-ish spelling.
+    if name.is_empty() {
+        return Err(unkeyable("a name cannot be empty".to_string()));
+    }
+    let key = crate::ens::normalize_name(name).map_err(|e| {
+        unkeyable(match e {
+            crate::ens::ResolutionError::UnnormalizableName { detail, .. } => detail,
+            // `normalize_name` returns no other variant; carry whatever it says
+            // rather than asserting the shape of somebody else's error.
+            other => other.to_string(),
+        })
+    })?;
+    if key.is_empty() {
+        return Err(unkeyable("it normalizes to an empty name".to_string()));
+    }
+    Ok(key)
 }
 
 /// The persisted trusted-name pins: one small JSON file, isolatable via the
@@ -716,23 +856,43 @@ impl TrustedNamePins {
         }
     }
 
-    /// The pin for `name`, or `None` when it has never been blessed. Looked up by
-    /// [`pin_key`], so casing cannot split one name across two pins.
+    /// The pin for `name`, or `None` when it has never been blessed — or has no
+    /// [`pin_key`] at all, which is the same answer to the question asked here
+    /// ("what has the user blessed for this name?") and never a claim that the
+    /// name is fine.
+    ///
+    /// Looked up by [`pin_key`], so no spelling of one identity can split it
+    /// across two pins.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&TrustedNamePin> {
-        let key = pin_key(name);
+        let key = pin_key(name).ok()?;
         self.pins.iter().find(|pin| pin.name == key)
     }
 
     /// Record (or RE-record) `name`'s current `cid` as blessed, with the posture
-    /// werust was showing and the moment the user did it.
+    /// werust was showing and the moment the user did it — or say WHY the name
+    /// cannot be recorded at all.
     ///
     /// Re-blessing a changed name REPLACES its pin: the SSH-host-key model's
     /// "I have looked at the change and I accept the new content". The store is
     /// therefore always at most one pin per name.
-    pub fn bless(&mut self, name: &str, cid: &str, posture: TrustPosture, blessed_at: u64) {
+    ///
+    /// A name with no [`pin_key`] records NOTHING and returns the
+    /// [`UnkeyableName`] saying so. Silently doing nothing is the one shape this
+    /// must not have: the user would click bless, the store would report a
+    /// successful save of an unchanged document, and no warning would ever
+    /// follow. It is unreachable through the browser (an unnormalizable name
+    /// fails resolution long before a page exists to bless), which is why it is a
+    /// refusal rather than a fallback key.
+    pub fn bless(
+        &mut self,
+        name: &str,
+        cid: &str,
+        posture: TrustPosture,
+        blessed_at: u64,
+    ) -> Result<(), UnkeyableName> {
         let pin = TrustedNamePin {
-            name: pin_key(name),
+            name: pin_key(name)?,
             cid: cid.to_string(),
             blessed_at,
             posture,
@@ -748,6 +908,7 @@ impl TrustedNamePins {
                 self.pins.sort_by(|a, b| a.name.cmp(&b.name));
             }
         }
+        Ok(())
     }
 
     /// The [`MutableNameTrust`] for a name resolving to `cid` right now: the
@@ -755,13 +916,20 @@ impl TrustedNamePins {
     ///
     /// This is the ONE place the store is consulted per load, so no presentation
     /// rule ever reads the filesystem.
+    ///
+    /// `None` when the name has no [`pin_key`]: there is no identity to pair, so
+    /// there is no axis — no pin, no warning, and no bless offer werust would
+    /// then have to refuse. That is deliberately NOT a `MutableNameTrust` with
+    /// `blessed: None`, which reads as "this name is simply unblessed" and would
+    /// offer a bless that could never be recorded.
     #[must_use]
-    pub fn check(&self, name: &str, cid: &str) -> MutableNameTrust {
-        MutableNameTrust {
-            name: name.to_string(),
+    pub fn check(&self, name: &str, cid: &str) -> Option<MutableNameTrust> {
+        let key = pin_key(name).ok()?;
+        Some(MutableNameTrust {
+            name: key,
             cid: cid.to_string(),
             blessed: self.get(name).cloned(),
-        }
+        })
     }
 
     /// How many names are blessed.
@@ -882,15 +1050,27 @@ fn read_entry(
     let unreadable = |what: &str| {
         UndeterminableTrust::UnreadableEntry(format!("entry {index} {what}", index = index + 1))
     };
-    let name = pin_key(
-        entry
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| unreadable("records no name"))?,
-    );
-    if name.is_empty() {
-        return Err(unreadable("records an empty name"));
-    }
+    // The RE-KEY: an entry recorded under an older key derivation (the ASCII
+    // `trim().to_lowercase()` fold) is read under TODAY's [`pin_key`], in place.
+    // That is the whole migration: a non-ASCII record written by an older build
+    // is found by ONE lookup here, so the next bless RE-blesses it instead of
+    // adding a second record for a name the user already trusts. It is idempotent
+    // by construction (normalizing an already-normalized key returns it), it
+    // reaches disk only through the ordinary atomic `save_to` (which refuses
+    // while the store is unreadable), and two old records that collapse onto ONE
+    // new key fall straight into the existing duplicate-key rule in `from_json`
+    // rather than being merged behind the user's back.
+    let recorded = entry
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unreadable("records no name"))?;
+    let name = pin_key(recorded).map_err(|why| {
+        // Reported, never dropped: the same rule the unknown-posture case follows.
+        // A recorded name this build cannot key is a record werust cannot honour,
+        // and quietly discarding it would let the next save delete a pin the user
+        // is still relying on.
+        unreadable(&format!("records a name werust cannot key: {why}"))
+    })?;
     let cid = entry
         .get("cid")
         .and_then(Value::as_str)
@@ -1113,7 +1293,8 @@ mod tests {
             "bafyone",
             TrustPosture::NameViaTrustedRpc,
             1_800_000_000,
-        );
+        )
+        .expect("a name werust can key");
         assert!(pins.save_to(&scratch.path).is_recorded());
         assert!(
             scratch.path.join(PINS_FILE).is_file(),
@@ -1141,7 +1322,8 @@ mod tests {
         let real_before = real_pin_store_snapshot();
         let scratch = ScratchDir::new("isolation");
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
+        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         assert!(pins.save_to(&scratch.path).is_recorded());
         assert_eq!(
             real_pin_store_snapshot(),
@@ -1211,8 +1393,10 @@ mod tests {
         // most ONE pin per name, so the next change is measured against what the
         // user last accepted.
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 10);
-        pins.bless("ronan.eth", "bafynew", TrustPosture::NameViaTrustedRpc, 20);
+        pins.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 10)
+            .expect("a name werust can key");
+        pins.bless("ronan.eth", "bafynew", TrustPosture::NameViaTrustedRpc, 20)
+            .expect("a name werust can key");
         assert_eq!(pins.len(), 1);
         let pin = pins.get("ronan.eth").expect("still one pin");
         assert_eq!(pin.cid, "bafynew");
@@ -1226,13 +1410,17 @@ mod tests {
         // name. Two pins would make the warning MISS, the one failure a TOFU store
         // cannot have.
         let mut pins = TrustedNamePins::default();
-        pins.bless("Ronan.ETH", "bafyone", TrustPosture::MutableName, 1);
+        pins.bless("Ronan.ETH", "bafyone", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         assert_eq!(pins.len(), 1);
         assert_eq!(
             pins.get(" ronan.eth ").map(|p| p.cid.as_str()),
             Some("bafyone")
         );
-        assert!(pins.check("RONAN.eth", "bafyother").is_changed());
+        assert!(pins
+            .check("RONAN.eth", "bafyother")
+            .expect("a name werust can key")
+            .is_changed());
     }
 
     #[test]
@@ -1242,14 +1430,273 @@ mod tests {
         // IPNS name. Both axes' names are controller-repointable, so both are
         // blessable and both warn identically.
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "bafyens", TrustPosture::NameViaTrustedRpc, 1);
-        pins.bless("k51qzifixture", "bafyipns", TrustPosture::MutableName, 2);
-        assert!(pins.check("ronan.eth", "bafyens").is_unchanged());
-        assert!(pins.check("ronan.eth", "bafyelse").is_changed());
-        assert!(pins.check("k51qzifixture", "bafyipns").is_unchanged());
-        assert!(pins.check("k51qzifixture", "bafyelse").is_changed());
+        pins.bless("ronan.eth", "bafyens", TrustPosture::NameViaTrustedRpc, 1)
+            .expect("an ENS name has a key");
+        pins.bless(IPNS_KEY_FIXTURE, "bafyipns", TrustPosture::MutableName, 2)
+            .expect("a bare IPNS key has a key too");
+        assert!(checked(&pins, "ronan.eth", "bafyens").is_unchanged());
+        assert!(checked(&pins, "ronan.eth", "bafyelse").is_changed());
+        assert!(checked(&pins, IPNS_KEY_FIXTURE, "bafyipns").is_unchanged());
+        assert!(checked(&pins, IPNS_KEY_FIXTURE, "bafyelse").is_changed());
         // An unknown name is simply unblessed on either axis.
-        assert!(!pins.check("stranger.eth", "bafyany").is_blessed());
+        assert!(!checked(&pins, "stranger.eth", "bafyany").is_blessed());
+    }
+
+    /// A real base36 IPNS key (the `k51qzi…` form an `ipns-ns` contenthash
+    /// decodes to), for the decision-2 assertion that a NON-ENS name goes through
+    /// the same normalization and comes out unchanged.
+    const IPNS_KEY_FIXTURE: &str = "k51qzi5uqu5dlvj2baxnqndepeb86cbk3ng7n3i46uzyxzyqj2xjonzllnv0v8";
+
+    /// ONE identity spelled two ways that ENSIP-15 normalization COLLAPSES and
+    /// ASCII case folding does not: an emoji with and without the U+FE0F
+    /// variation selector. Both are already lower case, so `to_lowercase()`
+    /// leaves them as two DIFFERENT strings — the store's old key space split one
+    /// blessed identity in two, and the warning missed.
+    const HEART_WITH_SELECTOR: &str = "❤\u{fe0f}.eth";
+    const HEART_WITHOUT_SELECTOR: &str = "❤.eth";
+
+    /// [`TrustedNamePins::check`] for a name the test asserts IS keyable, so the
+    /// existing assertions read as they did before the key became fallible.
+    fn checked(pins: &TrustedNamePins, name: &str, cid: &str) -> MutableNameTrust {
+        pins.check(name, cid)
+            .unwrap_or_else(|| panic!("`{name}` has a store key"))
+    }
+
+    #[test]
+    fn one_resolved_identity_is_one_key_even_when_normalizing_is_not_case_folding() {
+        // Acceptance: the key is the ENSIP-15-normalized name the resolution
+        // produced, so a name whose normalization is NOT plain case folding is
+        // looked up under exactly ONE key. The pair here differs only by an
+        // INVISIBLE U+FE0F, which the old `trim().to_lowercase()` key kept as two
+        // records: one blessed identity, two pins, and a warning that misses.
+        assert_ne!(
+            HEART_WITH_SELECTOR.trim().to_lowercase(),
+            HEART_WITHOUT_SELECTOR.trim().to_lowercase(),
+            "the OLD ASCII fold really did split this identity in two"
+        );
+        assert_eq!(
+            pin_key(HEART_WITH_SELECTOR).expect("a normalizable name"),
+            pin_key(HEART_WITHOUT_SELECTOR).expect("a normalizable name"),
+            "one identity, one key"
+        );
+
+        let mut pins = TrustedNamePins::default();
+        pins.bless(
+            HEART_WITH_SELECTOR,
+            "bafyone",
+            TrustPosture::NameViaTrustedRpc,
+            1,
+        )
+        .expect("a normalizable name records a pin");
+        assert_eq!(pins.len(), 1);
+        assert!(
+            checked(&pins, HEART_WITHOUT_SELECTOR, "bafyone").is_unchanged(),
+            "the OTHER spelling finds the SAME record"
+        );
+        assert!(checked(&pins, HEART_WITHOUT_SELECTOR, "bafytwo").is_changed());
+
+        // Re-blessing under the other spelling REPLACES that one record rather
+        // than growing a second key space.
+        pins.bless(
+            HEART_WITHOUT_SELECTOR,
+            "bafytwo",
+            TrustPosture::MutableName,
+            2,
+        )
+        .expect("a normalizable name records a pin");
+        assert_eq!(pins.len(), 1, "still ONE record: {pins:?}");
+        assert_eq!(
+            pins.get(HEART_WITH_SELECTOR).map(|pin| pin.cid.as_str()),
+            Some("bafytwo")
+        );
+    }
+
+    #[test]
+    fn a_bare_ipns_key_normalizes_to_itself_so_it_needs_no_second_key_space() {
+        // Settled decision 2, asserted rather than argued: a NON-ENS name goes
+        // through the SAME normalization, and that is a no-op on it. A base36
+        // IPNS key is a lower-case ASCII, dot-less label, so it comes back
+        // unchanged — and a future normalizer that started mangling such keys
+        // would red the gate here instead of silently orphaning every IPNS pin.
+        assert_eq!(
+            pin_key(IPNS_KEY_FIXTURE).expect("a bare IPNS key is a name werust can key"),
+            IPNS_KEY_FIXTURE,
+            "normalization is the identity on a bare IPNS key"
+        );
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_normalized_gets_no_key_and_records_no_pin() {
+        // Settled decision 1: the key is FALLIBLE. A name ENSIP-15 normalization
+        // refuses has NO key, so it has no pin and no warning — it does NOT fall
+        // back to the old trimmed-and-lower-cased form (that is the second key
+        // space this task exists to remove). The refusal is LEGIBLE at the call
+        // site rather than a silent `None` a later caller reads as "unblessed":
+        // the write says why, and the check has no axis to offer a bless from.
+        //
+        // Nothing can reach a load under such a name anyway — `ens::resolve`
+        // refuses it with its own typed `UnnormalizableName` long before a bless
+        // is possible — which is exactly why no fallback key is needed.
+        for refused in ["a..b.eth", "under_score.eth", "not a name", "", "   "] {
+            let why = pin_key(refused).expect_err("not a name werust can key");
+            assert!(
+                why.to_string().contains("key"),
+                "the refusal is legible: {why}"
+            );
+
+            let mut pins = TrustedNamePins::default();
+            assert_eq!(
+                pins.bless(refused, "bafy", TrustPosture::MutableName, 1),
+                Err(why),
+                "no key, no pin — and the write SAYS so"
+            );
+            assert!(pins.is_empty(), "nothing was recorded under a fallback key");
+            assert!(pins.get(refused).is_none());
+            assert!(
+                pins.check(refused, "bafy").is_none(),
+                "no key means no TOFU axis at all, never a bless offer"
+            );
+        }
+    }
+
+    #[test]
+    fn a_store_written_under_the_old_ascii_fold_is_re_keyed_on_load_and_stays_one_record() {
+        // Acceptance (the MIGRATION): a non-ASCII record written under the old
+        // `trim().to_lowercase()` key would MISS after this change, and the next
+        // bless would write a SECOND record for a name the user already trusts —
+        // precisely the missed warning the spec exists to close. So the store is
+        // re-keyed as it is READ, one lookup finds it, and the first bless after
+        // the upgrade creates no second entry. The rewrite reaches disk through
+        // the ordinary atomic save, which refuses while the store is unreadable.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("re-key");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let old_key = HEART_WITH_SELECTOR.trim().to_lowercase();
+        let new_key = pin_key(HEART_WITH_SELECTOR).expect("a normalizable name");
+        assert_ne!(old_key, new_key, "the fixture really is a re-keying case");
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            format!(
+                r#"{{"pins":[{{"name":"{old_key}","cid":"bafyold","blessedAt":1800000000,"posture":"name-via-trusted-rpc"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // ONE lookup, under the name the resolution produces today, finds it.
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        assert_eq!(pins.len(), 1);
+        let pin = pins
+            .get(HEART_WITHOUT_SELECTOR)
+            .expect("the old record is found under the NEW key");
+        assert_eq!(pin.name, new_key, "re-keyed in place");
+        assert_eq!(pin.cid, "bafyold", "and it is the SAME record");
+        assert_eq!(pin.blessed_at, 1_800_000_000);
+
+        // The first bless after the upgrade RE-blesses that one record; it does
+        // not add a second one for a name the user already trusts.
+        pins.bless(
+            HEART_WITHOUT_SELECTOR,
+            "bafynew",
+            TrustPosture::NameViaTrustedRpc,
+            2,
+        )
+        .expect("a normalizable name records a pin");
+        assert_eq!(pins.len(), 1, "no second record: {pins:?}");
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        assert_eq!(
+            dir_entries(&scratch.path),
+            vec![PINS_FILE.to_string()],
+            "the re-key goes through the ordinary atomic save: no temp file left"
+        );
+        let document = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
+        assert!(
+            document.contains(&new_key) && !document.contains(&old_key),
+            "the persisted document holds ONE key space: {document}"
+        );
+
+        // IDEMPOTENT: a second launch re-keys nothing, and a re-save is byte for
+        // byte the same document.
+        let reloaded = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        assert_eq!(reloaded, pins);
+        assert_eq!(reloaded.to_json(), pins.to_json());
+        assert_eq!(reloaded.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        assert_eq!(
+            std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store"),
+            document,
+            "running the migration twice changes nothing"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn no_re_key_is_written_while_the_store_cannot_be_read() {
+        // The migration is a WRITE, so it obeys the write rules it inherited: a
+        // store werust cannot read is never overwritten, not even to re-key it.
+        // A re-key that ignored this would be the worst version of the failure
+        // `docs/adr/0014` exists to prevent — a rewrite of every record in a file
+        // werust could not read in the first place.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("re-key-refused");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let corrupt = br#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1,"posture":"from-the-future"}]}"#;
+        std::fs::write(scratch.path.join(PINS_FILE), corrupt).unwrap();
+
+        // There is nothing to re-key, because there is nothing werust could read.
+        assert!(TrustedNamePins::load_from(&scratch.path).is_err());
+        let mut pins = TrustedNamePins::default();
+        pins.bless(HEART_WITH_SELECTOR, "bafynew", TrustPosture::MutableName, 2)
+            .expect("a normalizable name");
+        assert!(matches!(
+            pins.save_to(&scratch.path),
+            PinSaveOutcome::Refused(_)
+        ));
+        assert_eq!(
+            std::fs::read(scratch.path.join(PINS_FILE)).unwrap(),
+            corrupt,
+            "the records werust could not read are still on disk, byte for byte"
+        );
+        assert_eq!(
+            dir_entries(&scratch.path),
+            vec![PINS_FILE.to_string()],
+            "and no temp file was left beside them"
+        );
+        assert_eq!(real_pin_store_snapshot(), real_before);
+    }
+
+    #[test]
+    fn two_old_records_that_re_key_onto_one_key_are_reported_never_silently_merged() {
+        // Acceptance: the collapse this change can produce is the very bug being
+        // fixed (two records for ONE identity), so it is REPORTED through the
+        // store's existing duplicate-key outcome rather than resolved by picking
+        // whichever entry happened to sort first. Silently choosing would decide
+        // for the user WHICH content they trusted, and the write refuses while it
+        // holds, so nothing overwrites the two records either.
+        let scratch = ScratchDir::new("re-key-collision");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let with = HEART_WITH_SELECTOR.trim().to_lowercase();
+        let without = HEART_WITHOUT_SELECTOR.trim().to_lowercase();
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            format!(
+                r#"{{"pins":[
+                    {{"name":"{with}","cid":"bafyone","blessedAt":1,"posture":"mutable-name"}},
+                    {{"name":"{without}","cid":"bafytwo","blessedAt":2,"posture":"mutable-name"}}
+                ]}}"#
+            ),
+        )
+        .unwrap();
+
+        let why =
+            TrustedNamePins::load_from(&scratch.path).expect_err("two old records, one new key");
+        assert!(
+            matches!(&why, UndeterminableTrust::DuplicateName(name) if *name == without),
+            "the existing duplicate-key rule reports it: {why:?}"
+        );
+        assert!(why.to_string().contains(&without), "legible: {why}");
     }
 
     #[test]
@@ -1280,8 +1727,11 @@ mod tests {
             &v0,
             TrustPosture::NameViaTrustedRpc,
             1_800_000_000,
-        );
-        let seen = pins.check("ronan.eth", &android);
+        )
+        .expect("a name werust can key");
+        let seen = pins
+            .check("ronan.eth", &android)
+            .expect("a name werust can key");
         assert!(
             seen.is_unchanged(),
             "the CIDv0 pin and the base32 CIDv1 of the SAME root are one content root"
@@ -1296,7 +1746,9 @@ mod tests {
         // covers every multibase spelling of the same CIDv1, not just the two
         // werust happens to produce today.
         let mut mobile_first = TrustedNamePins::default();
-        mobile_first.bless("ronan.eth", &android, TrustPosture::MutableName, 1);
+        mobile_first
+            .bless("ronan.eth", &android, TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         for spelling in [
             v0.clone(),
             android.clone(),
@@ -1305,7 +1757,9 @@ mod tests {
             v1.to_string_of_base(cid::multibase::Base::Base58Btc)
                 .expect("a base58btc CIDv1"),
         ] {
-            let seen = mobile_first.check("ronan.eth", &spelling);
+            let seen = mobile_first
+                .check("ronan.eth", &spelling)
+                .expect("a name werust can key");
             assert!(
                 seen.is_unchanged() && !seen.is_changed(),
                 "`{spelling}` names the blessed root, so it is not a change"
@@ -1339,9 +1793,12 @@ mod tests {
             &blessed.to_string(),
             TrustPosture::NameViaTrustedRpc,
             1,
-        );
+        )
+        .expect("a name werust can key");
         for changed in [unrelated.to_string(), late] {
-            let seen = pins.check("ronan.eth", &changed);
+            let seen = pins
+                .check("ronan.eth", &changed)
+                .expect("a name werust can key");
             assert!(
                 seen.is_changed() && !seen.is_unchanged(),
                 "`{changed}` is a different root, so it still warns"
@@ -1361,7 +1818,8 @@ mod tests {
         // whatever is in the file.
         let real = dag_pb_root(b"a real root").to_string();
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "not-a-cid", TrustPosture::MutableName, 1);
+        pins.bless("ronan.eth", "not-a-cid", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
 
         // Two DIFFERENT unreadable strings are never equal, however alike.
         for current in [
@@ -1372,7 +1830,9 @@ mod tests {
             "",
             &real,
         ] {
-            let seen = pins.check("ronan.eth", current);
+            let seen = pins
+                .check("ronan.eth", current)
+                .expect("a name werust can key");
             assert!(
                 seen.is_changed() && !seen.is_unchanged(),
                 "`{current}` is not the recorded string, so it is a change"
@@ -1381,14 +1841,24 @@ mod tests {
         // The SAME unreadable string is the same string: the rule this change
         // inherits untouched, so nobody who blessed a root werust cannot parse
         // starts seeing a warning that re-blessing cannot clear.
-        let seen = pins.check("ronan.eth", "not-a-cid");
+        let seen = pins
+            .check("ronan.eth", "not-a-cid")
+            .expect("a name werust can key");
         assert!(seen.is_unchanged() && !seen.is_changed());
 
         // And a REAL root is never equal to an unreadable one, in either position.
         let mut real_pins = TrustedNamePins::default();
-        real_pins.bless("ronan.eth", &real, TrustPosture::MutableName, 1);
-        assert!(real_pins.check("ronan.eth", "not-a-cid").is_changed());
-        assert!(!real_pins.check("ronan.eth", "").is_unchanged());
+        real_pins
+            .bless("ronan.eth", &real, TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
+        assert!(real_pins
+            .check("ronan.eth", "not-a-cid")
+            .expect("a name werust can key")
+            .is_changed());
+        assert!(!real_pins
+            .check("ronan.eth", "")
+            .expect("a name werust can key")
+            .is_unchanged());
     }
 
     #[test]
@@ -1418,17 +1888,22 @@ mod tests {
 
         let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
         assert!(
-            pins.check("ronan.eth", &today).is_unchanged(),
+            pins.check("ronan.eth", &today)
+                .expect("a name werust can key")
+                .is_unchanged(),
             "the pin written under the OLD rule matches the form seen today"
         );
         assert!(
-            pins.check("ronan.eth", &recorded).is_unchanged(),
+            pins.check("ronan.eth", &recorded)
+                .expect("a name werust can key")
+                .is_unchanged(),
             "and still matches its own form, exactly as it always did"
         );
 
         // A read-modify-write (blessing some OTHER name) leaves the recorded
         // spelling byte for byte: werust records what it was given.
-        pins.bless("stranger.eth", &today, TrustPosture::MutableName, 2);
+        pins.bless("stranger.eth", &today, TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
         assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
         let document = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
         assert!(
@@ -1560,7 +2035,8 @@ mod tests {
         std::fs::write(scratch.path.join(PINS_FILE), corrupt).unwrap();
 
         let mut pins = TrustedNamePins::default();
-        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
         assert!(
             !pins.save_to(&scratch.path).is_recorded(),
             "the write refuses while the store cannot be read"
@@ -1600,7 +2076,8 @@ mod tests {
                 &format!("bafy{i}"),
                 posture,
                 i as u64,
-            );
+            )
+            .expect("a name werust can key");
         }
         let round_tripped = TrustedNamePins::from_json(&pins.to_json()).expect("a readable store");
         assert_eq!(round_tripped, pins);
@@ -1619,7 +2096,8 @@ mod tests {
         // `Refused`, which is reserved for the one POLICY refusal: a store werust
         // cannot read.
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
+        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         let outcome = pins.save_to(std::path::Path::new(""));
         assert!(!outcome.is_recorded());
         assert!(
@@ -1643,7 +2121,9 @@ mod tests {
         let live = scratch.path.join(PINS_FILE);
 
         let mut previous = TrustedNamePins::default();
-        previous.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1);
+        previous
+            .bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         assert_eq!(previous.save_to(&scratch.path), PinSaveOutcome::Recorded);
         let old_bytes = std::fs::read(&live).expect("the previous document");
 
@@ -1653,7 +2133,8 @@ mod tests {
             "bafynew",
             TrustPosture::NameViaTrustedRpc,
             2,
-        );
+        )
+        .expect("a name werust can key");
         let outcome = next.save_to_through(&scratch.path, |temp, document| {
             assert_eq!(
                 temp.parent(),
@@ -1705,12 +2186,15 @@ mod tests {
         let live = scratch.path.join(PINS_FILE);
 
         let mut previous = TrustedNamePins::default();
-        previous.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1);
+        previous
+            .bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
         assert_eq!(previous.save_to(&scratch.path), PinSaveOutcome::Recorded);
         let old_bytes = std::fs::read(&live).expect("the previous document");
 
         let mut next = previous.clone();
-        next.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
+        next.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
         let outcome = next.save_to_through(&scratch.path, |temp, document| {
             std::fs::write(temp, &document.as_bytes()[..document.len() / 2])?;
             Err(std::io::Error::other("the disk filled up mid-write"))
@@ -1774,8 +2258,10 @@ mod tests {
         // Exactly the read-modify-write a bless performs: load the document, record
         // into it, save it back.
         let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
-        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
-        pins.bless("ronan.eth", "bafynewer", TrustPosture::NameViaTrustedRpc, 3);
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2)
+            .expect("a name werust can key");
+        pins.bless("ronan.eth", "bafynewer", TrustPosture::NameViaTrustedRpc, 3)
+            .expect("a name werust can key");
         assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
 
         let text = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
@@ -1827,7 +2313,8 @@ mod tests {
         // been blocked on a plumbing change; it is not.
         let scratch = ScratchDir::new("outcomes");
         let mut pins = TrustedNamePins::default();
-        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
+        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1)
+            .expect("a name werust can key");
 
         let recorded = pins.save_to(&scratch.path);
         assert_eq!(recorded, PinSaveOutcome::Recorded);

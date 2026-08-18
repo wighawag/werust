@@ -14,7 +14,9 @@
 //! 1. [`namehash`] the name (ENSIP-1: normalize the labels, then fold the
 //!    normalized dotted name from the right with
 //!    `namehash(node) = keccak256(parent_node ++ keccak256(label))`, base case the
-//!    zero node) into the 32-byte `node`.
+//!    zero node) into the 32-byte `node`. The NORMALIZED name is KEPT, not
+//!    discarded: it is the name's identity, and [`resolve`] hands it out (see
+//!    [`normalize_name`]).
 //! 2. `registry.resolver(node)` — an `eth_call` through the seam to the canonical
 //!    mainnet ENS [`REGISTRY_ADDRESS`], ABI-decoding the returned resolver
 //!    address. A zero/absent resolver is a distinct fail-closed error.
@@ -166,12 +168,62 @@ impl std::fmt::Display for ResolutionError {
 
 impl std::error::Error for ResolutionError {}
 
+/// What an ENS read ANSWERED: the decoded contenthash, and the
+/// ENSIP-15-normalized name it was read for.
+///
+/// The normalized name rides along because it is the name's IDENTITY — the exact
+/// string the [`namehash`] this read was keyed on was folded from — and callers
+/// downstream need that identity, not the spelling a user happened to type: the
+/// trusted-name pin store keys on it, and a key derived a second time from the
+/// typed string is a second key space to drift (task
+/// `trust-store-keys-on-the-resolved-normalized-name-and-migrates`). It was
+/// computed here already and used to be thrown away.
+///
+/// Distinct from [`ResolvedName`](crate::name_resolution::ResolvedName), which is
+/// the WHOLE path's answer (this read, PLUS a followed `ipns-ns` record).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsResolution {
+    /// The ENSIP-15-normalized name this read was keyed on (see
+    /// [`normalize_name`]).
+    pub normalized_name: String,
+    /// The ENSIP-7 contenthash the resolver returned, decoded.
+    pub contenthash: DecodedContenthash,
+}
+
 /// keccak256 of `bytes` (the LEGACY Keccak Ethereum uses), via the bound
 /// `sha3::Keccak256`.
 fn keccak256(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Keccak256::new();
     hasher.update(bytes);
     hasher.finalize().into()
+}
+
+/// The ENSIP-15-normalized form of `name`: the name's IDENTITY, and the ONE call
+/// of the bound `ens-normalize` in this codebase.
+///
+/// Everything that must agree about "which name is this?" derives from HERE: the
+/// [`namehash`] the ENS read is keyed on, the name [`resolve`] hands back, and
+/// (through that) the key the trusted-name pin store records
+/// ([`pins::pin_key`](crate::pins::pin_key)). One call site is the point: two
+/// call sites of a library whose output IS the identity are two chances to
+/// drift, and a store whose key and whose resolved identity disagree is a TOFU
+/// warning that misses (task
+/// `trust-store-keys-on-the-resolved-normalized-name-and-migrates`).
+///
+/// Normalization is much more than case folding — it maps a fullwidth or circled
+/// Latin label onto its plain form and strips an emoji's U+FE0F variation
+/// selector — so an ASCII `to_lowercase()` is NOT an approximation of it: it is a
+/// DIFFERENT key space that splits one identity in two.
+///
+/// It can FAIL (an empty label, a disallowed character), which is a distinct
+/// typed [`UnnormalizableName`](ResolutionError::UnnormalizableName) rather than
+/// a mangled fallback: a name werust cannot normalize has no well-defined `node`
+/// and no well-defined store key.
+pub fn normalize_name(name: &str) -> Result<String, ResolutionError> {
+    ens_normalize::normalize(name).map_err(|e| ResolutionError::UnnormalizableName {
+        name: name.to_string(),
+        detail: e.to_string(),
+    })
 }
 
 /// Compute the ENSIP-1 `namehash` of `name`: the 32-byte `node` an ENS read is
@@ -185,21 +237,33 @@ fn keccak256(bytes: &[u8]) -> [u8; 32] {
 /// Normalization can FAIL (an empty label, a disallowed character): that surfaces
 /// as [`ResolutionError::UnnormalizableName`] rather than a silently-mangled node
 /// — the fail-closed "unnormalizable name" step. The empty string is the ENS root
-/// (the zero node) and is returned directly (the normalizer rejects an empty
-/// input, but the root node is well defined).
+/// (the zero node) and is returned directly (the root node is well defined, and
+/// folding the normalizer's empty output would hash an empty LABEL instead).
 pub fn namehash(name: &str) -> Result<[u8; 32], ResolutionError> {
-    let mut node = [0u8; 32];
+    normalized_name_and_node(name).map(|(_, node)| node)
+}
+
+/// The pair an ENS read needs: the ENSIP-15-[normalized](normalize_name) name AND
+/// the [`namehash`] `node` computed FROM IT.
+///
+/// Returned together, from one normalization, so a caller that needs both (that
+/// is [`resolve`], which reads at the node and reports the identity) cannot get
+/// them from two different normalizations.
+fn normalized_name_and_node(name: &str) -> Result<(String, [u8; 32]), ResolutionError> {
+    // The ENS ROOT: the zero node, and the empty name normalizes to itself.
     if name.is_empty() {
-        return Ok(node);
+        return Ok((String::new(), [0u8; 32]));
     }
+    let normalized = normalize_name(name)?;
+    let node = namehash_of_normalized(&normalized);
+    Ok((normalized, node))
+}
 
-    let normalized =
-        ens_normalize::normalize(name).map_err(|e| ResolutionError::UnnormalizableName {
-            name: name.to_string(),
-            detail: e.to_string(),
-        })?;
-
-    // Fold from the rightmost label inward: node = keccak256(node ++ keccak256(label)).
+/// Fold an ALREADY-NORMALIZED dotted name into its ENSIP-1 `node`: from the
+/// RIGHTMOST label inward, `node = keccak256(node ++ keccak256(label))`, starting
+/// from the zero node.
+fn namehash_of_normalized(normalized: &str) -> [u8; 32] {
+    let mut node = [0u8; 32];
     for label in normalized.split('.').rev() {
         let label_hash = keccak256(label.as_bytes());
         let mut buf = [0u8; 64];
@@ -207,7 +271,7 @@ pub fn namehash(name: &str) -> Result<[u8; 32], ResolutionError> {
         buf[32..].copy_from_slice(&label_hash);
         node = keccak256(&buf);
     }
-    Ok(node)
+    node
 }
 
 /// ABI-encode the calldata for a `fn(bytes32)` call: the 4-byte `selector`
@@ -329,8 +393,11 @@ fn read_u256_as_usize(word: &[u8]) -> Option<usize> {
 /// ENSIP-7 [`decode_contenthash`](crate::contenthash::decode_contenthash) decoder
 /// and surface its typed output.
 ///
-/// On success returns [`DecodedContenthash::Ipfs`] — an `ipfs://<cid>` reference
-/// ready to feed the existing verified `ipfs://` path. A well-formed
+/// On success returns an [`EnsResolution`]: the decoded contenthash (a
+/// [`DecodedContenthash::Ipfs`] `ipfs://<cid>` reference ready to feed the
+/// existing verified `ipfs://` path, or a mutable
+/// [`Ipns`](DecodedContenthash::Ipns) pointer for the caller to follow) PLUS the
+/// ENSIP-15-normalized name it was read for. A well-formed
 /// contenthash for an unsupported protocol is NOT returned as a success: it
 /// surfaces as [`ResolutionError::UnsupportedContenthash`], so the caller cannot
 /// accidentally treat a "points to Swarm" name as loadable. Every failure step is
@@ -342,8 +409,10 @@ fn read_u256_as_usize(word: &[u8]) -> Option<usize> {
 pub fn resolve(
     provider: &dyn EthereumProvider,
     name: &str,
-) -> Result<DecodedContenthash, ResolutionError> {
-    let node = namehash(name)?;
+) -> Result<EnsResolution, ResolutionError> {
+    // ONE normalization: the node this read is keyed on, and the identity it is
+    // reported under, come from the SAME call.
+    let (normalized_name, node) = normalized_name_and_node(name)?;
 
     // 1. registry.resolver(node) -> resolver address (or none).
     let resolver_return = provider
@@ -371,8 +440,11 @@ pub fn resolve(
     //    client-verified record before it loads); a well-formed UNSUPPORTED
     //    protocol stays a NAMED refusal, never a success.
     match decode_contenthash(&contenthash_bytes) {
-        Ok(decoded @ (DecodedContenthash::Ipfs { .. } | DecodedContenthash::Ipns { .. })) => {
-            Ok(decoded)
+        Ok(contenthash @ (DecodedContenthash::Ipfs { .. } | DecodedContenthash::Ipns { .. })) => {
+            Ok(EnsResolution {
+                normalized_name,
+                contenthash,
+            })
         }
         Ok(DecodedContenthash::Unsupported(proto)) => {
             Err(ResolutionError::UnsupportedContenthash(proto))
@@ -424,6 +496,69 @@ mod tests {
             namehash("foo.eth").expect("lower case"),
             "normalization makes case irrelevant to the node"
         );
+    }
+
+    /// ONE identity, spelled two ways ENSIP-15 collapses and ASCII case folding
+    /// does NOT: fullwidth Latin, which `to_lowercase()` maps to fullwidth
+    /// lower case rather than to the plain letters the namehash is folded from.
+    const FULLWIDTH_SPELLING: &str = "ＲＯＮＡＮ.eth";
+
+    #[test]
+    fn normalization_is_more_than_case_folding_and_the_node_follows_it() {
+        // The property the trusted-name store's key now rests on: normalization
+        // maps DIFFERENT spellings of one name onto one identity, and it is not
+        // approximated by lower-casing. The node is folded from that identity, so
+        // both spellings read the SAME ENS record — which is exactly why keying
+        // anything else (a store, a cache) on the typed spelling splits one
+        // identity in two.
+        assert_eq!(
+            normalize_name(FULLWIDTH_SPELLING).expect("fullwidth Latin normalizes"),
+            "ronan.eth"
+        );
+        assert_ne!(
+            FULLWIDTH_SPELLING.to_lowercase(),
+            "ronan.eth",
+            "case folding is a DIFFERENT answer"
+        );
+        assert_eq!(
+            namehash(FULLWIDTH_SPELLING).expect("fullwidth Latin normalizes"),
+            namehash("ronan.eth").expect("the normalized form"),
+            "the node is folded from the normalized name"
+        );
+    }
+
+    #[test]
+    fn a_resolution_answers_with_the_normalized_name_it_read_at() {
+        // The normalized name is no longer thrown away: the ENS read hands back
+        // the IDENTITY it was keyed on, so a caller downstream (the pin store's
+        // key) uses the value this read used rather than re-deriving one from the
+        // spelling a user typed.
+        let (contenthash_bytes, cid_str) = ipfs_contenthash_fixture();
+        let provider = ScriptedProvider::new(vec![
+            Ok(address_word(&[0x11u8; 20])),
+            Ok(abi_bytes_return(&contenthash_bytes)),
+        ]);
+
+        let resolved = resolve(&provider, FULLWIDTH_SPELLING).expect("the fixture name resolves");
+
+        assert_eq!(resolved.normalized_name, "ronan.eth");
+        assert_eq!(
+            resolved.contenthash,
+            DecodedContenthash::Ipfs {
+                uri: format!("ipfs://{cid_str}"),
+                cid: cid_str,
+            }
+        );
+        // And it really is the name the reads were keyed on, not a second
+        // normalization done for the answer's sake.
+        let node = namehash("ronan.eth").unwrap();
+        for call in provider.calls() {
+            assert!(
+                call.data.ends_with(&hex32(&node)),
+                "every read used the normalized name's node: {}",
+                call.data
+            );
+        }
     }
 
     #[test]
@@ -559,12 +694,15 @@ mod tests {
             Ok(abi_bytes_return(&contenthash_bytes)),
         ]);
 
-        let decoded = resolve(&provider, "ronan.eth").expect("the fixture name resolves");
+        let resolved = resolve(&provider, "ronan.eth").expect("the fixture name resolves");
         assert_eq!(
-            decoded,
-            DecodedContenthash::Ipfs {
-                uri: format!("ipfs://{cid_str}"),
-                cid: cid_str.clone(),
+            resolved,
+            EnsResolution {
+                normalized_name: "ronan.eth".to_string(),
+                contenthash: DecodedContenthash::Ipfs {
+                    uri: format!("ipfs://{cid_str}"),
+                    cid: cid_str.clone(),
+                },
             }
         );
 
@@ -753,12 +891,15 @@ mod tests {
         let server = SequencedRpcServer::start(bodies);
         let provider = RpcProvider::with_endpoint(&server.endpoint());
 
-        let decoded = resolve(&provider, "ronan.eth").expect("resolves over the bound transport");
+        let resolved = resolve(&provider, "ronan.eth").expect("resolves over the bound transport");
         assert_eq!(
-            decoded,
-            DecodedContenthash::Ipfs {
-                uri: format!("ipfs://{cid_str}"),
-                cid: cid_str,
+            resolved,
+            EnsResolution {
+                normalized_name: "ronan.eth".to_string(),
+                contenthash: DecodedContenthash::Ipfs {
+                    uri: format!("ipfs://{cid_str}"),
+                    cid: cid_str,
+                },
             }
         );
 

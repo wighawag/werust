@@ -238,8 +238,16 @@ impl CoreSession {
     /// SHARED [`BrowserShell::bless_current_name`](werust_core::BrowserShell::bless_current_name),
     /// so the pin store, its wire form and the warning rule are the desktop ones,
     /// not a mobile twin. Returns whether the pin was durably recorded.
+    ///
+    /// The shared shell reports the richer
+    /// [`PinSaveOutcome`](werust_core::pins::PinSaveOutcome) (nothing to record /
+    /// could not persist / refused because the store is unreadable); it is
+    /// COLLAPSED here because that is the JNI boundary's existing contract and
+    /// there is no trust-management surface on Android to say more with. Widening
+    /// the FFI is a surface change, and belongs to whichever task builds that
+    /// surface.
     pub fn bless_current_name(&mut self) -> bool {
-        self.shell.bless_current_name()
+        self.shell.bless_current_name().is_recorded()
     }
 
     /// Drain every pending load event off the backend and fold it into the

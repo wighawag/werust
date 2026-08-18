@@ -88,6 +88,38 @@
 //! axis, why the shell keeps its cache while it holds) are recorded at
 //! `docs/spikes/trust-store-fails-closed-instead-of-reading-as-nothing-trusted/DECISIONS.md`.
 //!
+//! # The WRITE: atomic, non-destructive, and honest about failing
+//!
+//! Three properties of the same [`save_to`](TrustedNamePins::save_to), all cheap
+//! and all invisible until the day they matter (task
+//! `trust-store-writes-atomically-and-keeps-fields-it-does-not-know`, decisions at
+//! `docs/spikes/trust-store-writes-atomically-and-keeps-fields-it-does-not-know/DECISIONS.md`):
+//!
+//! 1. **A reader never sees half a document.** The save writes a TEMP file in the
+//!    SAME directory, flushes it, and RENAMES it onto `pins.json`, so a crash, an
+//!    OOM kill or a full disk mid-write leaves the PREVIOUS document, not a
+//!    truncated one. Same directory is load-bearing (a rename is atomic only
+//!    within one filesystem), and the temp file is removed on the failure path.
+//!    Atomicity is not mutual exclusion: two windows can still LOSE an update,
+//!    which the advisory lock of
+//!    `trust-store-serialises-read-modify-write-so-no-bless-is-lost` owns. This
+//!    makes that loss clean instead of corrupt.
+//! 2. **A field this build does not know is CARRIED, never stripped.** Two werust
+//!    versions are two processes (the same fact the whole read-modify-write shape
+//!    follows from), so an OLDER build re-writing the document must not delete
+//!    what a NEWER one recorded. Unknown members are preserved at BOTH levels the
+//!    document has: the document itself, and each entry, re-attached to the same
+//!    pin on the way out. werust keeps authority over the fields it OWNS: the
+//!    known members are written last, so a carried member can never shadow one,
+//!    and the posture keeps the ONE shared wire spelling.
+//! 3. **The outcome is a sentence, not a bit** ([`PinSaveOutcome`]). "There was
+//!    nothing to record", "I could not write it" and "I refuse to write over a
+//!    store I cannot read" are three different answers, and the last two are the
+//!    ones worth showing someone. Nothing SHOWS them yet: there is no
+//!    trust-management surface and building one is out of scope, so the taxonomy
+//!    exists (and is propagated through the shell's bless path) so that surface is
+//!    not blocked on a plumbing change when it arrives.
+//!
 //! # Vocabulary note: "pin"
 //!
 //! `pin` is already used loosely in this crate for "held in place" (the shell
@@ -98,7 +130,9 @@
 //! spelling is the settled decision 2's (`pins.json`); the discipline is so the
 //! two senses cannot be confused at a call site.
 
-use serde_json::{json, Value};
+use std::collections::BTreeMap;
+
+use serde_json::{json, Map, Value};
 
 use renderer::TrustPosture;
 
@@ -304,6 +338,85 @@ impl From<Result<TrustedNamePins, UndeterminableTrust>> for PinStoreRead {
 }
 
 // ---------------------------------------------------------------------------
+// The WRITE outcome.
+// ---------------------------------------------------------------------------
+
+/// The outcome of WRITING the trusted-name pin store: the read side's
+/// [`PinStoreRead`] seen from the other direction, and the answer
+/// [`save_to`](TrustedNamePins::save_to) and
+/// [`BrowserShell::bless_current_name`](crate::BrowserShell::bless_current_name)
+/// both speak.
+///
+/// It is an OUTCOME, never an error: a store that cannot be written must not
+/// break browsing, and a bless that could not be recorded still holds for THIS
+/// session (the chrome updates; only a relaunch loses it). What it is NOT is a
+/// bare boolean, because "there was nothing to record", "I could not write it"
+/// and "I refuse to write over a store I cannot read" are three different
+/// sentences and a `false` says none of them. Only the last two are worth
+/// showing anyone, which is what [`problem`](PinSaveOutcome::problem) answers.
+///
+/// werust deliberately builds no user-facing surface for this yet (there is no
+/// trust-management UI at all, and `docs/adr/0014` is why the bless affordance
+/// withdraws instead): the taxonomy exists so the surface that eventually shows
+/// it is not blocked on a plumbing change. Decisions:
+/// `docs/spikes/trust-store-writes-atomically-and-keeps-fields-it-does-not-know/DECISIONS.md`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinSaveOutcome {
+    /// The document is on disk: the only success, and the only outcome that
+    /// survives a relaunch.
+    Recorded,
+    /// There was nothing to record in the first place (no mutable name on this
+    /// page, or a name already blessed at exactly this CID). The CALLER's answer,
+    /// never [`save_to`](TrustedNamePins::save_to)'s, and the one uninteresting
+    /// non-success: nothing was lost, because nothing was pending.
+    NothingToRecord,
+    /// There was something to record and it did not reach disk: no settings
+    /// directory on this system, no durable store on this shell, a full disk, a
+    /// permission error, an interrupted write. Carries a legible reason.
+    ///
+    /// NOT a policy decision: werust WOULD have written it. That distinction is
+    /// the whole reason [`Refused`](PinSaveOutcome::Refused) is a separate
+    /// variant.
+    CouldNotPersist(String),
+    /// werust REFUSED to write, because the store on disk cannot be READ
+    /// (`docs/adr/0014`): overwriting it is how ONE transient failure permanently
+    /// replaces every record with a single fresh one. Carries the same
+    /// [`UndeterminableTrust`] the read side reports, so a caller says WHY without
+    /// re-reading the file.
+    Refused(UndeterminableTrust),
+}
+
+impl PinSaveOutcome {
+    /// Whether the pins reached DISK: the old boolean, for a caller that only
+    /// needs "will this survive a relaunch?" (the mobile FFI boundaries, which
+    /// hand a `bool` to Kotlin and Swift, are exactly that caller).
+    #[must_use]
+    pub fn is_recorded(&self) -> bool {
+        matches!(self, Self::Recorded)
+    }
+
+    /// The sentence worth putting in front of a user, or `None` when there is
+    /// nothing to say (it was recorded, or there was nothing to record).
+    ///
+    /// The ONE place the two interesting outcomes are put into words, so a future
+    /// surface cannot mint a second wording, the same discipline the chrome's
+    /// derived strings follow (`docs/adr/0011`).
+    #[must_use]
+    pub fn problem(&self) -> Option<String> {
+        match self {
+            Self::Recorded | Self::NothingToRecord => None,
+            Self::CouldNotPersist(detail) => {
+                Some(format!("{PINS_FILE} could not be written: {detail}"))
+            }
+            Self::Refused(why) => Some(format!(
+                "nothing was written, because {why}, so the trusted names already recorded \
+                 there are not lost"
+            )),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The store.
 // ---------------------------------------------------------------------------
 
@@ -335,6 +448,18 @@ pub struct TrustedNamePins {
     /// The pins, kept sorted by [`pin_key`] so the persisted document is stable
     /// (a re-save with no change rewrites identical bytes).
     pins: Vec<TrustedNamePin>,
+    /// Members of the loaded DOCUMENT that this build does not know, carried
+    /// through untouched so a rewrite cannot strip them (see the module's
+    /// unknown-member note). Empty for a store built in memory, which is what
+    /// keeps `TrustedNamePins`'s equality meaning "the same pins, plus whatever
+    /// else the same document carried".
+    unknown_document_members: Map<String, Value>,
+    /// Members of a loaded ENTRY that this build does not know, keyed by that
+    /// entry's [`pin_key`], so they are re-attached to the SAME pin on the way
+    /// out. Keyed rather than stored on [`TrustedNamePin`] because that type's
+    /// fields are public and constructed by literal in three other crates' tests;
+    /// see the decisions doc.
+    unknown_entry_members: BTreeMap<String, Map<String, Value>>,
 }
 
 impl TrustedNamePins {
@@ -381,44 +506,105 @@ impl TrustedNamePins {
         }
     }
 
-    /// Persist the pins to the settings directory, creating it if needed. Returns
-    /// `false` when there is no settings directory, when the write REFUSES because
-    /// the store on disk cannot be read (see [`save_to`](TrustedNamePins::save_to)),
-    /// or when the write itself failed: the bless still took effect for THIS
-    /// session, it just could not be recorded.
-    pub fn save(&self) -> bool {
+    /// Persist the pins to the settings directory, creating it if needed, and say
+    /// WHAT happened ([`PinSaveOutcome`]): recorded, could not be persisted (no
+    /// settings directory on this system, or the write failed), or REFUSED because
+    /// the store on disk cannot be read (see [`save_to`](TrustedNamePins::save_to)).
+    ///
+    /// Only the first survives a relaunch; in every other case the bless still
+    /// took effect for THIS session, it just could not be recorded.
+    pub fn save(&self) -> PinSaveOutcome {
         match crate::retrieval::settings_dir() {
             Some(dir) => self.save_to(&dir),
-            None => false,
+            None => {
+                PinSaveOutcome::CouldNotPersist("this system has no settings directory".to_string())
+            }
         }
     }
 
     /// Persist the pins to a SPECIFIC directory (the directory-taking core
-    /// [`save`](TrustedNamePins::save) delegates to), creating it if needed.
+    /// [`save`](TrustedNamePins::save) delegates to), creating it if needed, and
+    /// say WHAT happened ([`PinSaveOutcome`]).
+    ///
+    /// # The write is ATOMIC: a temp file beside the store, renamed over it
+    ///
+    /// The document is written to a temp file in the SAME directory and then
+    /// RENAMED onto `pins.json`, so a reader observes the old document or the new
+    /// one and never a truncated one. A crash, an OOM kill or a full disk between
+    /// the first byte and the last is the case: a bare whole-file write leaves a
+    /// half-written store, which is the worst possible state for a record the
+    /// browser is about to trust, and (since `docs/adr/0014`) one that blocks
+    /// every later write too, because an unreadable store refuses them.
+    ///
+    /// SAME directory is load-bearing, not tidiness: a rename is atomic only
+    /// within one filesystem, and a temp directory is routinely a different one,
+    /// where the rename degrades into a copy and the guarantee is gone. The temp
+    /// file is removed on the failure path, so nothing is left beside the store.
     ///
     /// # The write REFUSES while trust cannot be determined
     ///
     /// This is the write half of the fail-closed rule (`docs/adr/0014`), and it
-    /// lives HERE rather than at each caller so no writer — today's
-    /// `bless_current_name`, or a later "forget this pin" — can forget it: the
-    /// save re-reads the document it is about to replace, and returns `false`
-    /// without touching a byte when that read is
-    /// [`UndeterminableTrust`]. Overwriting a store werust could not read is how
-    /// ONE transient failure permanently destroys every record it holds, and the
-    /// whole-file write below is exactly the mechanism that would do it.
+    /// lives HERE rather than at each caller so no writer (today's
+    /// `bless_current_name`, or a later "forget this pin") can forget it: the
+    /// save re-reads the document it is about to replace, and returns
+    /// [`Refused`](PinSaveOutcome::Refused) without touching a byte when that read
+    /// is [`UndeterminableTrust`]. Overwriting a store werust could not read is
+    /// how ONE transient failure permanently destroys every record it holds.
     ///
-    /// The refusal is reported the same way "there is no settings directory" is:
-    /// `false`, meaning the bless holds for THIS session but could not be
-    /// recorded. It is never an error, because a store werust cannot read must not
-    /// break browsing.
-    pub fn save_to(&self, dir: &std::path::Path) -> bool {
-        if dir.as_os_str().is_empty() || std::fs::create_dir_all(dir).is_err() {
-            return false;
+    /// Neither the refusal nor a failed write is an ERROR: the bless holds for
+    /// THIS session and simply cannot survive a relaunch, because a store werust
+    /// cannot read or write must not break browsing.
+    pub fn save_to(&self, dir: &std::path::Path) -> PinSaveOutcome {
+        self.save_to_through(dir, write_document)
+    }
+
+    /// [`save_to`](TrustedNamePins::save_to)'s body, with the step that puts BYTES
+    /// in the temp file supplied by the caller: the seam a test INTERRUPTS.
+    ///
+    /// Injecting the write step is what lets the mid-write failure (a full disk, a
+    /// power cut) be exercised through the real temp-then-rename path, and lets a
+    /// test assert from INSIDE that step that the live document has not been
+    /// touched yet. The alternative shapes were both worse: a `cfg!(test)` branch
+    /// is production behaviour that differs in a test build (this repo retired its
+    /// only one, and `crates/werust-core/tests/pin_store_edge_wiring_shape.rs`
+    /// reds the gate if it returns), and asserting only the observable end states
+    /// would never prove the ORDER, which is the entire property.
+    fn save_to_through(
+        &self,
+        dir: &std::path::Path,
+        write_temp: impl FnOnce(&std::path::Path, &str) -> std::io::Result<()>,
+    ) -> PinSaveOutcome {
+        if dir.as_os_str().is_empty() {
+            return PinSaveOutcome::CouldNotPersist(
+                "there is no directory to record into".to_string(),
+            );
         }
-        if Self::load_from(dir).is_err() {
-            return false;
+        if let Err(err) = std::fs::create_dir_all(dir) {
+            return PinSaveOutcome::CouldNotPersist(err.to_string());
         }
-        std::fs::write(dir.join(PINS_FILE), self.to_json()).is_ok()
+        if let Err(why) = Self::load_from(dir) {
+            return PinSaveOutcome::Refused(why);
+        }
+        let temp = dir.join(temp_document_name());
+        match write_temp(&temp, &self.to_json())
+            .and_then(|()| std::fs::rename(&temp, dir.join(PINS_FILE)))
+        {
+            Ok(()) => {
+                // The rename is the commit point; flushing the DIRECTORY is what
+                // makes it durable across a power cut on the filesystems that need
+                // it. Best-effort: it is not openable as a file on every platform
+                // (Windows), and failing to fsync a directory does not make the
+                // store any less correct for a reader.
+                let _ = std::fs::File::open(dir).map(|dir| dir.sync_all());
+                PinSaveOutcome::Recorded
+            }
+            Err(err) => {
+                // Leave nothing behind: a half-written temp file beside the store
+                // is litter at best, and at worst the next reader's puzzle.
+                let _ = std::fs::remove_file(&temp);
+                PinSaveOutcome::CouldNotPersist(err.to_string())
+            }
+        }
     }
 
     /// The pin for `name`, or `None` when it has never been blessed. Looked up by
@@ -484,27 +670,41 @@ impl TrustedNamePins {
     }
 
     /// Serialize to the persisted wire form:
-    /// `{"pins":[{"name":…,"cid":…,"blessedAt":…,"posture":"<wire name>"}]}`.
+    /// `{"pins":[{"name":…,"cid":…,"blessedAt":…,"posture":"<wire name>"}]}`,
+    /// PLUS every member this build does not know, exactly as it was read.
     ///
     /// The posture uses the ONE shared wire vocabulary
     /// ([`trust_posture_wire_name`]) the chrome JSON and the debug view's Network
     /// tab already speak (`docs/adr/0006`), so the store never mints a second
     /// spelling of a posture.
+    ///
+    /// The unknown members are written FIRST and the fields werust owns second,
+    /// so a preserved member can never shadow a field this build is authoritative
+    /// for. (Key order in the document itself is `serde_json`'s, which sorts.)
     #[must_use]
     pub fn to_json(&self) -> String {
         let pins: Vec<Value> = self
             .pins
             .iter()
             .map(|pin| {
-                json!({
-                    "name": pin.name,
-                    "cid": pin.cid,
-                    "blessedAt": pin.blessed_at,
-                    "posture": trust_posture_wire_name(pin.posture),
-                })
+                let mut entry = self
+                    .unknown_entry_members
+                    .get(&pin.name)
+                    .cloned()
+                    .unwrap_or_default();
+                entry.insert("name".to_string(), json!(pin.name));
+                entry.insert("cid".to_string(), json!(pin.cid));
+                entry.insert("blessedAt".to_string(), json!(pin.blessed_at));
+                entry.insert(
+                    "posture".to_string(),
+                    json!(trust_posture_wire_name(pin.posture)),
+                );
+                Value::Object(entry)
             })
             .collect();
-        json!({ "pins": pins }).to_string()
+        let mut document = self.unknown_document_members.clone();
+        document.insert("pins".to_string(), Value::Array(pins));
+        Value::Object(document).to_string()
     }
 
     /// Parse the persisted wire form, or say WHY trust cannot be determined from
@@ -526,25 +726,50 @@ impl TrustedNamePins {
             .get("pins")
             .and_then(Value::as_array)
             .ok_or_else(|| UndeterminableTrust::Unparseable("no `pins` array".to_string()))?;
-        let mut pins: Vec<TrustedNamePin> = entries
-            .iter()
-            .enumerate()
-            .map(|(index, entry)| read_entry(index, entry))
-            .collect::<Result<_, _>>()?;
+        let mut pins: Vec<TrustedNamePin> = Vec::with_capacity(entries.len());
+        let mut unknown_entry_members: BTreeMap<String, Map<String, Value>> = BTreeMap::new();
+        for (index, entry) in entries.iter().enumerate() {
+            let (pin, unknown) = read_entry(index, entry)?;
+            if !unknown.is_empty() {
+                unknown_entry_members.insert(pin.name.clone(), unknown);
+            }
+            pins.push(pin);
+        }
         pins.sort_by(|a, b| a.name.cmp(&b.name));
         if let Some(duplicate) = pins.windows(2).find(|pair| pair[0].name == pair[1].name) {
             return Err(UndeterminableTrust::DuplicateName(
                 duplicate[0].name.clone(),
             ));
         }
-        Ok(Self { pins })
+        // Everything BESIDE `pins`: carried, not understood, and written back
+        // untouched (the module's unknown-member note). `value` is an object here,
+        // because a non-object has no `pins` member to have got this far.
+        let unknown_document_members = value
+            .as_object()
+            .map(|document| {
+                document
+                    .iter()
+                    .filter(|(member, _)| member.as_str() != "pins")
+                    .map(|(member, carried)| (member.clone(), carried.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            pins,
+            unknown_document_members,
+            unknown_entry_members,
+        })
     }
 }
 
-/// One persisted entry -> one [`TrustedNamePin`], or WHY werust cannot read it
-/// honestly. The entry's position is carried in the reason because the name is
-/// exactly the field that may be missing.
-fn read_entry(index: usize, entry: &Value) -> Result<TrustedNamePin, UndeterminableTrust> {
+/// One persisted entry -> one [`TrustedNamePin`] PLUS the members of that entry
+/// this build does not know, or WHY werust cannot read it honestly. The entry's
+/// position is carried in the reason because the name is exactly the field that
+/// may be missing.
+fn read_entry(
+    index: usize,
+    entry: &Value,
+) -> Result<(TrustedNamePin, Map<String, Value>), UndeterminableTrust> {
     let unreadable = |what: &str| {
         UndeterminableTrust::UnreadableEntry(format!("entry {index} {what}", index = index + 1))
     };
@@ -576,12 +801,62 @@ fn read_entry(index: usize, entry: &Value) -> Result<TrustedNamePin, Undetermina
             "(`{name}`) records a trust posture this build does not know: `{spelling}`"
         ))
     })?;
-    Ok(TrustedNamePin {
-        name,
-        cid,
-        blessed_at,
-        posture,
-    })
+    // Whatever else this entry carried: a LATER build's field, kept so an older
+    // one cannot silently delete it (the module's unknown-member note).
+    let unknown = entry
+        .as_object()
+        .map(|members| {
+            members
+                .iter()
+                .filter(|(member, _)| !KNOWN_ENTRY_MEMBERS.contains(&member.as_str()))
+                .map(|(member, carried)| (member.clone(), carried.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok((
+        TrustedNamePin {
+            name,
+            cid,
+            blessed_at,
+            posture,
+        },
+        unknown,
+    ))
+}
+
+/// The entry members THIS build owns and re-serializes from
+/// [`TrustedNamePin`]. Everything else in an entry is a later build's, and is
+/// carried through untouched.
+const KNOWN_ENTRY_MEMBERS: [&str; 4] = ["name", "cid", "blessedAt", "posture"];
+
+/// The name of the temp file a save writes before renaming it onto `pins.json`,
+/// in the SAME directory (see [`TrustedNamePins::save_to`]).
+///
+/// Unique per process and per call, so two windows saving at the same moment
+/// cannot write each other's temp file. It is deliberately NOT unique enough to
+/// serialize them: two concurrent read-modify-writes can still lose an update,
+/// which is an advisory LOCK's job (task
+/// `trust-store-serialises-read-modify-write-so-no-bless-is-lost`), not a file
+/// name's. Atomicity makes that loss clean instead of corrupt.
+fn temp_document_name() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{PINS_FILE}.tmp-{pid}-{n}", pid = std::process::id(),)
+}
+
+/// Put the document in a file and FLUSH it to the storage device: the default
+/// write step [`TrustedNamePins::save_to`] renames into place.
+///
+/// The `sync_all` is the point of doing this by hand rather than with
+/// `fs::write`: renaming a file whose bytes are still only in the page cache
+/// gives an atomic swap to a document that may itself be empty after a power
+/// cut, which is the very state the temp-then-rename exists to prevent.
+fn write_document(path: &std::path::Path, document: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = std::fs::File::create(path)?;
+    file.write_all(document.as_bytes())?;
+    file.sync_all()
 }
 
 /// The full path to the pin-store file, or `None` if there is no settings dir.
@@ -675,6 +950,18 @@ mod tests {
         pins_file_path().and_then(|path| std::fs::read(path).ok())
     }
 
+    /// Every file name in a scratch directory, sorted: what a test asserts a save
+    /// left behind, so a temp file that survives (a successful save's, or an
+    /// interrupted one's) is a FAILURE rather than something nobody looked for.
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("the scratch dir exists")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn a_blessed_name_persists_across_launches_in_the_isolated_store() {
         // Acceptance: the pin (name -> CID + timestamp + posture) persists across
@@ -689,7 +976,7 @@ mod tests {
             TrustPosture::NameViaTrustedRpc,
             1_800_000_000,
         );
-        assert!(pins.save_to(&scratch.path));
+        assert!(pins.save_to(&scratch.path).is_recorded());
         assert!(
             scratch.path.join(PINS_FILE).is_file(),
             "the store is `pins.json`, in the scratch dir only"
@@ -717,18 +1004,14 @@ mod tests {
         let scratch = ScratchDir::new("isolation");
         let mut pins = TrustedNamePins::default();
         pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
-        assert!(pins.save_to(&scratch.path));
+        assert!(pins.save_to(&scratch.path).is_recorded());
         assert_eq!(
             real_pin_store_snapshot(),
             real_before,
             "the developer's own `pins.json` is never written by this suite"
         );
 
-        let written: Vec<String> = std::fs::read_dir(&scratch.path)
-            .expect("the scratch dir exists")
-            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(written, vec![PINS_FILE.to_string()]);
+        assert_eq!(dir_entries(&scratch.path), vec![PINS_FILE.to_string()]);
 
         // Both files resolve under the SAME directory, whatever it is.
         if let (Some(pins_path), Some(settings_path)) =
@@ -943,7 +1226,7 @@ mod tests {
         let mut pins = TrustedNamePins::default();
         pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
         assert!(
-            !pins.save_to(&scratch.path),
+            !pins.save_to(&scratch.path).is_recorded(),
             "the write refuses while the store cannot be read"
         );
         assert_eq!(
@@ -960,7 +1243,7 @@ mod tests {
         // And the refusal is SPECIFIC to that state: once the document is readable
         // again the very same save lands.
         std::fs::write(scratch.path.join(PINS_FILE), r#"{"pins":[]}"#).unwrap();
-        assert!(pins.save_to(&scratch.path));
+        assert!(pins.save_to(&scratch.path).is_recorded());
         assert_eq!(
             TrustedNamePins::load_from(&scratch.path),
             Ok(pins),
@@ -996,9 +1279,251 @@ mod tests {
     fn saving_without_a_directory_is_a_refusal_not_a_panic() {
         // No settings directory is an in-memory interim (the bless holds for this
         // session but cannot be recorded), exactly as the retrieval settings do.
+        // It reports [`PinSaveOutcome::CouldNotPersist`] and NOT the taxonomy's
+        // `Refused`, which is reserved for the one POLICY refusal: a store werust
+        // cannot read.
         let mut pins = TrustedNamePins::default();
         pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
-        assert!(!pins.save_to(std::path::Path::new("")));
+        let outcome = pins.save_to(std::path::Path::new(""));
+        assert!(!outcome.is_recorded());
+        assert!(
+            matches!(outcome, PinSaveOutcome::CouldNotPersist(_)),
+            "nowhere to write is not a panic and not a policy refusal: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn a_save_reaches_the_live_document_only_by_renaming_a_sibling_temp_file() {
+        // Acceptance: the write is ATOMIC. A reader observes the OLD document or
+        // the NEW one and never a truncated one, which is exactly what
+        // temp-file-plus-rename buys, and the temp file must be a SIBLING,
+        // because a rename ACROSS directories is not atomic at all (it degrades to
+        // a copy). The ordering is asserted from INSIDE the write step, which is
+        // the same seam the interrupted-write test below fails, so production code
+        // needs no test-only branch (this repo has no `cfg!(test)` branch left and
+        // is not growing one).
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("atomic");
+        let live = scratch.path.join(PINS_FILE);
+
+        let mut previous = TrustedNamePins::default();
+        previous.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1);
+        assert_eq!(previous.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        let old_bytes = std::fs::read(&live).expect("the previous document");
+
+        let mut next = previous.clone();
+        next.bless(
+            "stranger.eth",
+            "bafynew",
+            TrustPosture::NameViaTrustedRpc,
+            2,
+        );
+        let outcome = next.save_to_through(&scratch.path, |temp, document| {
+            assert_eq!(
+                temp.parent(),
+                Some(scratch.path.as_path()),
+                "the temp file is a SIBLING of the store: a cross-directory rename is not atomic"
+            );
+            assert_ne!(
+                temp,
+                live.as_path(),
+                "the live document is never written in place"
+            );
+            assert_eq!(
+                std::fs::read(&live).expect("the previous document"),
+                old_bytes,
+                "nothing reaches the live document before the rename"
+            );
+            std::fs::write(temp, document)
+        });
+
+        assert_eq!(outcome, PinSaveOutcome::Recorded);
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(next),
+            "the renamed document IS the store"
+        );
+        assert_eq!(
+            dir_entries(&scratch.path),
+            vec![PINS_FILE.to_string()],
+            "no temp file survives a successful save"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn a_write_interrupted_mid_document_leaves_the_previous_store_intact_and_no_temp_behind() {
+        // The day it matters: a full disk, an OOM kill or a power cut between the
+        // first byte and the last. With a bare whole-file write that leaves a
+        // TRUNCATED `pins.json`, the worst possible state for a record the
+        // browser is about to trust, and (since the third state landed) one that
+        // blocks every later write too. With temp-plus-rename the half-written
+        // bytes are in the temp file, the live document is untouched, and the temp
+        // file does not survive.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("interrupted");
+        let live = scratch.path.join(PINS_FILE);
+
+        let mut previous = TrustedNamePins::default();
+        previous.bless("ronan.eth", "bafyold", TrustPosture::MutableName, 1);
+        assert_eq!(previous.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        let old_bytes = std::fs::read(&live).expect("the previous document");
+
+        let mut next = previous.clone();
+        next.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
+        let outcome = next.save_to_through(&scratch.path, |temp, document| {
+            std::fs::write(temp, &document.as_bytes()[..document.len() / 2])?;
+            Err(std::io::Error::other("the disk filled up mid-write"))
+        });
+
+        assert!(
+            matches!(outcome, PinSaveOutcome::CouldNotPersist(_)),
+            "a failed write is reported, never swallowed: {outcome:?}"
+        );
+        assert!(
+            outcome
+                .problem()
+                .is_some_and(|why| why.contains("the disk filled up mid-write")),
+            "and it carries WHY: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&live).expect("the previous document"),
+            old_bytes,
+            "the PREVIOUS document is intact, byte for byte"
+        );
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(previous),
+            "and still readable, so the next write is not blocked either"
+        );
+        assert_eq!(
+            dir_entries(&scratch.path),
+            vec![PINS_FILE.to_string()],
+            "the half-written temp file is cleaned up on the failure path"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+    }
+
+    #[test]
+    fn members_this_build_does_not_know_survive_a_read_modify_write() {
+        // Two werust versions are two processes (this module's docs contemplate it
+        // and the store's whole shape follows from it), so an OLDER build must
+        // never silently strip what a NEWER one wrote, at BOTH levels the
+        // document has: the document itself, and each entry.
+        let scratch = ScratchDir::new("unknown-members");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let written_by_a_later_build = r#"{
+            "pins": [
+                {
+                    "name": "ronan.eth",
+                    "cid": "bafyold",
+                    "blessedAt": 1,
+                    "posture": "mutable-name",
+                    "retainedContent": {"path": "blobs/abc", "bytes": 1234}
+                }
+            ],
+            "normalizationVersion": "ensip15-2026",
+            "writtenBy": "werust 9.9.9"
+        }"#;
+        std::fs::write(scratch.path.join(PINS_FILE), written_by_a_later_build).unwrap();
+
+        // Exactly the read-modify-write a bless performs: load the document, record
+        // into it, save it back.
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
+        pins.bless("ronan.eth", "bafynewer", TrustPosture::NameViaTrustedRpc, 3);
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+
+        let text = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
+        let document: Value = serde_json::from_str(&text).expect("still one JSON document");
+        assert_eq!(
+            document["normalizationVersion"],
+            json!("ensip15-2026"),
+            "an unknown TOP-LEVEL member survives, unchanged: {text}"
+        );
+        assert_eq!(document["writtenBy"], json!("werust 9.9.9"));
+
+        let entries = document["pins"].as_array().expect("the `pins` array");
+        assert_eq!(entries.len(), 2);
+        let ronan = entries
+            .iter()
+            .find(|entry| entry["name"] == json!("ronan.eth"))
+            .expect("the re-blessed entry");
+        assert_eq!(
+            ronan["retainedContent"],
+            json!({"path": "blobs/abc", "bytes": 1234}),
+            "an unknown ENTRY member survives, unchanged, even across a RE-bless: {text}"
+        );
+        // And werust still owns the spelling of the fields werust owns: the shared
+        // posture vocabulary, not a second one.
+        assert_eq!(ronan["cid"], json!("bafynewer"));
+        assert_eq!(ronan["blessedAt"], json!(3));
+        assert_eq!(ronan["posture"], json!("name-via-trusted-rpc"));
+        let stranger = entries
+            .iter()
+            .find(|entry| entry["name"] == json!("stranger.eth"))
+            .expect("the newly blessed entry");
+        assert_eq!(
+            stranger.as_object().expect("an entry is an object").len(),
+            4,
+            "a NEW entry invents no members: {text}"
+        );
+
+        // The residue is READ back too, so it survives any number of round trips
+        // rather than only the first.
+        assert_eq!(TrustedNamePins::load_from(&scratch.path), Ok(pins));
+    }
+
+    #[test]
+    fn the_save_outcome_tells_recorded_from_could_not_persist_from_refused() {
+        // "There was nothing to record", "I could not write it" and "I refuse to
+        // write over a store I cannot read" are three different sentences, and
+        // only the last two are worth showing anyone. A bare boolean cannot tell
+        // them apart, so the surface that eventually says one of them would have
+        // been blocked on a plumbing change; it is not.
+        let scratch = ScratchDir::new("outcomes");
+        let mut pins = TrustedNamePins::default();
+        pins.bless("ronan.eth", "bafy", TrustPosture::MutableName, 1);
+
+        let recorded = pins.save_to(&scratch.path);
+        assert_eq!(recorded, PinSaveOutcome::Recorded);
+        assert!(recorded.is_recorded());
+        assert_eq!(recorded.problem(), None, "a save that landed says nothing");
+
+        // A store werust cannot read: REFUSED, carrying WHY, and nothing written
+        // (`docs/adr/0014`): distinguishable now, rather than the same `false` a
+        // full disk produces.
+        let corrupt = br#"{"pins":[{"name":"a.eth","cid":"bafy","blessedAt":1,"posture":"from-the-future"}]}"#;
+        std::fs::write(scratch.path.join(PINS_FILE), corrupt).unwrap();
+        let refused = pins.save_to(&scratch.path);
+        assert!(
+            matches!(
+                refused,
+                PinSaveOutcome::Refused(UndeterminableTrust::UnreadableEntry(_))
+            ),
+            "the refusal names the store's third state: {refused:?}"
+        );
+        assert!(!refused.is_recorded());
+        assert!(refused.problem().is_some_and(|why| why.contains(PINS_FILE)));
+        assert_eq!(
+            std::fs::read(scratch.path.join(PINS_FILE)).unwrap(),
+            corrupt,
+            "a refusal touches nothing"
+        );
+
+        // The fourth answer is the CALLER's, not the file's: there was nothing to
+        // record at all (no mutable name, or a name already blessed at exactly this
+        // CID). Uninteresting, and never a problem to put in front of anyone.
+        assert!(!PinSaveOutcome::NothingToRecord.is_recorded());
+        assert_eq!(PinSaveOutcome::NothingToRecord.problem(), None);
     }
 
     #[test]

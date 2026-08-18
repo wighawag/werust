@@ -1110,8 +1110,10 @@ pub fn trust_posture_wire_name(posture: TrustPosture) -> &'static str {
 /// back, and a private parser over there would be a second table to drift from.
 /// Deliberately total over [`TrustPosture::ALL`] (asserted by
 /// `every_posture_wire_name_round_trips`) and deliberately FALLIBLE: an unknown
-/// spelling in a persisted file is dropped, never silently defaulted to a
-/// posture the user never saw.
+/// spelling is never silently defaulted to a posture the user never saw. In a
+/// PERSISTED file it is not dropped either — the pin store reports it, and stops
+/// writing, rather than shrinking a record it cannot read
+/// ([`UndeterminableTrust`](crate::pins::UndeterminableTrust), `docs/adr/0014`).
 #[must_use]
 pub fn trust_posture_from_wire_name(name: &str) -> Option<TrustPosture> {
     TrustPosture::ALL

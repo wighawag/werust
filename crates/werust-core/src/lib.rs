@@ -625,10 +625,26 @@ pub struct ChromeState {
     /// the facts stay apart, so no seam has to learn what a pin is.
     ///
     /// FAIL-SAFE: this axis can only make the chrome say MORE. An unblessed name
-    /// (or an unreadable pin store) leaves every other rule exactly as it was
-    /// before, and nothing here participates in deciding what to load or whether
-    /// bytes verified.
+    /// leaves every other rule exactly as it was before, and nothing here
+    /// participates in deciding what to load or whether bytes verified.
     pub mutable_name: Option<crate::pins::MutableNameTrust>,
+    /// WHY werust cannot determine what the user has blessed, when it cannot: the
+    /// trust store's THIRD state ([`pins`](crate::pins)'s fail-safe note,
+    /// `docs/adr/0014`), `None` whenever the store was read (including a fresh
+    /// install's EMPTY one, and a shell with no durable store at all).
+    ///
+    /// A SEPARATE axis from [`mutable_name`](ChromeState::mutable_name) because it
+    /// is a fact about the STORE, not about this page's name: it holds whether or
+    /// not the current page is a name-resolved load, and it is exactly what stops
+    /// a missing pin from being read as "the user has blessed nothing". While it
+    /// is set the chrome states it ([`trust_pin_detail`]) and offers NO bless
+    /// ([`ChromeState::can_bless_name`]), because the write side REFUSES while it
+    /// holds and an offer werust would refuse is worse than no offer.
+    ///
+    /// It never makes the chrome say LESS: a warning already derived from what was
+    /// read stands, and the posture badge is untouched (the store is advisory and
+    /// says nothing about how THIS load's bytes were verified).
+    pub trust_undeterminable: Option<crate::pins::UndeterminableTrust>,
 }
 
 impl ChromeState {
@@ -733,11 +749,31 @@ impl ChromeState {
     /// and the trust surface is already where the posture is explained), so this
     /// only says whether the affordance EXISTS, never that anything should pop
     /// up.
+    ///
+    /// `false` while trust cannot be DETERMINED
+    /// ([`trust_undeterminable`](ChromeState::trust_undeterminable)): the write
+    /// side refuses to record into a store werust cannot read (`docs/adr/0014`),
+    /// so offering the action there would be offering a button that does nothing
+    /// — and the offer itself would assert the name is unblessed, which is the one
+    /// thing werust does not know in that state.
     #[must_use]
     pub fn can_bless_name(&self) -> bool {
-        self.mutable_name
-            .as_ref()
-            .is_some_and(crate::pins::MutableNameTrust::is_blessable)
+        !self.trust_is_undeterminable()
+            && self
+                .mutable_name
+                .as_ref()
+                .is_some_and(crate::pins::MutableNameTrust::is_blessable)
+    }
+
+    /// Whether werust cannot currently DETERMINE what the user has blessed (the
+    /// trust store's third state), as opposed to knowing that nothing is blessed.
+    ///
+    /// A pure read of the orthogonal
+    /// [`trust_undeterminable`](ChromeState::trust_undeterminable) axis, the same
+    /// shape [`has_invalid_entry`](ChromeState::has_invalid_entry) is.
+    #[must_use]
+    pub fn trust_is_undeterminable(&self) -> bool {
+        self.trust_undeterminable.is_some()
     }
 }
 
@@ -1378,6 +1414,14 @@ pub fn trust_pin_action_label(state: &ChromeState) -> &'static str {
 /// that shipped the trust EXPLANATION desktop-only for months (`docs/adr/0011`).
 /// It carries the CIDs verbatim because comparing them is the whole decision the
 /// user is being asked to make.
+///
+/// While trust cannot be DETERMINED
+/// ([`ChromeState::trust_undeterminable`], `docs/adr/0014`) this says exactly
+/// that, with the reason: the one thing it must never do there is claim the name
+/// is unblessed, because that is a claim werust cannot make from a store it could
+/// not read — and it would offer a bless the write side would refuse. It is the
+/// ONE place the third state is put into words, so all five edges (the two
+/// carriers, `desktop_paint::ChromePaint` and [`chrome_json`]) say it identically.
 #[must_use]
 pub fn trust_pin_detail(state: &ChromeState) -> String {
     let Some(name) = &state.mutable_name else {
@@ -1387,6 +1431,13 @@ pub fn trust_pin_detail(state: &ChromeState) -> String {
         "{} is a MUTABLE name: its controller can repoint it at any time.\nIt resolves to {} right now.",
         name.name, name.cid
     );
+    if let Some(why) = &state.trust_undeterminable {
+        return format!(
+            "{head}\nwerust cannot tell what you have trusted for this name: {why}. \
+             Nothing new can be recorded, and nothing already recorded has been changed, \
+             until that file can be read."
+        );
+    }
     match &name.blessed {
         None => format!("{head}\nYou have not trusted a version of this name yet."),
         Some(pin) if pin.cid == name.cid => format!(
@@ -1845,8 +1896,18 @@ pub struct BrowserShell {
     ///
     /// ADVISORY ONLY: it feeds [`ChromeState::mutable_name`] and nothing else. No
     /// load path, no verification and no posture reads it, so an empty store
-    /// (a fresh install, or an unreadable file) is exactly the pre-TOFU browser.
+    /// (a fresh install) is exactly the pre-TOFU browser.
     pins: crate::pins::TrustedNamePins,
+    /// WHY the last read of the store could not determine what is blessed, when it
+    /// could not: the store's THIRD state, carried beside the cache rather than
+    /// folded into it (`docs/adr/0014`).
+    ///
+    /// The pair moves together through
+    /// [`apply_pin_store_read`](BrowserShell::apply_pin_store_read), which is the
+    /// only writer of either, so no read site can update one and forget the other
+    /// — the mistake that would put the browser back where this task found it,
+    /// reading an unreadable store as "nothing trusted".
+    trust_undeterminable: Option<crate::pins::UndeterminableTrust>,
     /// WHERE the pin store is read from and written back to: the settings
     /// directory when a production edge asked for it
     /// ([`with_settings_pins`](BrowserShell::with_settings_pins)), a scratch
@@ -1916,22 +1977,25 @@ enum PinStoreLocation {
 }
 
 impl PinStoreLocation {
-    /// Re-read the store from disk, or `None` when there is nothing durable to
-    /// read (an [`Ephemeral`](PinStoreLocation::Ephemeral) shell, or
-    /// [`Settings`](PinStoreLocation::Settings) with no settings directory on
-    /// this system).
+    /// Re-read the store from disk: the pins, or NOTHING DURABLE to read (an
+    /// [`Ephemeral`](PinStoreLocation::Ephemeral) shell, or
+    /// [`Settings`](PinStoreLocation::Settings) with no settings directory on this
+    /// system), or the THIRD answer beside those two — a store werust cannot read,
+    /// so what is blessed cannot be determined.
     ///
-    /// `None` is deliberately distinct from "an empty store": a caller that has
-    /// pins in memory keeps them rather than dropping them on the floor, because
-    /// there is no file whose contents could have superseded them.
-    fn load(&self) -> Option<crate::pins::TrustedNamePins> {
+    /// All three are deliberately distinct from "an empty store":
+    /// [`NoStore`](crate::pins::PinStoreRead::NoStore) means a caller's in-memory
+    /// pins are still the truth (no file could have superseded them), and
+    /// [`Undeterminable`](crate::pins::PinStoreRead::Undeterminable) means werust
+    /// must claim nothing and write nothing (`docs/adr/0014`).
+    fn load(&self) -> crate::pins::PinStoreRead {
         match self {
             // Delegated, NOT re-derived: `TrustedNamePins::load` is the one site
             // that knows the user's store is `pins.json` in the settings
-            // directory, and it already reports the no-directory case as `None`.
+            // directory, and it already reports the no-directory case.
             Self::Settings => crate::pins::TrustedNamePins::load(),
-            Self::Dir(dir) => Some(crate::pins::TrustedNamePins::load_from(dir)),
-            Self::Ephemeral => None,
+            Self::Dir(dir) => crate::pins::TrustedNamePins::load_from(dir).into(),
+            Self::Ephemeral => crate::pins::PinStoreRead::NoStore,
         }
     }
 
@@ -2045,11 +2109,15 @@ impl BrowserShell {
             back_skip_issued: None,
             debug: crate::debug::DebugCapture::new(),
             // The blessed CIDs, read once per launch (and re-read on every
-            // navigation and every bless). A missing/unreadable store is simply
-            // empty, which is the pre-TOFU browser (fail-safe).
-            pins: pin_store.load().unwrap_or_default(),
+            // navigation and every bless). A MISSING store is simply empty, which
+            // is the pre-TOFU browser (fail-safe); one that cannot be READ is the
+            // third state, filled in by the read below.
+            pins: crate::pins::TrustedNamePins::default(),
+            trust_undeterminable: None,
             pin_store,
         };
+        let read = shell.pin_store.load();
+        shell.apply_pin_store_read(read);
         shell.refresh_chrome();
         shell
     }
@@ -2068,7 +2136,8 @@ impl BrowserShell {
     #[must_use]
     pub fn with_pins_dir(mut self, dir: &std::path::Path) -> Self {
         self.pin_store = PinStoreLocation::Dir(dir.to_path_buf());
-        self.pins = self.pin_store.load().unwrap_or_default();
+        let read = self.pin_store.load();
+        self.apply_pin_store_read(read);
         self.refresh_chrome();
         self
     }
@@ -2095,7 +2164,8 @@ impl BrowserShell {
     #[must_use]
     pub fn with_settings_pins(mut self) -> Self {
         self.pin_store = PinStoreLocation::Settings;
-        self.pins = self.pin_store.load().unwrap_or_default();
+        let read = self.pin_store.load();
+        self.apply_pin_store_read(read);
         self.refresh_chrome();
         self
     }
@@ -2629,6 +2699,15 @@ impl BrowserShell {
     /// the write failed, in which case the bless still holds for THIS session
     /// (the chrome updates), it simply cannot survive a relaunch. It is never an
     /// error: a pin store that cannot be written must not break browsing.
+    ///
+    /// A FOURTH case is a REFUSAL rather than a failure, and it is the only one
+    /// where the bless does not hold for this session either: the store on disk
+    /// cannot be READ (`docs/adr/0014`). Nothing is recorded, in memory or on
+    /// disk, because a store werust cannot read may not be overwritten — one
+    /// transient failure would replace every record in it with this single fresh
+    /// one. The chrome then STATES that trust cannot be determined instead of
+    /// showing an unpersisted bless, and the affordance withdraws
+    /// ([`ChromeState::can_bless_name`]).
     pub fn bless_current_name(&mut self) -> bool {
         // ONE gate, the very rule the edge's button visibility is painted from,
         // so "the button is shown" and "the action does something" cannot drift.
@@ -2652,7 +2731,22 @@ impl BrowserShell {
         // With no durable store to re-read, the in-memory pins ARE the truth (no
         // file could have superseded them), so this session's earlier blesses are
         // carried rather than dropped.
-        let mut pins = self.pin_store.load().unwrap_or_else(|| self.pins.clone());
+        //
+        // And it REFUSES outright while the store cannot be READ (`docs/adr/0014`):
+        // saving into what merely looks like an empty store is the same erasure
+        // from the other side, one transient failure replacing every record with a
+        // single fresh one. `TrustedNamePins::save_to` refuses too (that is the
+        // structural guarantee, for every writer); this returns early so the
+        // refusal is visible in the chrome rather than only in the return value.
+        let mut pins = match self.pin_store.load() {
+            crate::pins::PinStoreRead::Pins(pins) => pins,
+            crate::pins::PinStoreRead::NoStore => self.pins.clone(),
+            read @ crate::pins::PinStoreRead::Undeterminable(_) => {
+                self.apply_pin_store_read(read);
+                self.refresh_chrome();
+                return false;
+            }
+        };
         pins.bless(
             &current.name,
             &current.cid,
@@ -2663,6 +2757,7 @@ impl BrowserShell {
         // The re-read store (plus this bless) becomes the shell's cache, so a
         // concurrent writer's pins are visible here from now on too.
         self.pins = pins;
+        self.trust_undeterminable = None;
         // Re-derive the chrome's TOFU axis from the store, so the surface reflects
         // the bless immediately (the action label and the warning both change).
         self.refresh_chrome();
@@ -3219,8 +3314,39 @@ impl BrowserShell {
     /// so this session's own blesses are kept rather than dropped — the same rule
     /// [`bless_current_name`](BrowserShell::bless_current_name) applies.
     fn refresh_pin_store_cache(&mut self) {
-        if let Some(pins) = self.pin_store.load() {
-            self.pins = pins;
+        let read = self.pin_store.load();
+        self.apply_pin_store_read(read);
+    }
+
+    /// Take the outcome of a store READ into the shell: the pins cache and the
+    /// "cannot determine trust" axis move together, so no read site can update one
+    /// and forget the other (`docs/adr/0014`).
+    ///
+    /// The three answers, and why each does what it does:
+    ///
+    /// - [`Pins`](crate::pins::PinStoreRead::Pins): the file is the truth, so it
+    ///   replaces the cache and clears the axis — including when it is EMPTY,
+    ///   which is a fresh install and not a failure.
+    /// - [`NoStore`](crate::pins::PinStoreRead::NoStore): there is nowhere to read
+    ///   from, so the in-memory pins ARE the truth (nothing on disk could have
+    ///   superseded them) and this session's own blesses are kept.
+    /// - [`Undeterminable`](crate::pins::PinStoreRead::Undeterminable): the axis is
+    ///   set and the cache is KEPT. Keeping it is deliberate: whatever was last
+    ///   read is no less true than it was a moment ago, and dropping it would let
+    ///   a corrupt file SILENCE a change warning werust had already derived — the
+    ///   store may never make the chrome say less. It cannot make it say a name is
+    ///   unblessed either, because [`ChromeState::can_bless_name`] and
+    ///   [`trust_pin_detail`] both read the axis.
+    fn apply_pin_store_read(&mut self, read: crate::pins::PinStoreRead) {
+        match read {
+            crate::pins::PinStoreRead::Pins(pins) => {
+                self.pins = pins;
+                self.trust_undeterminable = None;
+            }
+            crate::pins::PinStoreRead::NoStore => self.trust_undeterminable = None,
+            crate::pins::PinStoreRead::Undeterminable(why) => {
+                self.trust_undeterminable = Some(why);
+            }
         }
     }
 
@@ -3289,6 +3415,12 @@ impl BrowserShell {
                 .then(|| self.pins.check(&entry.root_name, &entry.root_cid))
         });
         self.chrome.mutable_name = mutable_name;
+        // The store's THIRD state, carried to the chrome as its own axis: a store
+        // werust could not read must not paint as "nothing blessed"
+        // (`docs/adr/0014`). Copied here beside the axis it qualifies, so every
+        // presentation rule stays a pure function of `ChromeState` and no painter
+        // learns what a pin store is.
+        self.chrome.trust_undeterminable = self.trust_undeterminable.clone();
         // The trust posture is the backend's truth about the current load path
         // (content-verified vs served), pulled fresh like the load state so the
         // indicator tracks the page actually shown — including after a scheme
@@ -4567,6 +4699,7 @@ mod tests {
         assert!(!error_banner_visible(second.chrome()));
         assert_eq!(
             crate::pins::TrustedNamePins::load_from(&scratch.path)
+                .expect("the store reads")
                 .get("ronan.eth")
                 .map(|p| p.cid.clone()),
             Some(current_cid)
@@ -4793,7 +4926,7 @@ mod tests {
             .clone();
 
         // BOTH pins survive: the second writer merged into what it found on disk.
-        let on_disk = crate::pins::TrustedNamePins::load_from(&scratch.path);
+        let on_disk = crate::pins::TrustedNamePins::load_from(&scratch.path).expect("it reads");
         assert_eq!(
             on_disk.len(),
             2,
@@ -4955,6 +5088,10 @@ mod tests {
             shell.pins_for_test().is_empty(),
             "a default test shell reads no pin store"
         );
+        assert!(
+            !shell.chrome().trust_is_undeterminable(),
+            "having NO store to read is not the same as a store werust could not read"
+        );
         let axis = shell
             .chrome()
             .mutable_name
@@ -4979,6 +5116,105 @@ mod tests {
             real_before,
             "the REAL pin store is untouched by this suite"
         );
+    }
+
+    #[test]
+    fn a_store_werust_cannot_read_states_it_offers_no_bless_and_writes_nothing() {
+        // Acceptance (the THIRD state, carried through the shell's per-load read:
+        // task `trust-store-fails-closed-instead-of-reading-as-nothing-trusted`,
+        // `docs/adr/0014`). A store werust cannot read must NOT read as "nothing
+        // trusted": that is a silent re-trust of every name in it, and the next
+        // bless would then overwrite the file with a single fresh record. So the
+        // shell carries the state, the chrome STATES it, no bless is offered (the
+        // write would refuse it), and browsing is untouched.
+        let scratch = PinScratchDir::new("undeterminable");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        // A store written by a build that knows a posture this one does not: the
+        // record is real, werust simply cannot read it honestly.
+        let corrupt = br#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1,"posture":"from-the-future"}]}"#;
+        let store = scratch.path.join(crate::pins::PINS_FILE);
+        std::fs::write(&store, corrupt).unwrap();
+
+        let (contenthash, _) = ipfs_contenthash_fixture(b"the site as it is today");
+        let (mut shell, handle) = shell_with_provider_and_pins(
+            vec![
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&contenthash)),
+                // A second navigation (the reload below) re-resolves the name.
+                Ok(address_word(&[0x11u8; 20])),
+                Ok(abi_bytes_return(&contenthash)),
+            ],
+            &scratch.path,
+        );
+        load_eth_name(&mut shell, &handle, "ronan.eth");
+
+        let chrome = shell.chrome();
+        // The LOAD is exactly what it would have been: an advisory store werust
+        // cannot read is never a reason to break browsing.
+        assert_eq!(chrome.trust_posture, TrustPosture::NameViaTrustedRpc);
+        assert!(chrome.last_error.is_none());
+        assert_eq!(trust_indicator(chrome), "◈ name via trusted RPC");
+        // The third state is carried, not flattened into an empty store.
+        assert!(chrome.trust_is_undeterminable());
+        assert!(
+            !chrome.mutable_name_changed(),
+            "werust does not invent a change out of a store it cannot read"
+        );
+        // No bless is offered, because the write rule would REFUSE it.
+        assert!(!chrome.can_bless_name());
+        assert!(!trust_pin_action_visible(chrome));
+        assert_eq!(trust_pin_action_label(chrome), "");
+        // And the surface SAYS so rather than claiming the name is unblessed.
+        let detail = trust_pin_detail(chrome);
+        assert!(detail.contains("ronan.eth"), "names the name: {detail}");
+        assert!(
+            !detail.contains("not trusted a version"),
+            "never claims the user has blessed nothing: {detail}"
+        );
+        assert!(
+            detail.contains("cannot tell") && detail.contains(crate::pins::PINS_FILE),
+            "states WHY trust cannot be determined: {detail}"
+        );
+
+        // A bless attempted anyway (the edge is the only caller, and it paints its
+        // button from the rule above) records nothing and destroys nothing.
+        assert!(!shell.bless_current_name());
+        assert_eq!(
+            std::fs::read(&store).unwrap(),
+            corrupt,
+            "the records werust could not read are still on disk, byte for byte"
+        );
+
+        // Repaired on disk (here: by a build that knows the posture again), the
+        // very next navigation picks it up and the axis is ordinary once more.
+        std::fs::write(
+            &store,
+            r#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1,"posture":"mutable-name"}]}"#,
+        )
+        .unwrap();
+        shell.reload().expect("an ENS page reloads");
+        handle.serve_via_verified_content_path();
+        settle(&mut shell, &handle);
+        let chrome = shell.chrome();
+        assert!(!chrome.trust_is_undeterminable());
+        assert!(
+            chrome.mutable_name_changed(),
+            "the readable store's pin is now visible, and this CID is not it"
+        );
+        assert!(chrome.can_bless_name());
+
+        // Finally the RACE the write rule exists for: the store goes bad AFTER the
+        // navigation that read it, so the offer is on screen and the user takes it.
+        // The bless re-reads, refuses, and destroys nothing; the chrome states the
+        // third state; and the change warning it had already derived STANDS, because
+        // an unreadable store may never make werust say LESS than it already did.
+        std::fs::write(&store, corrupt).unwrap();
+        assert!(!shell.bless_current_name(), "the write refuses");
+        assert_eq!(std::fs::read(&store).unwrap(), corrupt, "byte for byte");
+        let chrome = shell.chrome();
+        assert!(chrome.trust_is_undeterminable());
+        assert!(!chrome.can_bless_name());
+        assert!(chrome.mutable_name_changed());
     }
 
     #[test]
@@ -7666,7 +7902,8 @@ mod tests {
     ///
     /// The remaining axes are NOT enum-shaped and are driven over representative
     /// values instead: an empty vs non-empty URL, an absent vs present
-    /// invalid-entry text, and both history flags. So a rule that started
+    /// invalid-entry text, an absent vs present "trust cannot be determined"
+    /// reason, and both history flags. So a rule that started
     /// branching on the CONTENT of one of those strings (a particular scheme, say)
     /// could still escape this drive; a rule that branches on a state MACHINE
     /// cannot. A few thousand plain values, so it stays a fast unit test.
@@ -7679,20 +7916,30 @@ mod tests {
                     for last_error in failure_reasons.iter().copied() {
                         for invalid_entry in [None, Some("not a url")] {
                             for mutable_name in every_mutable_name_shape() {
-                                for can_go_back in [false, true] {
-                                    for can_go_forward in [false, true] {
-                                        for url_text in ["", "ipfs://bafy/index.html"] {
-                                            shapes.push(ChromeState {
-                                                url_text: url_text.to_string(),
-                                                load_state,
-                                                load_step,
-                                                trust_posture: posture,
-                                                last_error: last_error.map(str::to_string),
-                                                invalid_entry: invalid_entry.map(str::to_string),
-                                                mutable_name: mutable_name.clone(),
-                                                can_go_back,
-                                                can_go_forward,
-                                            });
+                                for trust_undeterminable in [
+                                    None,
+                                    Some(crate::pins::UndeterminableTrust::UnreadableEntry(
+                                        "entry 1 (`ronan.eth`) records no cid".to_string(),
+                                    )),
+                                ] {
+                                    for can_go_back in [false, true] {
+                                        for can_go_forward in [false, true] {
+                                            for url_text in ["", "ipfs://bafy/index.html"] {
+                                                shapes.push(ChromeState {
+                                                    url_text: url_text.to_string(),
+                                                    load_state,
+                                                    load_step,
+                                                    trust_posture: posture,
+                                                    last_error: last_error.map(str::to_string),
+                                                    invalid_entry: invalid_entry
+                                                        .map(str::to_string),
+                                                    mutable_name: mutable_name.clone(),
+                                                    trust_undeterminable: trust_undeterminable
+                                                        .clone(),
+                                                    can_go_back,
+                                                    can_go_forward,
+                                                });
+                                            }
                                         }
                                     }
                                 }

@@ -1581,8 +1581,13 @@ ios = { state = "stubbed", task = "ios-marks-user-intent-for-settings-mutations"
 # and marking never takes the session lock); the Kotlin half is pinned by
 # crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs. HONEST
 # LIMIT: there is no Android CI leg (`android-instrumented-emulator-ci-leg` is
-# unbuilt), so the on-device half is a HAND-RUN probe,
-# `app/src/androidTest/.../SettingsIntentSignalTest.kt`, recorded with the
-# emulator + System WebView version at
+# unbuilt), so NO CI evidence is claimed. The on-device half is a HAND-RUN probe,
+# `app/src/androidTest/.../SettingsIntentSignalTest.kt`, run 2026-08-18 on an
+# API-36 emulator with System WebView 142.0.7444.174 (5 cases green: a real tap
+# on werust's own form reports a gesture and marks, a script's `location =` and a
+# hostile page's link do not, `window.open` never reaches the hook, and the URI
+# the scheme handler is asked for is byte-for-byte the one the hook reported),
+# plus a hand-driven walk-through of the debug APK through the attack. Readings:
 # docs/spikes/android-marks-user-intent-for-settings-mutations/MEASUREMENTS.md.
+# A hand-run is one engine version on one device, not a standing guarantee.
 android = { state = "implemented" }

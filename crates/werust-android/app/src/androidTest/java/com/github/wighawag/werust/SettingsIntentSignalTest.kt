@@ -190,6 +190,43 @@ class SettingsIntentSignalTest {
         )
     }
 
+    /**
+     * THE OTHER HALF OF THE MARK, which only a running System WebView can
+     * settle: the core compares a mark against the URL the SCHEME HANDLER is
+     * later asked for (`werust_core::intent::intent_key`, the frame key PLUS the
+     * query, compared verbatim), so the user's own change applies only if the
+     * URI this WebView hands `shouldInterceptRequest` is the URI it reported to
+     * `shouldOverrideUrlLoading` a moment earlier. WebKit is known to re-spell
+     * what the chrome asked for (`werust:///settings`, a bare trailing slash),
+     * which is why `intent_key` collapses those forms; what BLINK does with a
+     * custom scheme is a reading, not a deduction, and a mismatch would refuse
+     * every settings change made from werust's own form on Android.
+     *
+     * The navigation is allowed to PROCEED here (every other case cancels it),
+     * so the same navigation is observed at both hooks. It is started by a
+     * script-driven submit rather than a tap because the SPELLING is what is
+     * measured and it does not depend on the gesture; the gesture reading is
+     * the case above.
+     */
+    @Test
+    fun the_uri_the_scheme_handler_is_asked_for_is_the_uri_the_hook_reported() {
+        probe.load(SETTINGS_URL)
+        probe.clearNavigations()
+        probe.allowNavigation = true
+        probe.evaluate("document.getElementById('use').click(); 'submitted'")
+
+        val nav = probe.awaitNavigation() ?: error("the form submit must reach the navigation hook")
+        val served = probe.awaitMainFrameRequestWithQuery()
+            ?: error("the allowed navigation must reach the scheme handler")
+        Log.i(EVIDENCE_TAG, "SPELLING marked=${nav.url} served=$served")
+        assertTrue(
+            "the scheme handler is asked for the very URI the hook reported, so the " +
+                "mark the core left matches what it is later asked to spend\n" +
+                "  marked: ${nav.url}\n  served: $served",
+            served == nav.url,
+        )
+    }
+
     private companion object {
         /** The logcat tag the captured on-device evidence is logged under (quoted in MEASUREMENTS.md). */
         const val EVIDENCE_TAG = "SettingsIntentProbe"
@@ -272,6 +309,17 @@ class SettingsIntentSignalTest {
         /** Every navigation the marking hook was told about. */
         val navigations = CopyOnWriteArrayList<Navigation>()
 
+        /** Every URI the scheme handler (`shouldInterceptRequest`) was asked for. */
+        val requested = CopyOnWriteArrayList<String>()
+
+        /**
+         * Whether a reported navigation is allowed to PROCEED. Default `false`
+         * (each case cancels, staying on the page under test); the spelling case
+         * sets it so one navigation is observed at BOTH hooks.
+         */
+        @Volatile
+        var allowNavigation = false
+
         private var pageFinished = CountDownLatch(1)
         private var windowOpened = CountDownLatch(1)
 
@@ -294,6 +342,7 @@ class SettingsIntentSignalTest {
                         request: WebResourceRequest,
                     ): WebResourceResponse? {
                         val url = request.url.toString()
+                        if (request.isForMainFrame) requested.add(url)
                         val html = when {
                             url.startsWith("werust://") -> SETTINGS_HTML
                             url.startsWith(HOSTILE_URL) -> HOSTILE_HTML
@@ -320,9 +369,10 @@ class SettingsIntentSignalTest {
                                     request.isRedirect,
                             )
                         )
-                        // Cancel it: the probe measures the REPORT, and staying on
-                        // the page under test keeps the cases independent.
-                        return true
+                        // Cancel it unless the case asked otherwise: the probe
+                        // measures the REPORT, and staying on the page under test
+                        // keeps the cases independent.
+                        return !allowNavigation
                     }
 
                     override fun onPageFinished(view: WebView, url: String) {
@@ -354,6 +404,7 @@ class SettingsIntentSignalTest {
 
         fun clearNavigations() {
             navigations.clear()
+            requested.clear()
             windowOpened = CountDownLatch(1)
         }
 
@@ -386,6 +437,20 @@ class SettingsIntentSignalTest {
         }
 
         fun awaitWindowOpen(): Boolean = windowOpened.await(10, TimeUnit.SECONDS)
+
+        /**
+         * The first MAIN-FRAME URI the scheme handler was asked for that carries
+         * a query (i.e. the mutating settings document, not the page the case
+         * started on), or `null`.
+         */
+        fun awaitMainFrameRequestWithQuery(): String? {
+            val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10)
+            while (System.nanoTime() < deadline) {
+                requested.firstOrNull { it.contains('?') }?.let { return it }
+                SystemClock.sleep(100)
+            }
+            return null
+        }
 
         /**
          * What the SHARED rule says about a reported navigation: the same

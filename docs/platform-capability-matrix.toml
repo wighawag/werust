@@ -1565,4 +1565,29 @@ desktop = { state = "implemented" }
 macos = { state = "stubbed", task = "macos-marks-user-intent-for-settings-mutations" }
 windows = { state = "stubbed", task = "windows-marks-user-intent-for-settings-mutations" }
 ios = { state = "stubbed", task = "ios-marks-user-intent-for-settings-mutations" }
-android = { state = "stubbed", task = "android-marks-user-intent-for-settings-mutations" }
+# Android (task `android-marks-user-intent-for-settings-mutations`):
+# `werust_android_core::install_settings_page` registers the `werust` scheme
+# against the gated core entry point and returns the ONE carrier, which the
+# session hands to its shell (`with_navigation_intent`) and to Kotlin's
+# `WebViewClient.shouldOverrideUrlLoading`. That hook REPORTS the facts Android
+# gives it (`request.url`, `WebView.url`, `isForMainFrame`, `hasGesture()`,
+# `isRedirect` — reported as a redirect when the platform is too old to say) and
+# `IntentMarker::note_page_navigation` decides, requiring all of them plus a
+# document that is werust's own `werust://` page. `onCreateWindow` (the
+# `_blank`/`window.open` router, `docs/adr/0010`) reports nothing. The Rust half
+# is gate-compiled and unit-tested in `crates/werust-android/rust/src/lib.rs`
+# (the form submit applies and persists, a page-started navigation and a
+# sub-resource change nothing byte-for-byte, each required fact is load-bearing,
+# and marking never takes the session lock); the Kotlin half is pinned by
+# crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs. HONEST
+# LIMIT: there is no Android CI leg (`android-instrumented-emulator-ci-leg` is
+# unbuilt), so NO CI evidence is claimed. The on-device half is a HAND-RUN probe,
+# `app/src/androidTest/.../SettingsIntentSignalTest.kt`, run 2026-08-18 on an
+# API-36 emulator with System WebView 142.0.7444.174 (5 cases green: a real tap
+# on werust's own form reports a gesture and marks, a script's `location =` and a
+# hostile page's link do not, `window.open` never reaches the hook, and the URI
+# the scheme handler is asked for is byte-for-byte the one the hook reported),
+# plus a hand-driven walk-through of the debug APK through the attack. Readings:
+# docs/spikes/android-marks-user-intent-for-settings-mutations/MEASUREMENTS.md.
+# A hand-run is one engine version on one device, not a standing guarantee.
+android = { state = "implemented" }

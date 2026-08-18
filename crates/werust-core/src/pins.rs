@@ -49,18 +49,44 @@
 //! posture instead would have silently made `ipfs-ns` ENS sites unblessable while
 //! the ADR calls them mutable.
 //!
-//! # Fail-safe
+//! # Fail-safe, and the THIRD state
 //!
 //! The pin store is ADVISORY and one-directional: it can only make werust say
 //! MORE, never less. An unblessed name behaves exactly as it did before; a
 //! blessed-and-unchanged name behaves exactly as it did before; a blessed-then-
 //! CHANGED name adds a louder warning. Nothing here authorises a load, relaxes a
-//! verification, or feeds the retrieval path; a missing, unreadable or corrupt
-//! `pins.json` therefore degrades to "no pins" (the pre-TOFU behaviour) rather
-//! than failing a load, exactly as [`RetrievalSettings`](crate::retrieval::RetrievalSettings)
-//! re-defaults. The blessed CID is never used to CHOOSE what to load either: the
+//! verification, or feeds the retrieval path, and a load NEVER fails because of
+//! this file. The blessed CID is never used to CHOOSE what to load either: the
 //! name still resolves normally and the bytes are still hash-verified, so a pin
 //! can never cause unverified content to render.
+//!
+//! What a fail-safe store may NOT do is read as "nothing trusted" when it cannot
+//! be read at all. "No records" (a fresh install: no settings directory, no
+//! `pins.json`) and "cannot determine trust" (an unreadable file, a document that
+//! is not this wire form, an entry werust cannot read honestly, two entries for
+//! one name) are DIFFERENT facts, and the store distinguishes them
+//! ([`UndeterminableTrust`], [`PinStoreRead`], task
+//! `trust-store-fails-closed-instead-of-reading-as-nothing-trusted`,
+//! `docs/adr/0014`). The asymmetry that ADR records, and the rule this module
+//! implements, is:
+//!
+//! - **Readers get the STATE.** A missing file is still an EMPTY store (a fresh
+//!   install is not an error), but an unreadable one yields
+//!   [`UndeterminableTrust`] carrying WHY, so no caller can flatten it into
+//!   "nothing blessed" by accident. A malformed entry is REPORTED rather than
+//!   filtered out, so a future fifth [`TrustPosture`] cannot silently un-trust
+//!   every name recorded under it.
+//! - **Writers REFUSE while it holds** ([`save_to`](TrustedNamePins::save_to)).
+//!   This is the half a naive fix forgets and the exploitable one: inserting into
+//!   what merely LOOKS like an empty store is how ONE transient read failure
+//!   permanently replaces every record with a single fresh one — the same
+//!   destruction, from the write side.
+//!
+//! Neither half fails a LOAD: the chrome states that trust cannot be determined
+//! and offers no bless (which the write would refuse anyway), and browsing is
+//! untouched. The secondary shape choices (why the chrome carries it as its own
+//! axis, why the shell keeps its cache while it holds) are recorded at
+//! `docs/spikes/trust-store-fails-closed-instead-of-reading-as-nothing-trusted/DECISIONS.md`.
 //!
 //! # Vocabulary note: "pin"
 //!
@@ -174,6 +200,12 @@ impl MutableNameTrust {
     ///
     /// This is what makes the action a TOFU bless rather than a no-op button: a
     /// name already blessed to exactly this CID has nothing left to record.
+    ///
+    /// Says nothing about whether the store could be READ, which is a store-wide
+    /// fact rather than a per-name one
+    /// ([`ChromeState::trust_undeterminable`](crate::ChromeState::trust_undeterminable)).
+    /// [`ChromeState::can_bless_name`](crate::ChromeState::can_bless_name) is the
+    /// gate that combines the two, and it is what an edge paints its button from.
     #[must_use]
     pub fn is_blessable(&self) -> bool {
         !self.is_unchanged()
@@ -183,6 +215,91 @@ impl MutableNameTrust {
     #[must_use]
     pub fn blessed_on(&self) -> Option<String> {
         self.blessed.as_ref().map(TrustedNamePin::blessed_on)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The THIRD state: "cannot determine trust".
+// ---------------------------------------------------------------------------
+
+/// WHY werust cannot determine what the user has blessed: the store's THIRD
+/// state, distinct from "no records" and never flattened into it.
+///
+/// A fresh install has NO records, which is a fact werust knows. This type is the
+/// other thing: werust cannot tell, and says so. It carries a legible reason
+/// because "your trust store is unreadable" with no WHICH is not actionable, and
+/// because the reason is what the trust surface shows the user
+/// ([`crate::trust_pin_detail`]).
+///
+/// While a read yields one of these, the WRITE side refuses
+/// ([`TrustedNamePins::save_to`]) and the chrome offers no bless: the two halves
+/// of one rule (`docs/adr/0014`), because a reader that merely NOTICES the state
+/// while the writer overwrites the file anyway loses every record it could not
+/// read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UndeterminableTrust {
+    /// `pins.json` exists but could not be READ (a permission, an I/O error, a
+    /// non-UTF-8 document). A MISSING file is NOT this: it is an empty store.
+    Unreadable(String),
+    /// The document is not this store's wire form at all (not JSON, or no `pins`
+    /// array): werust cannot tell whether it holds one record or a hundred.
+    Unparseable(String),
+    /// One ENTRY cannot be read honestly: no name, no CID, no bless timestamp, or
+    /// a [`TrustPosture`] spelling this build does not know (a store written by a
+    /// LATER werust). Reported rather than dropped, because the next save would
+    /// persist the survivors and make the drop permanent.
+    UnreadableEntry(String),
+    /// Two entries record the SAME name. Silently keeping one of them lets a
+    /// hand-edited or half-merged file choose for the user.
+    DuplicateName(String),
+}
+
+impl std::fmt::Display for UndeterminableTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(detail) => write!(f, "{PINS_FILE} could not be read: {detail}"),
+            Self::Unparseable(detail) => write!(
+                f,
+                "{PINS_FILE} is not a trusted-name store werust can read: {detail}"
+            ),
+            Self::UnreadableEntry(detail) => write!(
+                f,
+                "{PINS_FILE} records something werust cannot read honestly: {detail}"
+            ),
+            Self::DuplicateName(name) => {
+                write!(f, "{PINS_FILE} records two trusted-name pins for `{name}`")
+            }
+        }
+    }
+}
+
+/// The outcome of READING the trusted-name pin store: the three answers a caller
+/// must tell apart.
+///
+/// [`NoStore`](PinStoreRead::NoStore) and
+/// [`Undeterminable`](PinStoreRead::Undeterminable) are BOTH distinct from an
+/// empty [`Pins`](PinStoreRead::Pins): "there is nowhere to read from" means a
+/// caller's in-memory pins are still the truth (no file could have superseded
+/// them), "cannot determine trust" means werust must neither claim a name is
+/// unblessed nor write, and an EMPTY store means the user has genuinely blessed
+/// nothing yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinStoreRead {
+    /// There is nowhere durable to read from at all (no settings directory on this
+    /// system, or a caller that asked for no store). NOT an empty store.
+    NoStore,
+    /// The store as recorded. An ABSENT file is an empty one: a fresh install.
+    Pins(TrustedNamePins),
+    /// werust cannot determine what is blessed, and will not write until it can.
+    Undeterminable(UndeterminableTrust),
+}
+
+impl From<Result<TrustedNamePins, UndeterminableTrust>> for PinStoreRead {
+    fn from(read: Result<TrustedNamePins, UndeterminableTrust>) -> Self {
+        match read {
+            Ok(pins) => Self::Pins(pins),
+            Err(why) => Self::Undeterminable(why),
+        }
     }
 }
 
@@ -210,9 +327,9 @@ pub fn pin_key(name: &str) -> String {
 /// database"): a sorted list of pins, [`load`](TrustedNamePins::load) /
 /// [`save`](TrustedNamePins::save) — the ONE pair that knows the store lives in
 /// the settings directory — plus the directory-taking cores tests drive.
-/// A missing or corrupt file loads as EMPTY rather than failing, because an
-/// unreadable pin store must degrade to the pre-TOFU behaviour, never to a
-/// broken browser (see the module's fail-safe note).
+/// A MISSING file loads as EMPTY (a fresh install), while an UNREADABLE one
+/// yields [`UndeterminableTrust`] rather than a silent empty store, and blocks
+/// the write while it holds (see the module's fail-safe note).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TrustedNamePins {
     /// The pins, kept sorted by [`pin_key`] so the persisted document is stable
@@ -221,16 +338,14 @@ pub struct TrustedNamePins {
 }
 
 impl TrustedNamePins {
-    /// Load the pins from the settings directory, or `None` when this system has
-    /// no settings directory at all.
+    /// Read the USER's store: the [`PinStoreRead`] for `pins.json` in the settings
+    /// directory, or [`NoStore`](PinStoreRead::NoStore) when this system has no
+    /// settings directory at all.
     ///
-    /// `None` is deliberately NOT the same as an empty store: no file (nothing
-    /// blessed yet) and an unreadable/corrupt file both load as EMPTY, because an
-    /// unreadable pin store must degrade to the pre-TOFU behaviour (the module's
-    /// fail-safe note). "There is nowhere to read from" is a different fact, and
-    /// a caller holding pins in memory needs it to know that nothing on disk could
-    /// have superseded them. It is the read-side mirror of
-    /// [`save`](TrustedNamePins::save)'s `false`, which reports the same absence.
+    /// The three answers are deliberately distinct (the module's fail-safe note):
+    /// "there is nowhere to read from" is not "an empty store" (a caller holding
+    /// pins in memory keeps them, because no file could have superseded them), and
+    /// neither of those is "werust cannot determine what is blessed".
     ///
     /// This is the ONLY way to read the USER's store: the shell reaches it through
     /// its own `PinStoreLocation::Settings`, which delegates here rather than
@@ -238,28 +353,39 @@ impl TrustedNamePins {
     /// site that knows where the user's `pins.json` is (task
     /// `pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns`).
     #[must_use]
-    pub fn load() -> Option<Self> {
-        crate::retrieval::settings_dir().map(|dir| Self::load_from(&dir))
+    pub fn load() -> PinStoreRead {
+        match crate::retrieval::settings_dir() {
+            Some(dir) => Self::load_from(&dir).into(),
+            None => PinStoreRead::NoStore,
+        }
     }
 
     /// Load the pins from a SPECIFIC directory (the directory-taking core
-    /// [`load`](TrustedNamePins::load) delegates to).
+    /// [`load`](TrustedNamePins::load) delegates to), or say WHY trust cannot be
+    /// determined from what is there.
     ///
-    /// The explicit-directory seam, identical to
+    /// The explicit-directory seam, mirroring
     /// [`RetrievalSettings::load_from`](crate::retrieval::RetrievalSettings::load_from):
     /// tests pass their OWN scratch directory so they isolate the store WITHOUT
     /// mutating process-global env, and the real `pins.json` is never touched.
-    #[must_use]
-    pub fn load_from(dir: &std::path::Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(dir.join(PINS_FILE)) else {
-            return Self::default();
-        };
-        Self::from_json(&text).unwrap_or_default()
+    ///
+    /// A MISSING file is `Ok` and EMPTY — a fresh install must behave exactly as
+    /// it always has. Every OTHER read failure is [`UndeterminableTrust`], because
+    /// the alternative (reading an unreadable store as "nothing trusted") is the
+    /// silent re-trust this module refuses to perform.
+    pub fn load_from(dir: &std::path::Path) -> Result<Self, UndeterminableTrust> {
+        match std::fs::read_to_string(dir.join(PINS_FILE)) {
+            Ok(text) => Self::from_json(&text),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(err) => Err(UndeterminableTrust::Unreadable(err.to_string())),
+        }
     }
 
     /// Persist the pins to the settings directory, creating it if needed. Returns
-    /// `false` when there is no settings directory or the write failed: the
-    /// bless still took effect for THIS session, it just could not be recorded.
+    /// `false` when there is no settings directory, when the write REFUSES because
+    /// the store on disk cannot be read (see [`save_to`](TrustedNamePins::save_to)),
+    /// or when the write itself failed: the bless still took effect for THIS
+    /// session, it just could not be recorded.
     pub fn save(&self) -> bool {
         match crate::retrieval::settings_dir() {
             Some(dir) => self.save_to(&dir),
@@ -269,8 +395,27 @@ impl TrustedNamePins {
 
     /// Persist the pins to a SPECIFIC directory (the directory-taking core
     /// [`save`](TrustedNamePins::save) delegates to), creating it if needed.
+    ///
+    /// # The write REFUSES while trust cannot be determined
+    ///
+    /// This is the write half of the fail-closed rule (`docs/adr/0014`), and it
+    /// lives HERE rather than at each caller so no writer — today's
+    /// `bless_current_name`, or a later "forget this pin" — can forget it: the
+    /// save re-reads the document it is about to replace, and returns `false`
+    /// without touching a byte when that read is
+    /// [`UndeterminableTrust`]. Overwriting a store werust could not read is how
+    /// ONE transient failure permanently destroys every record it holds, and the
+    /// whole-file write below is exactly the mechanism that would do it.
+    ///
+    /// The refusal is reported the same way "there is no settings directory" is:
+    /// `false`, meaning the bless holds for THIS session but could not be
+    /// recorded. It is never an error, because a store werust cannot read must not
+    /// break browsing.
     pub fn save_to(&self, dir: &std::path::Path) -> bool {
         if dir.as_os_str().is_empty() || std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+        if Self::load_from(dir).is_err() {
             return false;
         }
         std::fs::write(dir.join(PINS_FILE), self.to_json()).is_ok()
@@ -330,7 +475,9 @@ impl TrustedNamePins {
         self.pins.len()
     }
 
-    /// Whether nothing is blessed (a fresh install, or an unreadable store).
+    /// Whether nothing is blessed — a fresh install. NEVER the answer for a store
+    /// werust could not read: that one is [`UndeterminableTrust`], which is not a
+    /// [`TrustedNamePins`] at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
@@ -360,37 +507,81 @@ impl TrustedNamePins {
         json!({ "pins": pins }).to_string()
     }
 
-    /// Parse the persisted wire form. Returns `None` only on a JSON parse error;
-    /// individual entries that are malformed (no name, no CID, an unknown posture
-    /// spelling) are DROPPED rather than defaulted, because a pin werust cannot
-    /// read honestly is a pin it must not claim the user made.
-    #[must_use]
-    pub fn from_json(text: &str) -> Option<Self> {
-        let value: Value = serde_json::from_str(text).ok()?;
-        let entries = value.get("pins").and_then(Value::as_array)?;
+    /// Parse the persisted wire form, or say WHY trust cannot be determined from
+    /// this document.
+    ///
+    /// Every failure REPORTS instead of shrinking the store (the module's
+    /// fail-safe note): a document that is not this wire form is
+    /// [`Unparseable`](UndeterminableTrust::Unparseable), an entry werust cannot
+    /// read honestly (no name, no CID, no timestamp, a posture spelling this build
+    /// does not know) is [`UnreadableEntry`](UndeterminableTrust::UnreadableEntry),
+    /// and two entries for one key are
+    /// [`DuplicateName`](UndeterminableTrust::DuplicateName). Dropping any of them
+    /// would be silent: the next save persists the survivors, so a build that met
+    /// a fifth [`TrustPosture`] would un-trust every name recorded under it.
+    pub fn from_json(text: &str) -> Result<Self, UndeterminableTrust> {
+        let value: Value = serde_json::from_str(text)
+            .map_err(|err| UndeterminableTrust::Unparseable(err.to_string()))?;
+        let entries = value
+            .get("pins")
+            .and_then(Value::as_array)
+            .ok_or_else(|| UndeterminableTrust::Unparseable("no `pins` array".to_string()))?;
         let mut pins: Vec<TrustedNamePin> = entries
             .iter()
-            .filter_map(|entry| {
-                let name = pin_key(entry.get("name").and_then(Value::as_str)?);
-                let cid = entry.get("cid").and_then(Value::as_str)?.to_string();
-                if name.is_empty() || cid.is_empty() {
-                    return None;
-                }
-                let blessed_at = entry.get("blessedAt").and_then(Value::as_u64)?;
-                let posture =
-                    trust_posture_from_wire_name(entry.get("posture").and_then(Value::as_str)?)?;
-                Some(TrustedNamePin {
-                    name,
-                    cid,
-                    blessed_at,
-                    posture,
-                })
-            })
-            .collect();
+            .enumerate()
+            .map(|(index, entry)| read_entry(index, entry))
+            .collect::<Result<_, _>>()?;
         pins.sort_by(|a, b| a.name.cmp(&b.name));
-        pins.dedup_by(|a, b| a.name == b.name);
-        Some(Self { pins })
+        if let Some(duplicate) = pins.windows(2).find(|pair| pair[0].name == pair[1].name) {
+            return Err(UndeterminableTrust::DuplicateName(
+                duplicate[0].name.clone(),
+            ));
+        }
+        Ok(Self { pins })
     }
+}
+
+/// One persisted entry -> one [`TrustedNamePin`], or WHY werust cannot read it
+/// honestly. The entry's position is carried in the reason because the name is
+/// exactly the field that may be missing.
+fn read_entry(index: usize, entry: &Value) -> Result<TrustedNamePin, UndeterminableTrust> {
+    let unreadable = |what: &str| {
+        UndeterminableTrust::UnreadableEntry(format!("entry {index} {what}", index = index + 1))
+    };
+    let name = pin_key(
+        entry
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| unreadable("records no name"))?,
+    );
+    if name.is_empty() {
+        return Err(unreadable("records an empty name"));
+    }
+    let cid = entry
+        .get("cid")
+        .and_then(Value::as_str)
+        .filter(|cid| !cid.is_empty())
+        .ok_or_else(|| unreadable(&format!("(`{name}`) records no cid")))?
+        .to_string();
+    let blessed_at = entry
+        .get("blessedAt")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| unreadable(&format!("(`{name}`) records no bless timestamp")))?;
+    let spelling = entry
+        .get("posture")
+        .and_then(Value::as_str)
+        .ok_or_else(|| unreadable(&format!("(`{name}`) records no trust posture")))?;
+    let posture = trust_posture_from_wire_name(spelling).ok_or_else(|| {
+        unreadable(&format!(
+            "(`{name}`) records a trust posture this build does not know: `{spelling}`"
+        ))
+    })?;
+    Ok(TrustedNamePin {
+        name,
+        cid,
+        blessed_at,
+        posture,
+    })
 }
 
 /// The full path to the pin-store file, or `None` if there is no settings dir.
@@ -489,7 +680,7 @@ mod tests {
         // Acceptance: the pin (name -> CID + timestamp + posture) persists across
         // launches, isolated to a scratch dir through the directory-taking core.
         let scratch = ScratchDir::new("persist");
-        let mut pins = TrustedNamePins::load_from(&scratch.path);
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a fresh install reads");
         assert!(pins.is_empty(), "a fresh install has no pins");
 
         pins.bless(
@@ -505,7 +696,7 @@ mod tests {
         );
 
         // A fresh load (a new "launch") reads the SAME pin back, all three facts.
-        let reloaded = TrustedNamePins::load_from(&scratch.path);
+        let reloaded = TrustedNamePins::load_from(&scratch.path).expect("the store reads back");
         let pin = reloaded
             .get("ronan.eth")
             .expect("the pin survived a reload");
@@ -641,33 +832,140 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_or_corrupt_store_degrades_to_no_pins_never_to_a_broken_load() {
-        // Fail-safe: the pin store can only make werust say MORE. A fresh install,
-        // a corrupt file, or an entry werust cannot read must all read as "nothing
-        // blessed" (the exact pre-TOFU behaviour), never a panic and never a
-        // claimed pin nobody made.
-        let scratch = ScratchDir::new("corrupt");
-        assert!(TrustedNamePins::load_from(&scratch.path).is_empty());
-
+    fn a_missing_store_is_empty_but_an_unreadable_one_cannot_determine_trust() {
+        // The INVERSION of the old
+        // `a_missing_or_corrupt_store_degrades_to_no_pins_never_to_a_broken_load`
+        // (task `trust-store-fails-closed-instead-of-reading-as-nothing-trusted`,
+        // `docs/adr/0014`): a store werust cannot read is NO LONGER "nothing
+        // blessed", because reading it as an empty store and then writing into
+        // that apparent emptiness is how one transient failure destroys every
+        // record. What still holds: no panic, no invented pin, and a MISSING file
+        // is an EMPTY store (a fresh install is not an error).
+        let scratch = ScratchDir::new("undeterminable");
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(TrustedNamePins::default()),
+            "no settings directory at all is a fresh install, not a failure"
+        );
         std::fs::create_dir_all(&scratch.path).unwrap();
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(TrustedNamePins::default()),
+            "a directory with no `pins.json` is a fresh install too"
+        );
+
+        // A document that is not this store's wire form at all.
         for bad in [
             "not json {",
+            "",
             "[]",
             "{}",
             r#"{"pins":"nope"}"#,
-            // Well-formed JSON whose ENTRIES are unreadable: no cid, no posture,
-            // an unknown posture spelling, an empty name.
+            r#"{"pins":{}}"#,
+            // TRUNCATED mid-document: the shape a killed or full-disk write leaves.
+            r#"{"pins":[{"name":"a.eth","cid":"baf"#,
+        ] {
+            std::fs::write(scratch.path.join(PINS_FILE), bad).unwrap();
+            let why =
+                TrustedNamePins::load_from(&scratch.path).expect_err("not a store werust can read");
+            assert!(
+                matches!(why, UndeterminableTrust::Unparseable(_)),
+                "`{bad}` is unparseable, got {why:?}"
+            );
+            assert!(!why.to_string().is_empty(), "the reason is legible");
+        }
+
+        // Well-formed JSON whose ENTRIES are unreadable: no cid, no timestamp, an
+        // unknown posture spelling, an empty name. Each REPORTS rather than
+        // quietly shrinking the file, so a future fifth trust posture cannot
+        // un-trust every name recorded under it.
+        for bad in [
             r#"{"pins":[{"name":"a.eth","blessedAt":1,"posture":"mutable-name"}]}"#,
+            r#"{"pins":[{"name":"a.eth","cid":"bafy","posture":"mutable-name"}]}"#,
             r#"{"pins":[{"name":"a.eth","cid":"bafy","blessedAt":1}]}"#,
             r#"{"pins":[{"name":"a.eth","cid":"bafy","blessedAt":1,"posture":"totally-trusted"}]}"#,
             r#"{"pins":[{"name":"  ","cid":"bafy","blessedAt":1,"posture":"mutable-name"}]}"#,
         ] {
             std::fs::write(scratch.path.join(PINS_FILE), bad).unwrap();
+            let why = TrustedNamePins::load_from(&scratch.path)
+                .expect_err("an entry werust cannot read honestly");
             assert!(
-                TrustedNamePins::load_from(&scratch.path).is_empty(),
-                "`{bad}` must degrade to no pins"
+                matches!(why, UndeterminableTrust::UnreadableEntry(_)),
+                "`{bad}` is an unreadable entry, got {why:?}"
             );
+            assert!(!why.to_string().is_empty(), "the reason is legible");
         }
+
+        // Two entries for ONE key: reported, never silently resolved to whichever
+        // one happened to sort first.
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            r#"{"pins":[
+                {"name":"a.eth","cid":"bafyone","blessedAt":1,"posture":"mutable-name"},
+                {"name":"A.eth","cid":"bafytwo","blessedAt":2,"posture":"mutable-name"}
+            ]}"#,
+        )
+        .unwrap();
+        let why = TrustedNamePins::load_from(&scratch.path).expect_err("two entries, one name");
+        assert!(
+            matches!(&why, UndeterminableTrust::DuplicateName(name) if name == "a.eth"),
+            "a duplicate key is reported, got {why:?}"
+        );
+
+        // A file that EXISTS and cannot be read at all (here: a directory where
+        // the document should be) is undeterminable too, not a fresh install.
+        std::fs::remove_file(scratch.path.join(PINS_FILE)).unwrap();
+        std::fs::create_dir_all(scratch.path.join(PINS_FILE)).unwrap();
+        assert!(
+            matches!(
+                TrustedNamePins::load_from(&scratch.path),
+                Err(UndeterminableTrust::Unreadable(_))
+            ),
+            "an unreadable file is not an empty store"
+        );
+    }
+
+    #[test]
+    fn no_write_reaches_a_store_werust_cannot_read() {
+        // The half a naive fix forgets, and the exploitable one: inserting into
+        // what merely LOOKS like an empty store is how ONE transient read failure
+        // permanently replaces every record with a single fresh one. So the write
+        // REFUSES while trust cannot be determined, and the bytes on disk are
+        // still there afterwards, byte for byte (`docs/adr/0014`).
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("refuse-write");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        // A store recorded by a build that knows a posture this one does not: the
+        // records are real, werust simply cannot read them honestly.
+        let corrupt = br#"{"pins":[{"name":"ronan.eth","cid":"bafyold","blessedAt":1,"posture":"from-the-future"}]}"#;
+        std::fs::write(scratch.path.join(PINS_FILE), corrupt).unwrap();
+
+        let mut pins = TrustedNamePins::default();
+        pins.bless("stranger.eth", "bafynew", TrustPosture::MutableName, 2);
+        assert!(
+            !pins.save_to(&scratch.path),
+            "the write refuses while the store cannot be read"
+        );
+        assert_eq!(
+            std::fs::read(scratch.path.join(PINS_FILE)).unwrap(),
+            corrupt,
+            "the records werust could not read are still on disk, byte for byte"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
+
+        // And the refusal is SPECIFIC to that state: once the document is readable
+        // again the very same save lands.
+        std::fs::write(scratch.path.join(PINS_FILE), r#"{"pins":[]}"#).unwrap();
+        assert!(pins.save_to(&scratch.path));
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path),
+            Ok(pins),
+            "a readable store still round-trips"
+        );
     }
 
     #[test]
@@ -685,7 +983,7 @@ mod tests {
                 i as u64,
             );
         }
-        let round_tripped = TrustedNamePins::from_json(&pins.to_json()).expect("valid JSON");
+        let round_tripped = TrustedNamePins::from_json(&pins.to_json()).expect("a readable store");
         assert_eq!(round_tripped, pins);
         assert_eq!(round_tripped.len(), TrustPosture::ALL.len());
 

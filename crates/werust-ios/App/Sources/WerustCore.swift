@@ -254,6 +254,43 @@ final class WerustCore {
         url.withCString { werust_ios_on_history_navigated(handle, $0) }
     }
 
+    /// Report a navigation the PAGE is starting, so the core can mark it as the
+    /// user's INTENT when it is a link/form the user activated inside a surface
+    /// werust itself drew, which is what a `werust://settings?backend=…` MUTATION
+    /// requires (`docs/adr/0013`, task
+    /// `ios-marks-user-intent-for-settings-mutations`).
+    ///
+    /// Reported from the navigation delegate's `decidePolicyFor`, which is the
+    /// only iOS callback that sees a page-initiated navigation BEFORE it happens.
+    /// It is needed because the settings page is a plain GET form: submitting it is
+    /// a PAGE-initiated navigation that never passes through [navigate], the
+    /// chrome-only front door the URL bar commits to (which marks by itself).
+    ///
+    /// This passes the FACTS `WKNavigationAction` carries and decides NOTHING: the
+    /// rule (which of them add up to a mark) lives in the Rust edge, where the
+    /// Linux gate can test it with each fact flipped in turn, and whether a marked
+    /// navigation may actually MUTATE is the shared core's call. A Swift-side `if`
+    /// choosing when to report would be a hand-written twin of a rule (the species
+    /// of copy `docs/adr/0011` deleted from this edge), in the one place where a
+    /// drifted copy is a security hole rather than a wrong glyph.
+    ///
+    /// `navigationType` is `WKNavigationAction.navigationType.rawValue`, WebKit's
+    /// own vocabulary (`.linkActivated` / `.formSubmitted` are the user activating
+    /// something in the page; a script's `location = …` reports `.other`), passed
+    /// through untranslated for the same reason. Returns whether the navigation was
+    /// marked; the caller ignores it (nothing on this side reads a mark).
+    @discardableResult
+    func notePageNavigation(
+        target: String, document: String, mainFrame: Bool, navigationType: Int
+    ) -> Bool {
+        target.withCString { t in
+            document.withCString { d in
+                werust_ios_note_page_navigation(
+                    handle, t, d, mainFrame, Int32(truncatingIfNeeded: navigationType))
+            }
+        }
+    }
+
     /// Report the platform `WKWebView`'s error signal into the core.
     func onPageFailed(_ url: String, _ reason: String) {
         url.withCString { u in

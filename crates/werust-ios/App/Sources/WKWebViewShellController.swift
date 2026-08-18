@@ -748,6 +748,15 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     // in-place rule is `renderer::new_window_action` (pinned by the seam test
     // `a_new_window_request_navigates_the_current_view_in_place`). Manual
     // verification steps: docs/spikes/blank-and-window-open-links-navigate-in-place/README.md.
+    //
+    // IT REPORTS NOTHING TO THE CORE, DELIBERATELY. The target here is a URL the
+    // PAGE chose, so this hook must never supply the user-intent signal a
+    // `werust://settings` mutation requires (`docs/adr/0013`): reporting it would
+    // hand any page a settings write with one
+    // `window.open('werust://settings?backend=custom&url=http://attacker/')`. The
+    // router must not become a trust bypass, and
+    // `crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs` reds the
+    // gate if a report appears here.
     func webView(
         _ wv: WKWebView,
         createWebViewWith configuration: WKWebViewConfiguration,
@@ -800,11 +809,35 @@ final class WKWebViewShellController: UIViewController, UITextFieldDelegate, WKN
     // same `targetFrame` idiom the `_blank` hook above already uses, and it is
     // checked BEFORE the report, pinned in that order by
     // `crates/werust-ios/rust/tests/back_forward_gesture_wiring_shape.rs`.
+    //
+    // IT IS ALSO WHERE THIS EDGE SUPPLIES THE USER-INTENT SIGNAL a settings
+    // MUTATION requires (`docs/adr/0013`, task
+    // `ios-marks-user-intent-for-settings-mutations`). A `werust://settings?backend=…`
+    // change is applied only for a MAIN-FRAME request whose navigation werust's own
+    // chrome MARKED as intended: the URL bar's Enter marks by itself (it commits
+    // through `core.navigate`, the chrome-only front door), and werust's own
+    // settings page is a plain GET FORM, so submitting it is a PAGE-initiated
+    // navigation that reaches no other core entry point: this hook is the only
+    // place iOS sees it. The report is UNCONDITIONAL and comes FIRST: this layer is
+    // a signal source, so it hands over the facts `WKNavigationAction` carries (the
+    // target, the SOURCE frame's own document, whether the TARGET frame is the main
+    // frame, and WebKit's navigation-type raw value) and the RULE lives in the Rust
+    // edge, where the Linux gate tests it with each fact flipped in turn. A Swift
+    // `if` deciding when to report would be a hand-written twin of that rule, in the
+    // one place where a drifted copy is a hole rather than a wrong glyph. Marking is
+    // harmless for the overwhelming majority of navigations: the core matches a mark
+    // against the exact URL, query included. Pinned by
+    // `crates/werust-core/tests/settings_user_intent_edge_wiring_shape.rs`.
     func webView(
         _ wv: WKWebView,
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+        core.notePageNavigation(
+            target: navigationAction.request.url?.absoluteString ?? "",
+            document: navigationAction.sourceFrame.request.url?.absoluteString ?? "",
+            mainFrame: navigationAction.targetFrame?.isMainFrame == true,
+            navigationType: navigationAction.navigationType.rawValue)
         if navigationAction.navigationType == .backForward,
             navigationAction.targetFrame?.isMainFrame == true,
             let target = navigationAction.request.url?.absoluteString, !target.isEmpty

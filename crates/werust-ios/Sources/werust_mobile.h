@@ -186,6 +186,30 @@ void werust_ios_on_url_changed(WerustCoreSession *session, const char *url);
 void werust_ios_on_history_navigated(WerustCoreSession *session,
                                      const char *url);
 
+/* Report a navigation the PAGE is starting, from the WKNavigationDelegate's
+ * decidePolicyFor, so the core can mark it as the user's INTENT when it is a
+ * link/form the user activated inside a surface werust itself drew. A
+ * `werust://settings?backend=...` MUTATION is applied only for a MAIN-FRAME
+ * request whose navigation werust's chrome marked (docs/adr/0013): the URL bar's
+ * Enter marks through werust_ios_navigate, and THIS covers the settings page's
+ * own GET form, which is page-initiated and so never passes through that front
+ * door.
+ *
+ * Swift passes the FACTS WKNavigationAction carries and decides nothing:
+ * `target` is navigationAction.request.url, `document` is
+ * navigationAction.sourceFrame.request.url (the document the navigation starts
+ * FROM), `main_frame` is navigationAction.targetFrame?.isMainFrame == true, and
+ * `navigation_type` is navigationAction.navigationType.rawValue (WebKit's own
+ * WKNavigationType: 0 linkActivated, 1 formSubmitted, 2 backForward, 3 reload,
+ * 4 formResubmitted, -1 other). Which of them add up to a mark is the Rust
+ * edge's rule; whether a marked navigation may MUTATE is the shared core's.
+ * Returns whether the navigation was marked. NOT called from the WKUIDelegate
+ * new-window hook: a _blank/window.open target is a URL the PAGE chose
+ * (docs/adr/0010), and that router must never become a trust bypass. */
+bool werust_ios_note_page_navigation(WerustCoreSession *session,
+                                     const char *target, const char *document,
+                                     bool main_frame, int32_t navigation_type);
+
 /* The current chrome as a heap C string (JSON: url / loadState / loading /
  * canGoBack / canGoForward / trustPosture / error), for Swift to paint the URL
  * bar, nav-control enablement, status line, and the trust indicator. Free with

@@ -2416,6 +2416,7 @@ mod tests {
         // never a spelling minted in this binary (task
         // `cli-resolve-follows-mutable-names-to-the-cid`).
         let immutable = ResolvedName::Immutable {
+            normalized_name: "example.eth".into(),
             uri: "ipfs://bafkreiabc".into(),
             cid: "bafkreiabc".into(),
         };
@@ -2454,6 +2455,7 @@ mod tests {
         // `--json` carries BOTH the followed pointer and the resolved CID, so a
         // script that pins the CID can see where it came from.
         let mutable = ResolvedName::Mutable {
+            normalized_name: "ronan.eth".into(),
             pointer: "ipns://k51qzifixture".into(),
             uri: "ipfs://bafkreicurrent".into(),
             cid: "bafkreicurrent".into(),

@@ -26,6 +26,20 @@
 //! followed name as if it were plain content-verified: the shell flags the load
 //! mutable-named, and the CLI says so in its output.
 //!
+//! # The NAME the resolution produced is part of the answer
+//!
+//! A resolution answers with an identity, not only with bytes: [`ResolvedName`]
+//! carries the ENSIP-15-NORMALIZED name
+//! ([`normalized_name`](ResolvedName::normalized_name)) beside the CID, in BOTH
+//! cases. The namehash computed it already and used to discard it, which left
+//! every consumer to re-derive "which name is this?" for itself — and the
+//! trusted-name pin store's own derivation (an ASCII `trim().to_lowercase()`)
+//! was a DIFFERENT key space, so one blessed identity spelled two ways became
+//! two records and the change warning missed (task
+//! `trust-store-keys-on-the-resolved-normalized-name-and-migrates`). Surfacing
+//! it HERE is what makes the store's key and the resolved identity the same
+//! value rather than two values that agree until they do not.
+//!
 //! # Fail-closed
 //!
 //! Nothing is guessed or partially resolved: every failure is the ENS core's or
@@ -63,6 +77,9 @@ pub enum ResolvedName {
     /// An immutable `ipfs-ns` name: the contenthash IS the CID. No record fetch
     /// happened — this case makes NO network call beyond the ENS reads.
     Immutable {
+        /// The ENSIP-15-normalized NAME this resolution was for: the identity,
+        /// not the spelling the user typed (see the module's identity note).
+        normalized_name: String,
         /// The `ipfs://<cid>` URI, ready to feed the verified `ipfs://` path.
         uri: String,
         /// The canonical CID string (the `<cid>` in the URI).
@@ -71,6 +88,11 @@ pub enum ResolvedName {
     /// A MUTABLE `ipns-ns` name, FOLLOWED through a client-verified IPNS record
     /// to the CID it currently points at.
     Mutable {
+        /// The ENSIP-15-normalized NAME this resolution was for — the ENS name
+        /// that was asked for, NOT the `ipns-ns` key it pointed at (see the
+        /// module's identity note, and [`mutable_pointer`](ResolvedName::mutable_pointer)
+        /// for the pointer).
+        normalized_name: String,
         /// The `ipns://<name>` pointer that was followed (the ENS contenthash
         /// itself), kept so a caller can report WHERE the CID came from.
         pointer: String,
@@ -95,6 +117,27 @@ impl ResolvedName {
     pub fn cid(&self) -> &str {
         match self {
             ResolvedName::Immutable { cid, .. } | ResolvedName::Mutable { cid, .. } => cid,
+        }
+    }
+
+    /// The ENSIP-15-NORMALIZED name this resolution was for, whichever case this
+    /// is: the resolved IDENTITY.
+    ///
+    /// This is what a caller keying anything on the name must use — the trusted
+    /// name pin store keys on exactly this value
+    /// ([`pins::pin_key`](crate::pins::pin_key)) — rather than re-deriving an
+    /// identity from the string the user typed. It is the same normalization the
+    /// [`namehash`](crate::ens::namehash) this resolution read at was folded
+    /// from, so the key and the resolved identity cannot diverge.
+    #[must_use]
+    pub fn normalized_name(&self) -> &str {
+        match self {
+            ResolvedName::Immutable {
+                normalized_name, ..
+            }
+            | ResolvedName::Mutable {
+                normalized_name, ..
+            } => normalized_name,
         }
     }
 
@@ -201,12 +244,22 @@ pub fn resolve_name_with_progress(
     on_step: &mut dyn FnMut(LoadStep),
 ) -> Result<ResolvedName, NameResolutionError> {
     // Step 1: the ENS read (namehash -> registry -> resolver -> ENSIP-7 decode).
+    // It answers with the decoded contenthash AND the ENSIP-15-normalized name it
+    // was keyed on; that name is the resolved IDENTITY and is carried out with
+    // every case below, never re-derived downstream.
     on_step(LoadStep::ResolvingName);
-    let decoded = crate::ens::resolve(provider, name).map_err(NameResolutionError::Ens)?;
-    match decoded {
+    let crate::ens::EnsResolution {
+        normalized_name,
+        contenthash,
+    } = crate::ens::resolve(provider, name).map_err(NameResolutionError::Ens)?;
+    match contenthash {
         // The immutable `ipfs-ns` case: the contenthash IS the CID. No record
         // fetch, no second network hop.
-        DecodedContenthash::Ipfs { uri, cid } => Ok(ResolvedName::Immutable { uri, cid }),
+        DecodedContenthash::Ipfs { uri, cid } => Ok(ResolvedName::Immutable {
+            normalized_name,
+            uri,
+            cid,
+        }),
         // The MUTABLE `ipns-ns` case: follow the pointer through a signed record
         // that is fetched from an UNTRUSTED source and VERIFIED client-side
         // against the key before its CID is used at all (`docs/adr/0007`).
@@ -216,6 +269,7 @@ pub fn resolve_name_with_progress(
             let resolved = crate::ipns::resolve_ipns_name(ipns_source, &ipns_name)
                 .map_err(NameResolutionError::Ipns)?;
             Ok(ResolvedName::Mutable {
+                normalized_name,
                 pointer: format!("{IPNS_SCHEME}://{ipns_name}"),
                 uri: resolved.uri,
                 cid: resolved.cid,
@@ -416,6 +470,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedName::Mutable {
+                normalized_name: "ronan.eth".to_string(),
                 pointer: format!("ipns://{}", key.name),
                 uri: format!("ipfs://{target_cid}"),
                 cid: target_cid.clone(),
@@ -449,6 +504,7 @@ mod tests {
         assert_eq!(
             resolved,
             ResolvedName::Immutable {
+                normalized_name: "example.eth".to_string(),
                 uri: uri.clone(),
                 cid: cid.clone(),
             }
@@ -512,6 +568,83 @@ mod tests {
             NameResolutionError::Ens(ResolutionError::UnsupportedContenthash(ProtoCode::Swarm))
         ));
         assert!(err.to_string().contains("Swarm"), "named: {err}");
+    }
+
+    #[test]
+    fn both_cases_carry_out_the_normalized_name_the_resolution_was_keyed_on() {
+        // Acceptance: the resolution RETURNS the ENSIP-15-normalized name, for the
+        // immutable `ipfs-ns` case and the followed mutable `ipns-ns` case alike,
+        // so the one caller that keys durable state on a name (the trusted-name
+        // pin store) takes the identity from HERE instead of folding the typed
+        // spelling itself. The spelling used is one an ASCII fold would NOT
+        // collapse: fullwidth Latin.
+        let fullwidth = "ＲＯＮＡＮ.eth";
+        assert_ne!(
+            fullwidth.to_lowercase(),
+            "ronan.eth",
+            "the fixture really is a case the old fold got wrong"
+        );
+
+        // 1. Immutable (`ipfs-ns`).
+        let (contenthash, _uri, _cid) = ipfs_contenthash_fixture(b"an immutable site");
+        let source = CountingRecordSource::empty();
+        let provider = ScriptedProvider::new(vec![
+            Ok(address_word(&[0x77u8; 20])),
+            Ok(abi_bytes_return(&contenthash)),
+        ]);
+        let resolved = resolve_name(&provider, &source, fullwidth).expect("an ipfs-ns name");
+        assert_eq!(resolved.normalized_name(), "ronan.eth");
+
+        // 2. Mutable (`ipns-ns`), FOLLOWED through its verified record. The
+        //    normalized name is the ENS name that was asked for, NOT the IPNS key
+        //    it points at — the pointer carries that.
+        let key = IpnsKeyFixture::new();
+        let target_cid = cid_v1_raw_sha256(b"the site the name points at today").expect("a cid");
+        let source =
+            CountingRecordSource::with_record(&key.name, key.signed_record_for(&target_cid));
+        let provider = ScriptedProvider::new(vec![
+            Ok(address_word(&[0x88u8; 20])),
+            Ok(abi_bytes_return(&key.contenthash)),
+        ]);
+        let resolved = resolve_name(&provider, &source, fullwidth).expect("an ipns-ns name");
+        assert_eq!(resolved.normalized_name(), "ronan.eth");
+        assert_eq!(
+            resolved.mutable_pointer(),
+            Some(format!("ipns://{}", key.name).as_str()),
+            "the followed pointer is a separate fact from the name's identity"
+        );
+
+        // And it IS the store's key for that identity: the value the shell hands
+        // the trusted-name store needs no further folding.
+        assert_eq!(
+            crate::pins::pin_key(resolved.normalized_name()).expect("a keyable identity"),
+            resolved.normalized_name(),
+            "the resolved identity IS the store key"
+        );
+    }
+
+    #[test]
+    fn an_unnormalizable_name_never_reaches_a_resolution_so_it_never_reaches_a_pin() {
+        // The grounding for the store's FALLIBLE key (settled decision 1): a name
+        // ENSIP-15 refuses fails HERE, with the ENS core's own typed reason and
+        // before any `eth_call`, so it can never reach a successful load. There is
+        // nothing to bless under such a name, which is why the store needs no
+        // fallback key space for one.
+        let source = CountingRecordSource::empty();
+        let provider = ScriptedProvider::new(vec![]);
+        let err = resolve_name(&provider, &source, "a..b.eth").expect_err("an empty label");
+        assert!(
+            matches!(
+                err,
+                NameResolutionError::Ens(ResolutionError::UnnormalizableName { .. })
+            ),
+            "the ENS core's own typed refusal: {err:?}"
+        );
+        assert_eq!(source.fetches.get(), 0, "and nothing was fetched for it");
+        assert!(
+            crate::pins::pin_key("a..b.eth").is_err(),
+            "and it has no key"
+        );
     }
 
     #[test]

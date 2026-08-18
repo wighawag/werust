@@ -2,15 +2,16 @@
 title: "One record per identity: key the trust store on the ENSIP-15-normalized name the resolution produced, and re-key what is already there"
 slug: trust-store-keys-on-the-resolved-normalized-name-and-migrates
 spec: trust-store-hardening
-needsAnswers: true
 blockedBy: [trust-store-compares-cids-by-canonical-form]
 covers: [6, 7, 12]
 ---
 
-## Open questions
+## Decisions (answered by the human, 2026-08-17)
 
-1. **What is the key for a name that FAILS ENSIP-15 normalization?** The key function is public and infallible today, and the resolution path already has a typed `UnnormalizableName` refusal, so such a name never reaches a successful load. Candidate rules: (a) the key becomes fallible and an unnormalizable name simply cannot be recorded (nothing is blessed, nothing is warned); (b) it falls back to the trimmed/lower-cased form, which is a SECOND key space inside one store and is what the spec forbids doing accidentally; (c) it is recorded under an explicitly marked non-normalized key space. Which rule ships?
-2. **What is the key for a name that is not an ENS label at all?** A bare IPNS key (`k51qzi...`) is blessable today and is not an ENSIP-15 label. Does it go through the same normalization (it is plain ASCII, so it survives it), or is it keyed by a stated separate rule? The answer must not create an unmarked second key space, and it must keep the existing "both ENS and IPNS names are blessable and checked the same way" behaviour.
+These CLOSE the two questions this task launched with. They are recorded rather than deleted because they decide the store's key space, which is a security property, and because the sibling tasks behind this one inherit them.
+
+1. **A name that FAILS ENSIP-15 normalization cannot be recorded at all.** The key becomes FALLIBLE: no key, no pin, no warning. It does NOT fall back to the old trimmed-and-lower-cased form (that is the second key space the spec forbids) and it does NOT get an explicitly marked separate key space (more machinery for a case the front door cannot produce). The grounding is that the resolution path already refuses an unnormalizable name with its typed `UnnormalizableName` error, so such a name never reaches a successful load: there is nothing to bless and therefore no warning to lose. Make the refusal legible at the call site rather than a silent `None` that a later caller mistakes for "unblessed".
+2. **A non-ENS name goes through the SAME normalization, and that is a no-op on it.** No separate rule and no second key space. A bare IPNS key (`k51qzi…`, base36) is already a lowercase ASCII, dot-less label, so normalizing it returns it unchanged; assert that in a test rather than asserting it in prose, so a future normalizer change that started mangling such keys would red the gate. The existing behaviour that both ENS and IPNS names are blessable and checked identically MUST survive (there is already a test for it).
 
 ## What to build
 
@@ -32,7 +33,7 @@ The migration must be safe under the store's other new rules: it is a write, so 
 - [ ] Re-keying is idempotent (running it twice changes nothing) and obeys the store's write rules: it does not write while the store is unreadable, and it goes through the atomic write.
 - [ ] Two old records that re-key onto one new key are REPORTED by the store's existing duplicate-key rule, never silently resolved to one of them.
 - [ ] Existing behaviour is preserved: `Ronan.ETH` and ` ronan.eth ` still resolve to one record, and both ENS and IPNS-style names stay blessable and checked identically.
-- [ ] The rule for a name that fails normalization, and for a name that is not an ENS label, is IMPLEMENTED as answered above, tested, and recorded; the store never contains two key spaces without that being explicit.
+- [ ] The two decisions above are IMPLEMENTED as stated (an unnormalizable name yields no key and no pin, legibly; a bare IPNS key normalizes to itself, asserted by a test), tested, and recorded; the store never contains two key spaces without that being explicit.
 - [ ] Tests cover the new behaviour in the existing style, isolated to a scratch directory, with the real `pins.json` asserted UNTOUCHED.
 - [ ] `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo build && cargo test` green.
 
@@ -42,7 +43,7 @@ The migration must be safe under the store's other new rules: it is a write, so 
 
 ## Prompt
 
-> Goal: make the trusted-name pin store's key the RESOLVED IDENTITY, and migrate what is already recorded. Answer the two open questions above (they are in the task frontmatter as `needsAnswers`) before building: they decide the key space, which is a security-relevant choice, not an implementation detail.
+> Goal: make the trusted-name pin store's key the RESOLVED IDENTITY, and migrate what is already recorded. The two questions this task launched with are ANSWERED, in the `## Decisions` section above: an unnormalizable name gets NO key and therefore no pin (a fallible key, never a fallback to the old ASCII fold), and a non-ENS name such as a bare IPNS key goes through the same normalization, which is a no-op on it. Implement those two rules as stated; they decide the key space, so do not re-open them.
 >
 > Today `pin_key` is `trim().to_lowercase()` in `werust_core::pins`, while `werust_core::ens`'s namehash normalizes the name through the bound `ens-normalize` crate (ENSIP-15) and discards the result; `werust_core::name_resolution`'s resolved-name value carries the URI, the CID and the followed mutable pointer but NOT the normalized name. Surface it there (both the immutable `ipfs-ns` and the followed mutable `ipns-ns` cases) and let the shell key the store on it. Do NOT re-derive normalization at the store layer: the point is that the key and the resolved identity cannot diverge, and a second call site is a second chance to drift. The headless `werust resolve` CLI and the GUI share that one resolution path: keep them sharing it.
 >

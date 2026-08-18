@@ -42,7 +42,7 @@ The task was recovered with `requeue` (keep + continue) and a precise handoff, r
 
 This is a dorfl runner behaviour, not a werust one, so nothing in this repo can fix it. Recorded rather than acted on. If it recurs, the two things to look at are the "is this push ours" comparison in the surface retry loop, and whether a completed item should reap its own `work/questions/` sidecar.
 
-## Update 2026-08-16: recurrence, five duplicates, plus a backlog-driven wrinkle
+## Update 2026-08-17: recurrence, five duplicates, plus a backlog-driven wrinkle
 
 Recurred on dorfl 0.11.1 while driving `task:pin-warning-reads-a-stale-cache-so-another-windows-bless-never-warns` from `work/tasks/backlog/` (`do --isolated --allow-backlog`). The gate failed for an ENVIRONMENTAL reason (the fresh-worktree gate built in `/tmp`, a 16G tmpfs, and hit `No space left on device`), so the bounce path ran.
 
@@ -55,4 +55,4 @@ What was observed, which sharpens the original signal:
 
 Also seen in the same session, and probably worth its own look: `dorfl status` reported 487 in-flight locks (4 for this repo) while `git ls-remote origin 'refs/dorfl/lock/*'` returned NOTHING. The locks exist only in the local mirror under `~/.dorfl/repos/.../werust.git`. The arbiter is the authoritative record, so `status` is reporting stale mirror refs as live holds, which makes an operator believe work is in flight when none is.
 
-Source: driving the werust board with the `drive-tasks` conductor, 2026-08-16.
+Source: driving the werust board with the `drive-tasks` conductor, 2026-08-17.

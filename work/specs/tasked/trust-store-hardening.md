@@ -4,7 +4,7 @@ slug: trust-store-hardening
 ---
 
 > Launch snapshot — records intent at creation, NOT maintained. Current truth: `docs/adr/` (decisions) + the code; remaining work: `work/tasks/ready/` tasks.
-> Tasked 2026-08-16 (`to-task`): the Implementation / Testing detail this spec carried moved INTO the tasks it emitted (`work/tasks/`, carrying `spec: trust-store-hardening`), which are the current truth for what to build. Durable rationale is recorded as ADRs by the tasks that decide it, not predicted here.
+> Tasked 2026-08-17 (`to-task`): the Implementation / Testing detail this spec carried moved INTO the tasks it emitted (`work/tasks/`, carrying `spec: trust-store-hardening`), which are the current truth for what to build. Durable rationale is recorded as ADRs by the tasks that decide it, not predicted here.
 
 ## Problem Statement
 

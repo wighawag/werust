@@ -120,6 +120,37 @@
 //!    exists (and is propagated through the shell's bless path) so that surface is
 //!    not blocked on a plumbing change when it arrives.
 //!
+//! # One content root, more than one CID spelling
+//!
+//! A CID is a self-describing name, and the SAME content root has more than one
+//! legal spelling: a CIDv0 `Qm…` and its CIDv1 `bafybe…` are one root, and a
+//! CIDv1 can be written in any multibase. werust really does meet both forms:
+//! the ENSIP-7 decoder emits whatever form the name's contenthash carried
+//! ([`crate::contenthash`]), while the Android edge canonicalises every CID to
+//! lowercase base32 CIDv1 for its internal origin
+//! (`crates/werust-android/rust/src/origin_map.rs`). So a raw string equality
+//! reported "this changed since you trusted it" for a REPUBLISH OF IDENTICAL
+//! CONTENT, or merely for the same site seen through another edge. False
+//! positives are what train a user to click through the one warning that
+//! matters, so the comparison goes through ONE canonical form
+//! ([`same_content_root`], the vetted `cid` crate, never a hand-rolled
+//! multibase). Two decisions the shape rests on (task
+//! `trust-store-compares-cids-by-canonical-form`, recorded at
+//! `docs/spikes/trust-store-compares-cids-by-canonical-form/DECISIONS.md`):
+//!
+//! 1. **Canonicalisation happens at COMPARISON time; the store keeps the
+//!    spelling it was given.** A pin recorded by an earlier build therefore
+//!    matches the moment this build runs, with no rewrite and no migration step,
+//!    which matters because canonicalising on the way IN could only ever fix pins
+//!    written after it landed, so it would need this comparison anyway. It also
+//!    keeps the store's promise to record what it was handed, the same care the
+//!    unknown-member note describes.
+//! 2. **A string werust cannot parse as a CID is compared LITERALLY**, byte for
+//!    byte, exactly as before. Canonicalisation can therefore never invent an
+//!    equality between two spellings werust could not read, and a root werust
+//!    cannot parse is not condemned to a warning that no re-bless could ever
+//!    clear. Never a panic, whatever is in the file.
+//!
 //! # Vocabulary note: "pin"
 //!
 //! `pin` is already used loosely in this crate for "held in place" (the shell
@@ -134,6 +165,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Map, Value};
 
+use fetcher::Cid;
 use renderer::TrustPosture;
 
 use crate::debug::{trust_posture_from_wire_name, trust_posture_wire_name};
@@ -161,7 +193,10 @@ pub struct TrustedNamePin {
     /// The mutable name, in the store's canonical (lower-cased, trimmed) key
     /// form; see [`pin_key`].
     pub name: String,
-    /// The CID the name resolved to when it was blessed.
+    /// The CID the name resolved to when it was blessed, VERBATIM in the form
+    /// that resolution produced (a CIDv0 `Qm…` or a CIDv1 `bafybe…`): the store
+    /// records what it was given and canonicalises only to COMPARE
+    /// ([`same_content_root`]).
     pub cid: String,
     /// When it was blessed, in whole seconds since the Unix epoch (UTC).
     pub blessed_at: u64,
@@ -178,6 +213,68 @@ impl TrustedNamePin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The CID comparison: one content root, more than one spelling.
+// ---------------------------------------------------------------------------
+
+/// Whether two CID strings name the SAME content root: the comparison the whole
+/// change warning rests on ([`MutableNameTrust::is_changed`] /
+/// [`is_unchanged`](MutableNameTrust::is_unchanged)).
+///
+/// It is deliberately NOT `==`. One content root has more than one legal
+/// spelling, and werust meets more than one of them (the module's CID-spelling
+/// note): the ENSIP-7 decoder emits whatever form the contenthash carried, and
+/// the Android edge hands the core the lowercase base32 CIDv1 of the same root.
+/// Comparing strings therefore warned about a REPUBLISH OF IDENTICAL CONTENT.
+///
+/// The rule, in the order it applies:
+///
+/// 1. **The same string is the same root.** This is the pre-existing rule, kept
+///    whole, so nothing that matched before this change stops matching, and so a
+///    root werust cannot parse still compares as it always did.
+/// 2. **Otherwise, both sides must PARSE, and their canonical forms must match.**
+///    Canonical here is the CIDv1 of the same multihash and codec
+///    ([`canonical_root`]), which is spelling-independent (any multibase) and
+///    version-independent (a CIDv0 `Qm…` and its `bafybe…`), while a genuinely
+///    different root (different bytes, or the same bytes addressed under a
+///    different codec) stays different.
+/// 3. **A string that does not parse is never canonicalised**, so two spellings
+///    werust could not read are equal only when they are literally the same
+///    string, and a real CID is never equal to an unreadable one.
+///
+/// Public because it is the ONE place this comparison is made: a later reader of
+/// the store (the withhold-on-change work) must reuse it rather than mint a
+/// second `==` that reintroduces the false positive.
+#[must_use]
+pub fn same_content_root(recorded: &str, current: &str) -> bool {
+    if recorded == current {
+        return true;
+    }
+    match (canonical_root(recorded), canonical_root(current)) {
+        (Some(recorded), Some(current)) => recorded == current,
+        // Not a CID werust can read: rule 3. Never a panic, and never an
+        // equality canonicalisation invented.
+        _ => false,
+    }
+}
+
+/// ONE canonical form for a CID string, its CIDv1, or `None` when the string is
+/// not a CID werust can read.
+///
+/// The parse and the conversion are the vetted `cid` crate's (the SAME `cid 0.11`
+/// lineage the `fetcher` verify boundary and the Android origin map use, reached
+/// through [`fetcher::Cid`] so this module cannot drift onto a second one): a
+/// multibase decode is exactly the kind of thing this project binds rather than
+/// hand-rolls (`docs/adr/0001`). Comparing the PARSED values rather than
+/// re-rendered strings is what makes every multibase spelling of one CIDv1 equal
+/// for free.
+///
+/// A CIDv0 converts to the CIDv1 of the same dag-pb sha2-256 multihash, which is
+/// the identity ENSIP-7 and the Android edge disagree about the spelling of.
+fn canonical_root(cid: &str) -> Option<Cid> {
+    Cid::try_from(cid).ok()?.into_v1().ok()
+}
+
 /// The MUTABLE-NAME identity of the page currently shown, paired with whatever
 /// the user has blessed for that name.
 ///
@@ -190,6 +287,10 @@ impl TrustedNamePin {
 /// `None` on the [`ChromeState`](crate::ChromeState) means the current page is
 /// not a name-resolved load at all (a direct `ipfs://<cid>`, an ordinary
 /// `https://` page, a failed load): nothing to bless, nothing to warn about.
+///
+/// The two CIDs here are compared by [`same_content_root`], never by `==`: the
+/// blessed one and the live one can be two spellings of ONE root (see the
+/// module's CID-spelling note).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MutableNameTrust {
     /// The mutable name the user sees in the URL bar for this site (the ROOT
@@ -219,13 +320,21 @@ impl MutableNameTrust {
     /// the name *could* change, this says it *did*.
     #[must_use]
     pub fn is_changed(&self) -> bool {
-        self.blessed.as_ref().is_some_and(|pin| pin.cid != self.cid)
+        self.blessed
+            .as_ref()
+            .is_some_and(|pin| !same_content_root(&pin.cid, &self.cid))
     }
 
     /// Whether the name is blessed AND still resolves to the blessed CID.
+    ///
+    /// "The same CID" means the same CONTENT ROOT, not the same string: a
+    /// republish of identical content under another CID spelling is unchanged
+    /// (see [`same_content_root`] and the module's CID-spelling note).
     #[must_use]
     pub fn is_unchanged(&self) -> bool {
-        self.blessed.as_ref().is_some_and(|pin| pin.cid == self.cid)
+        self.blessed
+            .as_ref()
+            .is_some_and(|pin| same_content_root(&pin.cid, &self.cid))
     }
 
     /// Whether blessing would record something NEW: either the name has no pin
@@ -950,6 +1059,35 @@ mod tests {
         pins_file_path().and_then(|path| std::fs::read(path).ok())
     }
 
+    /// A REAL dag-pb content root, DERIVED from `content` rather than pasted: the
+    /// shape an ENS `ipfs-ns` contenthash carries when it holds a CIDv0, and the
+    /// ONE root every spelling in the comparison tests names.
+    ///
+    /// Built from the same [`fetcher::cid_v1_raw_sha256`] helper the verified
+    /// retrieval path derives with (the `cid 0.11` lineage the verify boundary
+    /// owns), re-wrapped as a CIDv0 over that exact sha2-256 multihash: the same
+    /// derivation `contenthash`'s own CIDv0 test uses. No hand-built digest, no
+    /// pasted fixture string.
+    fn dag_pb_root(content: &[u8]) -> fetcher::Cid {
+        let raw = fetcher::cid_v1_raw_sha256(content).expect("derive a sha2-256 root");
+        let raw = fetcher::Cid::try_from(raw.as_str()).expect("the derived root parses");
+        fetcher::Cid::new_v0(*raw.hash()).expect("a CIDv0 over the same sha2-256 multihash")
+    }
+
+    /// A DIFFERENT content root whose canonical spelling differs from `root`'s
+    /// only at the very END: the same multihash with the LAST digest byte flipped.
+    ///
+    /// base32 packs five bits per character, so flipping the last bit moves only
+    /// the final character or two: the pair a comparison that gave up early (a
+    /// prefix match, a truncated key) would call equal.
+    fn root_with_a_late_difference(root: &fetcher::Cid) -> fetcher::Cid {
+        let mut digest = root.hash().digest().to_vec();
+        *digest.last_mut().expect("a sha2-256 digest is 32 bytes") ^= 0x01;
+        let hash = cid::multihash::Multihash::<64>::wrap(root.hash().code(), &digest)
+            .expect("a 32-byte sha2-256 multihash");
+        fetcher::Cid::new_v1(root.codec(), hash)
+    }
+
     /// Every file name in a scratch directory, sorted: what a test asserts a save
     /// left behind, so a temp file that survives (a successful save's, or an
     /// interrupted one's) is a FAILURE rather than something nobody looked for.
@@ -1112,6 +1250,204 @@ mod tests {
         assert!(pins.check("k51qzifixture", "bafyelse").is_changed());
         // An unknown name is simply unblessed on either axis.
         assert!(!pins.check("stranger.eth", "bafyany").is_blessed());
+    }
+
+    #[test]
+    fn one_content_root_in_another_cid_spelling_is_not_a_change() {
+        // Acceptance: a REPUBLISH OF IDENTICAL CONTENT under a different CID
+        // spelling must not warn. The ENSIP-7 decoder emits whatever form the
+        // contenthash carried (a CIDv0 `Qm…` here), while the Android edge hands
+        // the core the lowercase base32 CIDv1 of the SAME root, so one content
+        // root reaches this comparison under more than one string. Raw string
+        // equality called that a change: the false positive that trains a user to
+        // click through the warning that matters.
+        let root = dag_pb_root(b"the version the user blessed");
+        let v0 = root.to_string();
+        let v1 = root.into_v1().expect("a CIDv0 converts to CIDv1");
+        let android = v1.to_string();
+        assert!(v0.starts_with("Qm"), "the CIDv0 form is base58btc: {v0}");
+        assert!(
+            android.starts_with("bafybe"),
+            "the Android/ENS canonical form is lowercase base32 CIDv1: {android}"
+        );
+        assert_ne!(v0, android, "one root, two strings: the whole problem");
+
+        // Blessed in the RESOLUTION's form, seen in the form the Android edge
+        // hands the core (`crates/werust-android/rust/src/origin_map.rs`).
+        let mut pins = TrustedNamePins::default();
+        pins.bless(
+            "ronan.eth",
+            &v0,
+            TrustPosture::NameViaTrustedRpc,
+            1_800_000_000,
+        );
+        let seen = pins.check("ronan.eth", &android);
+        assert!(
+            seen.is_unchanged(),
+            "the CIDv0 pin and the base32 CIDv1 of the SAME root are one content root"
+        );
+        assert!(!seen.is_changed(), "so nothing warns");
+        assert!(
+            !seen.is_blessable(),
+            "and there is nothing left for the user to record"
+        );
+
+        // The mapping is symmetric (blessed on Android, seen on desktop) and
+        // covers every multibase spelling of the same CIDv1, not just the two
+        // werust happens to produce today.
+        let mut mobile_first = TrustedNamePins::default();
+        mobile_first.bless("ronan.eth", &android, TrustPosture::MutableName, 1);
+        for spelling in [
+            v0.clone(),
+            android.clone(),
+            v1.to_string_of_base(cid::multibase::Base::Base32Upper)
+                .expect("an uppercase base32 CIDv1"),
+            v1.to_string_of_base(cid::multibase::Base::Base58Btc)
+                .expect("a base58btc CIDv1"),
+        ] {
+            let seen = mobile_first.check("ronan.eth", &spelling);
+            assert!(
+                seen.is_unchanged() && !seen.is_changed(),
+                "`{spelling}` names the blessed root, so it is not a change"
+            );
+        }
+    }
+
+    #[test]
+    fn two_genuinely_different_roots_still_compare_unequal() {
+        // The other half, and the one that must not be traded away: canonicalising
+        // may not make two DIFFERENT roots equal. Including the pair a comparison
+        // that gave up early would miss: identical but for the last character.
+        let blessed = dag_pb_root(b"the version the user blessed");
+        let unrelated = dag_pb_root(b"a DIFFERENT version, published later");
+        let late = root_with_a_late_difference(&blessed.into_v1().expect("a CIDv1"));
+        let blessed_v1 = blessed.into_v1().expect("a CIDv1").to_string();
+        let late = late.to_string();
+        let shared = blessed_v1
+            .chars()
+            .zip(late.chars())
+            .take_while(|(a, b)| a == b)
+            .count();
+        assert!(
+            shared > blessed_v1.len() - 4 && blessed_v1 != late,
+            "the late-difference pair shares all but the tail: {blessed_v1} vs {late}"
+        );
+
+        let mut pins = TrustedNamePins::default();
+        pins.bless(
+            "ronan.eth",
+            &blessed.to_string(),
+            TrustPosture::NameViaTrustedRpc,
+            1,
+        );
+        for changed in [unrelated.to_string(), late] {
+            let seen = pins.check("ronan.eth", &changed);
+            assert!(
+                seen.is_changed() && !seen.is_unchanged(),
+                "`{changed}` is a different root, so it still warns"
+            );
+            assert!(seen.is_blessable(), "the user can look, then accept it");
+        }
+    }
+
+    #[test]
+    fn a_cid_werust_cannot_parse_is_compared_literally_and_never_canonicalised() {
+        // The stated rule for a string that is not a CID at all (decisions doc at
+        // `docs/spikes/trust-store-compares-cids-by-canonical-form/DECISIONS.md`):
+        // it is compared BYTE FOR BYTE, exactly as before this change, and never
+        // canonicalised. So canonicalisation can never invent an equality between
+        // two spellings werust could not read, and a root werust cannot parse is
+        // not condemned to a warning no re-bless can ever clear. Never a panic,
+        // whatever is in the file.
+        let real = dag_pb_root(b"a real root").to_string();
+        let mut pins = TrustedNamePins::default();
+        pins.bless("ronan.eth", "not-a-cid", TrustPosture::MutableName, 1);
+
+        // Two DIFFERENT unreadable strings are never equal, however alike.
+        for current in [
+            "not-a-cid-either",
+            "not-a-cid ",
+            "NOT-A-CID",
+            "not-a-ci",
+            "",
+            &real,
+        ] {
+            let seen = pins.check("ronan.eth", current);
+            assert!(
+                seen.is_changed() && !seen.is_unchanged(),
+                "`{current}` is not the recorded string, so it is a change"
+            );
+        }
+        // The SAME unreadable string is the same string: the rule this change
+        // inherits untouched, so nobody who blessed a root werust cannot parse
+        // starts seeing a warning that re-blessing cannot clear.
+        let seen = pins.check("ronan.eth", "not-a-cid");
+        assert!(seen.is_unchanged() && !seen.is_changed());
+
+        // And a REAL root is never equal to an unreadable one, in either position.
+        let mut real_pins = TrustedNamePins::default();
+        real_pins.bless("ronan.eth", &real, TrustPosture::MutableName, 1);
+        assert!(real_pins.check("ronan.eth", "not-a-cid").is_changed());
+        assert!(!real_pins.check("ronan.eth", "").is_unchanged());
+    }
+
+    #[test]
+    fn a_pin_recorded_under_the_old_rule_still_matches_and_is_never_rewritten() {
+        // The migration question, answered by NOT having one: canonicalisation
+        // happens at COMPARISON time, so the store keeps the spelling it was given
+        // and a pin recorded by an earlier build matches the moment this build
+        // runs: no rewrite, no upgrade step, and nobody loses a warning to this
+        // task. Driven through the directory-taking cores against a scratch dir,
+        // with the developer's own store asserted untouched.
+        let real_before = real_pin_store_snapshot();
+        let scratch = ScratchDir::new("old-rule");
+        std::fs::create_dir_all(&scratch.path).unwrap();
+        let root = dag_pb_root(b"the version the user blessed");
+        let recorded = root.to_string();
+        let today = root.into_v1().expect("a CIDv1").to_string();
+
+        // Exactly what a build BEFORE this change wrote: the CID verbatim, in
+        // whatever form the contenthash decoder produced.
+        std::fs::write(
+            scratch.path.join(PINS_FILE),
+            format!(
+                r#"{{"pins":[{{"name":"ronan.eth","cid":"{recorded}","blessedAt":1800000000,"posture":"name-via-trusted-rpc"}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        let mut pins = TrustedNamePins::load_from(&scratch.path).expect("a readable store");
+        assert!(
+            pins.check("ronan.eth", &today).is_unchanged(),
+            "the pin written under the OLD rule matches the form seen today"
+        );
+        assert!(
+            pins.check("ronan.eth", &recorded).is_unchanged(),
+            "and still matches its own form, exactly as it always did"
+        );
+
+        // A read-modify-write (blessing some OTHER name) leaves the recorded
+        // spelling byte for byte: werust records what it was given.
+        pins.bless("stranger.eth", &today, TrustPosture::MutableName, 2);
+        assert_eq!(pins.save_to(&scratch.path), PinSaveOutcome::Recorded);
+        let document = std::fs::read_to_string(scratch.path.join(PINS_FILE)).expect("the store");
+        assert!(
+            document.contains(&recorded),
+            "the recorded CID is kept VERBATIM, never canonicalised on the way out: {document}"
+        );
+        assert_eq!(
+            TrustedNamePins::load_from(&scratch.path)
+                .expect("a readable store")
+                .get("ronan.eth")
+                .map(|pin| pin.cid.clone()),
+            Some(recorded),
+            "and reads back unchanged"
+        );
+        assert_eq!(
+            real_pin_store_snapshot(),
+            real_before,
+            "the developer's own `pins.json` is never written by this suite"
+        );
     }
 
     #[test]

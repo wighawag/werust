@@ -1440,7 +1440,11 @@ pub fn trust_pin_detail(state: &ChromeState) -> String {
     }
     match &name.blessed {
         None => format!("{head}\nYou have not trusted a version of this name yet."),
-        Some(pin) if pin.cid == name.cid => format!(
+        // The ONE comparison the whole TOFU axis is derived from
+        // (`pins::same_content_root`), never a second `==`: a republish of
+        // identical content under another CID spelling must not make this surface
+        // claim a change the badge and the banner do not see.
+        Some(pin) if name.is_unchanged() => format!(
             "{head}\nYou trusted exactly this content on {}.",
             pin.blessed_on()
         ),
@@ -4739,6 +4743,60 @@ mod tests {
                 .get("ronan.eth")
                 .map(|p| p.cid.clone()),
             Some(current_cid)
+        );
+    }
+
+    #[test]
+    fn a_republish_under_another_cid_spelling_says_nothing_changed_on_every_surface() {
+        // The chrome half of `trust-store-compares-cids-by-canonical-form`: the
+        // whole TOFU axis is derived from the ONE comparison
+        // (`pins::same_content_root`), so the banner, the bless affordance AND the
+        // trust surface's sentence all agree that a CIDv0 pin and the base32 CIDv1
+        // of the SAME root are the same content. `trust_pin_detail` carried its
+        // own `==` and would otherwise have gone on telling the user "on <date>
+        // you trusted <Qm…> instead" under a badge and a banner that said nothing
+        // had changed. The CIDs are DERIVED (the two forms the ENS decoder and the
+        // Android edge really produce), never pasted.
+        let root = Cid::try_from(
+            cid_v1_raw_sha256(b"the version the user blessed")
+                .expect("derive a root")
+                .as_str(),
+        )
+        .expect("the derived root parses");
+        let v0 = Cid::new_v0(*root.hash()).expect("a CIDv0 over the same sha2-256 multihash");
+        let v1 = v0.into_v1().expect("its CIDv1");
+        let state = ChromeState {
+            mutable_name: Some(crate::pins::MutableNameTrust {
+                name: "ronan.eth".to_string(),
+                cid: v1.to_string(),
+                blessed: Some(crate::pins::TrustedNamePin {
+                    name: "ronan.eth".to_string(),
+                    cid: v0.to_string(),
+                    blessed_at: 1_800_000_000,
+                    posture: TrustPosture::NameViaTrustedRpc,
+                }),
+            }),
+            ..ChromeState::default()
+        };
+
+        assert!(
+            !state.mutable_name_changed(),
+            "a re-encoding of identical content is not a change"
+        );
+        assert!(!error_banner_visible(&state), "so no banner is raised");
+        assert_eq!(error_banner_text(&state), "");
+        assert!(
+            !trust_pin_action_visible(&state),
+            "and there is nothing left for the user to re-trust"
+        );
+        let detail = trust_pin_detail(&state);
+        assert!(
+            detail.contains("You trusted exactly this content on 2027-01-15"),
+            "the trust surface agrees with the badge: {detail}"
+        );
+        assert!(
+            !detail.contains("instead"),
+            "it never says the user trusted something else: {detail}"
         );
     }
 
